@@ -1,6 +1,6 @@
 # from preprocess import *
-from cme_toolbox import *
-from inference import *
+from .cme_toolbox import *
+from .inference import *
 import pickle
 from scipy import stats
 from scipy import odr
