@@ -1,0 +1,18 @@
+Metadata-Version: 2.1
+Name: monod
+Version: 0.2.2
+Summary: the Monod package fits CME models to sequencing data.
+Home-page: https://github.com/pachterlab/monod
+Author: Gennady Gorin, Lior Pachter
+Author-email: ggorin@caltech.edu, lpachter@caltech.edu
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: Linux
+Requires-Python: >=3.6
+Description-Content-Type: text/markdown
+License-File: LICENSE
+
+# Monod: a package for CME inference from seq data
+
+Write a readme here
+

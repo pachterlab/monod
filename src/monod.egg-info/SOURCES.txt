@@ -1,0 +1,15 @@
+LICENSE
+README.md
+pyproject.toml
+setup.cfg
+src/monod/__init__.py
+src/monod/analysis.py
+src/monod/cme_toolbox.py
+src/monod/extract_data.py
+src/monod/inference.py
+src/monod/preprocess.py
+src/monod.egg-info/PKG-INFO
+src/monod.egg-info/SOURCES.txt
+src/monod.egg-info/dependency_links.txt
+src/monod.egg-info/requires.txt
+src/monod.egg-info/top_level.txt
