@@ -1,4 +1,3 @@
-pickle
 numpy
 scipy
 numdifftools

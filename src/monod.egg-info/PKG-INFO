@@ -6,8 +6,8 @@ Home-page: https://github.com/pachterlab/monod
 Author: Gennady Gorin, Lior Pachter
 Author-email: ggorin@caltech.edu, lpachter@caltech.edu
 Classifier: Programming Language :: Python :: 3
-Classifier: License :: OSI Approved :: MIT License
-Classifier: Operating System :: Linux
+Classifier: License :: OSI Approved :: BSD License
+Classifier: Operating System :: OS Independent
 Requires-Python: >=3.6
 Description-Content-Type: text/markdown
 License-File: LICENSE
