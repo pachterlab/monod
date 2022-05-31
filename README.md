@@ -1,6 +1,6 @@
 # *Monod*: a package for CME inference from seq data
 
-[![PyPI version](https://badge.fury.io/py/monod.svg)](https://pypi.org/project/monod/)
+[![PyPI version](https://badge.fury.io/py/monod.svg)](https://badge.fury.io/py/monod)
 
 This repository contains the current version of the *Monod* package, which implements procedures for fitting and analyzing stochastic models of transcription and sequencing. 
 
