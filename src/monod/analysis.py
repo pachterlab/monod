@@ -150,7 +150,7 @@ def plot_params_for_pair(sr1,sr2,gene_filter_ = None,\
 
     
     fig_string = sr1.batch_analysis_string+'/pair_parameter_comparison_{}.png'.format(meta)
-    plt.savefig(fig_string)
+    plt.savefig(fig_string,dpi=450)
     log.info('Figure stored to {}.'.format(fig_string))
 
 def find_most_concordant_samp(sr1,sr2):
@@ -248,7 +248,7 @@ def plot_AIC_weights(sr_arr,sd,models,ax1=None,meta=None,figsize=None,
     if savefig:
         fig_string = (sr_arr[0].batch_analysis_string)+('/AIC_comparison{}.png'.format(meta))
 
-        plt.savefig(fig_string)
+        plt.savefig(fig_string,dpi=450)
         log.info('Figure stored to {}.'.format(fig_string))
     return w
 
@@ -290,7 +290,7 @@ def compare_AIC_weights(w,dataset_names,batch_analysis_string,model_ind=0,figsiz
     fig1.tight_layout()
     fig_string = batch_analysis_string+'/AIC_comparison_grid.png'
 
-    plt.savefig(fig_string)
+    plt.savefig(fig_string,dpi=450)
     log.info('Figure stored to {}.'.format(fig_string))
 
 def compute_diffreg(sr1,sr2,modeltype='id',gene_filter_ = None,
@@ -383,7 +383,7 @@ def compute_diffreg(sr1,sr2,modeltype='id',gene_filter_ = None,
         fig1.tight_layout()    
         fig_string = sr1.batch_analysis_string+'/parameter_residuals_{}.png'.format(meta)
 
-        plt.savefig(fig_string)
+        plt.savefig(fig_string,dpi=450)
         log.info('Figure stored to {}.'.format(fig_string))
 
     return  gn, np.asarray(gf), np.asarray(offs), np.asarray(resid)

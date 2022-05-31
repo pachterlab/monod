@@ -566,7 +566,7 @@ class SearchResults:
             ax.set_yticks([])
         if savefig:
             fig_string = self.analysis_figure_string+'/landscape.png'
-            plt.savefig(fig_string)
+            plt.savefig(fig_string,dpi=450)
             log.info('Figure stored to {}.'.format(fig_string))
 
 
@@ -636,7 +636,7 @@ class SearchResults:
             ax1[i].set_xlabel(r'$log_{10}$ value')
         fig1.tight_layout()
         fig_string = self.analysis_figure_string+'/parameter_marginals.png'
-        plt.savefig(fig_string)
+        plt.savefig(fig_string,dpi=450)
         log.info('Figure stored to {}.'.format(fig_string))
 
     def plot_KL(self,ax,gene_filter=None,discard_rejected=True,nbin=15):
@@ -659,7 +659,7 @@ class SearchResults:
         ax.set_xlabel('KL divergence')
         ax.set_ylabel('# genes')
         fig_string = self.analysis_figure_string+'/kldiv.png'
-        plt.savefig(fig_string)
+        plt.savefig(fig_string,dpi=450)
         log.info('Figure stored to {}.'.format(fig_string))
 
     def chisquare_testing(self,search_data,viz=False,EPS=1e-12,threshold=0.05,bonferroni=True):    
@@ -704,7 +704,7 @@ class SearchResults:
             plt.xlabel('Chi-square statistic')
             plt.ylabel('# genes')
             fig_string = self.analysis_figure_string+'/chisquare.png'
-            plt.savefig(fig_string)
+            plt.savefig(fig_string,dpi=450)
             log.info('Figure stored to {}.'.format(fig_string))
 
         t2 = time.time()
@@ -806,7 +806,7 @@ class SearchResults:
                     ax1[axloc].set_ylabel('n_genes = '+str(resamp_vec[samp_num]))
 
         fig_string = self.analysis_figure_string+'/subsampling.png'
-        plt.savefig(fig_string)
+        plt.savefig(fig_string,dpi=450)
         log.info('Figure stored to {}.'.format(fig_string))
         self.find_sampling_optimum() #reset sampling optimum here
 
@@ -841,7 +841,7 @@ class SearchResults:
             ax1[axloc].set_title('n_genes = '+str(resamp_vec[samp_num]))
         
         fig_string = self.analysis_figure_string+'/subsampling_stability.png'
-        plt.savefig(fig_string)
+        plt.savefig(fig_string,dpi=450)
         log.info('Figure stored to {}.'.format(fig_string))
 
         self.find_sampling_optimum()#reset sampling optimum.
@@ -874,7 +874,7 @@ class SearchResults:
                 self.plot_landscape(ax1[axloc], discard_rejected=True, levels=30,hideticks=True)
         if viz:
             fig_string = self.analysis_figure_string+'/chisquare_stability.png'
-            plt.savefig(fig_string)
+            plt.savefig(fig_string,dpi=450)
             log.info('Figure stored to {}.'.format(fig_string))
             
         if overwrite:
@@ -989,7 +989,7 @@ class SearchResults:
                 ax1[i].set_ylim([self.sp.phys_lb[i],self.sp.phys_ub[i]])
         fig1.tight_layout()
         fig_string = self.analysis_figure_string+'/length_dependence.png'
-        plt.savefig(fig_string)
+        plt.savefig(fig_string,dpi=450)
         log.info('Figure stored to {}.'.format(fig_string))
 
     def plot_gene_distributions(self,search_data,sz = (5,5),figsize = (10,10),\
@@ -1079,7 +1079,7 @@ class SearchResults:
         fig1.tight_layout(pad=0.02)
 
         fig_string = self.analysis_figure_string+'/gene_distributions_{}.png'.format(marg)
-        plt.savefig(fig_string)
+        plt.savefig(fig_string,dpi=450)
         log.info('Figure stored to {}.'.format(fig_string))
 
     def get_logL(self,search_data,EPS=1e-20):
