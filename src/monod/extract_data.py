@@ -253,11 +253,14 @@ class SearchData:
         f[:,1,1] = 1-f[:,0,1]
         return f
 
-def normalize_count_matrix(X,sizefactor = 'pf',lognormalize=True,pcount=0):
+def normalize_count_matrix(X,sizefactor = 'pf',lognormalize=True,pcount=0,logbase='e'):
     if sizefactor is not None:
         if sizefactor == 'pf':
             sizefactor = X.sum(0).mean()
         X = X/(X.sum(0)[None,:]+pcount)*sizefactor
     if lognormalize:
-        X = np.log(X+1)
+        if logbase=='e':
+            X = np.log(X+1)
+        elif logbase ==2:
+            X = np.log2(X+1)
     return X
