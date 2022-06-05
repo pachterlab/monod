@@ -102,7 +102,7 @@ def extract_data(dataset_filepath, transcriptome_filepath, dataset_name,
                         c='firebrick',alpha=0.9)
         dataset_diagnostics_dir_string = dataset_string + '/diagnostic_figures'
         make_dir(dataset_diagnostics_dir_string)
-        plt.savefig(dataset_diagnostics_dir_string+'/{}.png'.format(dataset_name))
+        plt.savefig(dataset_diagnostics_dir_string+'/{}.png'.format(dataset_name),dpi=450)
 
     n_genes = len(gene_names)
     M = np.asarray([np.amax(U[gene_index]) for gene_index in range(n_genes)],dtype=int)+padding[0]
@@ -239,18 +239,9 @@ class SearchData:
         CV2_1 = S.var(1)/S.mean(1)**2
         CV2_2 = U.var(1)/U.mean(1)**2
 
-        if sizefactor is not None:
-            if sizefactor == 'pf':
-                c1 = S.sum(0).mean()
-                c2 = U.sum(0).mean()
-            else:
-                c1 = sizefactor
-                c2 = sizefactor
-            S = S/(S.sum(0)[None,:]+pcount)*c1
-            U = U/(U.sum(0)[None,:]+pcount)*c2
-        if lognormalize:
-            S = np.log(1+S)
-            U = np.log(1+U)
+        S = normalize_count_matrix(S,sizefactor,lognormalize,pcount)
+        U = normalize_count_matrix(U,sizefactor,lognormalize,pcount)
+
         CV2_1_ = S.var(1)/S.mean(1)**2
         CV2_2_ = U.var(1)/U.mean(1)**2    
 
@@ -261,3 +252,12 @@ class SearchData:
         f[:,0,1] = CV2_1_/CV2_1
         f[:,1,1] = 1-f[:,0,1]
         return f
+
+def normalize_count_matrix(X,sizefactor = 'pf',lognormalize=True,pcount=0):
+    if sizefactor is not None:
+        if sizefactor == 'pf':
+            sizefactor = X.sum(0).mean()
+        X = X/(X.sum(0)[None,:]+pcount)*sizefactor
+    if lognormalize:
+        X = np.log(X+1)
+    return X
