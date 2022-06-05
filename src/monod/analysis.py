@@ -1,6 +1,7 @@
 # from preprocess import *
 from .cme_toolbox import *
 from .inference import *
+from .extract_data import *
 import pickle
 from scipy import stats
 from scipy import odr
@@ -10,7 +11,6 @@ from scipy import odr
 ## Helper functions
 ########################
 
-import pickle
 def load_search_results(full_result_string):
     """
     This function attempts to load in search results.
@@ -297,7 +297,7 @@ def compute_diffreg(sr1,sr2,modeltype='id',gene_filter_ = None,
                      discard_rejected = True,
                      use_sigma=True,
                      figsize=None,
-                     meta = '12',viz=True,pval=0.001):
+                     meta = '12',viz=True,pval_thr=0.001,nit=10):
     """
     This function uses the optimal physical and sampling parameters obtained for a pair of datasets
     to attempt to identify sources of differential regulation (DR) under a model of transcription.
@@ -318,7 +318,8 @@ def compute_diffreg(sr1,sr2,modeltype='id',gene_filter_ = None,
     figsize: figure dimensions.
     meta: figure name metadata.
     viz: whether to plot the histograms of residuals.
-    pval: p-value threshold to use for the Z-test.
+    pval_thr: p-value threshold to use for the Z-test.
+    nit: number of FPI iterations to run.
 
     Output:
     gn: list of size n_phys_pars; each entry contains names of genes identified as DR.
@@ -359,11 +360,11 @@ def compute_diffreg(sr1,sr2,modeltype='id',gene_filter_ = None,
         
         # xl = [sr1.sp.phys_lb[i],sr1.sp.phys_ub[i]]
         if use_sigma:
-            gf_,offs_,resid_ = diffreg_fpi(sr1.phys_optimum[gene_filter,i],sr2.phys_optimum[gene_filter,i],parnames[i],\
-                             modeltype=modeltype,ax1=ax,s1=sr1.sigma[gene_filter,i],s2=sr2.sigma[gene_filter,i],nit=10,viz=viz,pval=pval)
+            gf_,offs_,resid_,pval_ = diffreg_fpi(sr1.phys_optimum[gene_filter,i],sr2.phys_optimum[gene_filter,i],parnames[i],\
+                             modeltype=modeltype,ax1=ax,s1=sr1.sigma[gene_filter,i],s2=sr2.sigma[gene_filter,i],nit=nit,viz=viz,pval_thr=pval_thr)
         else:
-            gf_,offs_,resid_ = diffreg_fpi(sr1.phys_optimum[gene_filter,i],sr2.phys_optimum[gene_filter,i],parnames[i],\
-                             modeltype=modeltype,ax1=ax,s1=None,s2=None,nit=10,viz=viz,pval=pval)
+            gf_,offs_,resid_,pval_ = diffreg_fpi(sr1.phys_optimum[gene_filter,i],sr2.phys_optimum[gene_filter,i],parnames[i],\
+                             modeltype=modeltype,ax1=ax,s1=None,s2=None,nit=nit,viz=viz,pval_thr=pvapval_thrl)
         resid_arr[gene_filter] = resid_
 
         filtind = np.arange(sr1.n_genes)
@@ -405,7 +406,7 @@ def linoffset(B, x, modeltype='id'):
     elif modeltype=='lin':
         return B[1]*x + B[0]
 
-def diffreg_fpi(m1,m2,parname,modeltype='id',ax1=None,s1=None,s2=None,nit=10,pval = 0.001,viz=True):
+def diffreg_fpi(m1,m2,parname=None,modeltype='id',ax1=None,s1=None,s2=None,nit=10,pval_thr = 0.001,viz=True):
     """
     This function uses the optimal physical and sampling parameters obtained for a pair of datasets
     to attempt to identify differentially regulated (DR) genes under a model of transcription, for a single parameter.
@@ -422,14 +423,15 @@ def diffreg_fpi(m1,m2,parname,modeltype='id',ax1=None,s1=None,s2=None,nit=10,pva
     ax1: matplotlib axes to plot into.
     s1: standard error corresponding to m1 estimates.
     s2: standard error corresponding to m2 estimates.
-    nit: number of FPI iterations. to run.
-    pval: p-value threshold to use for the Z-test.
+    nit: number of FPI iterations to run.
+    pval_thr: p-value threshold to use for the Z-test.
     viz: whether to plot the histograms of residuals.
 
     Output:
     gf: ndarray of size n_genes_filtered; if true, the gene has been identified as DR.
     out.beta: ndarray of size n_model_pars, contains (b) or (b,a) for the current physical parameter.
     resid: ndarray of size n_genes_filtered; contains residuals for the current physical parameter under the final fit statistical model.
+    pval: p-value under the z-test.
     """
     fs=12
     gf = np.ones(len(m1),dtype=bool)
@@ -469,7 +471,8 @@ def diffreg_fpi(m1,m2,parname,modeltype='id',ax1=None,s1=None,s2=None,nit=10,pva
                         color=aesthetics['hist_fit_color_2'],label='Initial fit')
 
         z = (resid-fitparams[0])/fitparams[1]
-        gf = np.logical_not((scipy.stats.norm.sf(np.abs(z))*2)<(pval))
+        pval = (scipy.stats.norm.sf(np.abs(z))*2)
+        gf = np.logical_not(pval<pval_thr)
         if j==(nit-1) and viz:
             n,bins = np.histogram(resid,200,density=True)
             binc = np.diff(bins)/2 + bins[:-1]
@@ -486,7 +489,7 @@ def diffreg_fpi(m1,m2,parname,modeltype='id',ax1=None,s1=None,s2=None,nit=10,pva
         ax1.set_xlabel(parname+' residual',fontsize=fs)
         ax1.set_ylabel('Density',fontsize=fs)
     gf = np.logical_not(gf)
-    return gf,out.beta,resid
+    return gf,out.beta,resid,pval
 
 def compare_gene_distributions(sr_arr,sd_arr,sz = (5,5),figsize = (10,10),\
                marg='mature',logscale=None,title=True,\
@@ -572,7 +575,8 @@ def compare_gene_distributions(sr_arr,sd_arr,sz = (5,5),figsize = (10,10),\
 
 
 def compute_diffexp(sd1,sd2,sizefactor = 'pf',lognormalize=True,pcount=0,
-                    pval=0.001,method='ttest',bonferroni=True,modeltype='lin',viz=True,knee_thr=None):
+                    pval_thr=0.001,method='ttest',bonferroni=True,modeltype='lin',viz=True,knee_thr=None,
+                    fc_thr = 1,ax1=None,viz_resid=False):
     """
     This function attempts to identify differentially expressed (DE) genes using a simple comparison of 
     the meand of gene-specific count distributions.
@@ -584,9 +588,9 @@ def compute_diffexp(sd1,sd2,sizefactor = 'pf',lognormalize=True,pcount=0,
         'pf': Proportional fitting; set the size of each cell to the mean size.
         a number: use this number (e.g., 1e4 for cp10k).
         None: do not do size/depth normalization.
-    lognormalize: whether to use a log-transformation for the t-test.
+    lognormalize: whether to use a log2-transformation for the t-test.
     pcount: pseudocount added to ensure division by zero does not occur.
-    pval: p-value threshold for proposing that a gene is DE.
+    pval_thr: p-value threshold for proposing that a gene is DE.
     method: the DE identification method to use.
         If 'ttest', use scipy.stats.ttest_ind, Welch’s t-test.
         If 'logmeanfpi', use the fixed-point iteration procedure on the distribution of log-means.
@@ -595,10 +599,14 @@ def compute_diffexp(sd1,sd2,sizefactor = 'pf',lognormalize=True,pcount=0,
     modeltype: statistical model for variation between means, as in diffreg_fpi.
     viz: whether to visualize the results for non-'ttest' methods.
     knee_thr: knee plot UMI threshold used to filter out low-expression cells.
+    fc_thr: fold change threshold for t-test.
     """
     s1 = np.copy(sd1.S)
     s2 = np.copy(sd2.S)
-    
+
+    if (viz or viz_resid) and ax1 is None:
+        fig1,ax1 = plt.subplots(1,1)
+        
     if method=='ttest':
 
         if knee_thr is not None:
@@ -609,34 +617,42 @@ def compute_diffexp(sd1,sd2,sizefactor = 'pf',lognormalize=True,pcount=0,
 
         gf = np.zeros(sd1.n_genes,dtype=bool)
         if bonferroni:
-            pval /= sd1.n_genes
-        if sizefactor is not None:
-            if sizefactor == 'pf':
-                c1 = s1.sum(0).mean()
-                c2 = s2.sum(0).mean()
-            else:
-                c1 = sizefactor
-                c2 = sizefactor
-            s1 = s1/(s1.sum(0)[None,:]+pcount)*c1
-            s2 = s2/(s2.sum(0)[None,:]+pcount)*c2
-        if lognormalize:
-            s1 = np.log(s1+1)
-            s2 = np.log(s2+1)
+            pval_thr /= sd1.n_genes
+        s1 = normalize_count_matrix(s1,sizefactor = 'pf',lognormalize=True,pcount=0,logbase=2)
+        s2 = normalize_count_matrix(s2,sizefactor = 'pf',lognormalize=True,pcount=0,logbase=2)
+
+        p = np.zeros(sd1.n_genes)
         for i in range(sd1.n_genes):
-            s,p = scipy.stats.ttest_ind(s1[i],s2[i],equal_var=False)
-            if p<pval:
+            _,p_ = scipy.stats.ttest_ind(s1[i],s2[i],equal_var=False)
+            if p_<pval_thr:
                 gf[i] = True
+            p[i] = p_
+        if lognormalize:
+            fc = s2.mean(1) - s1.mean(1)
+        else:
+            fc = np.log2(s1+1).mean(1) - np.log2(s2+1).mean(1)
+        gf = gf & (np.abs(fc)>fc_thr)
+
+        if viz: 
+            pv = -np.log10(p)
+            ax1.scatter(fc[gf],pv[gf],5,'r')
+            ax1.scatter(fc[~gf],pv[~gf],3,'darkgray')
+            ax1.set_xlabel(r'Fold change ($\log_2$)')
+            ax1.set_ylabel(r'$-\log_{10} p$')
     else:
         if method=='logmeanfpi':
-            m1 = np.log(s1.mean(1))
-            m2 = np.log(s2.mean(1))
+            m1 = np.log2(s1.mean(1))
+            m2 = np.log2(s2.mean(1))
         elif method == 'meanlogfpi':
-            m1 = np.log(s1+1).mean(1)
-            m2 = np.log(s2+1).mean(1)
-        if viz:
-            fig1,ax1 = plt.subplots(1,1)
-        else:
-            ax1=None
-        gf,offs_,resid_ = diffreg_fpi(m1,m2,'Spliced mean',\
-                         modeltype=modeltype,ax1=ax1,s1=None,s2=None,nit=30,viz=viz,pval=pval)
-    return gf
+            m1 = np.log2(s1+1).mean(1)
+            m2 = np.log2(s2+1).mean(1)
+        gf,offs_,resid_,p = diffreg_fpi(m1,m2,'Spliced mean',\
+                         modeltype=modeltype,ax1=ax1,s1=None,s2=None,nit=30,viz=viz_resid,pval_thr=pval_thr)
+        # fc = m2-m1
+        if viz: 
+            pv = -np.log10(p)
+            ax1.scatter(fc[gf],pv[gf],5,'r')
+            ax1.scatter(fc[~gf],pv[~gf],3,'darkgray')
+            ax1.set_xlabel(r'Fold change ($\log_2$)')
+            ax1.set_ylabel(r'$-\log_{10} p$')
+    return gf,fc
