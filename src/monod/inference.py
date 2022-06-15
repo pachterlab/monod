@@ -3,13 +3,13 @@ import time
 import numpy as np
 import scipy
 from scipy import optimize
-from preprocess import *
-from cme_toolbox import *
+from .preprocess import *
+from .cme_toolbox import *
 import multiprocessing
 #lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
 import warnings
 import numdifftools
-from plot_aesthetics import *
+from .plot_aesthetics import *
 
 
 
