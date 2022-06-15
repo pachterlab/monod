@@ -3,7 +3,7 @@ import csv
 import matplotlib.pyplot as plt
 import pickle
 
-from .preprocess import * #identify_annotated_genes, get_transcriptome, import_raw, filter_by_gene, make_dir
+from preprocess import * #identify_annotated_genes, get_transcriptome, import_raw, filter_by_gene, make_dir
 
 
 
