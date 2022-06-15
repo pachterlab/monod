@@ -618,8 +618,8 @@ def compute_diffexp(sd1,sd2,sizefactor = 'pf',lognormalize=True,pcount=0,
         gf = np.zeros(sd1.n_genes,dtype=bool)
         if bonferroni:
             pval_thr /= sd1.n_genes
-        s1 = normalize_count_matrix(s1,sizefactor = 'pf',lognormalize=True,pcount=0,logbase=2)
-        s2 = normalize_count_matrix(s2,sizefactor = 'pf',lognormalize=True,pcount=0,logbase=2)
+        s1 = normalize_count_matrix(s1,sizefactor = sizefactor,lognormalize=lognormalize,pcount=0,logbase=2)
+        s2 = normalize_count_matrix(s2,sizefactor = sizefactor,lognormalize=lognormalize,pcount=0,logbase=2)
 
         p = np.zeros(sd1.n_genes)
         for i in range(sd1.n_genes):
