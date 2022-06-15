@@ -4,7 +4,7 @@ import numpy as np
 import scipy
 
 from scipy.fft import irfft2
-from preprocess import *
+from .preprocess import *
 
 
 class CMEModel:
