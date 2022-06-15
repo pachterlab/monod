@@ -293,14 +293,15 @@ def compare_AIC_weights(w,dataset_names,batch_analysis_string,model_ind=0,figsiz
     plt.savefig(fig_string,dpi=450)
     log.info('Figure stored to {}.'.format(fig_string))
 
-def compute_diffreg(sr1,sr2,modeltype='id',gene_filter_ = None,
+def diffexp_pars(sr1,sr2,modeltype='id',gene_filter_ = None,
                      discard_rejected = True,
                      use_sigma=True,
                      figsize=None,
                      meta = '12',viz=True,pval_thr=0.001,nit=10):
     """
     This function uses the optimal physical and sampling parameters obtained for a pair of datasets
-    to attempt to identify sources of differential regulation (DR) under a model of transcription.
+    to attempt to identify sources of differential expression under a model of transcription,
+    i.e., calling patterns of DE-theta, where theta is a biophysical parameter identifiable at steady state.
     Specifically, it uses a fixed-point iteration procedure to distinguish a set of genes with
     Gaussian aleatory variation from a set with systematic, high-magnitude deviations between the datasets.
 
@@ -360,10 +361,10 @@ def compute_diffreg(sr1,sr2,modeltype='id',gene_filter_ = None,
         
         # xl = [sr1.sp.phys_lb[i],sr1.sp.phys_ub[i]]
         if use_sigma:
-            gf_,offs_,resid_,pval_ = diffreg_fpi(sr1.phys_optimum[gene_filter,i],sr2.phys_optimum[gene_filter,i],parnames[i],\
+            gf_,offs_,resid_,pval_ = diffexp_fpi(sr1.phys_optimum[gene_filter,i],sr2.phys_optimum[gene_filter,i],parnames[i],\
                              modeltype=modeltype,ax1=ax,s1=sr1.sigma[gene_filter,i],s2=sr2.sigma[gene_filter,i],nit=nit,viz=viz,pval_thr=pval_thr)
         else:
-            gf_,offs_,resid_,pval_ = diffreg_fpi(sr1.phys_optimum[gene_filter,i],sr2.phys_optimum[gene_filter,i],parnames[i],\
+            gf_,offs_,resid_,pval_ = diffexp_fpi(sr1.phys_optimum[gene_filter,i],sr2.phys_optimum[gene_filter,i],parnames[i],\
                              modeltype=modeltype,ax1=ax,s1=None,s2=None,nit=nit,viz=viz,pval_thr=pvapval_thrl)
         resid_arr[gene_filter] = resid_
 
@@ -406,10 +407,10 @@ def linoffset(B, x, modeltype='id'):
     elif modeltype=='lin':
         return B[1]*x + B[0]
 
-def diffreg_fpi(m1,m2,parname=None,modeltype='id',ax1=None,s1=None,s2=None,nit=10,pval_thr = 0.001,viz=True):
+def diffexp_fpi(m1,m2,parname=None,modeltype='id',ax1=None,s1=None,s2=None,nit=10,pval_thr = 0.001,viz=True):
     """
     This function uses the optimal physical and sampling parameters obtained for a pair of datasets
-    to attempt to identify differentially regulated (DR) genes under a model of transcription, for a single parameter.
+    to attempt to identify differentially expressed genes under a model of transcription, for a single stest statistic.
     Specifically, it uses a fixed-point iteration (FPI) procedure to distinguish a set of genes with
     Gaussian aleatory variation from a set with systematic, high-magnitude deviations between the datasets.
 
@@ -574,12 +575,12 @@ def compare_gene_distributions(sr_arr,sd_arr,sz = (5,5),figsize = (10,10),\
     fig1.tight_layout(pad=0.02)
 
 
-def compute_diffexp(sd1,sd2,sizefactor = 'pf',lognormalize=True,pcount=0,
+def diffexp_mean(sd1,sd2,sizefactor = 'pf',lognormalize=True,pcount=0,
                     pval_thr=0.001,method='ttest',bonferroni=True,modeltype='lin',viz=True,knee_thr=None,
                     fc_thr = 1,ax1=None,viz_resid=False):
     """
-    This function attempts to identify differentially expressed (DE) genes using a simple comparison of 
-    the meand of gene-specific count distributions.
+    This function attempts to identify differentially expressed genes using a simple comparison of 
+    the means of gene-specific count distributions, i.e., DE-mu using the normalized mean as a test statistic.
 
     Input:
     sd1: SearchData instance 1.
@@ -596,7 +597,7 @@ def compute_diffexp(sd1,sd2,sizefactor = 'pf',lognormalize=True,pcount=0,
         If 'logmeanfpi', use the fixed-point iteration procedure on the distribution of log-means.
         If 'meanlogfpi', use the FPI procedure on the distribution of means of log+1 counts.
     bonferroni: whether to use a multiple comparison correction for the ttest method.
-    modeltype: statistical model for variation between means, as in diffreg_fpi.
+    modeltype: statistical model for variation between means, as in diffexp_fpi.
     viz: whether to visualize the results for non-'ttest' methods.
     knee_thr: knee plot UMI threshold used to filter out low-expression cells.
     fc_thr: fold change threshold for t-test.
@@ -646,7 +647,7 @@ def compute_diffexp(sd1,sd2,sizefactor = 'pf',lognormalize=True,pcount=0,
         elif method == 'meanlogfpi':
             m1 = np.log2(s1+1).mean(1)
             m2 = np.log2(s2+1).mean(1)
-        gf,offs_,resid_,p = diffreg_fpi(m1,m2,'Spliced mean',\
+        gf,offs_,resid_,p = diffexp_fpi(m1,m2,'Spliced mean',\
                          modeltype=modeltype,ax1=ax1,s1=None,s2=None,nit=30,viz=viz_resid,pval_thr=pval_thr)
         # fc = m2-m1
         if viz: 
