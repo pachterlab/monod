@@ -92,7 +92,6 @@ def extract_data(
     # if this is ever necessary, just make a different reference list.
     annotation_filter = identify_annotated_genes(gene_names, transcriptome_dict)
     *layers, gene_names = filter_by_gene(annotation_filter, *layers, gene_names)
-    # S,U,gene_names = filter_by_gene(annotation_filter,S,U,gene_names)
 
     # initialize the gene length array.
     len_arr = np.array([transcriptome_dict[k] for k in gene_names])
