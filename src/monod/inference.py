@@ -18,7 +18,7 @@ from tqdm import tqdm
 # from tqdm.contrib.concurrent import process_map  # or thread_map
 
 
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+# warnings.filterwarnings("ignore", category=DeprecationWarning) #let's do more gargeted stuff...
 
 
 class InferenceParameters:
@@ -211,6 +211,7 @@ class InferenceParameters:
         """
 
         t1 = time.time()
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
         if num_cores > 1:
             log.info("Starting parallelized grid scan.")
             parallelize(
@@ -235,6 +236,8 @@ class InferenceParameters:
                 )
             ]
             log.info("Non-parallelized grid scan complete.")
+
+        warnings.resetwarnings()
         results = SearchResults(self, search_data)
         results.aggregate_grid_points()
         full_result_string = results.store_on_disk()
@@ -1236,7 +1239,7 @@ class SearchResults:
         """
         log.info("Computing local Hessian.")
         t1 = time.time()
-
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
         if num_cores > 1:
             log.info("Starting parallelized Hessian computation.")
             hess = parallelize(
@@ -1255,13 +1258,16 @@ class SearchResults:
                 self.par_fun_hess(x) for x in zip(range(self.n_genes), [search_data] * self.n_genes)
             ]
             log.info("Non-parallelized Hessian computation complete.")
+        warnings.resetwarnings()
         hess = np.asarray(hess)
 
         fail = np.zeros(self.n_genes, dtype=bool)
         sigma = np.zeros((self.n_genes, self.sp.n_phys_pars))
 
         for gene_index in range(self.n_genes):
-            try:
+            try:    
+
+
                 hess_inv = np.linalg.inv(hess[gene_index, :, :])
                 sigma[gene_index, :] = np.sqrt(np.diag(hess_inv)) / np.sqrt(self.n_cells)
             except:
