@@ -1,72 +1,132 @@
 import pickle
 import time
 import numpy as np
+import matplotlib.pyplot as plt
 import scipy
-from scipy import optimize
-from .preprocess import *
-from .cme_toolbox import *
+from scipy import optimize, stats
+from .preprocess import make_dir, log
+from .cme_toolbox import CMEModel  # may be unnecessary
 import multiprocessing
-#lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
+import os
+
+# lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
 import warnings
-import numdifftools
-from .plot_aesthetics import *
+from .plot_aesthetics import aesthetics
+
+from tqdm import tqdm
+
+# from tqdm.contrib.concurrent import process_map  # or thread_map
 
 
-
-warnings.filterwarnings("ignore", category=DeprecationWarning) 
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
 class InferenceParameters:
+    """Stores parameters and distributes the multi-grid point inference procedure.
+
+    Attributes
+    ----------
+    gradient_params: dict
+        settings for gradient descent.
+        "max_iterations" defines the maximum number of gradient descent iterations.
+        "init_pattern" defines whether the first try starts at the method of moments estimate.
+        "num_restarts" defines how many attempts should be made.
+    phys_lb: float np.ndarray
+        log10 lower bounds on biological parameters.
+    phys_ub: float np.ndarray
+        log10 upper bounds on biological parameters.
+    grad_bnd: scipy.optimize.Bounds
+        log10 lower and upper bounds on biological parameters.
+    use_lengths: bool
+        if True, the nascent Poisson model technical variation parameter is a
+        coefficient multiplied by gene length.
+        if False, the parameter is the genome-wide nascent sampling rate.
+    samp_lb: np.ndarray
+        log10 lower bounds on technical variation parameters.
+    samp_ub: np.ndarray
+        log10 upper bounds on technical variation parameters.
+    gridsize: list of ints or int np.ndarray
+        grid size for evaluating the technical variation parameters.
+    model: monod.cme_toolbox.CMEModel
+        CME model used for inference.
+    n_phys_pars: int
+        number of biological model parameters.
+    n_samp_pars: int
+        number of technical variation model parameters. Set to 2 for consistency.
+    dataset_string: str
+        dataset-specific directory location.
+    inference_string: str
+        run-specific directory location within dataset_string.
+    sampl_vals: list of lists of floats
+        list of grid points.
+    X: np.ndarray
+        grid point values representing unspliced RNA sampling parameters.
+    Y: np.ndarray
+        grid point values representing spliced RNA sampling parameters.
+    n_grid_pts: int
+        total number of grid points to evaluate.
+
     """
-    This class stores the parameters for the inference procedure.
 
-    Attributes:
-    grad_bnd: lower and upper bounds as a scipy.optimize.Bounds object.
-    n_phys_pars: number of biological parameters.
-    n_samp_pars: number of technical parameters.
-    sampl_vals: list of grid points.
-    X: grid point values in first dimension (unspliced sampling).
-    Y: grid point values in second dimension (spliced sampling).
-    n_grid_pts: total number of grid points.
-    inference_string: search subdirectory string.
+    def __init__(
+        self,
+        phys_lb,
+        phys_ub,
+        samp_lb,
+        samp_ub,
+        gridsize,
+        dataset_string,
+        model,
+        use_lengths=True,
+        gradient_params={
+            "max_iterations": 10,
+            "init_pattern": "moments",
+            "num_restarts": 1,
+        },
+        run_meta="",
+    ):
+        """Initialize the InferenceParameters instance.
 
-    All others are listed under __init__ inputs.
-    """
-    def __init__(self,phys_lb,phys_ub,samp_lb,samp_ub,gridsize,dataset_string,model,use_lengths=True,\
-    			 gradient_params = {'max_iterations':10,'init_pattern':'moments','num_restarts':1},run_meta=''):
-        """
-        This method initializes the InferenceParameters instance.
-
-        Input:
-        phys_lb: log10 lower bounds on biological parameters.
-        phys_ub: log10 upper bounds on biological parameters.
-        samp_lb: log10 lower bounds on technical parameters.
-        samp_ub: log10 upper bounds on technical parameters.
-        gridsize: list of two ints; grid size for technical parameter scan.
-        dataset_string: dataset-specific directory.
-        model: instance of CMEModel class.
-        use_lengths: bool; whether to model unspliced capture rate as length-dependent.
-        gradient_params: dict containing the following entries:
-            max_iterations: number of gradient descent steps
-            init_pattern: where to initialize the search ('moments' for method of moments, 'random' otherwise)
-            num_restarts: number of searches to run per gene and grid point.
-        run_meta: metadata string for the search.
-
-        Creates: 
-        Copy of object on the disk, as a parameters.pr object in the search subdirectory.
+        Parameters
+        ----------
+        phys_lb: list of floats or float np.ndarray
+            log10 lower bounds on biological parameters.
+        phys_ub: list of floats or float np.ndarray
+            log10 upper bounds on biological parameters.
+        samp_lb: list of floats or float np.ndarray
+            log10 lower bounds on technical variation parameters.
+        samp_ub: list of floats or float np.ndarray
+            log10 upper bounds on technical variation parameters.
+        gridsize: list of ints or int np.ndarray
+            grid size for evaluating the technical variation parameters.
+        dataset_string: str
+            dataset-specific directory location.
+        model: monod.cme_toolbox.CMEModel
+            CME model used for inference.
+        use_lengths: bool, optional
+            if True, the nascent Poisson model technical variation parameter is a
+            coefficient multiplied by gene length.
+            if False, the parameter is the genome-wide nascent sampling rate.
+        gradient_params: dict, optional
+            settings for gradient descent.
+            "max_iterations" defines the maximum number of gradient descent iterations.
+            "init_pattern" defines whether the first try starts at the method of moments estimate.
+            "num_restarts" defines how many attempts should be made.
+        run_meta: str, optional
+            any additional metadata to append to the run directory name.
         """
         self.gradient_params = gradient_params
         self.phys_lb = np.array(phys_lb)
         self.phys_ub = np.array(phys_ub)
-        self.grad_bnd = scipy.optimize.Bounds(phys_lb,phys_ub)
+        self.grad_bnd = scipy.optimize.Bounds(phys_lb, phys_ub)
 
         self.use_lengths = use_lengths
 
-        if model.seq_model == 'None':
-            log.info('Sequencing model set to None. All sampling parameters set to null.')
-            samp_lb = [1,1]
-            samp_ub = [1,1]
-            gridsize = [1,1]
+        if model.seq_model == "None":
+            log.info("Sequencing model set to None. All sampling parameters set to null.")
+            samp_lb = [1, 1]
+            samp_ub = [1, 1]
+            gridsize = [1, 1]
 
         self.samp_lb = np.array(samp_lb)
         self.samp_ub = np.array(samp_ub)
@@ -76,127 +136,225 @@ class InferenceParameters:
         self.model = model
 
         self.n_phys_pars = model.get_num_params()
-        self.n_samp_pars = len(self.samp_ub) #this will always be 2 for now
+        self.n_samp_pars = len(self.samp_ub)  # this will always be 2 for now
 
-        if len(run_meta)>0:
-            run_meta = '_'+run_meta 
+        if len(run_meta) > 0:
+            run_meta = "_" + run_meta
 
         self.dataset_string = dataset_string
-        inference_string = dataset_string + '/' \
-            + model.bio_model + '_' + model.seq_model + '_' \
-            + '{:.0f}x{:.0f}'.format(gridsize[0],gridsize[1]) + run_meta
+        inference_string = f"{dataset_string}/{model.bio_model}_{model.seq_model}_{gridsize[0]:.0f}x{gridsize[1]:.0f}{run_meta}"
         make_dir(inference_string)
         self.inference_string = inference_string
-        inference_parameter_string = inference_string + '/parameters.pr'
+        inference_parameter_string = inference_string + "/parameters.pr"
         self.store_inference_parameters(inference_parameter_string)
 
     def construct_grid(self):
+        """Creates a grid of points over the two-dimensional technical variation parameter domain.
+
+        Sets
+        ----
+        sampl_vals: list of lists of floats
+            list of grid points.
+        X: np.ndarray
+            grid point values representing unspliced RNA sampling parameters.
+        Y: np.ndarray
+            grid point values representing spliced RNA sampling parameters.
+        n_grid_pts: int
+            total number of grid points to evaluate.
         """
-        This method creates a grid of points over the sampling parameter domain.
-        """
-        X,Y = np.meshgrid(\
-                          np.linspace(self.samp_lb[0],self.samp_ub[0],self.gridsize[0]),\
-                          np.linspace(self.samp_lb[1],self.samp_ub[1],self.gridsize[1]),indexing='ij')
-        X=X.flatten()
-        Y=Y.flatten()
+        X, Y = np.meshgrid(
+            np.linspace(self.samp_lb[0], self.samp_ub[0], self.gridsize[0]),
+            np.linspace(self.samp_lb[1], self.samp_ub[1], self.gridsize[1]),
+            indexing="ij",
+        )
+        X = X.flatten()
+        Y = Y.flatten()
         self.X = X
         self.Y = Y
-        self.sampl_vals = list(zip(X,Y))
+        self.sampl_vals = list(zip(X, Y))
         self.n_grid_points = len(X)
 
-    def store_inference_parameters(self,inference_parameter_string):
-        """
-        This method attempts to save the inference parameter object.
+    def store_inference_parameters(self, inference_parameter_string):
+        """This helper method attempts to save the InferenceParameters object.
 
-        Input:
-        inference_parameter_string: search subdirectory location.
+        Parameters
+        ----------
+        inference_parameter_string: str
+            file location.
         """
         try:
-            with open(inference_parameter_string,'wb') as ipfs:
+            with open(inference_parameter_string, "wb") as ipfs:
                 pickle.dump(self, ipfs)
-            log.info('Global inference parameters stored to {}.'.format(inference_parameter_string))
+            log.info("Global inference parameters stored to {}.".format(inference_parameter_string))
         except:
-            log.error('Global inference parameters could not be stored to {}.'.format(inference_parameter_string))
+            log.error(
+                "Global inference parameters could not be stored to {}.".format(
+                    inference_parameter_string
+                )
+            )
 
-    def fit_all_grid_points(self,num_cores,search_data):
-        """
-        This method fits the search data.
+    def fit_all_grid_points(self, num_cores, search_data):
+        """Fits the search data for all genes over all grid points.
 
-        Input:
-        num_cores: number of cores to use for parallelization over grid points.
-        search_data: SearchData object.
+        Parameters
+        ----------
+        num_cores: int
+            number of cores to use for parallelization over grid points.
+        search_data: monod.extract_data.SearchData
+            SearchData object with the data to fit.
 
-        Output:
-        full_result_string: location of the SearchResults object.
+        Returns
+        -------
+        full_result_string: str
+            disk location of the SearchResults object.
 
-        Creates:
-        A copy of the SearchResult object on disk in the search subdirectory, as grid_scan_results.res.
-        Temporarily, a set of grid-specific GridPointResults objects, as grid_point_X.gp.
         """
 
         t1 = time.time()
-        if num_cores>1:
-            log.info('Starting parallelized grid scan.')
-            pool=multiprocessing.Pool(processes=num_cores)
-            pool.map(self.par_fun,zip(range(self.n_grid_points),[[search_data,self.model]]*self.n_grid_points))
-            pool.close()
-            pool.join()
-            log.info('Parallelized grid scan complete.')
+        if num_cores > 1:
+            log.info("Starting parallelized grid scan.")
+            parallelize(
+                function=self.par_fun,
+                iterable=zip(
+                    range(self.n_grid_points),
+                    [[search_data, self.model]] * self.n_grid_points,
+                ),
+                num_cores=num_cores,
+                num_entries=self.n_grid_points,
+                completion_message="Parallelized grid scan complete.",
+                termination_message="The scan has been manually terminated.",
+                error_message="The scan has been terminated due to computation issues. Please check MoM estimates.",
+            )
         else:
-            log.info('Starting non-parallelized grid scan.')
-            for point_index in range(self.n_grid_points):
-                grad_inference = GradientInference(self,self.model,search_data,point_index)
-                grad_inference.fit_all_genes(self.model,search_data)
-            log.info('Non-parallelized grid scan complete.')
-        # full_result_string = self.store_search_results()
-        results = SearchResults(self,search_data)
+            log.info("Starting non-parallelized grid scan.")
+            [
+                self.par_fun(x)
+                for x in zip(
+                    range(self.n_grid_points),
+                    [[search_data, self.model]] * self.n_grid_points,
+                )
+            ]
+            log.info("Non-parallelized grid scan complete.")
+        results = SearchResults(self, search_data)
         results.aggregate_grid_points()
         full_result_string = results.store_on_disk()
 
         t2 = time.time()
-        log.info('Runtime: {:.1f} seconds.'.format(t2-t1))
+        log.info("Runtime: {:.1f} seconds.".format(t2 - t1))
         return full_result_string
 
-    def par_fun(self,inputs):
+    def par_fun(self, inputs):
+        """Helper method for the grid point parallelization procedure.
+
+        Parameters
+        ----------
+        inputs: tuple
+            entry 0: int
+                point index within [0, n_grid_points) to evaluate at.
+            entry 1: tuple
+                entry 0: monod.extract_data.SearchData
+                    SearchData object with the data to fit.
+                entry 1: monod.cme_toolbox.CMEModel
+                    CME model used for inference.
         """
-        This is a helper method for the parallelization procedure.
-        """
-        point_index,(search_data,model) = inputs
-        grad_inference = GradientInference(self,model,search_data,point_index)
-        grad_inference.fit_all_genes(model,search_data)
+        point_index, (search_data, model) = inputs
+        grad_inference = GradientInference(self, model, search_data, point_index)
+        grad_inference.fit_all_genes(model, search_data)
 
 
 class GradientInference:
+    """Runs the grid point-specific inference procedures.
+
+    Attributes
+    ----------
+    grid_point: list of floats
+        genome-wide technical variation parameter values at the current grid point.
+    point_index: int
+        the index of the current point, within [0, n_grid_points).
+    regressor: np.ndarray
+        gene-specific technical variation parameter values at the current grid point.
+        these values will be different for each gene if use_lengths=True in the
+        InferenceParameters constructor.
+    grad_bnd: scipy.optimize.Bounds
+        log10 lower and upper bounds on biological parameters.
+    gradient_params: dict
+        settings for gradient descent.
+        "max_iterations" defines the maximum number of gradient descent iterations.
+        "init_pattern" defines whether the first try starts at the method of moments estimate.
+        "num_restarts" defines how many attempts should be made.
+    phys_lb: float np.ndarray
+        log10 lower bounds on biological parameters.
+    phys_ub: float np.ndarray
+        log10 upper bounds on biological parameters.
+    n_phys_pars: int
+        number of biological model parameters.
+    n_samp_pars: int
+        number of technical variation model parameters.
+    inference_string: str
+        run-specific directory location.
+    param_MoM: np.ndarray
+        method of moments estimates for all genes under the current technical variation parameters.
     """
-    This class contains the grid point-specific inference parameters and procedures.
 
-    Attributes: 
-    grid_point: the (genome-wide) sampling parameter values at the current grid point.
-    regressor: for the length-based Poisson sampling model, the values of the gene-specific sampling rates.
-    param_MoM: method of moments estimates for all genes under the current parameters.
+    def __init__(self, global_parameters, model, search_data, point_index):
+        """Initialize a GradientInference object.
 
-    All others are listed under __init__ inputs and in the definition of InferenceParameters.
-    """
-    def __init__(self,global_parameters,model,search_data,point_index):
+        Parameters
+        ----------
+        global_parameters: InferenceParameters
+            information about the global parameter inference procedure.
+        model: monod.cme_toolbox.CMEModel
+            CME model used for inference.
+        search_data: monod.extract_data.SearchData
+            SearchData object with the data to fit.
+        point_index: int
+            the index of the current point, within [0, n_grid_points).
+
+        Sets
+        ----
+        grid_point: list of floats
+            genome-wide technical variation parameter values at the current grid point.
+        point_index: int
+            the index of the current point, within [0, n_grid_points).
+        regressor: np.ndarray
+            gene-specific technical variation parameter values at the current grid point.
+            these values will be different for each gene if use_lengths=True in the
+            InferenceParameters constructor.
+        grad_bnd: scipy.optimize.Bounds
+            log10 lower and upper bounds on biological parameters.
+        gradient_params: dict
+            settings for gradient descent.
+            "max_iterations" defines the maximum number of gradient descent iterations.
+            "init_pattern" defines whether the first try starts at the method of moments estimate.
+            "num_restarts" defines how many attempts should be made.
+        phys_lb: float np.ndarray
+            log10 lower bounds on biological parameters.
+        phys_ub: float np.ndarray
+            log10 upper bounds on biological parameters.
+        n_phys_pars: int
+            number of biological model parameters.
+        n_samp_pars: int
+            number of technical variation model parameters.
+        inference_string: str
+            run-specific directory location.
+        param_MoM: np.ndarray
+            method of moments estimates for all genes under the current technical variation parameters.
+
         """
-        This method initializes a GradientInference object.
-
-        Input:
-        global_parameters: an InferenceParameters instance.
-        model: a CMEModel instance.
-        search_data: a SearchData instance.
-        point_index: the integer grid point index.
-        """
-        regressor = np.array([global_parameters.sampl_vals[point_index]]*search_data.n_genes)
+        regressor = np.array([global_parameters.sampl_vals[point_index]] * search_data.n_genes)
         if global_parameters.use_lengths:
-            if model.seq_model == 'Bernoulli':
-                raise ValueError('The Bernoulli model does not yet have a physical length-based model.')
-            elif model.seq_model == 'None': 
-                raise ValueError('The model without technical noise has no length effects.')
-            elif model.seq_model == 'Poisson':
-                regressor[:,0] += search_data.gene_log_lengths
+            if model.seq_model == "Bernoulli":
+                raise ValueError(
+                    "The Bernoulli model does not yet have a physical length-based model."
+                )
+            elif model.seq_model == "None":
+                raise ValueError("The model without technical noise has no length effects.")
+            elif model.seq_model == "Poisson":
+                regressor[:, 0] += search_data.gene_log_lengths
             else:
-                raise ValueError('Please select a technical noise model from {Poisson}, {Bernoulli}, {None}.')
+                raise ValueError(
+                    "Please select a technical noise model from {Poisson}, {Bernoulli}, {None}."
+                )
         self.grid_point = global_parameters.sampl_vals[point_index]
         self.point_index = point_index
         self.regressor = regressor
@@ -206,126 +364,218 @@ class GradientInference:
         self.phys_ub = global_parameters.phys_ub
         self.n_phys_pars = global_parameters.n_phys_pars
         self.n_samp_pars = global_parameters.n_samp_pars
-        # self.n_phys_pars = len(global_parameters.phys_lb)
-        # self.n_samp_pars = len(global_parameters.samp_ub)
 
         self.inference_string = global_parameters.inference_string
-        if self.gradient_params['init_pattern'] == 'moments':
-            self.param_MoM = np.asarray([model.get_MoM(\
-                                    search_data.moments[i],\
-                                    global_parameters.phys_lb,\
-                                    global_parameters.phys_ub,\
-                                    regressor[i]) for i in range(search_data.n_genes)])
-            
-    def optimize_gene(self,gene_index,model,search_data):
-        """
-        This method attempts to fit the data for a single gene using gradient descent over the KL divergence lanscape.
-        If num_restarts>1 and init_pattern=moments, the first search starting point is set to the MoM parameter estimate.
-        If num_restarts>1, the optimum is only updated if new KLD is lower than 0.99*previous lowest KLD.
+        if self.gradient_params["init_pattern"] == "moments":
+            self.param_MoM = np.asarray(
+                [
+                    model.get_MoM(
+                        search_data.moments[i],
+                        global_parameters.phys_lb,
+                        global_parameters.phys_ub,
+                        regressor[i],
+                    )
+                    for i in range(search_data.n_genes)
+                ]
+            )
 
-        Input:
-        gene_index: integer index of current gene.
-        model: a CMEModel instance.
-        search_data: a SearchData instance.
+    def optimize_gene(self, gene_index, model, search_data):
+        """Fit the data for a single gene using KL divergence gradient descent.
 
-        Output:
-        x: optimal parameter values.
-        err: KL divergence of the model at x.
+        If init_pattern = moments, the first search's starting point is set to the
+            method of moments parameter estimate for the current grid point.
+        If num_restarts>1, the optimum is only updated if new KLD is lower
+            than 0.99*previous lowest KLD.
+
+        Parameters
+        ----------
+        gene_index: int
+            index of the current gene, as defined by the gene_names attribute of search_data.
+        model: monod.cme_toolbox.CMEModel
+            CME model used for inference.
+        search_data: monod.extract_data.SearchData
+            SearchData object with the data to fit.
+
+        Returns
+        -------
+        x: np.ndarray
+            optimal biological parameter values.
+        err: float
+            Kullback-Leibler divergence of the model at x, relative to data.
         """
-        x0 = np.random.rand(self.gradient_params['num_restarts'],self.n_phys_pars)*(self.phys_ub-self.phys_lb)+self.phys_lb
-        if self.gradient_params['init_pattern'] == 'moments': #this can be extended to other initialization patterns, like latin squares
+        x0 = (
+            np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
+            * (self.phys_ub - self.phys_lb)
+            + self.phys_lb
+        )
+        if (
+            self.gradient_params["init_pattern"] == "moments"
+        ):  # this can be extended to other initialization patterns, like latin squares
             x0[0] = self.param_MoM[gene_index]
         x = x0[0]
         err = np.inf
         ERR_THRESH = 0.99
 
-        for restart in range(self.gradient_params['num_restarts']):
-            res_arr = scipy.optimize.minimize(lambda x: \
-                        kl_div(
-                           data=search_data.hist[gene_index],
-                           proposal=model.eval_model_pss(
-                               x, 
-                               [search_data.M[gene_index],search_data.N[gene_index]], 
-                               self.regressor[gene_index])),
-                        x0=x0[restart], \
-                        bounds=self.grad_bnd,\
-                        options={'maxiter':self.gradient_params['max_iterations'],'disp':False})
-            if res_arr.fun < err*ERR_THRESH: #do not replace old best estimate if there is little marginal benefit
+        # print(hist_type)
+        hist_type = get_hist_type(search_data)
+
+        for restart in range(self.gradient_params["num_restarts"]):
+            res_arr = scipy.optimize.minimize(
+                lambda x: model.eval_model_kld(
+                    p=x,  # limits=[search_data.M[gene_index],search_data.N[gene_index]],\
+                    limits=search_data.M[:, gene_index],
+                    samp=self.regressor[gene_index],
+                    data=search_data.hist[gene_index],
+                    hist_type=hist_type,
+                ),
+                x0=x0[restart],
+                bounds=self.grad_bnd,
+                options={
+                    "maxiter": self.gradient_params["max_iterations"],
+                    "disp": False,
+                },
+            )
+            if (
+                res_arr.fun < err * ERR_THRESH
+            ):  # do not replace old best estimate if there is little marginal benefit
                 x = res_arr.x
                 err = res_arr.fun
+        if not (np.isfinite(x).all()):
+            log.warning("Gene index: " + str(gene_index))
+            raise ValueError("Search failed. Please check input data.")
         return x, err
 
-    def iterate_over_genes(self,model,search_data):
-        """
-        This method runs optimize_gene for every gene at the current grid point.
+    def iterate_over_genes(self, model, search_data):
+        """Run gradient descent for every gene at the current grid point.
 
-        Input:
-        model: a CMEModel instance.
-        search_data: a SearchData instance.
+        Parameters
+        ----------
+        model: monod.cme_toolbox.CMEModel
+            CME model used for inference.
+        search_data: monod.extract_data.SearchData
+            SearchData object with the data to fit.
 
-        Output:
-        param_estimates: optimal parameter values for each gene.
-        klds: KL divergence of the model for each gene at param_estimates.
-        obj_func: sum of klds.
-        d_time: function runtime.
+        Returns
+        -------
+        param_estimates: np.ndarray
+            optimal biological parameter values for each gene, an n_genes x n_phys_pars array.
+        klds: np.ndarray
+            Kullback-Leibler divergence of the model for each gene at param_estimates.
+        obj_func: float
+            sum of klds; total error at the current grid point.
+        d_time: float
+            runtime in seconds.
         """
         t1 = time.time()
-        
-        param_estimates, klds = zip(*[self.optimize_gene(gene_index,model,search_data) for gene_index in range(search_data.n_genes)])
-        
+
+        param_estimates, klds = zip(
+            *[
+                self.optimize_gene(gene_index, model, search_data)
+                for gene_index in range(search_data.n_genes)
+            ]
+        )
+
         klds = np.asarray(klds)
         param_estimates = np.asarray(param_estimates)
         obj_func = klds.sum()
-        
+
         t2 = time.time()
-        d_time = t2-t1
+        d_time = t2 - t1
 
         return param_estimates, klds, obj_func, d_time
 
-    def fit_all_genes(self,model,search_data):
-        """
-        This method runs iterate_over_genes and stores the results as a .
+    def fit_all_genes(self, model, search_data):
+        """Wraps iterate_over_genes and stores the results on disk.
 
-        Input:
-        model: a CMEModel instance.
-        search_data: a SearchData instance.
+        Parameters
+        ----------
+        model: monod.cme_toolbox.CMEModel
+            CME model used for inference.
+        search_data: monod.extract_data.SearchData
+            SearchData object with the data to fit.
 
-        Creates:
-        A copy of the GridPointResults object on disk in the search subdirectory.
         """
-        search_out = self.iterate_over_genes(model,search_data)
-        results = GridPointResults(*search_out,self.regressor,self.grid_point,self.point_index,self.inference_string)
+        search_out = self.iterate_over_genes(model, search_data)
+        results = GridPointResults(
+            *search_out,
+            self.regressor,
+            self.grid_point,
+            self.point_index,
+            self.inference_string,
+        )
         results.store_grid_point_results()
+
 
 ########################
 ## Helper functions
 ########################
-def kl_div(data, proposal,EPS=1e-15):
-    """
-    This helper function computes the Kullback-Leibler divergence between experimental data histogram and proposed PMF. 
 
-    Input:
-    data: experimental data histogram.
-    proposal: proposed PMF computed by the CMEModel method.
-    EPS: minimum allowed proposal probability mass. 
+
+def get_hist_type(search_data):
+    """A helper function for backwards compatibility.
+
+    If the histogram type is not specified in the SearchData object, assume it is the legacy
+    type "grid".
+
+    Parameters
+    ----------
+    search_data: monod.extract_data.SearchData
+        SearchData object with the data to fit.
+
+    Returns
+    -------
+    hist_type: str
+        flavor of histogram used to generate search_data, either "unique" or "grid".
     """
-    proposal[proposal<EPS]=EPS
-    filt = data>0
-    data = data[filt]
-    proposal = proposal[filt]
-    d=data*np.log(data/proposal)
-    return np.sum(d)
+
+    if hasattr(search_data, "hist_type") and search_data.hist_type == "unique":
+        hist_type = "unique"
+    else:
+        hist_type = "grid"
+    return hist_type
+
 
 ########################
 ## Helper classes
 ########################
 class GridPointResults:
-    """
-    This class temporarily stores the fit parameters for a single grid point.
+    """Temporarily stores the fit parameters for a single grid point.
 
-    Attributes as in GradientInference.
+    Attributes
+    ----------
+    param_estimates: np.ndarray
+        optimal biological parameter values for each gene, an n_genes x n_phys_pars array.
+    klds: np.ndarray
+        Kullback-Leibler divergence of the model for each gene at param_estimates.
+    obj_func: float
+        sum of klds; total error at the current grid point.
+    d_time: float
+        runtime in seconds.
+    regressor: np.ndarray
+        gene-specific technical variation parameter values at the current grid point.
+        these values will be different for each gene if use_lengths=True in the
+        InferenceParameters constructor.
+    grid_point: list of floats
+        genome-wide technical variation parameter values at the current grid point.
+    point_index: int
+        the index of the current point, within [0, n_grid_points).
+    inference_string: str
+        run-specific directory location.
+
     """
-    def __init__(self,param_estimates, klds, obj_func, d_time,regressor,grid_point,point_index,inference_string):
+
+    def __init__(
+        self,
+        param_estimates,
+        klds,
+        obj_func,
+        d_time,
+        regressor,
+        grid_point,
+        point_index,
+        inference_string,
+    ):
+        """Creates a GridPointResults object and sets all of its attributes."""
         self.param_estimates = param_estimates
         self.klds = klds
         self.obj_func = obj_func
@@ -334,51 +584,115 @@ class GridPointResults:
         self.grid_point = grid_point
         self.point_index = point_index
         self.inference_string = inference_string
+
     def store_grid_point_results(self):
-        """
-        This function attempts to store the grid point results to disk as a grid_point_X.gp object.
-        """
+        """This helper method attempts to store the grid point results to disk as a grid_point_X.gp object."""
         try:
-            grid_point_result_string = self.inference_string + '/grid_point_'+str(self.point_index)+'.gp'
-            with open(grid_point_result_string,'wb') as gpfs:
+            grid_point_result_string = (
+                self.inference_string + "/grid_point_" + str(self.point_index) + ".gp"
+            )
+            with open(grid_point_result_string, "wb") as gpfs:
                 pickle.dump(self, gpfs)
-            log.debug('Grid point {:.0f} results stored to {}.'.format(self.point_index,grid_point_result_string))
+            log.debug(
+                "Grid point {:.0f} results stored to {}.".format(
+                    self.point_index, grid_point_result_string
+                )
+            )
         except:
-            log.error('Grid point {:.0f} results could not be stored to {}.'.format(self.point_index,grid_point_result_string))
+            log.error(
+                "Grid point {:.0f} results could not be stored to {}.".format(
+                    self.point_index, grid_point_result_string
+                )
+            )
+
 
 class SearchResults:
-    """
-    This class provides a self-contained interface for the storage and analysis of the results of a single inference run. 
+    """Stores and analyzes the results of a single inference run.
 
-    Attributes: 
-    sp: an InferenceParameters instance.
-    inference_string: the location of the search subdirectory.
-    model: a CMEModel instance.
-    n_genes: number of genes.
-    n_cells: number of cells.
-    gene_log_lengths: log lengths of each gene.
-    gene_names: np string array of gene names.
-    param_estimates: optimal parameter values for each gene, a n_grid_pts x n_genes x n_phys_pars array.
-    klds: KL divergence of the model for each gene at param_estimates, a n_grid_pts x n_genes array.
-    obj_func: sum of klds at each grid point, a n_grid_pts vector.
-    d_time: function runtime for each grid point, a n_grid_pts vector.
-    regressor: the values of the gene-specific sampling rates at each grid point; a n_grid_pts x n_genes array.
-    """
-    def __init__(self,inference_parameters,search_data):
-        """
-        This class instantiates a SearchResults object.
+    The first thirteen attributes relate to data loaded from the search.
+    The others relate to data processing after the search is completed.
 
-        Input:
-        inference_parameters: an InferenceParameters instance.
-        search_data: a SearchData instance.
+    Attributes
+    ----------
+    sp: InferenceParameters
+        search parameters used to generate the run.
+    inference_string: str
+        run-specific directory location.
+    model: monod.cme_toolbox.CMEModel
+        CME model used for inference.
+    n_genes: int
+        number of analyzed genes.
+    n_cells: int
+        number of cells in the dataset.
+    gene_log_lengths: float np.ndarray
+        log lengths of analyzed genes.
+    gene_names: str np.ndarray
+        list of analyzed genes.
+    param_estimates: float np.ndarray
+        optimal biological parameter values for each gene, an n_grid_pts x n_genes x n_phys_pars array.
+    klds: float np.ndarray
+        Kullback-Leibler divergence of the model for each gene at param_estimates, an n_grid_pts x n_genes array.
+    obj_func: float np.ndarray
+        sum of klds at each grid points; total error at the current grid point, a length-n_grid_pts array.
+    d_time: float np.ndarray
+        runtime in seconds for each grid point, a length-n_grid_pts array.
+    regressor: float np.ndarray
+        gene-specific technical variation parameter values at each grid point.
+        an n_grid_pts x n_genes array.
+        these values will be different for each gene if use_lengths=True in the
+        InferenceParameters constructor.
+    analysis_figure_string: str
+        directory for analysis figures.
+
+    samp_optimum: list of floats
+        estimated value of the technical noise parameters.
+    samp_optimum_ind: int
+        index of the sampling parameter optimum grid point.
+    phys_optimum: float np.ndarray
+        gene-specific physical parameter values at the sampling parameter optimum.
+    regressor_optimum: float np.ndarray
+        gene-specific technical variation parameter values at the sampling parameter optimum.
+    csq: np.ndarray
+        chi-squared statistics for all genes, computed at the grid point indexed by rejection_index.
+    pval: np.ndarray
+        p-values calculated by the chi-squared test at the grid point indexed by rejection_index.
+    rejected_genes: bool np.ndarray
+        a boolean filter that reports the genes rejected by the goodness-of-fit procedure,
+        whose parameters cannot be safely interpeted.
+    rejection_index: int
+        the grid point at which the goodness-of-fit procedure was performed to generate
+        the rejected_genes attribute.
+    sigma: float np.ndarray
+        the standard error of the parameter maximum likelihood estimate at the at the grid
+        point indexed by sigma_index.
+        a n_genes x n_phys_pars array.
+    sigma_index: int
+        the grid point at which the Fisher information procedure was performed to generate
+        the sigma attribute.
+    batch_analysis_string: str
+        location of the directory for batch-wide analyses.
+    """
+
+    ####################################
+    #   Construction and I/O methods   #
+    ####################################
+    def __init__(self, inference_parameters, search_data):
+        """Creates a SearchResults object.
+
+        Parameters
+        ----------
+        inference_parameters: InferenceParameters
+            search parameters used to generate the run.
+        search_data: monod.extract_data.SearchData
+            SearchData object with the fit data.
         """
-        #pull in info from search parameters.
+        # pull in info from search parameters.
         self.sp = inference_parameters
 
         self.inference_string = inference_parameters.inference_string
         self.model = inference_parameters.model
 
-        #pull in small amount of non-cell-specific from search data
+        # pull in small amount of non-cell-specific info from search data
         self.n_genes = search_data.n_genes
         self.n_cells = search_data.n_cells
         self.gene_log_lengths = search_data.gene_log_lengths
@@ -391,22 +705,24 @@ class SearchResults:
         self.regressor = []
 
     def aggregate_grid_points(self):
-        """
-        This helper method runs append_grid_point for all grid points, then removes the original grid point files.
+        """This helper method concatenates all of the grid point results.
+
+        The method runs append_grid_point for all grid points, then removes the original grid point files.
         """
         for point_index in range(self.sp.n_grid_points):
             self.append_grid_point(point_index)
         self.clean_up()
 
     def append_grid_point(self, point_index):
-        """
-        This helper method updates the result attributes from a GridPointResult object stored on disk.
+        """This helper method updates the result attributes from a GridPointResult object stored on disk.
 
-        Input:
-        point_index: index of the current grid point.
+        Parameters
+        ----------
+        point_index: int
+            index of the grid point results to load from disk.
         """
-        grid_point_result_string = self.inference_string + '/grid_point_'+str(point_index)+'.gp'
-        with open(grid_point_result_string,'rb') as ipfs:
+        grid_point_result_string = self.inference_string + "/grid_point_" + str(point_index) + ".gp"
+        with open(grid_point_result_string, "rb") as ipfs:
             grid_point_results = pickle.load(ipfs)
             self.param_estimates += [grid_point_results.param_estimates]
             self.klds += [grid_point_results.klds]
@@ -415,109 +731,106 @@ class SearchResults:
             self.regressor += [grid_point_results.regressor]
 
     def clean_up(self):
-        """
-        This helper method removes GridPointResult objects stored on disk, finalizes the result attributes,
-        and creates a directory for analysis figures.
+        """This helper method removes temporary files and finalizes the SearchResults object.
+
+        The GridPointResult objects are erased from disk, the attributes are converted to
+        np.ndarrays, and a directory for analysis figures is created.
         """
         for point_index in range(self.sp.n_grid_points):
-            os.remove(self.inference_string + '/grid_point_'+str(point_index)+'.gp')
-        log.info('All grid point data cleaned from disk.')
+            os.remove(self.inference_string + "/grid_point_" + str(point_index) + ".gp")
+        log.info("All grid point data cleaned from disk.")
         self.param_estimates = np.asarray(self.param_estimates)
         self.klds = np.asarray(self.klds)
         self.obj_func = np.asarray(self.obj_func)
         self.d_time = np.asarray(self.d_time)
         self.regressor = np.asarray(self.regressor)
 
-        analysis_figure_string = self.inference_string + '/analysis_figures'
+        analysis_figure_string = self.inference_string + "/analysis_figures"
         self.analysis_figure_string = analysis_figure_string
         make_dir(analysis_figure_string)
 
     def store_on_disk(self):
-        """
-        This helper method attempts to store the SearchResults object on disk.
+        """This helper method attempts to store the SearchResults object to disk.
 
-        Output:
-        full_result_string: string with file location.
+        Returns
+        -------
+        full_result_string: str
+            file location.
         """
         try:
-            full_result_string = self.inference_string + '/grid_scan_results.res'
-            with open(full_result_string,'wb') as srfs:
+            full_result_string = self.inference_string + "/grid_scan_results.res"
+            with open(full_result_string, "wb") as srfs:
                 pickle.dump(self, srfs)
-            log.debug('Grid scan results stored to {}.'.format(full_result_string))
+            log.debug("Grid scan results stored to {}.".format(full_result_string))
         except:
-            log.error('Grid scan results could not be stored to {}.'.format(full_result_string))
+            log.error("Grid scan results could not be stored to {}.".format(full_result_string))
         self.full_result_string = full_result_string
         return full_result_string
 
-
     def update_on_disk(self):
-        """
-        This helper method attempts to store an updated SearchResults objects on disk.
+        """This helper method attempts to store a modified SearchResults object to disk.
 
-        Output:
-        upd_result_string: string with file location.
+        This is separate from store_on_disk() to avoid overwriting data.
+
+        Returns
+        -------
+        upd_result_string: str
+            file location.
         """
         try:
-            upd_result_string = self.inference_string + '/grid_scan_results_upd.res'
-            with open(upd_result_string,'wb') as srfs:
+            upd_result_string = self.inference_string + "/grid_scan_results_upd.res"
+            with open(upd_result_string, "wb") as srfs:
                 pickle.dump(self, srfs)
-            log.debug('Updated results stored to {}.'.format(upd_result_string))
+            log.debug("Updated results stored to {}.".format(upd_result_string))
         except:
-            log.error('Updated results could not be stored to {}.'.format(upd_result_string))
+            log.error("Updated results could not be stored to {}.".format(upd_result_string))
         self.upd_result_string = upd_result_string
         return upd_result_string
 
+    ####################################
+    #         Analysis methods         #
+    ####################################
 
-####################################
-#         Analysis methods         #
-####################################
-    """
-    In this section of the algorithm, we implement analysis methods.
+    def find_sampling_optimum(self, gene_filter=None, discard_rejected=False):
+        """Identify and set the technical parameter optimum by minimizing the total KLD.
 
-    Attributes:
-    samp_optimum: sampling parameter optimum.
-    samp_optimum_ind: index of the sampling parameter optimum grid point.
-    phys_optimum: gene-specific physical parameter values at the sampling parameter optimum.
-    regressor_optimum: gene-specific sampling parameter values at the sampling parameter optimum.
-    rejected_genes: boolean filter of genes that have been rejected by chi-square goodness-of-fit.
-    csq: chi-square values for each gene at the sampling parameter optimum.
-    pval: p-value under the chi-square GOF test. 
-    sigma: standard errors of the biological parameter MLEs at the sampling parameter optimum (and conditional on it).
-        a n_genes x n_phys_pars array.
-    """
-    
-    def find_sampling_optimum(self,gene_filter=None,discard_rejected=False):
-        """
-        This method identifies and sets the technical parameter optimum by minimizing the total KLD.
-        
-        Input:
-        gene_filter: 
-            If None, use all genes. 
+        Parameters
+        ----------
+        gene_filter: None or np.ndarray, optional
+            If None, use all genes.
             If a boolean or integer filter, use the filtered gene subset.
-        discard_rejected: whether to omit genes in the rejected_genes attribute.
+        discard_rejected: bool, optional
+            whether to omit genes in the rejected_genes attribute during the calculation.
 
-        Output: 
-        samp_optimum: sampling parameter optimum value.
+        Returns
+        -------
+        samp_optimum: list of floats
+            estimated value of the technical noise parameters.
         """
         if gene_filter is None:
             total_divergence = self.obj_func
         else:
-            gene_filter = self.get_bool_filt(gene_filter,discard_rejected)
-            total_divergence = self.klds[:,gene_filter].sum(1)
+            gene_filter = self.get_bool_filt(gene_filter, discard_rejected)
+            total_divergence = self.klds[:, gene_filter].sum(1)
         samp_optimum_ind = np.argmin(total_divergence)
         self.set_sampling_optimum(samp_optimum_ind)
         return self.samp_optimum
 
-    def set_sampling_optimum(self,samp_optimum_ind):
-        """
-        This helper method sets the technical parameter optimum according to a given index,
-        and updates the samp_optimum_ind, samp_optimum, phys_optimum, and regressor_optimum attributes.
+    def set_sampling_optimum(self, samp_optimum_ind):
+        """Set the technical parameter optimum to a specific grid point index.
 
-        Input:
-        samp_optimum_ind: integer index of the optimum grid point.
+        Define the value, then update the samp_optimum_ind, samp_optimum,
+        phys_optimum, and regressor_optimum attributes that depend on this value.
 
-        Output: 
-        samp_optimum: sampling parameter optimum value.
+        Parameters
+        ----------
+        samp_optimum_ind: int
+            index of the grid point.
+
+        Returns
+        -------
+        samp_optimum: list of floats
+            value of the technical noise parameters at the grid point.
         """
         self.samp_optimum_ind = samp_optimum_ind
         self.samp_optimum = self.sp.sampl_vals[samp_optimum_ind]
@@ -525,620 +838,911 @@ class SearchResults:
         self.regressor_optimum = self.regressor[samp_optimum_ind]
         return self.samp_optimum
 
-    def plot_landscape(self, ax, plot_optimum = True, gene_filter=None, discard_rejected=False, \
-        logscale=True, colorbar=False,levels=40,hideticks=False,savefig = False):
-        """
-        This method plots the KL divergence landscape over the evaluated grid points.
+    def plot_landscape(
+        self,
+        ax,
+        plot_optimum=True,
+        gene_filter=None,
+        discard_rejected=False,
+        logscale=True,
+        colorbar=False,
+        hideticks=False,
+        savefig=False,
+    ):
+        """Plot the 2D Kullback-Leibler divergence (KLD) landscape over the evaluated grid points.
 
-        Input:
-        ax: matplotlib axes to plot into.
-        plot_optimum: whether to plot a point at the optimum.
-        gene_filter: 
-            If None, plot landscape for all genes. 
+        The landscape is computed by adding together gene-specific values at each grid points,
+        potentially only over a subset of the genes.
+
+        Parameters
+        ----------
+        ax: matplotlib.axes.Axes
+            axes to plot into.
+        plot_optimum: bool, optional
+            whether to plot a dot at the estimated optimum.
+        gene_filter: bool, optional
+            If None, plot landscape for all genes.
             If a boolean or integer filter, plot lanscape determined by the filtered gene subset.
-        discard_rejected: whether to omit genes in the rejected_genes attribute.
-        logscale: whether to show log10 of the total KLD.
-        colorbar: whether to show a color legend.
-        levels: number of levels for plotting contourf.
-        hideticks: whether to hide the ticks around the plot.
-        savefig: whether to save the figure.
+        discard_rejected: bool, optional
+             whether to omit genes in the rejected_genes attribute during the calculation.
+        logscale: bool, optional
+            whether to show log10 of the total KLD instead of the raw value.
+        colorbar: bool, optional
+            whether to display a colobrar.
+        hideticks: bool, optional
+            whether to hide the ticks and coordinates around the plot.
+        savefig: bool, optional
+            whether to save the figure to disk.
         """
 
         if gene_filter is None:
             total_divergence = self.obj_func
         else:
-            gene_filter = self.get_bool_filt(gene_filter,discard_rejected)
-            total_divergence = self.klds[:,gene_filter].sum(1)
+            gene_filter = self.get_bool_filt(gene_filter, discard_rejected)
+            total_divergence = self.klds[:, gene_filter].sum(1)
 
         if logscale:
             total_divergence = np.log10(total_divergence)
 
-        X = np.reshape(self.sp.X,self.sp.gridsize)
-        Y = np.reshape(self.sp.Y,self.sp.gridsize)
-        Z = np.reshape(total_divergence,self.sp.gridsize)
-        contourplot = ax.contourf(X,Y,Z,levels)
+        dx = (np.asarray(self.sp.samp_ub) - np.asarray(self.sp.samp_lb)) / (
+            np.asarray(self.sp.gridsize) - 1
+        )
+        dx[dx < 1e-10] = 0.1
+        extent = [
+            self.sp.samp_lb[0] - dx[0] / 2,
+            self.sp.samp_ub[0] + dx[0] / 2,
+            self.sp.samp_lb[1] - dx[1] / 2,
+            self.sp.samp_ub[1] + dx[1] / 2,
+        ]
+        lnd = ax.imshow(np.flipud(np.reshape(total_divergence, self.sp.gridsize).T), extent=extent)
+
         if plot_optimum:
-            ax.scatter(self.samp_optimum[0],self.samp_optimum[1],c='r',s=50)
+            ax.scatter(self.samp_optimum[0], self.samp_optimum[1], c="crimson", s=50)
         if colorbar:
-            plt.colorbar(contourplot)
+            plt.colorbar(lnd, ax=ax)
         if hideticks:
             ax.set_xticks([])
             ax.set_yticks([])
         if savefig:
-            fig_string = self.analysis_figure_string+'/landscape.png'
-            plt.savefig(fig_string,dpi=450)
-            log.info('Figure stored to {}.'.format(fig_string))
+            fig_string = self.analysis_figure_string + "/landscape.png"
+            plt.savefig(fig_string, dpi=450)
+            log.info("Figure stored to {}.".format(fig_string))
 
+    def get_bool_filt(self, gene_filter, discard_rejected):
+        """This helper method constructs gene filters.
 
-    def get_bool_filt(self,gene_filter,discard_rejected):
-        """
-        This helper method combines an arbitrary (potentially None, boolean, or integer) gene filter with the
-        rejected_genes attribute (a boolean filter) to produce an overall set of genes to be analyzed or visualized. 
+        The method intersects an arbitrary (potentially None, boolean, or integer) gene selection with the
+        rejected_genes attribute (a boolean filter) to produce an overall set of genes to be analyzed or visualized.
+
+        Parameters
+        ----------
+        gene_filter: None, bool np.ndarray, or int np.ndarray
+            if an array, select the genes in the array,
+            if None, consider all genes.
+        discard_rejected: bool
+            if True, omit genes that are rejected by the goodness-of-fit procedure.
+
+        Returns
+        -------
+        gene_filter: bool np.ndarray
+            genes that are retained by the filter.
         """
 
         if gene_filter is None:
-            gene_filter = np.ones(self.n_genes,dtype=bool)
+            gene_filter = np.ones(self.n_genes, dtype=bool)
         else:
-            if gene_filter.dtype != np.bool:
-                gf_temp = np.zeros(self.n_genes,dtype=bool)
+            if gene_filter.dtype is not bool:
+                gf_temp = np.zeros(self.n_genes, dtype=bool)
                 gf_temp[gene_filter] = True
                 gene_filter = gf_temp
 
         if discard_rejected:
-            if hasattr(self,'rejection_index'):
+            if hasattr(self, "rejection_index"):
                 if self.rejection_index != self.samp_optimum_ind:
-                    raise ValueError('Sampling parameter value is inconsistent.')
-                gene_filter = np.logical_and(~self.rejected_genes,gene_filter)
+                    raise ValueError("Sampling parameter value is inconsistent.")
+                gene_filter = np.logical_and(~self.rejected_genes, gene_filter)
             else:
-                log.info('No rejection statistics have been computed.')
+                log.info("No rejection statistics have been computed.")
         return gene_filter
 
-    def plot_param_marg(self,gene_filter=None,discard_rejected=True,nbin=15,\
-                        fitlaw=scipy.stats.norminvgauss,axis_search_bounds = True,figsize=None):
-        """
-        This method plots the physical parameter distributions at the sampling parameter optimum.
+    def plot_param_marg(
+        self,
+        gene_filter=None,
+        discard_rejected=True,
+        nbin=15,
+        fitlaw=scipy.stats.norminvgauss,
+        axis_search_bounds=True,
+        figsize=None,
+    ):
+        """Plot and fit the biological parameter distributions at the sampling parameter optimum.
 
-        Input:
-        gene_filter: 
-            If None, plot all genes. 
-            If a boolean or integer filter, plot only a subset of genes indicated by the filter.
-        discard_rejected: whether to omit genes in the rejected_genes attribute.
-        nbin: number of bins used for the histogram.
-        fitlaw: statistical law used to fit the parameter distributions.
-        axis_search_bounds: whether to place the x-limits of the plots at the parameter search bounds.
-        figsize: figure dimensions.
+        Parameters
+        ----------
+        gene_filter: None or np.ndarray, optional
+            If None, plot all genes.
+            If a boolean or integer filter, plot the filtered gene subset.
+        discard_rejected: bool, optional
+             whether to omit genes in the rejected_genes attribute.
+        nbin: int, optional
+            number of bins used to construct the histogram.
+        fitlaw: scipy.stats.rv_continuous, optional
+            statistical law used to fit the parameter distributions.
+        axis_search_bounds: bool, optional
+            whether to place the x-limits of the plots at the parameter search bounds.
+        figsize: tuple or None, optional
+            figure dimensions.
         """
         num_params = self.sp.n_phys_pars
-        if figsize is None:
-            figsize = (4*num_params,4)
-        fig1,ax1=plt.subplots(nrows=1,ncols=num_params,figsize=figsize)
+        figsize = figsize or (4 * num_params, 4)
+        fig1, ax1 = plt.subplots(nrows=1, ncols=num_params, figsize=figsize)
 
-        #identify genes to plot, extract their data
-        gene_filter = self.get_bool_filt(gene_filter,discard_rejected)
-        param_data = self.phys_optimum[gene_filter,:]
+        # identify genes to plot, extract their data
+        gene_filter = self.get_bool_filt(gene_filter, discard_rejected)
+        param_data = self.phys_optimum[gene_filter, :]
 
         for i in range(num_params):
-            ax1[i].hist(param_data[:,i],nbin,density=True,\
-                        color=aesthetics['hist_face_color'])
+            ax1[i].hist(
+                param_data[:, i],
+                nbin,
+                density=True,
+                color=aesthetics["hist_face_color"],
+            )
             if fitlaw is not None:
-                fitparams = fitlaw.fit(param_data[:,i])
-                
+                fitparams = fitlaw.fit(param_data[:, i])
+
                 xmin, xmax = ax1[i].get_xlim()
                 x = np.linspace(xmin, xmax, 100)
                 p = fitlaw.pdf(x, *fitparams)
-                ax1[i].plot(x, p, '--', \
-                            linewidth=aesthetics['hist_fit_lw'],\
-                            color=aesthetics['hist_fit_color'])
-            
+                ax1[i].plot(
+                    x,
+                    p,
+                    "--",
+                    linewidth=aesthetics["hist_fit_lw"],
+                    color=aesthetics["hist_fit_color"],
+                )
+
             if axis_search_bounds:
-                ax1[i].set_xlim([self.sp.phys_lb[i],self.sp.phys_ub[i]])
+                ax1[i].set_xlim([self.sp.phys_lb[i], self.sp.phys_ub[i]])
             ax1[i].set_title(self.model.get_log_name_str()[i])
-            ax1[i].set_xlabel(r'$log_{10}$ value')
+            ax1[i].set_xlabel(r"$log_{10}$ value")
         fig1.tight_layout()
-        fig_string = self.analysis_figure_string+'/parameter_marginals.png'
-        plt.savefig(fig_string,dpi=450)
-        log.info('Figure stored to {}.'.format(fig_string))
+        fig_string = self.analysis_figure_string + "/parameter_marginals.png"
+        plt.savefig(fig_string, dpi=450)
+        log.info("Figure stored to {}.".format(fig_string))
 
-    def plot_KL(self,ax,gene_filter=None,discard_rejected=True,nbin=15):
-        """
-        This method plots the model KL divergences at the sampling parameter optimum.
+    def plot_KL(self, ax, gene_filter=None, discard_rejected=True, nbin=15):
+        """Plot the distribution of KL divergences at the sampling parameter optimum.
 
-        Input:
-        ax: matplotlib axes to plot into.
-        gene_filter: 
-            If None, plot all genes. 
-            If a boolean or integer filter, plot only a subset of genes indicated by the filter.
-        discard_rejected: whether to omit genes in the rejected_genes attribute.
-        nbin: number of bins used for the histogram.
+        Parameters
+        ----------
+        ax: matplotlib.axes.Axes
+            axes to plot into.
+        gene_filter: None or np.ndarray, optional
+            If None, plot all genes.
+            If a boolean or integer filter, plot the filtered gene subset.
+        discard_rejected: bool, optional
+             whether to omit genes in the rejected_genes attribute.
+        nbin: int, optional
+            number of bins used to construct the histogram.
         """
-        gene_filter = self.get_bool_filt(gene_filter,discard_rejected)
+        gene_filter = self.get_bool_filt(gene_filter, discard_rejected)
         kld_data = self.klds[self.samp_optimum_ind][gene_filter]
 
-        ax.hist(kld_data,nbin,\
-            color=aesthetics['hist_face_color'])
-        ax.set_xlabel('KL divergence')
-        ax.set_ylabel('# genes')
-        fig_string = self.analysis_figure_string+'/kldiv.png'
-        plt.savefig(fig_string,dpi=450)
-        log.info('Figure stored to {}.'.format(fig_string))
+        ax.hist(kld_data, nbin, color=aesthetics["hist_face_color"])
+        ax.set_xlabel("KL divergence")
+        ax.set_ylabel("# genes")
+        fig_string = self.analysis_figure_string + "/kldiv.png"
+        plt.savefig(fig_string, dpi=450)
+        log.info("Figure stored to {}.".format(fig_string))
 
-    def chisquare_testing(self,search_data,viz=False,EPS=1e-12,threshold=0.05,bonferroni=True):    
-        """
-        This method performs chi-square testing on the dataset at the sampling parameter optimum. 
+    def chisquare_testing(
+        self,
+        search_data,
+        viz=False,
+        EPS=1e-15,
+        threshold=0.05,
+        bonferroni=True,
+        reject_at_bounds=True,
+        bound_thr=0.01,
+    ):
+        """Perform goodness-of-fit testing at the current sampling parameter optimum to identify poor fits.
 
-        Input:
-        search_data: a SearchData instance.
-        viz: whether to visualize the histogram of the chi-square statistic.
-        EPS: probability rounding parameter -- anything below this is rounded to EPS.
-        threshold: chi-square rejection criterion; everything below this critical p-value 
-            is rejected as unlikely to have been generated by the model.
-        bonferroni: whether to apply the Bonferroni correction to the p-value threshold.
-        
-        Outputs:
-        Tuple with chi-squared and p values for each gene.
+        This method performs two rounds of goodness-of-fit testing.
+        First, it applies a chi-squared test to the distributions induced by biological parameter values
+        at the sampling parameter optimum.
+        Optionally, it also rejectes genes that are too close to the search parameter bounds,
+        as they typically exhibit poor gradient descent performance or do not have enough counts to
+        reliably estimate parameters.
+        This is typically sufficient to reject genes with proposed distributions that are grossly
+        dissimilar to the raw data, whether due to inference failure or model misspecification.
 
         We typically expect about 5-15% of the genes to be rejected.
+
+        Parameters
+        ----------
+        search_data: monod.extract_data.SearchData
+            SearchData object with the fit data.
+        viz: bool, optional
+            whether to visualize the histogram of the chi-square statistic.
+        EPS: float, optional
+            probability rounding parameter: anything below this value is rounded to EPS.
+        threshold: float, optional
+            chi-square rejection criterion; everything below this critical p-value
+            is rejected as unlikely to have been generated by the model.
+        bonferroni: float, optional
+            whether to apply the Bonferroni correction to the p-value threshold.
+        reject_at_bounds: bool, optional
+            whether to also discard genes that are near the search bounds.
+        bound_thr: float, optional
+            how close the parameters must be close to the bounds (in units of the allowed
+            parameter range) to trigger rejection.
+
+        Returns
+        -------
+        csq: np.ndarray
+            chi-squared statistics for all genes, computed at the grid point indexed by rejection_index.
+        pval: np.ndarray
+            p-values calculated by the chi-squared test at the grid point indexed by rejection_index.
+
+        Sets
+        ----
+        csq: np.ndarray
+            chi-squared statistics for all genes, computed at the grid point indexed by rejection_index.
+        pval: np.ndarray
+            p-values calculated by the chi-squared test at the grid point indexed by rejection_index.
+        rejected_genes: bool np.ndarray
+            a boolean filter that reports the genes rejected by the goodness-of-fit procedure,
+            whose parameters cannot be safely interpeted.
+        rejection_index: int
+            the grid point at which the goodness-of-fit procedure was performed to generate
+            the rejected_genes attribute.
+
         """
         t1 = time.time()
 
+        hist_type = get_hist_type(search_data)
+
         csqarr = []
         for gene_index in range(self.n_genes):
-            samp = None if (self.model.seq_model == 'None') else self.regressor_optimum[gene_index]
-            lm = [search_data.M[gene_index],search_data.N[gene_index]]  
-            expected_freq = self.model.eval_model_pss(self.phys_optimum[gene_index],lm,samp).flatten()
-            csqarr += [scipy.stats.mstats.chisquare(search_data.hist[gene_index].flatten(),expected_freq)]
+            lm = search_data.M[:, gene_index]
+            expected_freq = self.model.eval_model_pss(
+                self.phys_optimum[gene_index], lm, self.regressor_optimum[gene_index]
+            )
+            expected_freq[expected_freq < EPS] = EPS
+            expected_freq /= expected_freq.sum()
+            PROPOSAL = search_data.n_cells * expected_freq
 
-        csq,pval = zip(*csqarr)
+            if hist_type == "grid":
+                DATA = search_data.n_cells * search_data.hist[gene_index].flatten()
+                PROPOSAL = PROPOSAL.flatten()
+            elif hist_type == "unique":
+                DATA = np.concatenate((search_data.n_cells * search_data.hist[gene_index][1], [0]))
+                PROPOSAL = PROPOSAL[
+                    search_data.hist[gene_index][0][:, 0],
+                    search_data.hist[gene_index][0][:, 1],
+                ]
+                PROPOSAL = np.concatenate((PROPOSAL, [search_data.n_cells - PROPOSAL.sum()]))
+            filt = (DATA > 5) & (PROPOSAL > 5)
+            chisq_data = np.concatenate((DATA[filt], [DATA[~filt].sum()]))
+            chisq_prop = np.concatenate((PROPOSAL[filt], [PROPOSAL[~filt].sum()]))
+
+            csqarr += [
+                scipy.stats.mstats.chisquare(chisq_data, chisq_prop, self.model.get_num_params())
+            ]
+
+        csq, pval = zip(*csqarr)
         csq = np.asarray(csq)
         pval = np.asarray(pval)
 
         if bonferroni:
             threshold /= self.n_genes
-        self.rejected_genes = pval<threshold
+        self.rejected_genes = pval < threshold
+
+        if reject_at_bounds:
+            bound_range = self.sp.phys_ub - self.sp.phys_lb
+            lb = self.sp.phys_lb + bound_range * bound_thr
+            ub = self.sp.phys_ub - bound_range * bound_thr
+
+            rej_poor_fit = ((self.phys_optimum < lb) | (self.phys_optimum > ub)).any(1)
+            self.rejected_genes = (self.rejected_genes) | rej_poor_fit
+
         self.pval = pval
         self.csq = csq
-        self.rejection_index = self.samp_optimum_ind #mostly for debug.
+        self.rejection_index = self.samp_optimum_ind  # mostly for debug.
 
         if viz:
             plt.hist(csq)
-            plt.xlabel('Chi-square statistic')
-            plt.ylabel('# genes')
-            fig_string = self.analysis_figure_string+'/chisquare.png'
-            plt.savefig(fig_string,dpi=450)
-            log.info('Figure stored to {}.'.format(fig_string))
+            plt.xlabel("Chi-square statistic")
+            plt.ylabel("# genes")
+            fig_string = self.analysis_figure_string + "/chisquare.png"
+            plt.savefig(fig_string, dpi=450)
+            log.info("Figure stored to {}.".format(fig_string))
 
         t2 = time.time()
-        log.info('Chi-square computation complete. Rejected {:.0f} genes out of {:.0f}. Runtime: {:.1f} seconds.'.format(\
-            np.sum(self.rejected_genes),self.n_genes,t2-t1))
-        return (csq,pval)
+        log.info(
+            "Chi-square computation complete. Rejected {:.0f} genes out of {:.0f}. Runtime: {:.1f} seconds.".format(
+                np.sum(self.rejected_genes), self.n_genes, t2 - t1
+            )
+        )
+        return (csq, pval)
 
+    def par_fun_hess(self, inputs):
+        """Helper method for the Hessian parallelization procedure.
 
+        Parameters
+        ----------
+        inputs: tuple
+            entry 0: int
+                gene index within [0, n_genes) to evaluate at.
+            entry 1: monod.extract_data.SearchData
+                SearchData object with the fit data.
 
-    def par_fun_hess(self,inputs):
+        Returns
+        -------
+        hess: float np.ndarray
+            Hessian of the current gene's KLD at the sampling parameter optimum and the
+            corresponding biological parameters, evaluated with respect to the
+            biological parameters.
         """
-        This is a helper method for the parallelization procedure.
-        """
-        gene_index,search_data = inputs
-        samp = None if (self.model.seq_model == 'None') else self.regressor_optimum[gene_index]
-        lm = [search_data.M[gene_index],search_data.N[gene_index]]  
-        Hfun = numdifftools.Hessian(lambda x: kl_div(
-            search_data.hist[gene_index], self.model.eval_model_pss(x, lm, samp)))
-        hess= Hfun(self.phys_optimum[gene_index])
+        import numdifftools  # this will fail if numdifftools has not been evaluted.
+
+        gene_index, search_data = inputs
+
+        if hasattr(search_data, "hist_type") and search_data.hist_type == "unique":
+            hist_type = "unique"
+        else:
+            hist_type = "grid"
+        Hfun = numdifftools.Hessian(
+            lambda x: self.model.eval_model_kld(
+                p=x,
+                limits=search_data.M[:, gene_index],
+                samp=self.regressor_optimum[gene_index],
+                data=search_data.hist[gene_index],
+                hist_type=hist_type,
+            )
+        )
+        hess = Hfun(self.phys_optimum[gene_index])
         return hess
 
-    def compute_sigma(self,search_data,num_cores=1):
-        """
-        This method computes estimates for the uncertainty in the biological parameter values
-        inferred by the search procedure. 
-        It creates the attribute sigma, which contains the Fisher information-based estimate
-        for the standard error of each parameter.
+    def compute_sigma(self, search_data, num_cores=1):
+        """Estimate uncertainty in biological parameter values.
 
-        Input:
-        search_data: a SearchData instance.
-        num_cores: number of cores to use for parallelization over genes.
+        This method iterates over genes, computes the Fisher information matrix by inverting
+        the Hessian with respect to biological parameters, and reports the local estimate
+        of standard errors of the parameters.
 
-        This is a high-value target for parallelization.
+        This method is fairly computationally demanding, so parallelization is recommended.
+
+        If inversion fails, the gene-specific standard errors are replaced with their mean over
+        all genes that did not fail.
+
+        Parameters
+        ----------
+        search_data: monod.extract_data.SearchData
+            SearchData object with the fit data.
+        num_cores: int, optional
+            number of cores to use for parallelization over genes.
+
+        Sets
+        ----
+        sigma: float np.ndarray
+            the standard error of the parameter maximum likelihood estimate at the sampling
+            parameter optimum.
+            a n_genes x n_phys_pars array.
+        sigma_index: int
+            the grid point at which the Fisher information procedure was performed to generate
+            the sigma attribute.
+
         """
-        log.info('Computing local Hessian.')
+        log.info("Computing local Hessian.")
         t1 = time.time()
 
-        if num_cores>1:
-            log.info('Starting parallelized Hessian computation.')
-            pool=multiprocessing.Pool(processes=num_cores)
-            hess = pool.map(self.par_fun_hess,zip(range(self.n_genes),[search_data]*self.n_genes))
-            pool.close()
-            pool.join()
-            log.info('Parallelized Hessian computation complete.')
-            hess = np.asarray(hess)
+        if num_cores > 1:
+            log.info("Starting parallelized Hessian computation.")
+            hess = parallelize(
+                function=self.par_fun_hess,
+                iterable=zip(range(self.n_genes), [search_data] * self.n_genes),
+                num_cores=num_cores,
+                num_entries=self.n_genes,
+                completion_message="Parallelized Hessian computation complete.",
+                termination_message="The Hessian computation has been manually terminated.",
+                error_message="The Hessian computation has been terminated due to numerical issues.",
+                use_tqdm=False,
+            )
         else:
-            log.info('Starting non-parallelized Hessian computation.')
-            hess = np.zeros((self.n_genes,self.sp.n_phys_pars,self.sp.n_phys_pars))
-            for gene_index in range(self.n_genes):
-                Hfun = numdifftools.Hessian(lambda x: kl_div(
-                    search_data.hist[gene_index], self.model.eval_model_pss(x, lm, samp)))
-                hess[gene_index,:,:] = Hfun(self.phys_optimum[gene_index])
-            log.info('Non-parallelized Hessian computation complete.')
+            log.info("Starting non-parallelized Hessian computation.")
+            hess = [
+                self.par_fun_hess(x) for x in zip(range(self.n_genes), [search_data] * self.n_genes)
+            ]
+            log.info("Non-parallelized Hessian computation complete.")
+        hess = np.asarray(hess)
 
-
-        fail = np.zeros(self.n_genes,dtype=bool)
-        sigma = np.zeros((self.n_genes,self.sp.n_phys_pars))
+        fail = np.zeros(self.n_genes, dtype=bool)
+        sigma = np.zeros((self.n_genes, self.sp.n_phys_pars))
 
         for gene_index in range(self.n_genes):
             try:
-                hess_inv = np.linalg.inv(hess[gene_index,:,:])
-                sigma[gene_index,:] = np.sqrt(np.diag(hess_inv))/np.sqrt(self.n_cells)
+                hess_inv = np.linalg.inv(hess[gene_index, :, :])
+                sigma[gene_index, :] = np.sqrt(np.diag(hess_inv)) / np.sqrt(self.n_cells)
             except:
-                fail[gene_index]=True
-                log.info('Gene {:.0f} ran into singularity; replaced with mean. (Search converged to local minimum?) '.format(gene_index))
+                fail[gene_index] = True
+                log.info(
+                    "Gene {:.0f} ran into singularity; replaced with mean. (Search converged to local minimum?) ".format(
+                        gene_index
+                    )
+                )
                 # errorbars[i,:] = np.mean(errorbars[:i,:])
-            if np.any(~np.isfinite(sigma[gene_index,:])):
-                fail[gene_index] =True
-                log.info('Gene {:.0f} gives negative stdev; replaced with mean. (Search converged to local minimum?)'.format(gene_index))
+            if np.any(~np.isfinite(sigma[gene_index, :])):
+                fail[gene_index] = True
+                log.info(
+                    "Gene {:.0f} gives negative stdev; replaced with mean. (Search converged to local minimum?)".format(
+                        gene_index
+                    )
+                )
                 # errorbars[i,:] = np.mean(errorbars[:i,:])
-        sigma[fail,:] = sigma[~fail,:].mean(0)
+        sigma[fail, :] = sigma[~fail, :].mean(0)
         self.sigma = sigma
-        self.sigma_index = self.samp_optimum_ind #mostly for debug
+        self.sigma_index = self.samp_optimum_ind  # mostly for debug
 
         t2 = time.time()
-        log.info('Standard error of the MLE computation complete. Runtime: {:.1f} seconds.'.format(t2-t1))
+        log.info(
+            "Standard error of the MLE computation complete. Runtime: {:.1f} seconds.".format(
+                t2 - t1
+            )
+        )
 
-    def resample_opt_viz(self,resamp_vec=(5,10,20,40,60),Ntries=4,figsize=(10,10)):
-        """
-        This method demonstrates the sensitivity of the sampling parameter landscape
-        and optimum to the number of genes analyzed.
+    def resample_opt_viz(self, resamp_vec=(5, 10, 20, 40, 60), Ntries=4, figsize=(10, 10)):
+        """Test the sensitivity of the technical noise parameter landscape to the number of genes analyzed.
 
-        Inputs:
-        resamp_vec: vector of the number of genes to select (without replacement).
-        Ntries: number of times to resample.
-        figsize: figure dimensions.
+        Parameters
+        ----------
+        resamp_vec: list or tuple of ints, optional
+            number of genes to select for downsampling (without replacement).
+        Ntries: int, optional
+            number of times to resample.
+        figsize: tuple of floats, optional
+            figure dimensions.
         """
         Nsamp = len(resamp_vec)
 
-        fig1,ax1=plt.subplots(nrows=Nsamp,ncols=Ntries,figsize=figsize)
+        fig1, ax1 = plt.subplots(nrows=Nsamp, ncols=Ntries, figsize=figsize)
         for samp_num in range(Nsamp):
             for i_ in range(Ntries):
-                axloc = (samp_num,i_) 
-                gene_filter = np.random.choice(self.n_genes,resamp_vec[samp_num],replace=False)
+                axloc = (samp_num, i_)
+                gene_filter = np.random.choice(self.n_genes, resamp_vec[samp_num], replace=False)
                 subsampled_samp_optimum = self.find_sampling_optimum(gene_filter)
-                self.plot_landscape(ax1[axloc], gene_filter=gene_filter,hideticks=True)
-                
-                if i_==0:
-                    ax1[axloc].set_ylabel('n_genes = '+str(resamp_vec[samp_num]))
+                self.plot_landscape(ax1[axloc], gene_filter=gene_filter, hideticks=True)
 
-        fig_string = self.analysis_figure_string+'/subsampling.png'
-        plt.savefig(fig_string,dpi=450)
-        log.info('Figure stored to {}.'.format(fig_string))
-        self.find_sampling_optimum() #reset sampling optimum here
+                if i_ == 0:
+                    ax1[axloc].set_ylabel("n_genes = " + str(resamp_vec[samp_num]))
 
-    def resample_opt_mc_viz(self,resamp_vec=(5,10,20,40,60),Ntries=1000,figsize=(16,4)):
+        fig_string = self.analysis_figure_string + "/subsampling.png"
+        plt.savefig(fig_string, dpi=450)
+        log.info("Figure stored to {}.".format(fig_string))
+        self.find_sampling_optimum()  # reset sampling optimum here
+
+    def resample_opt_mc_viz(self, resamp_vec=(5, 10, 20, 40, 60), Ntries=1000, figsize=(16, 4)):
+        """Test the sensitivity of technical noise parameter optima under gene downsampling.
+
+        The optima for each downsampled set are visualized on the parameter landscape
+        generated from the entire gene set.
+
+        Parameters
+        ----------
+        resamp_vec: list or tuple of ints, optional
+            number of genes to select for downsampling (without replacement).
+        Ntries: int, optional
+            number of times to resample.
+        figsize: tuple of floats, optional
+            figure dimensions.
         """
-        This method is an extension of resample_opt_viz, demonstrates the sensitivity of 
-        the optimum upon choosing a subset of genes.
-        The optimum is visualized on the parameter landscape generated from the entire gene set.
-
-        Inputs:
-        result_data: ResultData object.
-        resamp_vec: vector of the number of genes to select (without replacement).
-        Ntries: number of times to resample.
-        figsize: figure dimensions.
-        """    
         Nsamp = len(resamp_vec)
-        
-        fig1,ax1=plt.subplots(nrows=1,ncols=Nsamp,figsize=figsize)
+
+        fig1, ax1 = plt.subplots(nrows=1, ncols=Nsamp, figsize=figsize)
         for samp_num in range(Nsamp):
             axloc = samp_num
             subsampled_samp_optimum_array = []
             for i__ in range(Ntries):
-                gene_filter = np.random.choice(self.n_genes,resamp_vec[samp_num],replace=False) 
+                gene_filter = np.random.choice(self.n_genes, resamp_vec[samp_num], replace=False)
                 subsampled_samp_optimum = self.find_sampling_optimum(gene_filter)
-                subsampled_samp_optimum_array.append(subsampled_samp_optimum)       
+                subsampled_samp_optimum_array.append(subsampled_samp_optimum)
             subsampled_samp_optimum_array = np.asarray(subsampled_samp_optimum_array)
-        
-            self.plot_landscape(ax1[axloc], levels=30,hideticks=True)
-            jit = np.random.normal(scale=0.1,size=subsampled_samp_optimum_array.shape)
-            subsampled_samp_optimum_array=subsampled_samp_optimum_array+jit
-            ax1[axloc].scatter(subsampled_samp_optimum_array[:,0],subsampled_samp_optimum_array[:,1],c='r',s=3,alpha=0.3)
-            ax1[axloc].set_title('n_genes = '+str(resamp_vec[samp_num]))
-        
-        fig_string = self.analysis_figure_string+'/subsampling_stability.png'
-        plt.savefig(fig_string,dpi=450)
-        log.info('Figure stored to {}.'.format(fig_string))
 
-        self.find_sampling_optimum()#reset sampling optimum.
+            self.plot_landscape(ax1[axloc], hideticks=True)
+            jit = np.random.normal(scale=0.1, size=subsampled_samp_optimum_array.shape)
+            subsampled_samp_optimum_array = subsampled_samp_optimum_array + jit
+            ax1[axloc].scatter(
+                subsampled_samp_optimum_array[:, 0],
+                subsampled_samp_optimum_array[:, 1],
+                c="r",
+                s=3,
+                alpha=0.3,
+            )
+            ax1[axloc].set_title("n_genes = " + str(resamp_vec[samp_num]))
 
-    def chisq_best_param_correction(self,search_data,Ntries=10,viz=True,szfig=(2,5),figsize=(10,4),overwrite=True):
-        """
+        fig_string = self.analysis_figure_string + "/subsampling_stability.png"
+        plt.savefig(fig_string, dpi=450)
+        log.info("Figure stored to {}.".format(fig_string))
+
+        self.find_sampling_optimum()  # reset sampling optimum.
+
+    def chisq_best_param_correction(
+        self,
+        search_data,
+        Ntries=10,
+        viz=True,
+        szfig=(2, 5),
+        figsize=(10, 4),
+        overwrite=True,
+    ):
+        """Test the sensitivity of technical noise parameter optima after gene rejection.
+
         This method demonstrates the sensitivity of the sampling parameter landscape
         and optimum to the specific genes retained after chi-squared testing.
         It performs fixed-point iteration to illustrate whether the optimum converges.
 
-        Inputs:
-        search_data: a SearchData instance.
-        Ntries: number of steps of chi-squared testing to perform.
-        vis: whether to visualize.
-        szfig: figure subplot grid.
-        figsize: figure dimensions.
-        overwrite: whether to retain the optimum obtained at the end of the procedure. 
+        This can be used with viz=True to inspect the qualitative behavior of the optimum,
+        or with viz=False as a sanity check to make sure the optimum is not strongly skewed
+        by a small number of very poorly fit genes.
+
+        The procedure does not typically move the optimum.
+
+        Parameters
+        ----------
+        search_data: monod.extract_data.SearchData
+            SearchData object with the fit data.
+        Ntries: int, optional
+            number of steps of chi-squared testing to perform.
+        viz: bool, optional
+            whether to visualize the results.
+        szfig: tuple of ints, optional
+            dimensions of the figure subplot grid.
+        figsize: tuple of floats, optional
+            figure dimensions.
+        overwrite: bool, optional
+            whether to retain the optimum obtained at the end of the procedure.
         """
         if viz:
-            fig1,ax1=plt.subplots(nrows=szfig[0],ncols=szfig[1],figsize=figsize)
-        log.info('Original optimum: {:.2f}, {:.2f}.'.format(self.samp_optimum[0],self.samp_optimum[1]))
+            fig1, ax1 = plt.subplots(nrows=szfig[0], ncols=szfig[1], figsize=figsize)
+        log.info(
+            "Original optimum: {:.2f}, {:.2f}.".format(self.samp_optimum[0], self.samp_optimum[1])
+        )
         for i_ in range(Ntries):
             self.chisquare_testing(search_data)
             # gene_filter = ~self.rejected_genes
             well_fit_samp_optimum = self.find_sampling_optimum(discard_rejected=True)
-            log.info('New optimum: {:.2f}, {:.2f}.'.format(self.samp_optimum[0],self.samp_optimum[1]))
+            log.info(
+                "New optimum: {:.2f}, {:.2f}.".format(self.samp_optimum[0], self.samp_optimum[1])
+            )
 
             if viz:
-                axloc = np.unravel_index(i_,szfig) if (szfig[0]>1 and szfig[1]>1) else i_
-                self.plot_landscape(ax1[axloc], discard_rejected=True, levels=30,hideticks=True)
+                axloc = np.unravel_index(i_, szfig) if (szfig[0] > 1 and szfig[1] > 1) else i_
+                self.plot_landscape(ax1[axloc], discard_rejected=True, hideticks=True)
         if viz:
-            fig_string = self.analysis_figure_string+'/chisquare_stability.png'
-            plt.savefig(fig_string,dpi=450)
-            log.info('Figure stored to {}.'.format(fig_string))
-            
+            fig_string = self.analysis_figure_string + "/chisquare_stability.png"
+            plt.savefig(fig_string, dpi=450)
+            log.info("Figure stored to {}.".format(fig_string))
+
         if overwrite:
             self.chisquare_testing(search_data)
-            log.info('Optimum retained at {:.2f}, {:.2f}.'.format(self.samp_optimum[0],self.samp_optimum[1]))
+            log.info(
+                "Optimum retained at {:.2f}, {:.2f}.".format(
+                    self.samp_optimum[0], self.samp_optimum[1]
+                )
+            )
         else:
             self.find_sampling_optimum()
             self.chisquare_testing(search_data)
-            log.info('Optimum restored to {:.2f}, {:.2f}.'.format(self.samp_optimum[0],self.samp_optimum[1]))
+            log.info(
+                "Optimum restored to {:.2f}, {:.2f}.".format(
+                    self.samp_optimum[0], self.samp_optimum[1]
+                )
+            )
 
-    def plot_param_L_dep(self,gene_filter_ = None,\
-                         plot_errorbars=False,\
-                         figsize=None,c=2.576,\
-                         axis_search_bounds = True, plot_fit = False,\
-                         distinguish_rej = True):
-        """
-        This method plots the inferred physical parameters at the sampling parameter optimum
-        as a function of gene length.
+    def plot_param_L_dep(
+        self,
+        gene_filter_=None,
+        plot_errorbars=False,
+        figsize=None,
+        c=2.576,
+        axis_search_bounds=True,
+        plot_fit=False,
+        distinguish_rej=True,
+    ):
+        """Plot and fit the biological parameter dependence on length at the sampling parameter optimum.
 
-        Input:
-        gene_filter_: 
-            If None, plot all genes. 
-            If a boolean or integer filter, plot only a subset of genes indicated by the filter.
-        plot_errorbars: whether to use inferred standard error of MLEs to plot error bars.
-        figsize: figure dimensions.
-        c: error bar scaling factor. c=2.576 corresponds to a rough 99% CI.
-        axis_search_bounds: whether to place the x-limits of the plots at the parameter search bounds.
-        plot_fit: whether to plot a fit to the inferred parameters as a linear function of the length.
-        distinguish_rej: whether to distinguish genes in the rejected_genes attribute.
+        This dependence is expected to be weak; burst size may show a very slight negative trend.
+
+        Parameters
+        ----------
+        gene_filter_: None or np.ndarray, optional
+            If None, plot all genes.
+            If a boolean or integer filter, plot the filtered gene subset.
+        plot_errorbars: bool, optional
+            whether to use inferred standard error of maximum likelihood estimates to plot error bars.
+        figsize: None or tuple of floats, optional
+            figure dimensions.
+        c: float
+            if plotting the errorbars, the number of standard deviations to display.
+            this can be used for Gaussian approximations to the MLE confidence intervals.
+        axis_search_bounds: bool, optional
+            whether to place the x-limits of the plots at the parameter search bounds.
+        plot_fit: bool, optional
+            whether to plot a linear fit to the data points.
+        distinguish_rej: bool, optional
+             whether to distinguish the genes in the rejected_genes attribute by color.
         """
         num_params = self.sp.n_phys_pars
-        if figsize is None:
-            figsize = (4*num_params,4)
+        figsize = figsize or (4 * num_params, 4)
 
-        fig1,ax1=plt.subplots(nrows=1,ncols=num_params,figsize=figsize)
+        fig1, ax1 = plt.subplots(nrows=1, ncols=num_params, figsize=figsize)
 
+        gene_filter = self.get_bool_filt(gene_filter_, discard_rejected=False)
+        gene_filter_rej = np.zeros(self.n_genes, dtype=bool)
 
-        gene_filter = self.get_bool_filt(gene_filter_,discard_rejected=False)
-        gene_filter_rej = np.zeros(self.n_genes,dtype=bool)
-        # if gene_filter is None:
-        #     gene_filter = np.ones(self.phys_optimum.shape[0],dtype=bool)
-        #     gene_filter_rej = np.zeros(self.phys_optimum.shape[0],dtype=bool)
-        # else:
-        #     if gene_filter.dtype != np.bool:
-        #         gf_temp = np.zeros(self.phys_optimum.shape[0],dtype=bool)
-        #         gf_temp[gene_filter] = True
-        #         gene_filter = gf_temp
-        #         gene_filter_rej = np.zeros(self.phys_optimum.shape[0],dtype=bool) #something like this...
-
-        if distinguish_rej: #default
-            filt_rej = self.get_bool_filt(gene_filter_,discard_rejected=True) 
-            gene_filter_rej = np.logical_and(gene_filter,np.logical_not(filt_rej)) #subset for rejected genes
-            gene_filter = np.logical_and(gene_filter,filt_rej) #subset for non-rejected genes
-            # if hasattr(self,'rejected_genes'):
-            #     if self.rejection_index != self.samp_optimum_ind:
-            #         log.warning('Sampling parameter value is inconsistent.')
-            #         distinguish_rej = False
-            # #     else: #if everything is ready
-            # gene_filter_rej =  np.logical_and(gene_filter,self.rejected_genes)
-            # gene_filter = np.logical_and(gene_filter,~self.rejected_genes) #note this updates gene_filter!
-            acc_point_aesth = ('accepted_gene_color','accepted_gene_alpha','accepted_gene_ms')
-            rej_point_aesth = ('rejected_gene_color','rejected_gene_alpha','rejected_gene_ms')
-            # else:
-            #     log.info('Gene rejection needs to be precomputed to distinguish rejected points.')
-            #     distinguish_rej = False
-        else: #don't distinguish
-            acc_point_aesth = ('generic_gene_color','generic_gene_alpha','generic_gene_ms')
-            log.info('Falling back on generic marker properties.') 
+        if distinguish_rej:  # default
+            filt_rej = self.get_bool_filt(gene_filter_, discard_rejected=True)
+            gene_filter_rej = np.logical_and(
+                gene_filter, np.logical_not(filt_rej)
+            )  # subset for rejected genes
+            gene_filter = np.logical_and(gene_filter, filt_rej)
+            acc_point_aesth = (
+                "accepted_gene_color",
+                "accepted_gene_alpha",
+                "accepted_gene_ms",
+            )
+            rej_point_aesth = (
+                "rejected_gene_color",
+                "rejected_gene_alpha",
+                "rejected_gene_ms",
+            )
+        else:  # don't distinguish
+            acc_point_aesth = (
+                "generic_gene_color",
+                "generic_gene_alpha",
+                "generic_gene_ms",
+            )
+            log.info("Falling back on generic marker properties.")
 
         for i in range(num_params):
             if plot_errorbars:
 
-                lfun = lambda x,a,b: a*x+b
+                lfun = lambda x, a, b: a * x + b
                 if plot_fit:
-                    popt,pcov = scipy.optimize.curve_fit(lfun,self.gene_log_lengths[gene_filter],
-                                                         self.phys_optimum[gene_filter,i],\
-                                                         sigma=self.sigma[gene_filter,i],
-                                                         absolute_sigma=True)
-                    xl = np.array([min(self.gene_log_lengths),max(self.gene_log_lengths)])
+                    popt, pcov = scipy.optimize.curve_fit(
+                        lfun,
+                        self.gene_log_lengths[gene_filter],
+                        self.phys_optimum[gene_filter, i],
+                        sigma=self.sigma[gene_filter, i],
+                        absolute_sigma=True,
+                    )
+                    xl = np.array([min(self.gene_log_lengths), max(self.gene_log_lengths)])
 
-                    min_param = (popt[0]-np.sqrt(pcov[0,0])*c,popt[1]-np.sqrt(pcov[1,1])*c)
-                    max_param = (popt[0]+np.sqrt(pcov[0,0])*c,popt[1]+np.sqrt(pcov[1,1])*c)
-                    ax1[i].fill_between(xl,\
-                        lfun(xl,min_param[0],min_param[1]),\
-                        lfun(xl,max_param[0],max_param[1]),\
-                        facecolor=aesthetics['length_fit_face_color'],\
-                        alpha=aesthetics['length_fit_face_alpha'])
-                    ax1[i].plot(xl,lfun(xl,popt[0],popt[1]),\
-                        c=aesthetics['length_fit_line_color'],\
-                        linewidth=aesthetics['length_fit_lw'])
-                ax1[i].errorbar(self.gene_log_lengths[gene_filter],
-                                self.phys_optimum[gene_filter,i],
-                                self.sigma[gene_filter,i]*c,c=aesthetics['errorbar_gene_color'],
-                                alpha=aesthetics['errorbar_gene_alpha'],linestyle='None',
-                                linewidth = aesthetics['errorbar_lw'])
+                    min_param = (
+                        popt[0] - np.sqrt(pcov[0, 0]) * c,
+                        popt[1] - np.sqrt(pcov[1, 1]) * c,
+                    )
+                    max_param = (
+                        popt[0] + np.sqrt(pcov[0, 0]) * c,
+                        popt[1] + np.sqrt(pcov[1, 1]) * c,
+                    )
+                    ax1[i].fill_between(
+                        xl,
+                        lfun(xl, min_param[0], min_param[1]),
+                        lfun(xl, max_param[0], max_param[1]),
+                        facecolor=aesthetics["length_fit_face_color"],
+                        alpha=aesthetics["length_fit_face_alpha"],
+                    )
+                    ax1[i].plot(
+                        xl,
+                        lfun(xl, popt[0], popt[1]),
+                        c=aesthetics["length_fit_line_color"],
+                        linewidth=aesthetics["length_fit_lw"],
+                    )
+                ax1[i].errorbar(
+                    self.gene_log_lengths[gene_filter],
+                    self.phys_optimum[gene_filter, i],
+                    self.sigma[gene_filter, i] * c,
+                    c=aesthetics["errorbar_gene_color"],
+                    alpha=aesthetics["errorbar_gene_alpha"],
+                    linestyle="None",
+                    linewidth=aesthetics["errorbar_lw"],
+                )
 
-            ax1[i].scatter(self.gene_log_lengths[gene_filter],
-                           self.phys_optimum[gene_filter,i],\
-                           c=aesthetics[acc_point_aesth[0]],\
-                           alpha=aesthetics[acc_point_aesth[1]],\
-                           s=aesthetics[acc_point_aesth[2]])
+            ax1[i].scatter(
+                self.gene_log_lengths[gene_filter],
+                self.phys_optimum[gene_filter, i],
+                c=aesthetics[acc_point_aesth[0]],
+                alpha=aesthetics[acc_point_aesth[1]],
+                s=aesthetics[acc_point_aesth[2]],
+            )
             if np.any(gene_filter_rej):
-                ax1[i].scatter(self.gene_log_lengths[gene_filter_rej],
-                               self.phys_optimum[gene_filter_rej,i],\
-                               c=aesthetics[rej_point_aesth[0]],\
-                               alpha=aesthetics[rej_point_aesth[1]],\
-                               s=aesthetics[rej_point_aesth[2]])
+                ax1[i].scatter(
+                    self.gene_log_lengths[gene_filter_rej],
+                    self.phys_optimum[gene_filter_rej, i],
+                    c=aesthetics[rej_point_aesth[0]],
+                    alpha=aesthetics[rej_point_aesth[1]],
+                    s=aesthetics[rej_point_aesth[2]],
+                )
 
-            ax1[i].set_xlabel(r'$\log_{10}$ L')
+            ax1[i].set_xlabel(r"$\log_{10}$ L")
             ax1[i].set_ylabel(self.model.get_log_name_str()[i])
             if axis_search_bounds:
-                ax1[i].set_ylim([self.sp.phys_lb[i],self.sp.phys_ub[i]])
+                ax1[i].set_ylim([self.sp.phys_lb[i], self.sp.phys_ub[i]])
         fig1.tight_layout()
-        fig_string = self.analysis_figure_string+'/length_dependence.png'
-        plt.savefig(fig_string,dpi=450)
-        log.info('Figure stored to {}.'.format(fig_string))
+        fig_string = self.analysis_figure_string + "/length_dependence.png"
+        plt.savefig(fig_string, dpi=450)
+        log.info("Figure stored to {}.".format(fig_string))
 
-    def plot_gene_distributions(self,search_data,sz = (5,5),figsize = (10,10),\
-                   marg='joint',logscale=None,title=True,\
-                   genes_to_plot=None):
-        """
-        This method plots the gene count distributions and their fits at the sampling parameter optimum.
+    def plot_gene_distributions(
+        self,
+        search_data,
+        sz=(5, 5),
+        figsize=(10, 10),
+        marg="joint",
+        logscale=None,
+        title=True,
+        genes_to_plot=None,
+        savefig=True,
+    ):
+        """Plot the gene count distributions and their fits at the sampling parameter optimum.
 
-        Input:
-        search_data: a SearchData instance.
-        sz: subplot dimensions.
-        figsize: figure dimensions.
-        marg: whether to plot 'nascent' or 'mature' marginal, or the 'joint' distribution.
-        logscale: whether to apply a log-transformation to the PMF for ease of visualization.
-        title: whether to name the gene in the title.
-        genes_to_plot: which genes to plot, either a boolean or integer array.
+        Parameters
+        ----------
+        search_data: monod.extract_data.SearchData
+            SearchData object with the fit data.
+        szfig: tuple of ints, optional
+            dimensions of the figure subplot grid.
+        figsize: tuple of floats, optional
+            figure dimensions.
+        marg: str, optional
+            if 'nascent': plot unspliced RNA marginal.
+            if 'mature': plot spliced RNA marginal.
+            if 'joint': plot the bivariate distribution.
+        logscale: None or bool, optional
+            whether to plot probabilities or log-probabilities.
+            by default, True for 'joint', False for marginals.
+        title: bool, optional
+            whether to report the gene name in each subplot title.
+        genes_to_plot: bool or int np.ndarray or None, optional
+            if array, which genes to plot.
+            if None, plot by internal order.
+        savefig: bool, optional
+            whether to save the figure to disk.
         """
-        
+
         if logscale is None:
-            if marg=='joint':
+            if marg == "joint":
                 logscale = True
             else:
                 logscale = False
 
-        (nrows,ncols)=sz
-        fig1,ax1=plt.subplots(nrows=nrows,ncols=ncols,figsize=figsize)
+        (nrows, ncols) = sz
+        fig1, ax1 = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize)
 
         nax = np.prod(sz)
         if genes_to_plot is None:
             genes_to_plot = np.arange(nax)
-        
+
         genes_to_plot = np.asarray(genes_to_plot)
         if genes_to_plot.dtype == bool:
             gtp_temp = np.arange(self.n_genes)
             genes_to_plot = gtp_temp[genes_to_plot]
-        
+
         number_of_genes_to_plot = len(genes_to_plot)
         if number_of_genes_to_plot > self.n_genes:
             number_of_genes_to_plot = self.n_genes
-            genes_to_plot = genes_to_plot[:self.n_genes]
-        if number_of_genes_to_plot>nax: #This should no longer break...
+            genes_to_plot = genes_to_plot[: self.n_genes]
+        if number_of_genes_to_plot > nax:  # This should no longer break...
             number_of_genes_to_plot = nax
             genes_to_plot = genes_to_plot[:nax]
-            
 
-
-        j_=0
+        j_ = 0
         for i_ in genes_to_plot:
-            lm = [search_data.M[i_],search_data.N[i_]]
-            if marg == 'mature':
-                lm[0]=1
-            if marg == 'nascent':
-                lm[1]=1
-            axloc = np.unravel_index(j_,sz) if (sz[0]>1 and sz[1]>1) else j_
-            # axloc = np.unravel_index(i_,sz)
-            
-            samp = None if (self.model.seq_model == 'None') else self.regressor_optimum[i_]
-            Pa = np.squeeze(self.model.eval_model_pss(self.phys_optimum[i_],lm,samp))
+            lm = np.copy(search_data.M[:, i_])
+            if marg == "mature":
+                lm[0] = 1
+            if marg == "nascent":
+                lm[1] = 1
+            axloc = np.unravel_index(j_, sz) if (sz[0] > 1 and sz[1] > 1) else j_
 
+            samp = self.regressor_optimum[i_]
+            Pa = np.squeeze(self.model.eval_model_pss(self.phys_optimum[i_], lm, samp))
 
-            if marg=='joint':
+            if marg == "joint":
                 if logscale:
-                    Pa[Pa<1e-10]=1e-10
+                    Pa[Pa < 1e-10] = 1e-10
                     Pa = np.log10(Pa)
 
-                X_,Y_ = np.meshgrid(np.arange(search_data.M[i_])-0.5,
-                                    np.arange(search_data.N[i_])-0.5)
-                ax1[axloc].contourf(X_.T,Y_.T,Pa,20,cmap='summer')
-                
+                ax1[axloc].imshow(Pa.T, aspect="auto", cmap="summer")
+                ax1[axloc].invert_yaxis()
+
                 jitter_magn = 0.1
-                jitter_x = np.random.randn(self.n_cells)*jitter_magn
-                jitter_y = np.random.randn(self.n_cells)*jitter_magn
-                ax1[axloc].scatter(search_data.U[i_]+jitter_x,
-                                    search_data.S[i_]+jitter_y,c='k',s=1,alpha=0.1)
-                
-                ax1[axloc].set_xlim([-0.5,search_data.M[i_]-1.5])
-                ax1[axloc].set_ylim([-0.5,search_data.N[i_]-1.5])
+                jitter = np.random.randn(2, self.n_cells) * jitter_magn
+                ax1[axloc].scatter(*search_data.layers[:2, i_] + jitter, c="k", s=1, alpha=0.1)
+
+                ax1[axloc].set_xlim([-0.5, search_data.M[0, i_] - 1.5])
+                ax1[axloc].set_ylim([-0.5, search_data.M[1, i_] - 1.5])
             else:
-                plot_hist_and_fit(ax1[axloc],search_data,i_,Pa,marg)
+                plot_hist_and_fit(ax1[axloc], search_data, i_, Pa, marg)
                 if logscale:
-                    ax1[axloc].set_yscale('log')            
-            if title: #add a "rejected" thing
-                ax1[axloc].set_title(self.gene_names[i_],fontdict={'fontsize': 9})
+                    ax1[axloc].set_yscale("log")
+            if title:
+                titlestr = self.gene_names[i_]
+                if hasattr(self, "rejected_genes") and self.rejected_genes[i_]:
+                    titlestr += " (rej.)"
+                ax1[axloc].set_title(titlestr, fontdict={"fontsize": 9})
             ax1[axloc].set_xticks([])
             ax1[axloc].set_yticks([])
-            j_+=1
+            j_ += 1
         fig1.tight_layout(pad=0.02)
 
-        fig_string = self.analysis_figure_string+'/gene_distributions_{}.png'.format(marg)
-        plt.savefig(fig_string,dpi=450)
-        log.info('Figure stored to {}.'.format(fig_string))
+        if savefig:
+            fig_string = self.analysis_figure_string + "/gene_distributions_{}.png".format(marg)
+            plt.savefig(fig_string, dpi=450)
+            log.info("Figure stored to {}.".format(fig_string))
 
-    def get_logL(self,search_data,EPS=1e-20):
+    # the next two functions are useful for model selection, but are not currently in use.
+    # def get_logL(self,search_data,EPS=1e-20):
+    #     """
+    #     This method calculates the log-likelihood for all genes at the sampling parameter optimum.
+
+    #     Input:
+    #     search_data: a SearchData instance.
+    #     EPS: probability rounding parameter -- anything below this is rounded to EPS.
+
+    #     Output:
+    #     logL: a vector of size n_genes containing model log-likelihoods.
+    #     """
+    #     logL = np.zeros(self.n_genes)
+    #     for gene_index in range(self.n_genes):
+    #         samp = self.regressor_optimum[gene_index]
+    #         # samp = None if (self.model.seq_model == 'None') else self.regressor_optimum[gene_index]
+    #         offs = 20
+    #         lm = search_data.M[:,gene_index] + offs #[search_data.M[gene_index]+offs,search_data.N[gene_index]+offs]
+    #         Pss = self.model.eval_model_pss(self.phys_optimum[gene_index],lm,samp)
+    #         if np.any(Pss<EPS):
+    #             Pss[Pss<EPS] = EPS
+    #         expected_log_lik = np.log(Pss)
+    #         logL[gene_index] = expected_log_lik[search_data.U[gene_index].astype(int),search_data.S[gene_index].astype(int)].sum()
+    #     return logL
+
+    # def get_logL_Poiss(self,search_data,EPS=1e-20):
+    #     """
+    #     This method calculates the log-likelihood for all genes under the constitutive model with no sampling,
+    #     i.e., an uncorrelated bivariate Poisson distribution.
+
+    #     Input:
+    #     search_data: a SearchData instance.
+    #     EPS: probability rounding parameter -- anything below this is rounded to EPS.
+
+    #     Output:
+    #     logL: a vector of size n_genes containing model log-likelihoods under the Poisson model.
+    #     """
+    #     logL = np.zeros(self.n_genes)
+    #     for gene_index in range(self.n_genes):
+    #         # samp = self.regressor_optimum[gene_index]
+    #         # samp = None if (self.model.seq_model == 'None') else self.regressor_optimum[gene_index]
+    #         offs = 0
+    #         lm = search_data.M[:,gene_index] + offs#[search_data.M[gene_index]+offs,search_data.N[gene_index]+offs]
+    #         x = np.arange(lm[0])
+    #         y = np.arange(lm[1])
+    #         m1 = search_data.moments[gene_index]['U_mean']
+    #         m2 = search_data.moments[gene_index]['S_mean']
+    #         expected_log_lik = (x * np.log(m1) - m1 - scipy.special.gammaln(x+1))[:,None] + \
+    #                            (y * np.log(m2) - m2 - scipy.special.gammaln(y+1))[None,y]
+    #         logL[gene_index] = expected_log_lik[search_data.U[gene_index].astype(int),search_data.S[gene_index].astype(int)].sum()
+    #     return logL
+
+    def get_noise_decomp(self):
         """
-        This method calculates the log-likelihood for all genes at the sampling parameter optimum.
-
-        Input:
-        search_data: a SearchData instance.
-        EPS: probability rounding parameter -- anything below this is rounded to EPS.
-
-        Output:
-        logL: a vector of size n_genes containing model log-likelihoods.
-        """
-        logL = np.zeros(self.n_genes)
-        for gene_index in range(self.n_genes):
-            samp = None if (self.model.seq_model == 'None') else self.regressor_optimum[gene_index]
-            offs = 20
-            lm = [search_data.M[gene_index]+offs,search_data.N[gene_index]+offs]  
-            Pss = self.model.eval_model_pss(self.phys_optimum[gene_index],lm,samp)
-            if np.any(Pss<EPS):
-                Pss[Pss<EPS] = EPS
-            expected_log_lik = np.log(Pss)
-            logL[gene_index] = expected_log_lik[search_data.U[gene_index].astype(int),search_data.S[gene_index].astype(int)].sum()
-        return logL
-
-    def get_logL_Poiss(self,search_data,EPS=1e-20):   
-        """
-        This method calculates the log-likelihood for all genes under the constitutive model with no sampling,
-        i.e., an uncorrelated bivariate Poisson distribution.
-
-        Input:
-        search_data: a SearchData instance.
-        EPS: probability rounding parameter -- anything below this is rounded to EPS.
-
-        Output:
-        logL: a vector of size n_genes containing model log-likelihoods under the Poisson model.
-        """ 
-        logL = np.zeros(self.n_genes)
-        for gene_index in range(self.n_genes):
-            samp = None if (self.model.seq_model == 'None') else self.regressor_optimum[gene_index]
-            offs = 0
-            lm = [search_data.M[gene_index]+offs,search_data.N[gene_index]+offs]  
-            x = np.arange(lm[0])
-            y = np.arange(lm[1])
-            m1 = search_data.moments[gene_index]['U_mean']
-            m2 = search_data.moments[gene_index]['S_mean']
-            expected_log_lik = (x * np.log(m1) - m1 - scipy.special.gammaln(x+1))[:,None] + \
-                               (y * np.log(m2) - m2 - scipy.special.gammaln(y+1))[None,y]
-            logL[gene_index] = expected_log_lik[search_data.U[gene_index].astype(int),search_data.S[gene_index].astype(int)].sum()
-        return logL
-
-    def get_noise_decomp(self):        
-        """
+        #obsolete.
         This method reports the fractions of normalized variance attributable to intrinsic,
         extrinsic, and technical noise under the instantiated model, using the eval_model_noise
         method of the CMEModel class.
 
-        Output: 
-        f: array with size n_genes x 3 x 2. 
+        Output:
+        f: array with size n_genes x 3 x 2.
             dim 0: gene
             dim 1: variance fraction (intrinsic, extrinsic, technical)
             dim 2: species (unspliced, spliced)
@@ -1146,42 +1750,124 @@ class SearchResults:
         """
         f = []
         for gene_index in range(self.n_genes):
-            samp = None if (self.model.seq_model == 'None') else self.regressor_optimum[gene_index]
-            f.append([self.model.eval_model_noise(self.phys_optimum[gene_index],samp=samp)])
+            f.append(
+                [
+                    self.model.eval_model_noise(
+                        self.phys_optimum[gene_index],
+                        samp=self.regressor_optimum[gene_index],
+                    )
+                ]
+            )
         return np.asarray(f).squeeze()
 
-def plot_hist_and_fit(ax1,sd,i_,Pa,marg='nascent',\
-                      facecolor=aesthetics['hist_face_color'],\
-                      fitcolor=aesthetics['hist_fit_color'],\
-                      facealpha=aesthetics['hist_face_alpha'],\
-                      linestyle=aesthetics['linestyle']):
-    """
-    This helper function plots marginal gene count distributions and their fits at the sampling parameter optimum.
 
-    Input:
-    ax1: the matplotlib axes to plot into.
-    search_data: a SearchData instance.
-    i_: gene index.
-    Pa: model probability mass function
-    marg: whether to plot 'nascent' or 'mature' marginal.
-    facecolor: histogram face color.
-    fitcolor: model fit line color.
-    facealpha: histogram face alpha.
-    linestyle: model fit line style.
+def parallelize(
+    function,
+    iterable,
+    num_cores,
+    num_entries,
+    completion_message="Parallelization complete.",
+    termination_message="Parallelization manually terminated.",
+    error_message="Parallelization terminated due to error.",
+    use_tqdm=True,
+):
+    """Helper function to safely parallelize computations.
+
+    Inputs a single-parameter function and an iterable, requests a number of cores, \
+    and gracefully shuts down if needed.
+
+    Parameters
+    ----------
+    function: function
+        a one-parameter function that can be mapped using entries of the iterable.
+    iterable: iterable
+        an iterable to be passed into the function.        
+    num_cores: int
+        number of cores to use for parallelization.
+    num_entries: int
+        length of the iterable, used for tqdm.
+    completion_message: str, optional
+        string to print to log upon completion.
+    termination_message: str, optional
+        string to print to log if the process is manually terminated.
+    error_message: str, optional
+        string to print to log if the process fails due to a ValueError.
+    use_tqdm: bool, optional
+        whether to visualize progress using tqdm.
+
+    Returns
+    -------
+    x: iterable
+        result of applying function to iterable.
+
     """
-    if marg=='nascent':
-        ax1.hist(sd.U[i_],
-                        bins=np.arange(sd.M[i_])-0.5,\
-                        density=True,\
-                        color=facecolor,alpha=facealpha)
-        ax1.plot(np.arange(sd.M[i_]),Pa,\
-                        color=fitcolor,linestyle=linestyle)
-        ax1.set_xlim([-0.5,sd.U[i_].max()+2.5])
-    elif marg =='mature':
-        ax1.hist(sd.S[i_],
-                        bins=np.arange(sd.N[i_])-0.5,\
-                        density=True,\
-                        color=facecolor,alpha=facealpha)
-        ax1.plot(np.arange(sd.N[i_]),Pa,\
-                        color=fitcolor,linestyle=linestyle)
-        ax1.set_xlim([-0.5,sd.S[i_].max()+2.5])
+    try:
+        pool = multiprocessing.Pool(processes=num_cores)
+        if use_tqdm:
+            x = list(tqdm(pool.imap(function, iterable), total=num_entries))  # hacky
+        else:
+            x = pool.map(function, iterable)
+        pool.close()
+        pool.join()
+        log.info(completion_message)
+    except KeyboardInterrupt:
+        log.warning(termination_message)
+        pool.terminate()
+        pool.join()
+    except ValueError:
+        log.warning(error_message)
+        pool.terminate()
+        pool.join()
+    return x
+
+
+def plot_hist_and_fit(
+    ax1,
+    sd,
+    i_,
+    Pa,
+    marg="nascent",
+    facecolor=aesthetics["hist_face_color"],
+    fitcolor=aesthetics["hist_fit_color"],
+    facealpha=aesthetics["hist_face_alpha"],
+    linestyle=aesthetics["linestyle"],
+):
+    """Plots marginal gene count distributions and their fits at the sampling parameter optimum.
+
+    Parameters
+    ----------
+    ax: matplotlib.axes.Axes
+        axes to plot into.
+    sd: monod.extract_data.SearchData
+        SearchData object with the fit data.
+    i_: int
+        gene index to plot.
+    Pa: float np.ndarray
+        univariate probability mass function, typically computed through CMEModel.
+    marg: str, optional
+        which marginal to plot, typically 'nascent' or 'mature'.
+    facecolor: str or tuple, optional
+        histogram face color in a matplotlib-compatible format.
+    fitcolor: str or tuple, optional
+        model fit line color in a matplotlib-compatible format.
+    facealpha: float, optional
+        histogram face alpha.
+    linestyle: str, optional
+        model fit line style in a matplotlib-compatible format.
+    """
+
+    if marg == "nascent":
+        lind = 0
+    elif marg == "mature":
+        lind = 1
+    elif marg == "ambiguous":
+        lind = 2
+    ax1.hist(
+        sd.layers[lind, i_],
+        bins=np.arange(sd.M[lind, i_]) - 0.5,
+        density=True,
+        color=facecolor,
+        alpha=facealpha,
+    )
+    ax1.plot(np.arange(sd.M[lind, i_]), Pa, color=fitcolor, linestyle=linestyle)
+    ax1.set_xlim([-0.5, sd.layers[lind, i_].max() + 2.5])
