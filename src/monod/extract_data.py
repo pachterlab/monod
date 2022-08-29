@@ -104,7 +104,9 @@ def extract_data(
             analysis_gene_list = list(reader)[0]
         log.info("Gene list extracted from {}.".format(gene_result_list_file))
     except:
-        log.error("Gene list could not be extracted from {}.".format(gene_result_list_file))
+        log.error(
+            "Gene list could not be extracted from {}.".format(gene_result_list_file)
+        )
         # raise an error here in the next version.
 
     if viz:
@@ -127,7 +129,9 @@ def extract_data(
     gene_names = list(gene_names)
     gene_filter = [gene_names.index(gene) for gene in analysis_gene_list]
     gene_names = np.asarray(gene_names)
-    *layers, gene_names, len_arr = filter_by_gene(gene_filter, *layers, gene_names, len_arr)
+    *layers, gene_names, len_arr = filter_by_gene(
+        gene_filter, *layers, gene_names, len_arr
+    )
 
     S = layers[1]
     U = layers[0]
@@ -143,7 +147,9 @@ def extract_data(
             )
         dataset_diagnostics_dir_string = dataset_string + "/diagnostic_figures"
         make_dir(dataset_diagnostics_dir_string)
-        plt.savefig(dataset_diagnostics_dir_string + "/{}.png".format(dataset_name), dpi=450)
+        plt.savefig(
+            dataset_diagnostics_dir_string + "/{}.png".format(dataset_name), dpi=450
+        )
 
     n_genes = len(gene_names)
     M = np.amax(layers, axis=2) + padding[:, None]
@@ -309,7 +315,9 @@ class SearchData:
                 ax1.plot(rank_ * np.ones(2), [umi_sum.min(), umi_sum.max()], "r--")
             return cf
 
-    def get_noise_decomp(self, sizefactor="pf", lognormalize=True, pcount=0, knee_thr=None):
+    def get_noise_decomp(
+        self, sizefactor="pf", lognormalize=True, pcount=0, knee_thr=None
+    ):
         """
         #obsolete.
         This method performs normalization and variance stabilization on the raw data, and
@@ -359,7 +367,9 @@ class SearchData:
         return f
 
 
-def normalize_count_matrix(X, sizefactor="pf", lognormalize=True, pcount=0, logbase="e"):
+def normalize_count_matrix(
+    X, sizefactor="pf", lognormalize=True, pcount=0, logbase="e"
+):
     # obsolete.
     if sizefactor is not None:
         if sizefactor == "pf":

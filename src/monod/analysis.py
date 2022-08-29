@@ -38,7 +38,9 @@ def load_search_results(full_result_string):
 
         return search_results
     except Exception as ex:
-        log.error("Grid scan results could not be loaded from {}.".format(full_result_string))
+        log.error(
+            "Grid scan results could not be loaded from {}.".format(full_result_string)
+        )
         raise ex
 
 
@@ -218,7 +220,9 @@ def plot_params_for_pair(
             ax1[i].plot(xl, xl, "r--", linewidth=2)
     fig1.tight_layout()
 
-    fig_string = sr1.batch_analysis_string + "/pair_parameter_comparison_{}.png".format(meta)
+    fig_string = sr1.batch_analysis_string + "/pair_parameter_comparison_{}.png".format(
+        meta
+    )
     plt.savefig(fig_string, dpi=450)
     log.info("Figure stored to {}.".format(fig_string))
 
@@ -364,7 +368,9 @@ def plot_AIC_weights(
 
     fig1.tight_layout()
     if savefig:
-        fig_string = (sr_arr[0].batch_analysis_string) + ("/AIC_comparison{}.png".format(meta))
+        fig_string = (sr_arr[0].batch_analysis_string) + (
+            "/AIC_comparison{}.png".format(meta)
+        )
 
         plt.savefig(fig_string, dpi=450)
         log.info("Figure stored to {}.".format(fig_string))
@@ -412,7 +418,9 @@ def compare_AIC_weights(
                 )
                 ax1[i, k].plot(xx, kde(xx), "k")
             elif i == k:
-                ax1[i, k].hist(w[i, model_ind, :], 30, facecolor=aesthetics["hist_face_color"])
+                ax1[i, k].hist(
+                    w[i, model_ind, :], 30, facecolor=aesthetics["hist_face_color"]
+                )
             elif i < k:
                 fig1.delaxes(ax1[i, k])
             ax1[i, k].set_yticks([])
@@ -830,9 +838,13 @@ def compare_gene_distributions(
                 lm[1] = 1
             xlim = np.max([max(lm), xlim])
             samp = (
-                None if (sr_arr[j].model.seq_model == "None") else sr_arr[j].regressor_optimum[i_]
+                None
+                if (sr_arr[j].model.seq_model == "None")
+                else sr_arr[j].regressor_optimum[i_]
             )
-            Pa = np.squeeze(sr_arr[j].model.eval_model_pss(sr_arr[j].phys_optimum[i_], lm, samp))
+            Pa = np.squeeze(
+                sr_arr[j].model.eval_model_pss(sr_arr[j].phys_optimum[i_], lm, samp)
+            )
 
             if marg == "joint":
                 log.error("Potentially implement this later...")

@@ -123,7 +123,9 @@ class InferenceParameters:
         self.use_lengths = use_lengths
 
         if model.seq_model == "None":
-            log.info("Sequencing model set to None. All sampling parameters set to null.")
+            log.info(
+                "Sequencing model set to None. All sampling parameters set to null."
+            )
             samp_lb = [1, 1]
             samp_ub = [1, 1]
             gridsize = [1, 1]
@@ -185,7 +187,11 @@ class InferenceParameters:
         try:
             with open(inference_parameter_string, "wb") as ipfs:
                 pickle.dump(self, ipfs)
-            log.info("Global inference parameters stored to {}.".format(inference_parameter_string))
+            log.info(
+                "Global inference parameters stored to {}.".format(
+                    inference_parameter_string
+                )
+            )
         except:
             log.error(
                 "Global inference parameters could not be stored to {}.".format(
@@ -344,14 +350,18 @@ class GradientInference:
             method of moments estimates for all genes under the current technical variation parameters.
 
         """
-        regressor = np.array([global_parameters.sampl_vals[point_index]] * search_data.n_genes)
+        regressor = np.array(
+            [global_parameters.sampl_vals[point_index]] * search_data.n_genes
+        )
         if global_parameters.use_lengths:
             if model.seq_model == "Bernoulli":
                 raise ValueError(
                     "The Bernoulli model does not yet have a physical length-based model."
                 )
             elif model.seq_model == "None":
-                raise ValueError("The model without technical noise has no length effects.")
+                raise ValueError(
+                    "The model without technical noise has no length effects."
+                )
             elif model.seq_model == "Poisson":
                 regressor[:, 0] += search_data.gene_log_lengths
             else:
@@ -724,7 +734,9 @@ class SearchResults:
         point_index: int
             index of the grid point results to load from disk.
         """
-        grid_point_result_string = self.inference_string + "/grid_point_" + str(point_index) + ".gp"
+        grid_point_result_string = (
+            self.inference_string + "/grid_point_" + str(point_index) + ".gp"
+        )
         with open(grid_point_result_string, "rb") as ipfs:
             grid_point_results = pickle.load(ipfs)
             self.param_estimates += [grid_point_results.param_estimates]
@@ -766,7 +778,11 @@ class SearchResults:
                 pickle.dump(self, srfs)
             log.debug("Grid scan results stored to {}.".format(full_result_string))
         except:
-            log.error("Grid scan results could not be stored to {}.".format(full_result_string))
+            log.error(
+                "Grid scan results could not be stored to {}.".format(
+                    full_result_string
+                )
+            )
         self.full_result_string = full_result_string
         return full_result_string
 
@@ -786,7 +802,9 @@ class SearchResults:
                 pickle.dump(self, srfs)
             log.debug("Updated results stored to {}.".format(upd_result_string))
         except:
-            log.error("Updated results could not be stored to {}.".format(upd_result_string))
+            log.error(
+                "Updated results could not be stored to {}.".format(upd_result_string)
+            )
         self.upd_result_string = upd_result_string
         return upd_result_string
 
@@ -897,7 +915,9 @@ class SearchResults:
             self.sp.samp_lb[1] - dx[1] / 2,
             self.sp.samp_ub[1] + dx[1] / 2,
         ]
-        lnd = ax.imshow(np.flipud(np.reshape(total_divergence, self.sp.gridsize).T), extent=extent)
+        lnd = ax.imshow(
+            np.flipud(np.reshape(total_divergence, self.sp.gridsize).T), extent=extent
+        )
 
         if plot_optimum:
             ax.scatter(self.samp_optimum[0], self.samp_optimum[1], c="crimson", s=50)
@@ -1119,18 +1139,24 @@ class SearchResults:
                 DATA = search_data.n_cells * search_data.hist[gene_index].flatten()
                 PROPOSAL = PROPOSAL.flatten()
             elif hist_type == "unique":
-                DATA = np.concatenate((search_data.n_cells * search_data.hist[gene_index][1], [0]))
+                DATA = np.concatenate(
+                    (search_data.n_cells * search_data.hist[gene_index][1], [0])
+                )
                 PROPOSAL = PROPOSAL[
                     search_data.hist[gene_index][0][:, 0],
                     search_data.hist[gene_index][0][:, 1],
                 ]
-                PROPOSAL = np.concatenate((PROPOSAL, [search_data.n_cells - PROPOSAL.sum()]))
+                PROPOSAL = np.concatenate(
+                    (PROPOSAL, [search_data.n_cells - PROPOSAL.sum()])
+                )
             filt = (DATA > 5) & (PROPOSAL > 5)
             chisq_data = np.concatenate((DATA[filt], [DATA[~filt].sum()]))
             chisq_prop = np.concatenate((PROPOSAL[filt], [PROPOSAL[~filt].sum()]))
 
             csqarr += [
-                scipy.stats.mstats.chisquare(chisq_data, chisq_prop, self.model.get_num_params())
+                scipy.stats.mstats.chisquare(
+                    chisq_data, chisq_prop, self.model.get_num_params()
+                )
             ]
 
         csq, pval = zip(*csqarr)
@@ -1255,7 +1281,8 @@ class SearchResults:
         else:
             log.info("Starting non-parallelized Hessian computation.")
             hess = [
-                self.par_fun_hess(x) for x in zip(range(self.n_genes), [search_data] * self.n_genes)
+                self.par_fun_hess(x)
+                for x in zip(range(self.n_genes), [search_data] * self.n_genes)
             ]
             log.info("Non-parallelized Hessian computation complete.")
         warnings.resetwarnings()
@@ -1265,11 +1292,12 @@ class SearchResults:
         sigma = np.zeros((self.n_genes, self.sp.n_phys_pars))
 
         for gene_index in range(self.n_genes):
-            try:    
-
+            try:
 
                 hess_inv = np.linalg.inv(hess[gene_index, :, :])
-                sigma[gene_index, :] = np.sqrt(np.diag(hess_inv)) / np.sqrt(self.n_cells)
+                sigma[gene_index, :] = np.sqrt(np.diag(hess_inv)) / np.sqrt(
+                    self.n_cells
+                )
             except:
                 fail[gene_index] = True
                 log.info(
@@ -1297,7 +1325,9 @@ class SearchResults:
             )
         )
 
-    def resample_opt_viz(self, resamp_vec=(5, 10, 20, 40, 60), Ntries=4, figsize=(10, 10)):
+    def resample_opt_viz(
+        self, resamp_vec=(5, 10, 20, 40, 60), Ntries=4, figsize=(10, 10)
+    ):
         """Test the sensitivity of the technical noise parameter landscape to the number of genes analyzed.
 
         Parameters
@@ -1315,7 +1345,9 @@ class SearchResults:
         for samp_num in range(Nsamp):
             for i_ in range(Ntries):
                 axloc = (samp_num, i_)
-                gene_filter = np.random.choice(self.n_genes, resamp_vec[samp_num], replace=False)
+                gene_filter = np.random.choice(
+                    self.n_genes, resamp_vec[samp_num], replace=False
+                )
                 subsampled_samp_optimum = self.find_sampling_optimum(gene_filter)
                 self.plot_landscape(ax1[axloc], gene_filter=gene_filter, hideticks=True)
 
@@ -1327,7 +1359,9 @@ class SearchResults:
         log.info("Figure stored to {}.".format(fig_string))
         self.find_sampling_optimum()  # reset sampling optimum here
 
-    def resample_opt_mc_viz(self, resamp_vec=(5, 10, 20, 40, 60), Ntries=1000, figsize=(16, 4)):
+    def resample_opt_mc_viz(
+        self, resamp_vec=(5, 10, 20, 40, 60), Ntries=1000, figsize=(16, 4)
+    ):
         """Test the sensitivity of technical noise parameter optima under gene downsampling.
 
         The optima for each downsampled set are visualized on the parameter landscape
@@ -1349,7 +1383,9 @@ class SearchResults:
             axloc = samp_num
             subsampled_samp_optimum_array = []
             for i__ in range(Ntries):
-                gene_filter = np.random.choice(self.n_genes, resamp_vec[samp_num], replace=False)
+                gene_filter = np.random.choice(
+                    self.n_genes, resamp_vec[samp_num], replace=False
+                )
                 subsampled_samp_optimum = self.find_sampling_optimum(gene_filter)
                 subsampled_samp_optimum_array.append(subsampled_samp_optimum)
             subsampled_samp_optimum_array = np.asarray(subsampled_samp_optimum_array)
@@ -1411,18 +1447,26 @@ class SearchResults:
         if viz:
             fig1, ax1 = plt.subplots(nrows=szfig[0], ncols=szfig[1], figsize=figsize)
         log.info(
-            "Original optimum: {:.2f}, {:.2f}.".format(self.samp_optimum[0], self.samp_optimum[1])
+            "Original optimum: {:.2f}, {:.2f}.".format(
+                self.samp_optimum[0], self.samp_optimum[1]
+            )
         )
         for i_ in range(Ntries):
             self.chisquare_testing(search_data)
             # gene_filter = ~self.rejected_genes
             well_fit_samp_optimum = self.find_sampling_optimum(discard_rejected=True)
             log.info(
-                "New optimum: {:.2f}, {:.2f}.".format(self.samp_optimum[0], self.samp_optimum[1])
+                "New optimum: {:.2f}, {:.2f}.".format(
+                    self.samp_optimum[0], self.samp_optimum[1]
+                )
             )
 
             if viz:
-                axloc = np.unravel_index(i_, szfig) if (szfig[0] > 1 and szfig[1] > 1) else i_
+                axloc = (
+                    np.unravel_index(i_, szfig)
+                    if (szfig[0] > 1 and szfig[1] > 1)
+                    else i_
+                )
                 self.plot_landscape(ax1[axloc], discard_rejected=True, hideticks=True)
         if viz:
             fig_string = self.analysis_figure_string + "/chisquare_stability.png"
@@ -1522,7 +1566,9 @@ class SearchResults:
                         sigma=self.sigma[gene_filter, i],
                         absolute_sigma=True,
                     )
-                    xl = np.array([min(self.gene_log_lengths), max(self.gene_log_lengths)])
+                    xl = np.array(
+                        [min(self.gene_log_lengths), max(self.gene_log_lengths)]
+                    )
 
                     min_param = (
                         popt[0] - np.sqrt(pcov[0, 0]) * c,
@@ -1665,7 +1711,9 @@ class SearchResults:
 
                 jitter_magn = 0.1
                 jitter = np.random.randn(2, self.n_cells) * jitter_magn
-                ax1[axloc].scatter(*search_data.layers[:2, i_] + jitter, c="k", s=1, alpha=0.1)
+                ax1[axloc].scatter(
+                    *search_data.layers[:2, i_] + jitter, c="k", s=1, alpha=0.1
+                )
 
                 ax1[axloc].set_xlim([-0.5, search_data.M[0, i_] - 1.5])
                 ax1[axloc].set_ylim([-0.5, search_data.M[1, i_] - 1.5])
@@ -1684,7 +1732,9 @@ class SearchResults:
         fig1.tight_layout(pad=0.02)
 
         if savefig:
-            fig_string = self.analysis_figure_string + "/gene_distributions_{}.png".format(marg)
+            fig_string = (
+                self.analysis_figure_string + "/gene_distributions_{}.png".format(marg)
+            )
             plt.savefig(fig_string, dpi=450)
             log.info("Figure stored to {}.".format(fig_string))
 

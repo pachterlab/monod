@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 
 import time
 
-import loompy as lp #will be necessary later, probably
+import loompy as lp  # will be necessary later, probably
 import anndata as ad
 import os
 from datetime import datetime
@@ -150,12 +150,16 @@ def construct_batch(
     for dataset_index in range(n_datasets):
         dataset_filepath = dataset_filepaths[dataset_index]
         log.info("Dataset: " + dataset_names[dataset_index])
-        dataset_attr_names = attribute_names[dataset_index]  # pull out the correct attribute names
+        dataset_attr_names = attribute_names[
+            dataset_index
+        ]  # pull out the correct attribute names
         if cf is None:
             dataset_cf = None
         else:
             dataset_cf = cf[dataset_index]
-        layers, gene_names, n_cells = import_raw(dataset_filepath, dataset_attr_names, dataset_cf)
+        layers, gene_names, n_cells = import_raw(
+            dataset_filepath, dataset_attr_names, dataset_cf
+        )
         log.info(str(n_cells) + " cells detected.")
 
         # identify genes that are in the length annotations. discard all the rest.
@@ -167,7 +171,9 @@ def construct_batch(
         *layers, gene_names = filter_by_gene(annotation_filter, *layers, gene_names)
         if dataset_index == 0:  # this presupposes the data are well-structured
             gene_name_reference = np.copy(gene_names)
-            expression_filter_array = np.zeros((n_datasets, len(gene_name_reference)), dtype=bool)
+            expression_filter_array = np.zeros(
+                (n_datasets, len(gene_name_reference)), dtype=bool
+            )
         else:
             if not np.all(gene_name_reference == gene_names):
                 raise ValueError(
@@ -219,18 +225,24 @@ def construct_batch(
             gene_loc = np.where(gene_name_reference == gene)[0]
             if len(gene_loc) == 0:
                 log.warning(
-                    "Gene {} not found or has multiple entries in annotations.".format(gene)
+                    "Gene {} not found or has multiple entries in annotations.".format(
+                        gene
+                    )
                 )
             elif len(gene_loc) > 1:
                 log.error(
-                    "Multiple entries found for gene {}: this should never happen.".format(gene)
+                    "Multiple entries found for gene {}: this should never happen.".format(
+                        gene
+                    )
                 )
             else:
                 exp_fractions[gene_loc[0]] = 0
                 n_genes_enforced += 1
                 selected_genes_filter[gene_loc[0]] = True
 
-        q = np.quantile(exp_fractions, 1 - (n_genes - n_genes_enforced) / len(exp_fractions))
+        q = np.quantile(
+            exp_fractions, 1 - (n_genes - n_genes_enforced) / len(exp_fractions)
+        )
         selected_genes_filter[exp_fractions > q] = True
         np.random.seed(seed)
         random_genes = np.where(exp_fractions == q)[0]
@@ -263,11 +275,15 @@ def construct_batch(
             gene_loc = np.where(gene_name_reference == gene)[0]
             if len(gene_loc) == 0:
                 log.warning(
-                    "Gene {} not found or has multiple entries in annotations.".format(gene)
+                    "Gene {} not found or has multiple entries in annotations.".format(
+                        gene
+                    )
                 )
             elif len(gene_loc) > 1:
                 log.error(
-                    "Multiple entries found for gene {}: this should never happen.".format(gene)
+                    "Multiple entries found for gene {}: this should never happen.".format(
+                        gene
+                    )
                 )
             else:
                 exp_filter[gene_loc[0]] = False
@@ -277,7 +293,9 @@ def construct_batch(
         np.random.seed(seed)
         sampling_gene_set = np.where(exp_filter)[0]
         if n_genes < len(sampling_gene_set):
-            gene_select_ind = np.random.choice(sampling_gene_set, n_genes, replace=False)
+            gene_select_ind = np.random.choice(
+                sampling_gene_set, n_genes, replace=False
+            )
             log.info(str(n_genes) + " random genes selected.")
         else:
             gene_select_ind = sampling_gene_set
@@ -306,7 +324,8 @@ def construct_batch(
         for figure_ind in plt.get_fignums():
             plt.figure(figure_ind)
             plt.savefig(
-                diagnostics_dir_string + "/{}.png".format(dataset_names[figure_ind - 1]),
+                diagnostics_dir_string
+                + "/{}.png".format(dataset_names[figure_ind - 1]),
                 dpi=450,
             )
     return dir_string, dataset_strings
@@ -465,10 +484,14 @@ def import_raw(filename, attribute_names, cf):
         if fn_extension == "loom":  # loom file
             return import_vlm(filename, attribute_names, cf)
         elif fn_extension == "h5ad":
-            raise ValueError("This functionality is unsupported in the current version of Monod.")
+            raise ValueError(
+                "This functionality is unsupported in the current version of Monod."
+            )
             return import_h5ad(filename, attribute_names, cf)
         else:
-            raise ValueError("This functionality is unsupported in the current version of Monod.")
+            raise ValueError(
+                "This functionality is unsupported in the current version of Monod."
+            )
             return import_mtx(filename)
     else:  # assume passing in anndata
         return process_h5ad(filename, attribute_names, cf)
@@ -575,10 +598,10 @@ def import_vlm(filename, attribute_names, cf=None):
     with lp.connect(filename) as ds:
         if cf is None:
             cf = np.ones(len(ds.ca[cell_attr]), dtype=bool)
-        layers = [ds.layers[layer][:][:,cf] for layer in layer_names]
+        layers = [ds.layers[layer][:][:, cf] for layer in layer_names]
         gene_names = ds.ra[gene_attr]
         nCells = len(ds.ca[cell_attr])
-    layers = np.asarray(layers,dtype=int)
+    layers = np.asarray(layers, dtype=int)
     warnings.resetwarnings()
     return layers, gene_names, nCells
 

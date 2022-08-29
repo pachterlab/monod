@@ -107,9 +107,13 @@ class CMEModel:
             self.seq_model = "None"
         else:
             self.seq_model = seq_model
-        self.set_integration_parameters(fixed_quad_T, quad_order, quad_vec_T, quad_method)
+        self.set_integration_parameters(
+            fixed_quad_T, quad_order, quad_vec_T, quad_method
+        )
 
-    def set_integration_parameters(self, fixed_quad_T, quad_order, quad_vec_T, quad_method):
+    def set_integration_parameters(
+        self, fixed_quad_T, quad_order, quad_vec_T, quad_method
+    ):
         """Set quadrature parameters.
 
         Parameters
@@ -151,7 +155,9 @@ class CMEModel:
             return (r"$\log_{10} b$", r"$\log_{10} \beta$", r"$\log_{10} \gamma$")
         else:
             raise ValueError(
-                "Please select a biological noise model from {}.".format(self.available_biomodels)
+                "Please select a biological noise model from {}.".format(
+                    self.available_biomodels
+                )
             )
 
     def get_num_params(self):
@@ -298,7 +304,9 @@ class CMEModel:
             pass
         else:
             raise ValueError(
-                "Please select a technical noise model from {}.".format(self.available_seqmodels)
+                "Please select a technical noise model from {}.".format(
+                    self.available_seqmodels
+                )
             )
 
         gf = self.eval_model_pgf(p, g)
@@ -339,7 +347,9 @@ class CMEModel:
                 gf = scipy.integrate.fixed_quad(fun, 0, T, n=self.quad_order)[0]
             else:
                 raise ValueError("Please use one of the specified quadrature methods.")
-        elif self.bio_model == "Extrinsic":  # constitutive production with extrinsic noise
+        elif (
+            self.bio_model == "Extrinsic"
+        ):  # constitutive production with extrinsic noise
             alpha, beta, gamma = p
             gf = -alpha * np.log(1 - g[0] / beta - g[1] / gamma)
         elif self.bio_model == "Delay":  # bursty production with delayed degradation
@@ -365,7 +375,9 @@ class CMEModel:
             gf /= 2
         else:
             raise ValueError(
-                "Please select a biological noise model from {}.".format(self.available_biomodels)
+                "Please select a biological noise model from {}.".format(
+                    self.available_biomodels
+                )
             )
         return gf  # this is the log-generating function
 
@@ -562,7 +574,9 @@ class CMEModel:
         elif self.bio_model == "Bursty":  # bursty production
             b, beta, gamma = p
             mu = [b / beta, b / gamma]
-        elif self.bio_model == "Extrinsic":  # constitutive production with extrinsic noise
+        elif (
+            self.bio_model == "Extrinsic"
+        ):  # constitutive production with extrinsic noise
             alpha, beta, gamma = p
             mu = [alpha / beta, alpha / gamma]
         elif self.bio_model == "Delay":  # bursty production with delayed degradation
@@ -578,7 +592,9 @@ class CMEModel:
             noise_ext = [0, 0]
         elif self.bio_model == "Bursty":  # bursty production
             noise_ext = [beta, beta * gamma / (beta + gamma)]
-        elif self.bio_model == "Extrinsic":  # constitutive production with extrinsic noise
+        elif (
+            self.bio_model == "Extrinsic"
+        ):  # constitutive production with extrinsic noise
             noise_ext = [1 / alpha, 1 / alpha]
         elif self.bio_model == "Delay":  # bursty production with delayed degradation
             raise ValueError("Not yet implemented!")
