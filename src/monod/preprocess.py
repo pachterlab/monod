@@ -575,13 +575,10 @@ def import_vlm(filename, attribute_names, cf=None):
     with lp.connect(filename) as ds:
         if cf is None:
             cf = np.ones(len(ds.ca[cell_attr]), dtype=bool)
-        layers = [ds.layers[layer].astype(int)[:,cf] for layer in layer_names]
-        # S = ds.layers[spliced_layer][:, cf]
-        # U = ds.layers[unspliced_layer][:, cf]
+        layers = [ds.layers[layer][:][:,cf] for layer in layer_names]
         gene_names = ds.ra[gene_attr]
         nCells = len(ds.ca[cell_attr])
-        # nCells = S.shape(1)
-    layers = np.asarray(layers)
+    layers = np.asarray(layers,dtype=int)
     warnings.resetwarnings()
     return layers, gene_names, nCells
 
