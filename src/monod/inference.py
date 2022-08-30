@@ -1216,11 +1216,11 @@ class SearchResults:
         import numdifftools  # this will fail if numdifftools has not been evaluted.
 
         gene_index, search_data = inputs
-
-        if hasattr(search_data, "hist_type") and search_data.hist_type == "unique":
-            hist_type = "unique"
-        else:
-            hist_type = "grid"
+        hist_type = get_hist_type(search_data)
+        # if hasattr(search_data, "hist_type") and search_data.hist_type == "unique":
+        #     hist_type = "unique"
+        # else:
+        #     hist_type = "grid"
         Hfun = numdifftools.Hessian(
             lambda x: self.model.eval_model_kld(
                 p=x,
@@ -1751,6 +1751,7 @@ class SearchResults:
         Output:
         logL: a vector of size n_genes containing model log-likelihoods.
         """
+        hist_type = get_hist_type(search_data)
         logL = np.zeros(self.n_genes)
         for gene_index in range(self.n_genes):
             logL[gene_index] = self.model.eval_model_logL(
