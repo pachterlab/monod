@@ -595,7 +595,7 @@ def import_vlm(filename, attribute_names, cf=None):
     layer_names, gene_attr, cell_attr = attribute_names
     # spliced_layer, unspliced_layer, gene_attr, cell_attr = attribute_names
     warnings.filterwarnings("ignore", category=DeprecationWarning)
-    with lp.connect(filename) as ds:
+    with lp.connect(filename,mode='r') as ds:
         if cf is None:
             cf = np.ones(len(ds.ca[cell_attr]), dtype=bool)
         layers = [ds.layers[layer][:][:, cf] for layer in layer_names]

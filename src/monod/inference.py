@@ -1739,56 +1739,35 @@ class SearchResults:
             log.info("Figure stored to {}.".format(fig_string))
 
     # the next two functions are useful for model selection, but are not currently in use.
-    # def get_logL(self,search_data,EPS=1e-20):
-    #     """
-    #     This method calculates the log-likelihood for all genes at the sampling parameter optimum.
+    def get_logL(self,search_data,EPS=1e-20,offs=0):
+        """
+        This method calculates the log-likelihood for all genes at the sampling parameter optimum.
 
-    #     Input:
-    #     search_data: a SearchData instance.
-    #     EPS: probability rounding parameter -- anything below this is rounded to EPS.
+        Parameters
+        ----------
+        search_data: a SearchData instance.
+        EPS: probability rounding parameter -- anything below this is rounded to EPS.
 
-    #     Output:
-    #     logL: a vector of size n_genes containing model log-likelihoods.
-    #     """
-    #     logL = np.zeros(self.n_genes)
-    #     for gene_index in range(self.n_genes):
-    #         samp = self.regressor_optimum[gene_index]
-    #         # samp = None if (self.model.seq_model == 'None') else self.regressor_optimum[gene_index]
-    #         offs = 20
-    #         lm = search_data.M[:,gene_index] + offs #[search_data.M[gene_index]+offs,search_data.N[gene_index]+offs]
-    #         Pss = self.model.eval_model_pss(self.phys_optimum[gene_index],lm,samp)
-    #         if np.any(Pss<EPS):
-    #             Pss[Pss<EPS] = EPS
-    #         expected_log_lik = np.log(Pss)
-    #         logL[gene_index] = expected_log_lik[search_data.U[gene_index].astype(int),search_data.S[gene_index].astype(int)].sum()
-    #     return logL
+        Output:
+        logL: a vector of size n_genes containing model log-likelihoods.
+        """
+        logL = np.zeros(self.n_genes)
+        for gene_index in range(self.n_genes):
+            logL[gene_index] = self.model.eval_model_logL(
+                p=self.phys_optimum[gene_index],
+                limits=search_data.M[:, gene_index]+offs,
+                samp=self.regressor_optimum[gene_index],
+                data=search_data.hist[gene_index],
+                hist_type=hist_type,
+                EPS=EPS)
+            # Pss = self.model.eval_model_pss(self.phys_optimum[gene_index],lm,samp)
+            # if np.any(Pss<EPS):
+            #     Pss[Pss<EPS] = EPS
+            # expected_log_lik = np.log(Pss)
+            # eval_model_kld(self, p, limits, samp, data, hist_type="unique", EPS=EPS)
+            # logL[gene_index] = expected_log_lik[search_data.U[gene_index].astype(int),search_data.S[gene_index].astype(int)].sum()
+        return logL
 
-    # def get_logL_Poiss(self,search_data,EPS=1e-20):
-    #     """
-    #     This method calculates the log-likelihood for all genes under the constitutive model with no sampling,
-    #     i.e., an uncorrelated bivariate Poisson distribution.
-
-    #     Input:
-    #     search_data: a SearchData instance.
-    #     EPS: probability rounding parameter -- anything below this is rounded to EPS.
-
-    #     Output:
-    #     logL: a vector of size n_genes containing model log-likelihoods under the Poisson model.
-    #     """
-    #     logL = np.zeros(self.n_genes)
-    #     for gene_index in range(self.n_genes):
-    #         # samp = self.regressor_optimum[gene_index]
-    #         # samp = None if (self.model.seq_model == 'None') else self.regressor_optimum[gene_index]
-    #         offs = 0
-    #         lm = search_data.M[:,gene_index] + offs#[search_data.M[gene_index]+offs,search_data.N[gene_index]+offs]
-    #         x = np.arange(lm[0])
-    #         y = np.arange(lm[1])
-    #         m1 = search_data.moments[gene_index]['U_mean']
-    #         m2 = search_data.moments[gene_index]['S_mean']
-    #         expected_log_lik = (x * np.log(m1) - m1 - scipy.special.gammaln(x+1))[:,None] + \
-    #                            (y * np.log(m2) - m2 - scipy.special.gammaln(y+1))[None,y]
-    #         logL[gene_index] = expected_log_lik[search_data.U[gene_index].astype(int),search_data.S[gene_index].astype(int)].sum()
-    #     return logL
 
     def get_noise_decomp(self):
         """

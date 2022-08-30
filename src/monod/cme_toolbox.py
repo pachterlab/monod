@@ -8,7 +8,7 @@ import numpy as np
 import scipy
 from scipy import integrate
 
-from scipy.fft import irfft2, irfftn
+from scipy.fft import irfftn
 
 # from .nn_toolbox import basic_ml_bivariate, ml_microstate_logP
 
@@ -180,6 +180,48 @@ class CMEModel:
         elif self.amb_model == "Unequal":
             numpars += 2
         return numpars
+
+    def eval_model_kld(self, p, limits, samp, data, hist_type="unique", EPS=1e-15):
+        """Compute the log-likelihood of data under a set of parameters.
+
+        Parameters
+        ----------
+        p: np.ndarray
+            log10 biological parameters.
+        limits: list of int
+            grid size for PMF evaluation, size n_species.
+        samp: None or np.ndarray
+            sampling parameters, if applicable.
+        data: tuple or np.ndarray
+            experimental data histogram.
+        hist_type: str, optional
+            if "grid": the search data histogram was generated using np.histogramdd.
+            if "unique": the search data histogram was generated using np.unique.
+            "unique" is the preferred method for histogram generation, as it requires less memory to store.
+        EPS: float, optional
+            minimum allowed proposal probability mass. anything below this value is rounded up to EPS.
+
+        Returns
+        -------
+        logL: float
+            log-likelihood.
+        """
+        if hist_type == "grid":
+            raise ValueError('Not yet implemented!')
+            # proposal = self.eval_model_pss(p, limits, samp)
+            # proposal[proposal < EPS] = EPS
+            # filt = data > 0
+            # data = data[filt]
+            # proposal = proposal[filt]
+            # d = data * np.log(data / proposal)
+            # return np.sum(d)
+        elif hist_type == "unique":
+            x, f = data
+            proposal = self.eval_model_pss(p, limits, samp)
+            proposal[proposal < EPS] = EPS
+            proposal = proposal[tuple(x.T)]
+            logL = np.log(proposal)
+            return np.sum(logL)
 
     def eval_model_kld(self, p, limits, samp, data, hist_type="unique", EPS=1e-15):
         """Compute the Kullback-Leibler divergence between data and a fit.
@@ -524,7 +566,7 @@ class CMEModel:
             gamma = alpha / moments["S_mean"]
             x0 = np.asarray([alpha, beta, gamma])
         else:
-            raise ValueError("Please select from existing models.")
+            raise ValueError("Please select from implemented models.")
 
         if self.seq_model in ("Bernoulli", "Poisson"):
             if self.bio_model == "Constitutive":
@@ -532,9 +574,9 @@ class CMEModel:
             else:
                 x0[1:] = x0[1:] * samp
         if self.amb_model == "Equal":  # basic
-            x0 = np.concatenate((x0, [0.1]))
+            x0 = np.concatenate((x0, [0.1])) #just make a guess
         elif self.amb_model == "Unequal":
-            x0 = np.concatenate((x0, [0.1, 0.1]))
+            x0 = np.concatenate((x0, [0.1, 0.1])) #just make a guess
         for j in range(self.get_num_params()):
             x0[j] = np.clip(x0[j], lb[j], ub[j])
         x0 = np.log10(x0)
@@ -544,7 +586,7 @@ class CMEModel:
             )  # last resort -- makes it nondeterministic though
         return x0
 
-    def eval_model_noise(self, p, samp=None):
+    def eval_model_noise(self, p_, samp=None):
         """Compute CV2 fractions due to intrinsic, extrinsic, and technical noise.
 
         This method reports the fractions of normalized variance attributable to intrinsic (single-molecule),
@@ -552,7 +594,7 @@ class CMEModel:
 
         Parameters
         ----------
-        p: np.ndarray
+        p_: np.ndarray
             log10 biological parameters.
         samp: None or np.ndarray, optional
             sampling parameters, if applicable.
@@ -567,7 +609,7 @@ class CMEModel:
             dimension 0 sums to 1.
 
         """
-        p = 10**p
+        p = 10**p_
         if self.bio_model == "Constitutive":  # constitutive production
             beta, gamma = p
             mu = [1 / beta, 1 / gamma]
@@ -613,7 +655,7 @@ class CMEModel:
                 1 - noise_int / noise - noise_ext / noise,
             )
         elif self.seq_model == "Poisson":
-            samp = 10**samp
-            noise_tech = 1 / (mu * samp)
+            samp_ = 10**samp
+            noise_tech = 1 / (mu * samp_)
             noise = noise_int + noise_ext + noise_tech
             return (noise_int / noise, noise_ext / noise, noise_tech / noise)
