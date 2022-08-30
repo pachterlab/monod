@@ -181,7 +181,7 @@ class CMEModel:
             numpars += 2
         return numpars
 
-    def eval_model_kld(self, p, limits, samp, data, hist_type="unique", EPS=1e-15):
+    def eval_model_logL(self, p, limits, samp, data, hist_type="unique", EPS=1e-15):
         """Compute the log-likelihood of data under a set of parameters.
 
         Parameters
