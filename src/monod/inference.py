@@ -1067,6 +1067,7 @@ class SearchResults:
         bonferroni=True,
         reject_at_bounds=True,
         bound_thr=0.01,
+        grouping_thr=5
     ):
         """Perform goodness-of-fit testing at the current sampling parameter optimum to identify poor fits.
 
@@ -1099,6 +1100,8 @@ class SearchResults:
         bound_thr: float, optional
             how close the parameters must be close to the bounds (in units of the allowed
             parameter range) to trigger rejection.
+        grouping_thr: float or int, optional
+            minimum bin size for chi-squared test. 
 
         Returns
         -------
@@ -1149,7 +1152,7 @@ class SearchResults:
                 PROPOSAL = np.concatenate(
                     (PROPOSAL, [search_data.n_cells - PROPOSAL.sum()])
                 )
-            filt = (DATA > 5) & (PROPOSAL > 5)
+            filt = (DATA > grouping_thr) & (PROPOSAL > grouping_thr)
             chisq_data = np.concatenate((DATA[filt], [DATA[~filt].sum()]))
             chisq_prop = np.concatenate((PROPOSAL[filt], [PROPOSAL[~filt].sum()]))
 
