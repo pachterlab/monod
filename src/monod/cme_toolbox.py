@@ -99,6 +99,7 @@ class CMEModel:
             "Extrinsic",
             "Constitutive",
             "CIR",
+            "DelayedSplicing"
         )
         self.available_seqmodels = ("None", "Bernoulli", "Poisson")
         self.available_ambmodels = ("None", "Equal", "Unequal")
@@ -147,6 +148,8 @@ class CMEModel:
             return (r"$\log_{10} \beta$", r"$\log_{10} \gamma$")
         elif self.bio_model == "Delay":
             return (r"$\log_{10} b$", r"$\log_{10} \beta$", r"$\log_{10} \tau^{-1}$")
+        elif self.bio_model == "DelayedSplicing":
+            return (r"$\log_{10} b$", r"$\log_{10} \tau^{-1}$", r"$\log_{10} \gamma$")
         elif self.bio_model == "Bursty":
             return (r"$\log_{10} b$", r"$\log_{10} \beta$", r"$\log_{10} \gamma$")
         elif self.bio_model == "Extrinsic":
@@ -403,6 +406,16 @@ class CMEModel:
                 + 1 / beta / (1 - b * g[1]) * np.log((b * U - 1) / (b * g[0] - 1))
                 + tau * b * g[1] / (1 - b * g[1])
             )
+        elif self.bio_model == "DelayedSplicing":
+            b, tauinv, gamma = p
+            tau = 1 / tauinv
+            gf = tau * b * g[0] / (1 - b * g[0]) - 1 / gamma * np.log(1 - b * g[1])
+            # U = g[1] + (g[0] - g[1]) * np.exp(-beta * tau)
+            # gf = (
+            #     -1 / beta * np.log(1 - b * U)
+            #     + 1 / beta / (1 - b * g[1]) * np.log((b * U - 1) / (b * g[0] - 1))
+            #     + tau * b * g[1] / (1 - b * g[1])
+            # )
         elif self.bio_model == "CIR":  # CIR-like:
             b, beta, gamma = p
             fun = lambda x: self.cir_intfun(x, g, b, beta, gamma)
@@ -548,6 +561,15 @@ class CMEModel:
             beta = b / moments["U_mean"]
             tauinv = b / moments["S_mean"]
             x0 = np.asarray([b, beta, tauinv])
+
+        elif self.bio_model == 'DelayedSplicing':
+            b = moments["S_var"] / moments["S_mean"] - 1
+            b = np.clip(b, lb[0], ub[0])
+            tauinv = b / moments["U_mean"]
+            gamma = b / moments["S_mean"]
+
+            if self.seq_model != 'None':
+                raise ValueError('Not implemented yet!')
 
         elif self.bio_model == "Constitutive":
             beta = 1 / moments["U_mean"]
