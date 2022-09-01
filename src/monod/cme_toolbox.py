@@ -567,6 +567,7 @@ class CMEModel:
             b = np.clip(b, lb[0], ub[0])
             tauinv = b / moments["U_mean"]
             gamma = b / moments["S_mean"]
+            x0 = np.asarray([b, tauinv,gamma])
 
             if self.seq_model != 'None':
                 raise ValueError('Not implemented yet!')
