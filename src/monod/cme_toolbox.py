@@ -410,12 +410,6 @@ class CMEModel:
             b, tauinv, gamma = p
             tau = 1 / tauinv
             gf = tau * b * g[0] / (1 - b * g[0]) - 1 / gamma * np.log(1 - b * g[1])
-            # U = g[1] + (g[0] - g[1]) * np.exp(-beta * tau)
-            # gf = (
-            #     -1 / beta * np.log(1 - b * U)
-            #     + 1 / beta / (1 - b * g[1]) * np.log((b * U - 1) / (b * g[0] - 1))
-            #     + tau * b * g[1] / (1 - b * g[1])
-            # )
         elif self.bio_model == "CIR":  # CIR-like:
             b, beta, gamma = p
             fun = lambda x: self.cir_intfun(x, g, b, beta, gamma)
@@ -563,7 +557,8 @@ class CMEModel:
             x0 = np.asarray([b, beta, tauinv])
 
         elif self.bio_model == 'DelayedSplicing':
-            b = moments["S_var"] / moments["S_mean"] - 1
+            # b = moments["S_var"] / moments["S_mean"] - 1
+            b = (moments["U_var"] / moments["U_mean"] - 1)/2
             b = np.clip(b, lb[0], ub[0])
             tauinv = b / moments["U_mean"]
             gamma = b / moments["S_mean"]
