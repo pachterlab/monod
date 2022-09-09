@@ -537,7 +537,7 @@ def process_h5ad(file, attribute_names, cf=None):
     layers = np.asarray(layers)  # hmm
 
     gene_names = file.var_names.to_numpy()
-    nCells = layers[0].shape[1]
+    nCells = layers.shape[2]
     warnings.resetwarnings()
     return layers, gene_names, nCells
 
@@ -600,8 +600,8 @@ def import_vlm(filename, attribute_names, cf=None):
             cf = np.ones(len(ds.ca[cell_attr]), dtype=bool)
         layers = [ds.layers[layer][:][:, cf] for layer in layer_names]
         gene_names = ds.ra[gene_attr]
-        nCells = len(ds.ca[cell_attr])
     layers = np.asarray(layers, dtype=int)
+    nCells = layers.shape[2]
     warnings.resetwarnings()
     return layers, gene_names, nCells
 
