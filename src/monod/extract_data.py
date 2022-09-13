@@ -281,90 +281,53 @@ class SearchData:
         for j in range(len(input_data)):
             setattr(self, attr_names[j], input_data[j])
 
-    # def knee_plot(self, ax1=None, thr=None, viz=False):
-    #     """
-    #     # obsolete.
 
-    #     This method plots the knee plot for the spliced mRNA counts and filters for cells that have
-    #     more UMIs than the threshold.
-
-    #     Input:
-    #     ax1: matplotlib axes to plot into.
-    #     thr: UMI threshold.
-    #     viz: whether to visualize.
-
-    #     Output:
-    #     cf: cell filter for cells to be retained.
-    #     """
-    #     umi_sum = self.S.sum(0)
-    #     umi_rank = np.argsort(umi_sum)
-    #     if ax1 is None and viz:
-    #         fig1, ax1 = plt.subplots(1, 1, figsize=(7, 5))
-    #     usf = np.flip(umi_sum[umi_rank])
-    #     if viz:
-    #         ax1.plot(np.arange(self.n_cells), usf, "k")
-    #         ax1.set_xlabel("Cell rank")
-    #         ax1.set_ylabel("UMI count+1")
-    #         ax1.set_yscale("log")
-    #     if thr is not None:
-    #         cf = umi_sum > thr
-    #         rank_ = np.argmin(np.abs(usf - thr))
-    #         if viz:
-    #             ax1.plot([0, self.n_cells + 1], thr * np.ones(2), "r--")
-    #             ax1.plot(rank_ * np.ones(2), [umi_sum.min(), umi_sum.max()], "r--")
-    #         return cf
-
-    # def get_noise_decomp(
-    #     self, sizefactor="pf", lognormalize=True, pcount=0, knee_thr=None
-    # ):
     def get_noise_decomp(
         self, sizefactor="pf", lognormalize=True, pcount=0):
         """
-        #obsolete.
         This method performs normalization and variance stabilization on the raw data, and
         reports the fractions of normalized variance retained and removed as a result of the process.
-
-        Input:
-        sizefactor: what size factor to use.
-            'pf': Proportional fitting; set the size of each cell to the mean size.
-            a number: use this number (e.g., 1e4 for cp10k).
-            None: do not do size/depth normalization.
-        lognormalize: whether to do log(1+x).
-        pcount: pseudocount added to ensure division by zero does not occur.
-        knee_thr: knee plot UMI threshold used to filter out low-expression cells.
-
-        Output:
-        f: array with size n_genes x 2 x 2.
-            dim 0: gene
-            dim 1: variance fraction (retained, discarded)
-            dim 2: species (unspliced, spliced)
         The unspliced and spliced species are analyzed independently.
+
+        Parameters
+        ----------
+        sizefactor: str, float, int, or None, optional
+            what size factor to use.
+            If 'pf', use proportional fitting; set the size of each cell to the mean size.
+            If int or float, use this number (e.g., 1e4 for cp10k).
+            If None, do not do size/depth normalization.
+        lognormalize: bool, optional
+            whether to apply log(1+x) transformation.
+        pcount: int or float, optional
+            pseudocount added in size normalization to ensure division by zero does not occur.
+
+        Returns
+        f: float np.ndarray
+            array with size n_genes x 2 x 2, which contains the fraction of CV2 retained or discarded.
+            dim 0: gene index.
+            dim 1: variance fraction (retained, discarded).
+            dim 2: species (unspliced, spliced).
+        
         """
         f = np.zeros((self.n_genes, 2, 2))  # genes -- bio vs tech -- species
-        # presupposes only two species: no ambiguous.
 
         S = np.copy(self.layers[1])
         U = np.copy(self.layers[0])
 
-        # if knee_thr is not None:
-        #     cf = self.knee_plot(thr=knee_thr)
-        #     S = S[:, cf]
-        #     U = U[:, cf]
-
-        CV2_1 = S.var(1) / S.mean(1) ** 2
-        CV2_2 = U.var(1) / U.mean(1) ** 2
+        CV2_S = S.var(1) / S.mean(1) ** 2
+        CV2_U = U.var(1) / U.mean(1) ** 2
 
         S = normalize_count_matrix(S, sizefactor, lognormalize, pcount)
         U = normalize_count_matrix(U, sizefactor, lognormalize, pcount)
 
-        CV2_1_ = S.var(1) / S.mean(1) ** 2
-        CV2_2_ = U.var(1) / U.mean(1) ** 2
+        CV2_S_norm = S.var(1) / S.mean(1) ** 2
+        CV2_U_norm = U.var(1) / U.mean(1) ** 2
 
         # compute fraction of CV2 eliminated for unspliced and spliced
-        f[:, 0, 0] = CV2_2_ / CV2_2
+        f[:, 0, 0] = CV2_U_norm / CV2_U
         f[:, 1, 0] = 1 - f[:, 0, 0]
 
-        f[:, 0, 1] = CV2_1_ / CV2_1
+        f[:, 0, 1] = CV2_S_norm / CV2_S
         f[:, 1, 1] = 1 - f[:, 0, 1]
         return f
 
@@ -372,7 +335,31 @@ class SearchData:
 def normalize_count_matrix(
     X, sizefactor="pf", lognormalize=True, pcount=0, logbase="e"
 ):
-    # obsolete.
+    """
+    This helper function performs normalization and variance stabilization on a raw data matrix X.
+
+    Parameters
+    ----------
+    X: np.ndarray
+        gene x cell count matrix.
+    sizefactor: str, float, int, or None, optional
+        what size factor to use.
+        If 'pf', use proportional fitting; set the size of each cell to the mean size.
+        If int or float, use this number (e.g., 1e4 for cp10k).
+        If None, do not do size/depth normalization.
+    lognormalize: bool, optional
+        whether to apply log(1+x) transformation.
+    pcount: int or float, optional
+        pseudocount added in size normalization to ensure division by zero does not occur.
+    logbase: str or int
+        If 'e', use log base e.
+        If 2 or 10, use the corresponding integer base.
+
+    Returns
+    X: np.ndarray
+        normalized and transformed count matrix.
+    """
+
     if sizefactor is not None:
         if sizefactor == "pf":
             sizefactor = X.sum(0).mean()
@@ -382,4 +369,6 @@ def normalize_count_matrix(
             X = np.log(X + 1)
         elif logbase == 2:
             X = np.log2(X + 1)
+        elif logbase == 10:
+            X = np.log10(X + 1)
     return X
