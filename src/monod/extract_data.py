@@ -281,42 +281,44 @@ class SearchData:
         for j in range(len(input_data)):
             setattr(self, attr_names[j], input_data[j])
 
-    def knee_plot(self, ax1=None, thr=None, viz=False):
-        """
-        # obsolete.
+    # def knee_plot(self, ax1=None, thr=None, viz=False):
+    #     """
+    #     # obsolete.
 
-        This method plots the knee plot for the spliced mRNA counts and filters for cells that have
-        more UMIs than the threshold.
+    #     This method plots the knee plot for the spliced mRNA counts and filters for cells that have
+    #     more UMIs than the threshold.
 
-        Input:
-        ax1: matplotlib axes to plot into.
-        thr: UMI threshold.
-        viz: whether to visualize.
+    #     Input:
+    #     ax1: matplotlib axes to plot into.
+    #     thr: UMI threshold.
+    #     viz: whether to visualize.
 
-        Output:
-        cf: cell filter for cells to be retained.
-        """
-        umi_sum = self.S.sum(0)
-        umi_rank = np.argsort(umi_sum)
-        if ax1 is None and viz:
-            fig1, ax1 = plt.subplots(1, 1, figsize=(7, 5))
-        usf = np.flip(umi_sum[umi_rank])
-        if viz:
-            ax1.plot(np.arange(self.n_cells), usf, "k")
-            ax1.set_xlabel("Cell rank")
-            ax1.set_ylabel("UMI count+1")
-            ax1.set_yscale("log")
-        if thr is not None:
-            cf = umi_sum > thr
-            rank_ = np.argmin(np.abs(usf - thr))
-            if viz:
-                ax1.plot([0, self.n_cells + 1], thr * np.ones(2), "r--")
-                ax1.plot(rank_ * np.ones(2), [umi_sum.min(), umi_sum.max()], "r--")
-            return cf
+    #     Output:
+    #     cf: cell filter for cells to be retained.
+    #     """
+    #     umi_sum = self.S.sum(0)
+    #     umi_rank = np.argsort(umi_sum)
+    #     if ax1 is None and viz:
+    #         fig1, ax1 = plt.subplots(1, 1, figsize=(7, 5))
+    #     usf = np.flip(umi_sum[umi_rank])
+    #     if viz:
+    #         ax1.plot(np.arange(self.n_cells), usf, "k")
+    #         ax1.set_xlabel("Cell rank")
+    #         ax1.set_ylabel("UMI count+1")
+    #         ax1.set_yscale("log")
+    #     if thr is not None:
+    #         cf = umi_sum > thr
+    #         rank_ = np.argmin(np.abs(usf - thr))
+    #         if viz:
+    #             ax1.plot([0, self.n_cells + 1], thr * np.ones(2), "r--")
+    #             ax1.plot(rank_ * np.ones(2), [umi_sum.min(), umi_sum.max()], "r--")
+    #         return cf
 
+    # def get_noise_decomp(
+    #     self, sizefactor="pf", lognormalize=True, pcount=0, knee_thr=None
+    # ):
     def get_noise_decomp(
-        self, sizefactor="pf", lognormalize=True, pcount=0, knee_thr=None
-    ):
+        self, sizefactor="pf", lognormalize=True, pcount=0):
         """
         #obsolete.
         This method performs normalization and variance stabilization on the raw data, and
@@ -339,14 +341,15 @@ class SearchData:
         The unspliced and spliced species are analyzed independently.
         """
         f = np.zeros((self.n_genes, 2, 2))  # genes -- bio vs tech -- species
+        # presupposes only two species: no ambiguous.
 
-        S = np.copy(self.S)
-        U = np.copy(self.U)
+        S = np.copy(self.layers[1])
+        U = np.copy(self.layers[0])
 
-        if knee_thr is not None:
-            cf = self.knee_plot(thr=knee_thr)
-            S = S[:, cf]
-            U = U[:, cf]
+        # if knee_thr is not None:
+        #     cf = self.knee_plot(thr=knee_thr)
+        #     S = S[:, cf]
+        #     U = U[:, cf]
 
         CV2_1 = S.var(1) / S.mean(1) ** 2
         CV2_2 = U.var(1) / U.mean(1) ** 2

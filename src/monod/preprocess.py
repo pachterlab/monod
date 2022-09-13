@@ -673,3 +673,42 @@ def identify_annotated_genes(gene_names, feat_dict):
     ann_filt = np.zeros(n_gen_tot, dtype=bool)
     ann_filt[sel_ind] = True
     return ann_filt
+
+def knee_plot(X,ax1=None,thr=None,viz=False):
+    """
+    Plot the knee plot for a gene x cell dataset.
+
+    Parameters
+    ----------
+    X: np.ndarray
+        gene x cell count matrix.
+    ax1: matplotlib.axes.Axes, optional
+        axes to plot into.
+    thr: float or int, optional
+        minimum molecule count cutoff.
+    viz: bool, optional
+        whether to visualize the knee plot.
+
+    Returns
+    -------
+    cf: bool np.ndarray
+        cells that meet the minimum molecule count cutoff.
+    """
+    
+    umi_sum = X.sum(0)
+    n_cells = len(umi_sum)
+    umi_rank = np.argsort(umi_sum)
+    usf = np.flip(umi_sum[umi_rank])
+    if viz:
+        ax1.plot(np.arange(n_cells),usf,'k')
+        ax1.set_xlabel('Cell rank')
+        ax1.set_ylabel('UMI count+1')
+        ax1.set_yscale('log')
+    if thr is not None:
+        cf = umi_sum>thr
+        rank_ = np.argmin(np.abs(usf-thr))
+        if viz:
+            ax1.plot([0,n_cells+1],thr*np.ones(2),'r--')
+            ys = ax1.get_ylim()
+            ax1.plot(rank_*np.ones(2),ys,'r--')
+        return cf
