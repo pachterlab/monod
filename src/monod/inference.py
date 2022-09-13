@@ -1459,7 +1459,7 @@ class SearchResults:
             )
         )
         for i_ in range(Ntries):
-            self.chisquare_testing(search_data,threshold=threshold)
+            self.chisquare_testing(search_data, threshold=threshold)
             # gene_filter = ~self.rejected_genes
             well_fit_samp_optimum = self.find_sampling_optimum(discard_rejected=True)
             log.info(
@@ -1481,7 +1481,7 @@ class SearchResults:
             log.info("Figure stored to {}.".format(fig_string))
 
         if overwrite:
-            self.chisquare_testing(search_data,threshold=threshold)
+            self.chisquare_testing(search_data, threshold=threshold)
             log.info(
                 "Optimum retained at {:.2f}, {:.2f}.".format(
                     self.samp_optimum[0], self.samp_optimum[1]
@@ -1489,7 +1489,7 @@ class SearchResults:
             )
         else:
             self.find_sampling_optimum()
-            self.chisquare_testing(search_data,threshold=threshold)
+            self.chisquare_testing(search_data, threshold=threshold)
             log.info(
                 "Optimum restored to {:.2f}, {:.2f}.".format(
                     self.samp_optimum[0], self.samp_optimum[1]

@@ -281,9 +281,7 @@ class SearchData:
         for j in range(len(input_data)):
             setattr(self, attr_names[j], input_data[j])
 
-
-    def get_noise_decomp(
-        self, sizefactor="pf", lognormalize=True, pcount=0):
+    def get_noise_decomp(self, sizefactor="pf", lognormalize=True, pcount=0):
         """
         This method performs normalization and variance stabilization on the raw data, and
         reports the fractions of normalized variance retained and removed as a result of the process.
@@ -307,7 +305,7 @@ class SearchData:
             dim 0: gene index.
             dim 1: variance fraction (retained, discarded).
             dim 2: species (unspliced, spliced).
-        
+
         """
         f = np.zeros((self.n_genes, 2, 2))  # genes -- bio vs tech -- species
 
