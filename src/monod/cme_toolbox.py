@@ -99,7 +99,7 @@ class CMEModel:
             "Extrinsic",
             "Constitutive",
             "CIR",
-            "DelayedSplicing"
+            "DelayedSplicing",
         )
         self.available_seqmodels = ("None", "Bernoulli", "Poisson")
         self.available_ambmodels = ("None", "Equal", "Unequal")
@@ -210,7 +210,7 @@ class CMEModel:
             log-likelihood.
         """
         if hist_type == "grid":
-            raise ValueError('Not yet implemented!')
+            raise ValueError("Not yet implemented!")
             # proposal = self.eval_model_pss(p, limits, samp)
             # proposal[proposal < EPS] = EPS
             # filt = data > 0
@@ -556,16 +556,16 @@ class CMEModel:
             tauinv = b / moments["S_mean"]
             x0 = np.asarray([b, beta, tauinv])
 
-        elif self.bio_model == 'DelayedSplicing':
+        elif self.bio_model == "DelayedSplicing":
             # b = moments["S_var"] / moments["S_mean"] - 1
-            b = (moments["U_var"] / moments["U_mean"] - 1)/2
+            b = (moments["U_var"] / moments["U_mean"] - 1) / 2
             b = np.clip(b, lb[0], ub[0])
             tauinv = b / moments["U_mean"]
             gamma = b / moments["S_mean"]
-            x0 = np.asarray([b, tauinv,gamma])
+            x0 = np.asarray([b, tauinv, gamma])
 
-            if self.seq_model != 'None':
-                raise ValueError('Not implemented yet!')
+            if self.seq_model != "None":
+                raise ValueError("Not implemented yet!")
 
         elif self.bio_model == "Constitutive":
             beta = 1 / moments["U_mean"]
@@ -592,9 +592,9 @@ class CMEModel:
             else:
                 x0[1:] = x0[1:] * samp
         if self.amb_model == "Equal":  # basic
-            x0 = np.concatenate((x0, [0.1])) #just make a guess
+            x0 = np.concatenate((x0, [0.1]))  # just make a guess
         elif self.amb_model == "Unequal":
-            x0 = np.concatenate((x0, [0.1, 0.1])) #just make a guess
+            x0 = np.concatenate((x0, [0.1, 0.1]))  # just make a guess
         for j in range(self.get_num_params()):
             x0[j] = np.clip(x0[j], lb[j], ub[j])
         x0 = np.log10(x0)

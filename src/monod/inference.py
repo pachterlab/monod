@@ -1067,7 +1067,7 @@ class SearchResults:
         bonferroni=True,
         reject_at_bounds=True,
         bound_thr=0.01,
-        grouping_thr=5
+        grouping_thr=5,
     ):
         """Perform goodness-of-fit testing at the current sampling parameter optimum to identify poor fits.
 
@@ -1101,7 +1101,7 @@ class SearchResults:
             how close the parameters must be close to the bounds (in units of the allowed
             parameter range) to trigger rejection.
         grouping_thr: float or int, optional
-            minimum bin size for chi-squared test. 
+            minimum bin size for chi-squared test.
 
         Returns
         -------
@@ -1742,7 +1742,7 @@ class SearchResults:
             log.info("Figure stored to {}.".format(fig_string))
 
     # the next two functions are useful for model selection, but are not currently in use.
-    def get_logL(self,search_data,EPS=1e-20,offs=0):
+    def get_logL(self, search_data, EPS=1e-20, offs=0):
         """
         This method calculates the log-likelihood for all genes at the sampling parameter optimum.
 
@@ -1759,11 +1759,12 @@ class SearchResults:
         for gene_index in range(self.n_genes):
             logL[gene_index] = self.model.eval_model_logL(
                 p=self.phys_optimum[gene_index],
-                limits=search_data.M[:, gene_index]+offs,
+                limits=search_data.M[:, gene_index] + offs,
                 samp=self.regressor_optimum[gene_index],
                 data=search_data.hist[gene_index],
                 hist_type=hist_type,
-                EPS=EPS)
+                EPS=EPS,
+            )
             # Pss = self.model.eval_model_pss(self.phys_optimum[gene_index],lm,samp)
             # if np.any(Pss<EPS):
             #     Pss[Pss<EPS] = EPS
@@ -1771,7 +1772,6 @@ class SearchResults:
             # eval_model_kld(self, p, limits, samp, data, hist_type="unique", EPS=EPS)
             # logL[gene_index] = expected_log_lik[search_data.U[gene_index].astype(int),search_data.S[gene_index].astype(int)].sum()
         return logL
-
 
     def get_noise_decomp(self):
         """
