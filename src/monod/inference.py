@@ -1131,34 +1131,93 @@ class SearchResults:
         csqarr = []
         for gene_index in range(self.n_genes):
             lm = search_data.M[:, gene_index]
-            expected_freq = self.model.eval_model_pss(
-                self.phys_optimum[gene_index], lm, self.regressor_optimum[gene_index]
-            )
-            expected_freq[expected_freq < EPS] = EPS
-            expected_freq /= expected_freq.sum()
-            PROPOSAL = search_data.n_cells * expected_freq
+            expect_freq = self.model.eval_model_pss(
+                self.phys_optimum[gene_index], lm, self.regressor_optimum[gene_index] 
+            ) * search_data.n_cells
+            # expected_freq[expected_freq < EPS] = EPS
+            # expected_freq /= expected_freq.sum()
+            # PROPOSAL = search_data.n_cells * expected_freq
 
             if hist_type == "grid":
-                DATA = search_data.n_cells * search_data.hist[gene_index].flatten()
-                PROPOSAL = PROPOSAL.flatten()
+                raise ValueError('Not implemented in current version.')
             elif hist_type == "unique":
-                DATA = np.concatenate(
+                counts = np.concatenate(
                     (search_data.n_cells * search_data.hist[gene_index][1], [0])
                 )
-                PROPOSAL = PROPOSAL[
+                expect_freq = expect_freq[
                     search_data.hist[gene_index][0][:, 0],
                     search_data.hist[gene_index][0][:, 1],
                 ]
-                PROPOSAL = np.concatenate(
-                    (PROPOSAL, [search_data.n_cells - PROPOSAL.sum()])
+                expect_freq = np.concatenate(
+                    (expect_freq, [search_data.n_cells - expect_freq.sum()])
                 )
-            filt = (DATA > grouping_thr) & (PROPOSAL > grouping_thr)
-            chisq_data = np.concatenate((DATA[filt], [DATA[~filt].sum()]))
-            chisq_prop = np.concatenate((PROPOSAL[filt], [PROPOSAL[~filt].sum()]))
+
+            bins = []
+            bin_ind = 0
+            run_bin_obs = 0
+            run_bin_exp = 0
+            bin_obs = []
+            bin_exp = []
+            for i in range(len(counts)):
+                bins.append(bin_ind)
+                run_bin_obs += counts[i]
+                run_bin_exp += expect_freq[i]
+                if min(run_bin_obs,run_bin_exp) < 5:# and i
+                    pass
+                else:
+                    bin_ind += 1
+                    bin_obs.append(run_bin_obs)
+                    bin_exp.append(run_bin_exp)
+                    run_bin_obs = 0
+                    run_bin_exp = 0
+            bins=np.asarray(bins)
+            observed = np.asarray(bin_obs)
+            proposed = np.asarray(bin_exp)
+            observed[-1] += run_bin_obs
+            proposed[-1] += run_bin_exp
+            bins[bins==len(observed)] = len(observed)-1
+            
+            for b_ in range(len(bin_obs)): 
+                assert observed[b_] == (counts[bins==b_].sum())
+                assert np.isclose(proposed[b_],expect_freq[bins==b_].sum())
+            assert np.isclose(observed.sum(),sd_arr[dataset].n_cells)
+            assert np.isclose(proposed.sum(),sd_arr[dataset].n_cells)
+            assert np.isclose(sd_arr[dataset].n_cells,counts.sum())
+            assert np.isclose(sd_arr[dataset].n_cells,expect_freq.sum())
+
+            csq_res = scipy.stats.mstats.chisquare(observed, proposed, 3) #3 dof because models have 3 parameters...
+            csq[gene_count,dataset] = csq_res.statistic
+
+            
+            # filt = (DATA > grouping_thr) & (PROPOSAL > grouping_thr)
+            # chisq_data = np.concatenate((DATA[filt], [DATA[~filt].sum()]))
+            # chisq_prop = np.concatenate((PROPOSAL[filt], [PROPOSAL[~filt].sum()]))
+
+
+            # if hist_type == "grid":
+            #     DATA = search_data.n_cells * search_data.hist[gene_index].flatten()
+            #     PROPOSAL = PROPOSAL.flatten()
+            # elif hist_type == "unique":
+            #     DATA = np.concatenate(
+            #         (search_data.n_cells * search_data.hist[gene_index][1], [0])
+            #     )
+            #     PROPOSAL = PROPOSAL[
+            #         search_data.hist[gene_index][0][:, 0],
+            #         search_data.hist[gene_index][0][:, 1],
+            #     ]
+            #     PROPOSAL = np.concatenate(
+            #         (PROPOSAL, [search_data.n_cells - PROPOSAL.sum()])
+            #     )
+
+
+            # filt = (DATA > grouping_thr) & (PROPOSAL > grouping_thr)
+            # chisq_data = np.concatenate((DATA[filt], [DATA[~filt].sum()]))
+            # chisq_prop = np.concatenate((PROPOSAL[filt], [PROPOSAL[~filt].sum()]))
 
             csqarr += [
                 scipy.stats.mstats.chisquare(
-                    chisq_data, chisq_prop, self.model.get_num_params()
+                    observed, proposed,#chisq_data, chisq_prop, 
+                    self.model.get_num_params()
                 )
             ]
 
