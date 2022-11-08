@@ -1180,13 +1180,13 @@ class SearchResults:
             for b_ in range(len(bin_obs)): 
                 assert observed[b_] == (counts[bins==b_].sum())
                 assert np.isclose(proposed[b_],expect_freq[bins==b_].sum())
-            assert np.isclose(observed.sum(),sd_arr[dataset].n_cells)
-            assert np.isclose(proposed.sum(),sd_arr[dataset].n_cells)
-            assert np.isclose(sd_arr[dataset].n_cells,counts.sum())
-            assert np.isclose(sd_arr[dataset].n_cells,expect_freq.sum())
+            assert np.isclose(observed.sum(),search_data.n_cells)
+            assert np.isclose(proposed.sum(),search_data.n_cells)
+            assert np.isclose(search_data.n_cells,counts.sum())
+            assert np.isclose(search_data.n_cells,expect_freq.sum())
 
-            csq_res = scipy.stats.mstats.chisquare(observed, proposed, 3) #3 dof because models have 3 parameters...
-            csq[gene_count,dataset] = csq_res.statistic
+            # csq_res = scipy.stats.mstats.chisquare(observed, proposed, 3) #3 dof because models have 3 parameters...
+            # csq[gene_count,dataset] = csq_res.statistic
 
             
             # filt = (DATA > grouping_thr) & (PROPOSAL > grouping_thr)
