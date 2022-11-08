@@ -1178,7 +1178,7 @@ class SearchResults:
             bins[bins==len(observed)] = len(observed)-1
             
             for b_ in range(len(bin_obs)): 
-                assert observed[b_] == (counts[bins==b_].sum())
+                assert np.isclose(observed[b_],counts[bins==b_].sum())
                 assert np.isclose(proposed[b_],expect_freq[bins==b_].sum())
             assert np.isclose(observed.sum(),search_data.n_cells)
             assert np.isclose(proposed.sum(),search_data.n_cells)
