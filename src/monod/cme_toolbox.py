@@ -531,8 +531,10 @@ class CMEModel:
             samp = 10**samp
 
         if self.bio_model == "Bursty" or self.bio_model == "CIR":
-            b = moments["U_var"] / moments["U_mean"] - 1
-
+            try:
+                b = moments["U_var"] / moments["U_mean"] - 1
+            except:
+                b = 1 #safe for U_mean = U_var = 0
             if self.seq_model == "Bernoulli":
                 b /= samp[0]
             elif self.seq_model == "Poisson":
