@@ -391,8 +391,8 @@ class GradientInference:
                     )
                     for i in range(search_data.n_genes)
                 ]
-            warnings.resetwarnings()
             )
+            warnings.resetwarnings()
 
     def optimize_gene(self, gene_index, model, search_data):
         """Fit the data for a single gene using KL divergence gradient descent.
