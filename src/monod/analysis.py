@@ -563,7 +563,7 @@ def diffexp_pars(
                 s2=None,
                 nit=nit,
                 viz=viz,
-                pval_thr=pvapval_thrl,
+                pval_thr=pval_thr,
             )
         resid_arr[gene_filter] = resid_
 
