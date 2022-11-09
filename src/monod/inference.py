@@ -380,6 +380,7 @@ class GradientInference:
 
         self.inference_string = global_parameters.inference_string
         if self.gradient_params["init_pattern"] == "moments":
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
             self.param_MoM = np.asarray(
                 [
                     model.get_MoM(
@@ -390,6 +391,7 @@ class GradientInference:
                     )
                     for i in range(search_data.n_genes)
                 ]
+            warnings.resetwarnings()
             )
 
     def optimize_gene(self, gene_index, model, search_data):
