@@ -898,11 +898,12 @@ class SearchResults:
             whether to save the figure to disk.
         """
 
-        if gene_filter is None:
-            total_divergence = self.obj_func
-        else:
-            gene_filter = self.get_bool_filt(gene_filter, discard_rejected)
-            total_divergence = self.klds[:, gene_filter].sum(1)
+        # if gene_filter is None:
+        #     total_divergence = self.obj_func
+        # else:
+        #     gene_filter = self.get_bool_filt(gene_filter, discard_rejected)
+        gene_filter = self.get_bool_filt(gene_filter, discard_rejected)
+        total_divergence = self.klds[:, gene_filter].sum(1)
 
         if logscale:
             total_divergence = np.log10(total_divergence)
