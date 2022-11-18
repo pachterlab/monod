@@ -1166,7 +1166,7 @@ class SearchResults:
                     (expect_freq, [search_data.n_cells - expect_freq.sum()])
                 )
             
-            hellinger_ = 1/np.sqrt(2)*(( np.sqrt(expect_freq/sd.n_cells)-np.sqrt(counts/sd.n_cells))**2).sum()
+            hellinger_ = 1/np.sqrt(2)*((np.sqrt(expect_freq/search_data.n_cells)-np.sqrt(counts/search_data.n_cells))**2).sum()
 
             bins = []
             bin_ind = 0
