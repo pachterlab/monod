@@ -1070,6 +1070,8 @@ class SearchResults:
         reject_at_bounds=True,
         bound_thr=0.01,
         grouping_thr=5,
+        use_hellinger=True,
+        hellinger_thr = 0.05
     ):
         """Perform goodness-of-fit testing at the current sampling parameter optimum to identify poor fits.
 
@@ -1104,6 +1106,10 @@ class SearchResults:
             parameter range) to trigger rejection.
         grouping_thr: float or int, optional
             minimum bin size for chi-squared test.
+        use_hellinger: bool, optional
+            whether to use the Hellinger distance as an additional "effect size" estimate for goodness-of-fit.
+        hellinger_thr: float, optional
+            which threshold to use for the Hellinger distance rejection.
 
         Returns
         -------
@@ -1111,6 +1117,8 @@ class SearchResults:
             chi-squared statistics for all genes, computed at the grid point indexed by rejection_index.
         pval: np.ndarray
             p-values calculated by the chi-squared test at the grid point indexed by rejection_index.
+        hellinger: np.ndarray
+            hellinger distances for all genes, computed at the grid point indexed by rejection_index.
 
         Sets
         ----
@@ -1118,6 +1126,8 @@ class SearchResults:
             chi-squared statistics for all genes, computed at the grid point indexed by rejection_index.
         pval: np.ndarray
             p-values calculated by the chi-squared test at the grid point indexed by rejection_index.
+        hellinger: np.ndarray
+            hellinger distances for all genes, computed at the grid point indexed by rejection_index.
         rejected_genes: bool np.ndarray
             a boolean filter that reports the genes rejected by the goodness-of-fit procedure,
             whose parameters cannot be safely interpeted.
@@ -1131,6 +1141,7 @@ class SearchResults:
         hist_type = get_hist_type(search_data)
 
         csqarr = []
+        hellinger = []
         for gene_index in range(self.n_genes):
             lm = search_data.M[:, gene_index]
             expect_freq = self.model.eval_model_pss(
@@ -1153,6 +1164,8 @@ class SearchResults:
                 expect_freq = np.concatenate(
                     (expect_freq, [search_data.n_cells - expect_freq.sum()])
                 )
+            
+            hellinger_ = 1/np.sqrt(2)*(( np.sqrt(expect_freq/sd.n_cells)-np.sqrt(counts/sd.n_cells))**2).sum()
 
             bins = []
             bin_ind = 0
@@ -1187,35 +1200,6 @@ class SearchResults:
             assert np.isclose(search_data.n_cells,counts.sum())
             assert np.isclose(search_data.n_cells,expect_freq.sum())
 
-            # csq_res = scipy.stats.mstats.chisquare(observed, proposed, 3) #3 dof because models have 3 parameters...
-            # csq[gene_count,dataset] = csq_res.statistic
-
-            
-            # filt = (DATA > grouping_thr) & (PROPOSAL > grouping_thr)
-            # chisq_data = np.concatenate((DATA[filt], [DATA[~filt].sum()]))
-            # chisq_prop = np.concatenate((PROPOSAL[filt], [PROPOSAL[~filt].sum()]))
-
-
-            # if hist_type == "grid":
-            #     DATA = search_data.n_cells * search_data.hist[gene_index].flatten()
-            #     PROPOSAL = PROPOSAL.flatten()
-            # elif hist_type == "unique":
-            #     DATA = np.concatenate(
-            #         (search_data.n_cells * search_data.hist[gene_index][1], [0])
-            #     )
-            #     PROPOSAL = PROPOSAL[
-            #         search_data.hist[gene_index][0][:, 0],
-            #         search_data.hist[gene_index][0][:, 1],
-            #     ]
-            #     PROPOSAL = np.concatenate(
-            #         (PROPOSAL, [search_data.n_cells - PROPOSAL.sum()])
-            #     )
-
-
-            # filt = (DATA > grouping_thr) & (PROPOSAL > grouping_thr)
-            # chisq_data = np.concatenate((DATA[filt], [DATA[~filt].sum()]))
-            # chisq_prop = np.concatenate((PROPOSAL[filt], [PROPOSAL[~filt].sum()]))
-
             csqarr += [
                 scipy.stats.mstats.chisquare(
                     observed, proposed,#chisq_data, chisq_prop, 
@@ -1223,24 +1207,31 @@ class SearchResults:
                 )
             ]
 
+            hellinger.append(hellinger_)
+
         csq, pval = zip(*csqarr)
         csq = np.asarray(csq)
         pval = np.asarray(pval)
+        hellinger = np.asarray(hellinger)
 
         if bonferroni:
             threshold /= self.n_genes
         self.rejected_genes = pval < threshold
+        if use_hellinger:
+            rej_hellinger = hellinger > hellinger_thr
+            self.rejected_genes = (self.rejected_genes) & rej_hellinger
 
         if reject_at_bounds:
             bound_range = self.sp.phys_ub - self.sp.phys_lb
             lb = self.sp.phys_lb + bound_range * bound_thr
             ub = self.sp.phys_ub - bound_range * bound_thr
 
-            rej_poor_fit = ((self.phys_optimum < lb) | (self.phys_optimum > ub)).any(1)
-            self.rejected_genes = (self.rejected_genes) | rej_poor_fit
+            rej_at_bounds = ((self.phys_optimum < lb) | (self.phys_optimum > ub)).any(1)
+            self.rejected_genes = (self.rejected_genes) | rej_at_bounds
 
         self.pval = pval
         self.csq = csq
+        self.hellinger = hellinger
         self.rejection_index = self.samp_optimum_ind  # mostly for debug.
 
         if viz:
@@ -1257,7 +1248,7 @@ class SearchResults:
                 np.sum(self.rejected_genes), self.n_genes, t2 - t1
             )
         )
-        return (csq, pval)
+        return (csq, pval, hellinger)
 
     def par_fun_hess(self, inputs):
         """Helper method for the Hessian parallelization procedure.

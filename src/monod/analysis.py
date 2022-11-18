@@ -751,7 +751,7 @@ def diffexp_fpi(
                 width=np.diff(bins),
                 color=aesthetics["diffreg_gene_color"],
                 align="center",
-                label="Putative DR genes",
+                label="Putative DE genes",
             )
     if viz:
         ax1.set_xlabel(parname + " residual", fontsize=fs)
