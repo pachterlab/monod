@@ -1,5 +1,5 @@
 def bursty_none_logL(p,x):
-	"""Compute the log-likelihood of data microstates.
+    """Compute the log-likelihood of data microstates.
 
     Parameters
     ----------
