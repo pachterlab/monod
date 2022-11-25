@@ -10,7 +10,7 @@ from scipy import integrate
 
 from scipy.fft import irfftn
 
-# from .nn_toolbox import basic_ml_bivariate, ml_microstate_logP
+from .nn_toolbox import bursty_none_logL, bursty_none_grid
 
 
 class CMEModel:
@@ -210,7 +210,7 @@ class CMEModel:
             log-likelihood.
         """
         if hist_type == "grid":
-            raise ValueError("Not yet implemented!")
+            raise ValueError("obsolete!")
             # proposal = self.eval_model_pss(p, limits, samp)
             # proposal[proposal < EPS] = EPS
             # filt = data > 0
@@ -261,27 +261,24 @@ class CMEModel:
             return np.sum(d)
         elif hist_type == "unique":
             x, f = data
-            # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
-            # It will be implemented in a future version.
-            # if (
-            #     (self.quad_method == "nn")
-            #     and (self.bio_model == "Bursty")
-            #     and (self.seq_model == "None")
-            # ):
-            #     log_EPS = np.log(EPS)
-            #     log_proposal = ml_microstate_logP(p, x)
-            #     filt = (log_proposal < log_EPS) | (~np.isfinite(log_proposal))
-            #     log_proposal[filt] = log_EPS
-            #     d = f * (np.log(f) - log_proposal)
-            #     # print(np.sum(d))
-            #     # raise ValueError
-            #     return np.sum(d)
-            # else:
-            proposal = self.eval_model_pss(p, limits, samp)
-            proposal[proposal < EPS] = EPS
-            proposal = proposal[tuple(x.T)]
-            d = f * np.log(f / proposal)
-            return np.sum(d)
+            if (
+                (self.quad_method == "nn")
+                and (self.bio_model == "Bursty")
+                and (self.seq_model == "None")
+            ):
+                #neural method
+                log_EPS = np.log(EPS)
+                log_proposal = bursty_none_logL(p,x)
+                log_proposal[log_proposal < log_EPS] = log_EPS
+                d = f * (np.log(f) - log_proposal)
+                return np.sum(d)
+            else:
+                #non-neural method
+                proposal = self.eval_model_pss(p, limits, samp)
+                proposal[proposal < EPS] = EPS
+                proposal = proposal[tuple(x.T)]
+                d = f * np.log(f / proposal)
+                return np.sum(d)
 
     def eval_model_pss(self, p, limits, samp=None):
         """Evaluate the PMF of the model over a grid at a set of parameters.
@@ -303,13 +300,13 @@ class CMEModel:
         # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
         # It will be implemented in a future version.
 
-        # if (
-        #     (self.quad_method == "nn")
-        #     and (self.bio_model == "Bursty")
-        #     and (self.seq_model == "None")
-        # ):
-        #     return basic_ml_bivariate(p, limits)
-        # else:
+        if (
+            (self.quad_method == "nn")
+            and (self.bio_model == "Bursty")
+            and (self.seq_model == "None")
+        ):
+            return bursty_none_grid(p, limits)
+        else:
 
         if (self.amb_model != "None") and (len(limits) == 2):
             raise ValueError("Please specify a limit for the ambiguous species.")
