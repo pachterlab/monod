@@ -308,56 +308,56 @@ class CMEModel:
             return bursty_none_grid(p, limits)
         else:
 
-        if (self.amb_model != "None") and (len(limits) == 2):
-            raise ValueError("Please specify a limit for the ambiguous species.")
+            if (self.amb_model != "None") and (len(limits) == 2):
+                raise ValueError("Please specify a limit for the ambiguous species.")
 
-        u = []
-        mx = np.copy(limits)
-        mx[-1] = mx[-1] // 2 + 1
-        for i in range(len(mx)):
-            l = np.arange(mx[i])
-            u_ = np.exp(-2j * np.pi * l / limits[i]) - 1
-            u.append(u_)
-        g = np.meshgrid(*[u_ for u_ in u], indexing="ij")
-        for i in range(len(mx)):
-            g[i] = g[i].flatten()
-        g = np.asarray(g)[:, :, None]
+            u = []
+            mx = np.copy(limits)
+            mx[-1] = mx[-1] // 2 + 1
+            for i in range(len(mx)):
+                l = np.arange(mx[i])
+                u_ = np.exp(-2j * np.pi * l / limits[i]) - 1
+                u.append(u_)
+            g = np.meshgrid(*[u_ for u_ in u], indexing="ij")
+            for i in range(len(mx)):
+                g[i] = g[i].flatten()
+            g = np.asarray(g)[:, :, None]
 
-        if self.amb_model == "Unequal":
-            g_ = np.zeros((2, g.shape[1], g.shape[2]), dtype=np.complex128)
-            p_amb = np.power(10, p[-2:])
-            g_[0] = p_amb[0] * g[2] + (1 - p_amb[0]) * g[0]
-            g_[1] = p_amb[1] * g[2] + (1 - p_amb[1]) * g[1]
-            g = g_
-            p = np.copy(p[:-2])  # better safe
-        elif self.amb_model == "Equal":
-            g_ = np.zeros((2, g.shape[1], g.shape[2]), dtype=np.complex128)
-            p_amb = np.power(10, p[-1])
-            g_[0] = p_amb * g[2] + (1 - p_amb) * g[0]
-            g_[1] = p_amb * g[2] + (1 - p_amb) * g[1]
-            g = g_
-            p = np.copy(p[:-1])
+            if self.amb_model == "Unequal":
+                g_ = np.zeros((2, g.shape[1], g.shape[2]), dtype=np.complex128)
+                p_amb = np.power(10, p[-2:])
+                g_[0] = p_amb[0] * g[2] + (1 - p_amb[0]) * g[0]
+                g_[1] = p_amb[1] * g[2] + (1 - p_amb[1]) * g[1]
+                g = g_
+                p = np.copy(p[:-2])  # better safe
+            elif self.amb_model == "Equal":
+                g_ = np.zeros((2, g.shape[1], g.shape[2]), dtype=np.complex128)
+                p_amb = np.power(10, p[-1])
+                g_[0] = p_amb * g[2] + (1 - p_amb) * g[0]
+                g_[1] = p_amb * g[2] + (1 - p_amb) * g[1]
+                g = g_
+                p = np.copy(p[:-1])
 
-        if self.seq_model == "Poisson":
-            g = np.exp((np.power(10, samp))[:, None, None] * g) - 1
-        elif self.seq_model == "Bernoulli":
-            g *= np.asarray(samp)[:, None, None]
-        elif self.seq_model == "None":
-            pass
-        else:
-            raise ValueError(
-                "Please select a technical noise model from {}.".format(
-                    self.available_seqmodels
+            if self.seq_model == "Poisson":
+                g = np.exp((np.power(10, samp))[:, None, None] * g) - 1
+            elif self.seq_model == "Bernoulli":
+                g *= np.asarray(samp)[:, None, None]
+            elif self.seq_model == "None":
+                pass
+            else:
+                raise ValueError(
+                    "Please select a technical noise model from {}.".format(
+                        self.available_seqmodels
+                    )
                 )
-            )
 
-        gf = self.eval_model_pgf(p, g)
-        gf = np.exp(gf)
-        gf = gf.reshape(tuple(mx))
-        Pss = irfftn(gf, s=tuple(limits))
-        Pss = np.abs(Pss) / np.sum(np.abs(Pss))
-        Pss = Pss.squeeze()
-        return Pss
+            gf = self.eval_model_pgf(p, g)
+            gf = np.exp(gf)
+            gf = gf.reshape(tuple(mx))
+            Pss = irfftn(gf, s=tuple(limits))
+            Pss = np.abs(Pss) / np.sum(np.abs(Pss))
+            Pss = Pss.squeeze()
+            return Pss
 
     def eval_model_pgf(self, p_, g):
         """Evaluate the log-PGF of the model over the complex unit sphere at a set of parameters.
