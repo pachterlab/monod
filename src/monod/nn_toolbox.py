@@ -6,7 +6,7 @@ def bursty_none_logL(p,x):
     p: np.ndarray
         log10 biological parameters.
     x: int np.ndarray
-        microstates in the experimental data histogram, a 2 x Nstates array.
+        microstates in the experimental data histogram, a Nstates x 2 array.
 
     Returns
     -------

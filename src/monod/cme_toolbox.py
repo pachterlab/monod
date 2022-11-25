@@ -269,8 +269,8 @@ class CMEModel:
                 #neural method
                 log_EPS = np.log(EPS)
                 log_proposal = bursty_none_logL(p,x)
-                log_proposal[log_proposal < log_EPS] = log_EPS
-                d = f * (np.log(f) - log_proposal)
+                log_proposal[log_proposal < log_EPS] = log_EPS # <--- May be unnecessary.
+                d = f * (np.log(f) - log_proposal) # <--- I believe it's correct.
                 return np.sum(d)
             else:
                 #non-neural method
