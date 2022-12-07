@@ -281,7 +281,7 @@ class SearchData:
         for j in range(len(input_data)):
             setattr(self, attr_names[j], input_data[j])
 
-    def get_noise_decomp(self, sizefactor="pf", lognormalize=True, pcount=0):
+    def get_noise_decomp(self, sizefactor="pf", lognormalize=True, pcount=0, which_variance_measure='CV2'):
         """
         This method performs normalization and variance stabilization on the raw data, and
         reports the fractions of normalized variance retained and removed as a result of the process.
@@ -312,20 +312,32 @@ class SearchData:
         S = np.copy(self.layers[1])
         U = np.copy(self.layers[0])
 
-        CV2_S = S.var(1) / S.mean(1) ** 2
-        CV2_U = U.var(1) / U.mean(1) ** 2
+        if which_variance_measure == 'CV2':
+            var_fun = lambda X: X.var(1) / (X.mean(1)**2)
+        elif which_variance_measure == 'var':
+            var_fun = lambda X: X.var(1)
+        elif which_variance_measure == 'Fano':
+            var_fun = lambda X: X.var(1) / (X.mean(1))
+
+
+        var_S = var_fun(S)
+        var_U = var_fun(U)
+        # CV2_S = S.var(1) / S.mean(1) ** 2
+        # CV2_U = U.var(1) / U.mean(1) ** 2
 
         S = normalize_count_matrix(S, sizefactor, lognormalize, pcount)
         U = normalize_count_matrix(U, sizefactor, lognormalize, pcount)
 
-        CV2_S_norm = S.var(1) / S.mean(1) ** 2
-        CV2_U_norm = U.var(1) / U.mean(1) ** 2
+        var_S_norm = var_fun(S)
+        var_U_norm = var_fun(U)
+        # CV2_S_norm = S.var(1) / S.mean(1) ** 2
+        # CV2_U_norm = U.var(1) / U.mean(1) ** 2
 
         # compute fraction of CV2 eliminated for unspliced and spliced
-        f[:, 0, 0] = CV2_U_norm / CV2_U
+        f[:, 0, 0] = var_U_norm / var_U
         f[:, 1, 0] = 1 - f[:, 0, 0]
 
-        f[:, 0, 1] = CV2_S_norm / CV2_S
+        f[:, 0, 1] = var_S_norm / var_S
         f[:, 1, 1] = 1 - f[:, 0, 1]
         return f
 
