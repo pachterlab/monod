@@ -1,6 +1,6 @@
 Metadata-Version: 2.1
 Name: monod
-Version: 0.2.2.6
+Version: 0.2.5.0
 Summary: the Monod package fits CME models to sequencing data.
 Home-page: https://github.com/pachterlab/monod
 Author: Gennady Gorin, Lior Pachter

@@ -5,6 +5,7 @@ setup.cfg
 src/monod/__init__.py
 src/monod/analysis.py
 src/monod/cme_toolbox.py
+src/monod/drivers.py
 src/monod/extract_data.py
 src/monod/inference.py
 src/monod/plot_aesthetics.py
