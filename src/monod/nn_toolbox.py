@@ -1,4 +1,4 @@
-from nn_module.py import log_prob_nnNB
+from .nn_module import log_prob_nnNB
 
 def bursty_none_logL(p,x):
     """Compute the log-likelihood of data microstates.
