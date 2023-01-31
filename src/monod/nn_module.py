@@ -153,9 +153,7 @@ def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
     '''
     n,m = torch.tensor(n).to(torch.device(device)), torch.tensor(m).to(torch.device(device))
     b,beta,gamma = torch.tensor(p)
-    b,beta,gamma = torch.ones_like(n)*b,
-                   torch.ones_like(n)*beta,
-                   torch.ones_like(n)*gamma
+    b,beta,gamma = torch.ones_like(n)*b, torch.ones_like(n)*beta,torch.ones_like(n)*gamma
     b,beta,gamma= b.to(torch.device(device)),beta.to(torch.device(device)),gamma.to(torch.device(device))
     
     mu1 = b/beta
