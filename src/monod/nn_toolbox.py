@@ -1,3 +1,5 @@
+from nn_module.py import log_prob_nnNB
+
 def bursty_none_logL(p,x):
     """Compute the log-likelihood of data microstates.
 
@@ -13,8 +15,14 @@ def bursty_none_logL(p,x):
     log_proposal: float np.ndarray
         The log-likelihood of each state in Nstates.
     """
-
-    raise ValueError('Not yet implemented!')
+    p = 10**p
+    
+    n = x[:,0]
+    m = x[:,1]
+    
+    return log_prob_nnNB(p, n, m)
+    
+    #raise ValueError('Not yet implemented!')
 
 def bursty_none_grid(p,lm):
     """Evaluate the PMF of the model over a grid at a set of parameters.
@@ -32,5 +40,9 @@ def bursty_none_grid(p,lm):
     Pss: np.ndarray
         the steady-state model PMF over a grid (0,...,limits[0]-1) x (0,...,limits[1]-1).
     """
-
-    raise ValueError('Not yet implemented!')
+    p = 10**p
+    n,m = np.meshgrid(np.range(lm[0]),np.range(lm[1]),indexing='ij')
+    
+    return log_prob_nnNB(p,n,m)
+    
+    #raise ValueError('Not yet implemented!')
