@@ -44,7 +44,7 @@ def bursty_none_grid(p,lm):
         the steady-state model PMF over a grid (0,...,limits[0]-1) x (0,...,limits[1]-1).
     """
     p = 10**p
-    n,m = np.meshgrid(np.range(lm[0]),np.range(lm[1]),indexing='ij')
+    n,m = np.meshgrid(np.arange(lm[0]),np.arange(lm[1]),indexing='ij')
     
     return log_prob_nnNB(p,n,m)
     
