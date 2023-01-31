@@ -1,3 +1,6 @@
+import numpy as np
+
+
 from .nn_module import log_prob_nnNB
 
 def bursty_none_logL(p,x):
