@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-## YC added
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class MLP(nn.Module):
@@ -142,7 +141,7 @@ def get_ypred_at_RT(p,w,hyp,n,m,norm,eps=1e-8):
     return Y
 
 
-def log_prob_nnNB(p : torch.Tensor, n: torch.Tensor, m: torch.Tensor  eps : float = 1e-15):
+def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
     ''' Calculates probability for bursty model given the most accurate trained model.
       -----------------------------------
       n,m
