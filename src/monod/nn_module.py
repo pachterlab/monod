@@ -164,7 +164,7 @@ def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
     # negative binomial of nascent RNA n
     prob_nascent = torch.lgamma(n+r) - torch.lgamma(n+1) - torch.lgamma(r) + r * torch.log(r/(r+mu1)+eps) + n * torch.log(mu1/(r+mu1)+eps)
 
-
+    
     # get moments
     var1 = mu1 * (1+b)
     var2 = mu2 * (1+b*beta/(beta+gamma))
@@ -190,8 +190,7 @@ def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
 
     xmax_m = torch.ceil(torch.ceil(mu2) + 4*torch.sqrt(var2))
     xmax_m = torch.clip(xmax_m,30,np.inf).int()
-
-
+    
     # reshape and stack
     pv = torch.column_stack((torch.log10(b).reshape(-1),
                              torch.log10(beta).reshape(-1),
@@ -202,6 +201,7 @@ def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
                              n.reshape(-1)
                              ))
     # run through model
+    print(pv.size())
     w_,hyp_= model(pv)
 
 
