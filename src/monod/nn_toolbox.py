@@ -247,7 +247,7 @@ def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
                              n.reshape(-1)
                              ))
     # run through model
-    pv = pv.double()
+    pv = pv.long()
     w_,hyp_= model(pv)
 
 
