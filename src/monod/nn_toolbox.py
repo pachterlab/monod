@@ -54,7 +54,7 @@ def bursty_none_grid(p,lm):
 #     Pss = 10**log_prob_nnNB(p,n,m)
 #     Pss = Pss
 #     return Pss
-      return log_prob_nnNB(p,n,m)
+    return log_prob_nnNB(p,n,m)
     
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
