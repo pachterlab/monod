@@ -46,13 +46,13 @@ def bursty_none_grid(p,lm):
     Returns
     -------
     Pss: np.ndarray
-        the steady-state model PMF over a grid (0,...,limits[0]-1) x (0,...,limits[1]-1).
+        the steady-state model PMF over a grid (0,...,limits[0]-1) x (0,...,limits[1]-1). NOT log of PMF.
     """
     p = 10**p
     n,m = np.meshgrid(np.arange(lm[0]),np.arange(lm[1]),indexing='ij')
 
     
-    return log_prob_nnNB(p,n,m)
+    return 10**log_prob_nnNB(p,n,m)
     
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
