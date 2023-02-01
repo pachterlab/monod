@@ -167,18 +167,14 @@ def get_ypred_at_RT(p,w,hyp,n,m,norm,eps=1e-8):
 
     Y = torch.zeros((len(n),1)).to(torch.device(device))
 
-    # grid_i = grid[:,i].reshape((-1,1))
-
-    # r = r[:,i]
-    # w = w[:,i].reshape((-1,1))
-    # p_nb = p_nb[:,i]
-
 
     y_ = m * torch.log(grid + eps) - grid - torch.lgamma(m+1)
+    m_array = m.repeat(1,10)
 
     if (p_nb > 1e-10).any():
       index = [p_nb > 1e-10]
-      y_[index] += torch.special.gammaln(grid[index]+r[index]) - torch.special.gammaln(r[index])                 - grid[index]*torch.log(r[index] + grid[index]) + grid[index]                 + r[index]*torch.log(r[index]/(r[index]+grid[index]))
+      y_[index] += torch.special.gammaln(m_array[index]+r[index]) - torch.special.gammaln(r[index]) \
+                    - m_array[index]*torch.log(r[index] + grid[index]) + grid[index] + r[index]*torch.log(r[index]/(r[index]+grid[index]))
 
     y_ = torch.exp(y_)
     y_weighted = w*y_
