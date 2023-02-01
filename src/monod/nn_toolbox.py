@@ -248,7 +248,7 @@ def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
                              ))
     # run through model
     pv = pv.to(torch.float32)
-    print(pv.dtype)
+
     w_,hyp_= model(pv)
 
 
