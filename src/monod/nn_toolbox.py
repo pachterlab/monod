@@ -50,9 +50,10 @@ def bursty_none_grid(p,lm):
     """
     p = 10**p
     n,m = np.meshgrid(np.arange(lm[0]),np.arange(lm[1]),indexing='ij')
-
     
-    return log_prob_nnNB(p,n,m)
+    Pss = 10**log_prob_nnNB(p,n,m)
+    Pss = Pss/np.sum(Pss)
+    return Pss
     
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
