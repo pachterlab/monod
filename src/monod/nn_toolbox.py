@@ -52,7 +52,7 @@ def bursty_none_grid(p,lm):
     n,m = np.meshgrid(np.arange(lm[0]),np.arange(lm[1]),indexing='ij')
 
     
-    return 10**log_prob_nnNB(p,n,m)
+    return log_prob_nnNB(p,n,m)
     
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
