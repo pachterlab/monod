@@ -44,7 +44,6 @@ class MLP(nn.Module):
 
         return w_pred,hyp
 
-# YC added
 try:
     package_resources = importlib_resources.files("monod")
     model_path = os.path.join(package_resources,'models/best_model_MODEL.zip')
@@ -201,7 +200,8 @@ def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
                              n.reshape(-1)
                              ))
     # run through model
-    print(pv.size())
+    print(pv.dtype())
+    pv = pv.type(torch.DoubleTensor)
     w_,hyp_= model(pv)
 
 
