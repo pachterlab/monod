@@ -433,18 +433,17 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
     logmean_cond = logmean2 + logcorr * logstd2/logstd1 * (torch.log(n+1) - logmean1)
     logvar_cond = logvar2 * (1-logcorr**2)
     logstd_cond = logstd2 * torch.sqrt(1-logcorr**2)
-
-    xmax_m = torch.ceil(torch.ceil(mu2) + 4*torch.sqrt(var2))
-    xmax_m = torch.clip(xmax_m,30,np.inf).int()
+    
+    mean_cond = np.exp(logmean_cond + logvar_cond/2)
+    var_cond = np.exp(2*logmean_cond + logvar_cond) * (np.exp(logvar_cond) - 1)
     
     # reshape and stack
     pv = torch.column_stack((torch.log10(b).reshape(-1),
                              torch.log10(beta).reshape(-1),
                              torch.log10(gamma).reshape(-1),
-                             logmean_cond.reshape(-1),
-                             logstd_cond.reshape(-1),
-                             xmax_m.reshape(-1),
-                             n.reshape(-1)
+                             n.reshape(-1),
+                             mean_cond.reshape(-1),
+                             var_cond.reshape(-1),
                              ))
     # run through model
     pv = pv.to(torch.float32)
