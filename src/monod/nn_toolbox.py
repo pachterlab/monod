@@ -467,9 +467,6 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
     return(log_P)
 
 def get_ypred_log_1NB(vecs,m,s_mean,s_var):
-    
-    if use_old == True:
-        print('using old')
 
     b =  10**vecs[:,0]
     beta =  10**vecs[:,1]
