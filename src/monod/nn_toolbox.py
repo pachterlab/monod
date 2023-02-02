@@ -160,18 +160,6 @@ model.eval()
 model.to(torch.device(device))
 
 
-# load in model for 1 basis function
-model_1NB = MLP_1NB_varmax(input_size = 6, num_hidden_units = 256,
-                      num_hidden_layers = 3,
-                      output_size = 2, 
-                      activate='relu',
-                      final_activation = 'sigmoid',
-                     )
-
-model_1NB.load_state_dict(torch.load(model_1NB_path))
-model_1NB.eval()
-model_1NB.to(torch.device(device))
-
 
 def get_NORM(npdf,quantiles='cheb'):
     '''' Returns quantiles based on the number of kernel functions npdf.
@@ -387,6 +375,17 @@ class MLP_1NB_varmax(nn.Module):
 
         return s_mean,s_var
     
+# load in model for 1 basis function
+model_1NB = MLP_1NB_varmax(input_size = 6, num_hidden_units = 256,
+                      num_hidden_layers = 3,
+                      output_size = 2, 
+                      activate='relu',
+                      final_activation = 'sigmoid',
+                     )
+
+model_1NB.load_state_dict(torch.load(model_1NB_path))
+model_1NB.eval()
+model_1NB.to(torch.device(device))
 
 def log_prob_1NB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
     ''' Calculates probability for bursty model given the most accurate trained model.
@@ -450,7 +449,7 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
     # run through model
     pv = pv.to(torch.float32)
 
-    s_mean,s_var = model(pv)
+    s_mean,s_var = model_1NB(pv)
 
 
     n = n.reshape(-1,1)
