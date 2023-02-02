@@ -466,6 +466,7 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
 
     return(log_P)
 
+eps = 1e-20
 def get_ypred_log_1NB(vecs,m,s_mean,s_var):
 
     b =  10**vecs[:,0]
