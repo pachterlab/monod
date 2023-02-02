@@ -272,6 +272,17 @@ class CMEModel:
                 log_proposal[log_proposal < log_EPS] = log_EPS # <--- May be unnecessary.
                 d = f * (np.log(f) - log_proposal) # <--- I believe it's correct.
                 return np.sum(d)
+            elif (
+                (self.quad_method == "nn_10")
+                and (self.bio_model == "Bursty")
+                and (self.seq_model == "None")
+            ):
+                #neural method
+                log_EPS = np.log(EPS)
+                log_proposal = bursty_none_logL_10(p,x)
+                log_proposal[log_proposal < log_EPS] = log_EPS # <--- May be unnecessary.
+                d = f * (np.log(f) - log_proposal) # <--- I believe it's correct.
+                return np.sum(d)
             else:
                 #non-neural method
                 proposal = self.eval_model_pss(p, limits, samp)
@@ -306,6 +317,12 @@ class CMEModel:
             and (self.seq_model == "None")
         ):
             return bursty_none_grid(p, limits)
+        elif (
+            (self.quad_method == "nn_10")
+            and (self.bio_model == "Bursty")
+            and (self.seq_model == "None")
+        ):
+            return bursty_none_grid_10(p,limits)
         else:
 
             if (self.amb_model != "None") and (len(limits) == 2):
