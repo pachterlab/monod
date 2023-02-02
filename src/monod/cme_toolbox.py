@@ -10,7 +10,7 @@ from scipy import integrate
 
 from scipy.fft import irfftn
 
-from .nn_toolbox import bursty_none_logL, bursty_none_grid
+from .nn_toolbox import bursty_none_logL, bursty_none_grid, bursty_none_logL_10, bursty_none_grid_10
 
 
 class CMEModel:
