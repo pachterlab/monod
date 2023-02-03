@@ -51,7 +51,7 @@ def bursty_none_grid(p,lm):
     p = 10**p
     n,m = np.meshgrid(np.arange(lm[0]),np.arange(lm[1]),indexing='ij')
     
-    Pss = 10**log_prob_1NB(p,n,m)
+    Pss = np.exp(log_prob_1NB(p,n,m))
 
     return Pss
 
@@ -98,7 +98,7 @@ def bursty_none_grid_10(p,lm):
     p = 10**p
     n,m = np.meshgrid(np.arange(lm[0]),np.arange(lm[1]),indexing='ij')
     
-    Pss = 10**log_prob_nnNB(p,n,m)
+    Pss = np.exp(log_prob_nnNB(p,n,m))
     Pss = Pss
     return Pss
     
