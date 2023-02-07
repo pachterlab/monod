@@ -1072,7 +1072,7 @@ class SearchResults:
         bound_thr=0.01,
         grouping_thr=5,
         use_hellinger=True,
-        hellinger_thr = 0.05
+        hellinger_thr=0.05,
     ):
         """Perform goodness-of-fit testing at the current sampling parameter optimum to identify poor fits.
 
@@ -1145,15 +1145,20 @@ class SearchResults:
         hellinger = []
         for gene_index in range(self.n_genes):
             lm = search_data.M[:, gene_index]
-            expect_freq = self.model.eval_model_pss(
-                self.phys_optimum[gene_index], lm, self.regressor_optimum[gene_index] 
-            ) * search_data.n_cells
+            expect_freq = (
+                self.model.eval_model_pss(
+                    self.phys_optimum[gene_index],
+                    lm,
+                    self.regressor_optimum[gene_index],
+                )
+                * search_data.n_cells
+            )
             # expected_freq[expected_freq < EPS] = EPS
             # expected_freq /= expected_freq.sum()
             # PROPOSAL = search_data.n_cells * expected_freq
 
             if hist_type == "grid":
-                raise ValueError('Not implemented in current version.')
+                raise ValueError("Not implemented in current version.")
             elif hist_type == "unique":
                 counts = np.concatenate(
                     (search_data.n_cells * search_data.hist[gene_index][1], [0])
@@ -1165,8 +1170,18 @@ class SearchResults:
                 expect_freq = np.concatenate(
                     (expect_freq, [search_data.n_cells - expect_freq.sum()])
                 )
-            
-            hellinger_ = 1/np.sqrt(2)*((np.sqrt(expect_freq/search_data.n_cells)-np.sqrt(counts/search_data.n_cells))**2).sum()
+
+            hellinger_ = (
+                1
+                / np.sqrt(2)
+                * (
+                    (
+                        np.sqrt(expect_freq / search_data.n_cells)
+                        - np.sqrt(counts / search_data.n_cells)
+                    )
+                    ** 2
+                ).sum()
+            )
 
             bins = []
             bin_ind = 0
@@ -1178,7 +1193,7 @@ class SearchResults:
                 bins.append(bin_ind)
                 run_bin_obs += counts[i]
                 run_bin_exp += expect_freq[i]
-                if min(run_bin_obs,run_bin_exp) < 5:# and i
+                if min(run_bin_obs, run_bin_exp) < 5:  # and i
                     pass
                 else:
                     bin_ind += 1
@@ -1186,25 +1201,26 @@ class SearchResults:
                     bin_exp.append(run_bin_exp)
                     run_bin_obs = 0
                     run_bin_exp = 0
-            bins=np.asarray(bins)
+            bins = np.asarray(bins)
             observed = np.asarray(bin_obs)
             proposed = np.asarray(bin_exp)
             observed[-1] += run_bin_obs
             proposed[-1] += run_bin_exp
-            bins[bins==len(observed)] = len(observed)-1
-            
-            for b_ in range(len(bin_obs)): 
-                assert np.isclose(observed[b_],counts[bins==b_].sum())
-                assert np.isclose(proposed[b_],expect_freq[bins==b_].sum())
-            assert np.isclose(observed.sum(),search_data.n_cells)
-            assert np.isclose(proposed.sum(),search_data.n_cells)
-            assert np.isclose(search_data.n_cells,counts.sum())
-            assert np.isclose(search_data.n_cells,expect_freq.sum())
+            bins[bins == len(observed)] = len(observed) - 1
+
+            for b_ in range(len(bin_obs)):
+                assert np.isclose(observed[b_], counts[bins == b_].sum())
+                assert np.isclose(proposed[b_], expect_freq[bins == b_].sum())
+            assert np.isclose(observed.sum(), search_data.n_cells)
+            assert np.isclose(proposed.sum(), search_data.n_cells)
+            assert np.isclose(search_data.n_cells, counts.sum())
+            assert np.isclose(search_data.n_cells, expect_freq.sum())
 
             csqarr += [
                 scipy.stats.mstats.chisquare(
-                    observed, proposed,#chisq_data, chisq_prop, 
-                    self.model.get_num_params()
+                    observed,
+                    proposed,  # chisq_data, chisq_prop,
+                    self.model.get_num_params(),
                 )
             ]
 
