@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+print('Reloaded')
+
 def bursty_none_logL(p,x):
     """Compute the log-likelihood of data microstates.
 
