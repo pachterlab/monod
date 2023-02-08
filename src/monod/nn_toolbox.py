@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-print('Reloaded')
 
 def bursty_none_logL(p,x):
     """Compute the log-likelihood of data microstates.
@@ -437,7 +436,7 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
     logstd_cond = logstd2 * torch.sqrt(1-logcorr**2)
     
     mean_cond = torch.exp(logmean_cond + logvar_cond/2)
-    var_cond = torch.exp(2*logmean_cond + logvar_cond) * (np.exp(logvar_cond) - 1)
+    var_cond = torch.exp(2*logmean_cond + logvar_cond) * (torch.exp(logvar_cond) - 1)
     
     # reshape and stack
     pv = torch.column_stack((torch.log10(b).reshape(-1),
