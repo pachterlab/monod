@@ -388,6 +388,7 @@ model_1NB.eval()
 model_1NB.to(torch.device(device))
 
 print('Using device: ',device)
+eps = 1e-20
 
 def log_prob_1NB(p : np.array, n: np.array, m: np.array,  grid : bool, eps : float = 1e-15):
     ''' Calculates probability for bursty model given the most accurate trained model.
@@ -469,9 +470,8 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  grid : bool, eps : flo
     P = prob_cond*prefactor.reshape(-1,1)
 
 
-    return(np.log(P.numpy()))
+    return(np.log(P.numpy()+eps))
 
-eps = 1e-20
 
 def get_ypred_log_1NB(vecs,m,s_mean,s_var):
     ''' Calculates conditional log probability over grid. 
