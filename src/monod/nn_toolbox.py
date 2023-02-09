@@ -76,7 +76,7 @@ def bursty_none_logL_10(p,x):
     n = x[:,0]
     m = x[:,1]
     
-    return log_prob_nnNB(p, n, m)
+    return log_prob_nnNB(p, n, m, ind = True)
     
 
 
@@ -99,7 +99,7 @@ def bursty_none_grid_10(p,lm):
     p = 10**p
     n,m = np.arange(lm[0]),np.arange(lm[1])
     
-    Pss = np.exp(log_prob_nnNB(p,n,m))
+    Pss = np.exp(log_prob_nnNB(p,n,m,ind=False))
 
     return Pss
     
@@ -440,8 +440,11 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
     # feed through the model
     s_mean, s_var = model_1NB(vecs)
     
+    
     m = torch.tensor(m,dtype=torch.float32)
-    m = m.repeat(1,len(n)).reshape((len(n)),-1)
+    
+    if ind = False:
+        m = m.repeat(1,len(n)).reshape((len(n)),-1)
 
     # calculate the probability -- will be an array [n,m]
     prob_cond_log = get_ypred_log_1NB(vecs,m,s_mean,s_var)
