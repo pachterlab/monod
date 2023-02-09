@@ -441,7 +441,7 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  ind : bool = False, ep
     s_mean, s_var = model_1NB(vecs)
     
     
-    m = torch.tensor(m,dtype=torch.float32)
+    m = torch.tensor(m,dtype=torch.float32).to(torch.device(device))
     
     if ind == False:
         m = m.repeat(1,len(n)).reshape((len(n)),-1)
@@ -463,8 +463,6 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  ind : bool = False, ep
     
     P = prob_cond*prefactor.reshape(-1,1)
 
-    
-    P = P.detach().numpy()
 
     return(np.log(P))
 
