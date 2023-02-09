@@ -52,7 +52,7 @@ def bursty_none_grid(p,lm):
 #     p = 10**p
     n,m = np.arange(lm[0]),np.arange(lm[1])
     
-    Pss = np.exp(log_prob_1NB(p,n,m,ind=False))
+    Pss = np.exp(log_prob_1NB(p,n,m,ind=True))
 
     return Pss
 
