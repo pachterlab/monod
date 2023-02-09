@@ -467,7 +467,7 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  ind : bool = False, ep
     P = prob_cond*prefactor.reshape(-1,1)
 
 
-    return(np.log(P))
+    return(np.log(P.numpy()))
 
 eps = 1e-20
 
