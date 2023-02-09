@@ -24,7 +24,7 @@ def bursty_none_logL(p,x):
     log_proposal: float np.ndarray
         The log-likelihood of each state in Nstates.
     """
-    p = 10**p
+#     p = 10**p
     
     n = x[:,0]
     m = x[:,1]
@@ -49,7 +49,7 @@ def bursty_none_grid(p,lm):
     Pss: np.ndarray
         the steady-state model PMF over a grid (0,...,limits[0]-1) x (0,...,limits[1]-1). NOT log of PMF.
     """
-    p = 10**p
+#     p = 10**p
     n,m = np.arange(lm[0]),np.arange(lm[1])
     
     Pss = np.exp(log_prob_1NB(p,n,m))
