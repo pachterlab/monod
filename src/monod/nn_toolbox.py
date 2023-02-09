@@ -459,11 +459,10 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  ind : bool = False, ep
     
     prob_cond,prefactor = torch.exp(prob_cond_log),torch.exp(prefactor_log)
     
-    print('prob cond shape: ',prob_cond.shape)
-    print('prefactor shape: ',prefactor.shape)
+
     
     P = prob_cond*prefactor.reshape(-1,1)
-    print('P shape',P.shape)
+
     
     P = P.detach().numpy()
 
@@ -484,7 +483,6 @@ def get_ypred_log_1NB(vecs,m,s_mean,s_var):
     
 
     mean_cond = (s_mean*mean_cond).reshape(-1,1)
-    print('mean_cond shape',mean_cond.shape)
     var_cond = (s_var*var_cond).reshape(-1,1)
     
     r_cond = mean_cond**2/(var_cond-mean_cond).reshape(-1,1)
@@ -501,7 +499,6 @@ def get_ypred_log_1NB(vecs,m,s_mean,s_var):
     y_[filt] += torch.lgamma(m[filt]+r_cond[filt]) - torch.lgamma(r_cond[filt]) \
                 + r_cond[filt] * torch.log(r_cond[filt]/(r_cond[filt]+mean_cond[filt])+eps) \
                 - m[filt] * torch.log(r_cond[filt]+mean_cond[filt]+eps) + mean_cond[filt]
-    print('y_ shape',y_.shape)
     
     return(y_)
 
