@@ -438,7 +438,7 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
     vecs = torch.column_stack((log_b,log_beta,log_gamma,n,mean_cond,var_cond))
     
     # feed through the model
-    s_mean, s_var = model(vecs)
+    s_mean, s_var = model_1NB(vecs)
     
     m = torch.tensor(m,dtype=torch.float32)
     m = m.repeat(1,len(n)).reshape((len(n)),-1)
