@@ -435,7 +435,7 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  ind : bool = False, ep
                            torch.tensor(mean_cond,dtype=torch.float32),  \
                            torch.tensor(var_cond,dtype=torch.float32)
     
-    vecs = torch.column_stack((log_b,log_beta,log_gamma,n,mean_cond,var_cond))
+    vecs = torch.column_stack((log_b,log_beta,log_gamma,n,mean_cond,var_cond)).to(torch.device(device))
     
     # feed through the model
     s_mean, s_var = model_1NB(vecs)
@@ -447,7 +447,7 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  ind : bool = False, ep
         m = m.repeat(1,len(n)).reshape((len(n)),-1)
 
     # calculate the probability -- will be an array [n,m]
-    prob_cond_log = get_ypred_log_1NB(vecs,m,s_mean,s_var)
+    prob_cond_log = get_ypred_log_1NB(vecs,m,s_mean,s_var).detach().cpu()
     
     # negative binomial of n
     r = 1/torch.tensor(beta)
