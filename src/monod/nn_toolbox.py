@@ -448,8 +448,8 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  grid : bool, eps : flo
     if grid == False:
         m = m.reshape(-1,1)
     
-#     else:
-#         m = m.repeat(1,len(n)).reshape((len(n)),-1)
+    else:
+        m = m.repeat(1,len(n)).reshape((len(n)),-1)
 
     # calculate the probability -- will be an array [n,m]
     prob_cond_log = get_ypred_log_1NB(vecs,m,s_mean,s_var).detach().cpu()
