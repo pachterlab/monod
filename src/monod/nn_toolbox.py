@@ -179,8 +179,7 @@ def get_NORM(npdf,quantiles='cheb'):
         norm = torch.tensor(norm)
         return norm
 
-NORM = get_NORM(10).to(torch.device(device))
-norm = NORM
+norm = get_NORM(10).to(torch.device(device))
 
 
 def generate_grid(logmean_cond,logstd_cond,norm):
@@ -398,77 +397,76 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
       eps
         numerical stability constant
     '''
-    n,m = torch.tensor(n).to(torch.device(device)), torch.tensor(m).to(torch.device(device))
-    b,beta,gamma = torch.tensor(p)
-    b,beta,gamma = torch.ones_like(n)*b, torch.ones_like(n)*beta,torch.ones_like(n)*gamma
-    b,beta,gamma= b.to(torch.device(device)),beta.to(torch.device(device)),gamma.to(torch.device(device))
     
-    mu1 = b/beta
-    mu2 = b/gamma
+    log_b =  p[0] * np.ones(len(n))
+    b = 10**log_b
+    log_beta =  p[1] * np.ones(len(n))
+    beta = 10**log_beta
+    log_gamma =  p[2] * np.ones(len(n))
+    gamma = 10**log_gamma
     
-    r = 1/beta
-    
-    # negative binomial of nascent RNA n
-    prob_nascent = torch.lgamma(n+r) - torch.lgamma(n+1) - torch.lgamma(r) + r * torch.log(r/(r+mu1)+eps) + n * torch.log(mu1/(r+mu1)+eps)
+    mu1,mu2 = b/beta,b/gamma
+    var1,var2 = mu1*(1+b), mu2*(1+b*beta/(beta+gamma))
 
-    
-    # get moments
-    var1 = mu1 * (1+b)
-    var2 = mu2 * (1+b*beta/(beta+gamma))
     cov = b**2/(beta+gamma)
-
-    # calculate conditional moments
-    logvar1 = torch.log((var1/mu1**2)+1)
-    logvar2 = torch.log((var2/mu2**2)+1)
-    logstd1 = torch.sqrt(logvar1)
-    logstd2 = torch.sqrt(logvar2)
-
-    logmean1 = torch.log(mu1**2/torch.sqrt(var1+mu1**2))
-    logmean2 = torch.log(mu2**2/torch.sqrt(var2+mu2**2))
-
-    val = (logmean1 + logmean2 + (logvar1 + logvar2)/2)
-    val[val<-88] = -88
-    logcov = torch.log(cov * torch.exp(-(val)) +1 )
-    logcorr = logcov/torch.sqrt(logvar1 * logvar2)
-
-    logmean_cond = logmean2 + logcorr * logstd2/logstd1 * (torch.log(n+1) - logmean1)
-    logvar_cond = logvar2 * (1-logcorr**2)
-    logstd_cond = logstd2 * torch.sqrt(1-logcorr**2)
     
-    mean_cond = torch.exp(logmean_cond + logvar_cond/2)
-    var_cond = torch.exp(2*logmean_cond + logvar_cond) * (torch.exp(logvar_cond) - 1)
+    logvar1 = np.log((var1/mu1**2)+1)
+    logvar2 = np.log((var2/mu2**2)+1)
+
+    logstd1 = np.sqrt(logvar1)
+    logstd2 = np.sqrt(logvar2)
+
+    logmean1 = np.log(mu1**2/np.sqrt(var1+mu1**2))
+    logmean2 = np.log(mu2**2/np.sqrt(var2+mu2**2))
+
+    logcov = np.log(cov * np.exp(-(logmean1 + logmean2 + (logvar1 + logvar2)/2)) +1 )
+    logcorr = logcov/np.sqrt(logvar1 * logvar2)
+
+    logmean_cond = logmean2 + logcorr * logstd2/logstd1 * (np.log(n+1) - logmean1)
+    logvar_cond = logvar2 * (1-logcorr**2)  
+
+    mean_cond = np.exp(logmean_cond + logvar_cond/2)
+    var_cond = np.exp(2*logmean_cond + logvar_cond) * (np.exp(logvar_cond) - 1)
     
-    # reshape and stack
-    pv = torch.column_stack((torch.log10(b).reshape(-1),
-                             torch.log10(beta).reshape(-1),
-                             torch.log10(gamma).reshape(-1),
-                             n.reshape(-1),
-                             mean_cond.reshape(-1),
-                             var_cond.reshape(-1),
-                             ))
-    # run through model
-    pv = pv.to(torch.float32)
-
-    s_mean,s_var = model_1NB(pv)
-
-
-    n = n.reshape(-1,1)
-    m = m.reshape(-1,1)
+    log_b,log_beta,log_gamma = torch.tensor(log_b,dtype=torch.float32), \
+                               torch.tensor(log_beta,dtype=torch.float32), \
+                               torch.tensor(log_gamma,dtype=torch.float32) 
+    n,mean_cond,var_cond = torch.tensor(n,dtype=torch.float32), \
+                           torch.tensor(mean_cond,dtype=torch.float32),  \
+                           torch.tensor(var_cond,dtype=torch.float32)
     
-    # get conditional probabilites
-    ypred_cond  = get_ypred_log_1NB(pv,m,s_mean,s_var)
-
-    # multiply conditionals P(m|n) by P(n)
-    prob_nascent = torch.exp(prob_nascent)
-    predicted = prob_nascent * ypred_cond.reshape((prob_nascent.shape))
+    vecs = torch.column_stack((log_b,log_beta,log_gamma,n,mean_cond,var_cond))
     
-    log_P = torch.log(predicted+eps).detach().cpu().numpy()
+    # feed through the model
+    s_mean, s_var = model(vecs)
+    
+    m = torch.tensor(m,dtype=torch.float32)
+    m = m.repeat(1,len(n)).reshape((len(n)),-1)
 
+    # calculate the probability -- will be an array [n,m]
+    prob_cond_log = get_ypred_log_1NB(vecs,m,s_mean,s_var)
+    
+    # negative binomial of n
+    r = 1/torch.tensor(beta)
+    MU = torch.tensor(b)*r
+    
+    prefactor_log = torch.lgamma(n+r) - torch.lgamma(n+1) - torch.lgamma(r) \
+                + r * torch.log(r/(r+MU)) + n * torch.log(MU/(r+MU))
+    
+    
+    prob_cond,prefactor = torch.exp(prob_cond_log),torch.exp(prefactor_log)
+    
+    P = prob_cond*prefactor.reshape(-1,1)
+    
+    P = P.detach().numpy()
 
-    return(log_P)
+    return(np.log(P))
 
 eps = 1e-20
+
 def get_ypred_log_1NB(vecs,m,s_mean,s_var):
+    ''' Calculates conditional log probability over grid. 
+    '''
 
     b =  10**vecs[:,0]
     beta =  10**vecs[:,1]
@@ -478,28 +476,27 @@ def get_ypred_log_1NB(vecs,m,s_mean,s_var):
     var_cond = vecs[:,5]
     
 
-    mean_cond_scaled = s_mean*mean_cond 
-    var_cond_scaled = s_var*var_cond 
+    mean_cond = (s_mean*mean_cond).reshape(-1,1)
+    var_cond = (s_var*var_cond).reshape(-1,1)
+    
+    r_cond = mean_cond**2/(var_cond-mean_cond).reshape(-1,1)
 
-    r_cond = (mean_cond**2/(var_cond-mean_cond)).reshape(-1,1)
     p_cond = (mean_cond/var_cond).reshape(-1,1)
+
     r = (1/beta).reshape(-1,1)
 
-    mean_cond = mean_cond.reshape(-1,1)
-    var_cond = var_cond.reshape(-1,1)
-
-    filt = torch.logical_and(torch.logical_and(r>0,p_cond>0), p_cond<1)
-    filt = filt.flatten()
+    filt = (p_cond > 1e-10).flatten()
     
     #compute the Poisson mean
-    log_P = m * torch.log(mean_cond+eps) - mean_cond - torch.lgamma(m+1) 
+    y_ = m * torch.log(mean_cond+eps) - mean_cond - torch.lgamma(m+1) 
 
-    log_P[filt] += torch.lgamma(m[filt]+r_cond[filt]) - torch.lgamma(r_cond[filt]) \
+    y_[filt] += torch.lgamma(m[filt]+r_cond[filt]) - torch.lgamma(r_cond[filt]) \
                 + r_cond[filt] * torch.log(r_cond[filt]/(r_cond[filt]+mean_cond[filt])+eps) \
                 - m[filt] * torch.log(r_cond[filt]+mean_cond[filt]+eps) + mean_cond[filt]
 
     
-    return(torch.exp(log_P))
+    return(y_)
+
 
 
 
