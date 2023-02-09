@@ -29,7 +29,7 @@ def bursty_none_logL(p,x):
     n = x[:,0]
     m = x[:,1]
     
-    return log_prob_1NB(p, n, m, ind = True)
+    return log_prob_1NB(p, n, m, ind = True).flatten()
     
 
 
