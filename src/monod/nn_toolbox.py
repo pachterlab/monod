@@ -443,7 +443,10 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  ind : bool = False, ep
     
     m = torch.tensor(m,dtype=torch.float32).to(torch.device(device))
     
-    if ind == False:
+    if ind == True:
+        m = m.reshape(-1,1)
+    
+    else:
         m = m.repeat(1,len(n)).reshape((len(n)),-1)
 
     # calculate the probability -- will be an array [n,m]
