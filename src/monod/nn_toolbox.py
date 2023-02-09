@@ -29,7 +29,7 @@ def bursty_none_logL(p,x):
     n = x[:,0]
     m = x[:,1]
     
-    return log_prob_1NB(p, n, m, ind = True).flatten()
+    return log_prob_1NB(p, n, m, grid = False).flatten()
     
 
 
@@ -52,7 +52,7 @@ def bursty_none_grid(p,lm):
 #     p = 10**p
     n,m = np.arange(lm[0]),np.arange(lm[1])
     
-    Pss = np.exp(log_prob_1NB(p,n,m,ind=True))
+    Pss = np.exp(log_prob_1NB(p,n,m,grid=True))
 
     return Pss
 
@@ -389,7 +389,7 @@ model_1NB.to(torch.device(device))
 
 print('Using device: ',device)
 
-def log_prob_1NB(p : np.array, n: np.array, m: np.array,  ind : bool = False, eps : float = 1e-15):
+def log_prob_1NB(p : np.array, n: np.array, m: np.array,  grid : bool, eps : float = 1e-15):
     ''' Calculates probability for bursty model given the most accurate trained model.
       -----------------------------------
       n,m
@@ -445,11 +445,11 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  ind : bool = False, ep
     
     m = torch.tensor(m,dtype=torch.float32).to(torch.device(device))
     
-    if ind == True:
+    if grid == False:
         m = m.reshape(-1,1)
     
-    else:
-        m = m.repeat(1,len(n)).reshape((len(n)),-1)
+#     else:
+#         m = m.repeat(1,len(n)).reshape((len(n)),-1)
 
     # calculate the probability -- will be an array [n,m]
     prob_cond_log = get_ypred_log_1NB(vecs,m,s_mean,s_var).detach().cpu()
