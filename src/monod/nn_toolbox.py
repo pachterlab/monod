@@ -387,6 +387,8 @@ model_1NB.load_state_dict(torch.load(model_1NB_path))
 model_1NB.eval()
 model_1NB.to(torch.device(device))
 
+print('Using device: ',device)
+
 def log_prob_1NB(p : np.array, n: np.array, m: np.array,  ind : bool = False, eps : float = 1e-15):
     ''' Calculates probability for bursty model given the most accurate trained model.
       -----------------------------------
