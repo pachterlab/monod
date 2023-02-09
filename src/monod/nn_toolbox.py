@@ -387,7 +387,7 @@ model_1NB.load_state_dict(torch.load(model_1NB_path))
 model_1NB.eval()
 model_1NB.to(torch.device(device))
 
-def log_prob_1NB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
+def log_prob_1NB(p : np.array, n: np.array, m: np.array,  ind : bool = False, eps : float = 1e-15):
     ''' Calculates probability for bursty model given the most accurate trained model.
       -----------------------------------
       n,m
@@ -443,7 +443,7 @@ def log_prob_1NB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
     
     m = torch.tensor(m,dtype=torch.float32)
     
-    if ind = False:
+    if ind == False:
         m = m.repeat(1,len(n)).reshape((len(n)),-1)
 
     # calculate the probability -- will be an array [n,m]
