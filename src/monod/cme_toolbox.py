@@ -144,24 +144,31 @@ class CMEModel:
             TeX-formatted log-parameter names for the current transcriptional model.
             Useful for plot labels.
         """
+        param_str = []
         if self.bio_model == "Constitutive":
-            return (r"$\log_{10} \beta$", r"$\log_{10} \gamma$")
+            param_str += [r"$\log_{10} \beta$", r"$\log_{10} \gamma$"]
         elif self.bio_model == "Delay":
-            return (r"$\log_{10} b$", r"$\log_{10} \beta$", r"$\log_{10} \tau^{-1}$")
+            param_str += [r"$\log_{10} b$", r"$\log_{10} \beta$", r"$\log_{10} \tau^{-1}$"]
         elif self.bio_model == "DelayedSplicing":
-            return (r"$\log_{10} b$", r"$\log_{10} \tau^{-1}$", r"$\log_{10} \gamma$")
+            param_str += [r"$\log_{10} b$", r"$\log_{10} \tau^{-1}$", r"$\log_{10} \gamma$"]
         elif self.bio_model == "Bursty":
-            return (r"$\log_{10} b$", r"$\log_{10} \beta$", r"$\log_{10} \gamma$")
+            param_str += [r"$\log_{10} b$", r"$\log_{10} \beta$", r"$\log_{10} \gamma$"]
         elif self.bio_model == "Extrinsic":
-            return (r"$\log_{10} \alpha$", r"$\log_{10} \beta$", r"$\log_{10} \gamma$")
+            param_str += [r"$\log_{10} \alpha$", r"$\log_{10} \beta$", r"$\log_{10} \gamma$"]
         elif self.bio_model == "CIR":
-            return (r"$\log_{10} b$", r"$\log_{10} \beta$", r"$\log_{10} \gamma$")
+            param_str += [r"$\log_{10} b$", r"$\log_{10} \beta$", r"$\log_{10} \gamma$"]
         else:
             raise ValueError(
                 "Please select a biological noise model from {}.".format(
                     self.available_biomodels
                 )
             )
+        if self.amb_model == 'Equal':
+            param_str += [r'$\log_{10} p$']
+        elif self.amb_model == 'Unqeual':
+            param_str += [r'$\log_{10} p_N$',r'$\log_{10} p_M$']
+        return param_str
+
 
     def get_num_params(self):
         """Return the number of parameters for the model instance.
