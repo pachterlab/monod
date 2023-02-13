@@ -165,7 +165,7 @@ class CMEModel:
             )
         if self.amb_model == 'Equal':
             param_str += [r'$\log_{10} p$']
-        elif self.amb_model == 'Unqeual':
+        elif self.amb_model == 'Unequal':
             param_str += [r'$\log_{10} p_N$',r'$\log_{10} p_M$']
         return param_str
 
