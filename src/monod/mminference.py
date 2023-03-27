@@ -143,6 +143,7 @@ class InferenceParameters:
         self.construct_grid()
         self.model = model
 
+
         #k mixture components
         self.k = k
 
@@ -185,6 +186,8 @@ class InferenceParameters:
         self.Y = Y
         self.sampl_vals = list(zip(X, Y))
         self.n_grid_points = len(X)
+
+        print(self.n_grid_points)
 
     def store_inference_parameters(self, inference_parameter_string):
         """This helper method attempts to save the InferenceParameters object.
@@ -230,7 +233,6 @@ class InferenceParameters:
         warnings.filterwarnings("ignore", category=DeprecationWarning)
         if num_cores > 1:
             log.info("Starting parallelized grid scan.")
-            print(self.n_grid_points)
             parallelize(
                 function=self.par_fun,
                 iterable=zip(
