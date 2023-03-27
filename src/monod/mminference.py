@@ -230,6 +230,7 @@ class InferenceParameters:
         warnings.filterwarnings("ignore", category=DeprecationWarning)
         if num_cores > 1:
             log.info("Starting parallelized grid scan.")
+            print(self.n_grid_points)
             parallelize(
                 function=self.par_fun,
                 iterable=zip(
