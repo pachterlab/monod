@@ -234,7 +234,7 @@ class InferenceParameters:
                 iterable=zip(
                     range(self.n_grid_points),
                     [[search_data, self.model]] * self.n_grid_points,
-                    self.k,
+                    [self.k]* self.n_grid_points,
                 ),
                 num_cores=num_cores,
                 num_entries=self.n_grid_points,
@@ -249,7 +249,7 @@ class InferenceParameters:
                 for x in zip(
                     range(self.n_grid_points),
                     [[search_data, self.model]] * self.n_grid_points,
-                    self.k,
+                    [self.k]* self.n_grid_points,
                 )
             ]
             log.info("Non-parallelized grid scan complete.")
