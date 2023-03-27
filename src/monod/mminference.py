@@ -8,6 +8,7 @@ from .preprocess import make_dir, log
 from .cme_toolbox import CMEModel  # may be unnecessary
 import multiprocessing
 import os
+import itertools
 
 # lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
 import warnings
@@ -234,7 +235,7 @@ class InferenceParameters:
                 iterable=zip(
                     range(self.n_grid_points),
                     [[search_data, self.model]] * self.n_grid_points,
-                    [self.k]* self.n_grid_points,
+                    itertools.repeat(self.k, self.n_grid_points),
                 ),
                 num_cores=num_cores,
                 num_entries=self.n_grid_points,
@@ -249,7 +250,7 @@ class InferenceParameters:
                 for x in zip(
                     range(self.n_grid_points),
                     [[search_data, self.model]] * self.n_grid_points,
-                    [self.k]* self.n_grid_points,
+                    [self.k] * self.n_grid_points,
                 )
             ]
             log.info("Non-parallelized grid scan complete.")
