@@ -261,35 +261,40 @@ class CMEModel:
             return np.sum(d)
         elif hist_type == "unique":
             x, f = data
-            if (
-                (self.quad_method == "nn")
-                and (self.bio_model == "Bursty")
-                and (self.seq_model == "None")
-            ):
+            proposal = self.eval_model_pss(p, limits, samp)
+            proposal[proposal < EPS] = EPS
+            proposal = proposal[tuple(x.T)]
+            d = f * np.log(f / proposal)
+            return np.sum(d)
+#             if (
+#                 (self.quad_method == "nn")
+#                 and (self.bio_model == "Bursty")
+#                 and (self.seq_model == "None")
+#             ):
                 #neural method
-                log_EPS = np.log(EPS)
-                log_proposal = bursty_none_logL(p,x)
-                log_proposal[log_proposal < log_EPS] = log_EPS # <--- May be unnecessary.
-                d = f * (np.log(f) - log_proposal) # <--- I believe it's correct.
-                return np.sum(d)
-            elif (
-                (self.quad_method == "nn_10")
-                and (self.bio_model == "Bursty")
-                and (self.seq_model == "None")
-            ):
-                #neural method
-                log_EPS = np.log(EPS)
-                log_proposal = bursty_none_logL_10(p,x)
-                log_proposal[log_proposal < log_EPS] = log_EPS # <--- May be unnecessary.
-                d = f * (np.log(f) - log_proposal) # <--- I believe it's correct.
-                return np.sum(d)
-            else:
-                #non-neural method
-                proposal = self.eval_model_pss(p, limits, samp)
-                proposal[proposal < EPS] = EPS
-                proposal = proposal[tuple(x.T)]
-                d = f * np.log(f / proposal)
-                return np.sum(d)
+#                 log_EPS = np.log(EPS)
+#                 log_proposal = bursty_none_logL(p,x)
+#                 log_proposal[log_proposal < log_EPS] = log_EPS # <--- May be unnecessary.
+#                 d = f * (np.log(f) - log_proposal) # <--- I believe it's correct.
+#                 return np.sum(d)
+#             elif (
+#                 (self.quad_method == "nn_10")
+#                 and (self.bio_model == "Bursty")
+#                 and (self.seq_model == "None")
+#             ):
+#                 #neural method
+#                 log_EPS = np.log(EPS)
+#                 log_proposal = bursty_none_logL_10(p,x)
+#                 log_proposal[log_proposal < log_EPS] = log_EPS # <--- May be unnecessary.
+#                 d = f * (np.log(f) - log_proposal) # <--- I believe it's correct.
+#                 return np.sum(d)
+#             else:
+#                 #non-neural method
+#                 proposal = self.eval_model_pss(p, limits, samp)
+#                 proposal[proposal < EPS] = EPS
+#                 proposal = proposal[tuple(x.T)]
+#                 d = f * np.log(f / proposal)
+#                 return np.sum(d)
 
     def eval_model_pss(self, p, limits, samp=None):
         """Evaluate the PMF of the model over a grid at a set of parameters.
