@@ -158,7 +158,6 @@ class InferenceParameters:
         inference_parameter_string = inference_string + "/parameters.pr"
         self.store_inference_parameters(inference_parameter_string)
 
-        print('k: ',self.k)
 
     def construct_grid(self):
         """Creates a grid of points over the two-dimensional technical variation parameter domain.
@@ -284,7 +283,7 @@ class InferenceParameters:
         """
         point_index, (search_data, model), k = inputs
         grad_inference = GradientInference(self, model, search_data, point_index, k)
-        grad_inference.fit_all_genes(model, search_data)
+        #grad_inference.fit_all_genes(model, search_data)
 
 
 class GradientInference:
@@ -364,6 +363,10 @@ class GradientInference:
             number of biological model parameters.
         n_samp_pars: int
             number of technical variation model parameters.
+        weights: list of floats
+            p(z=k) values
+        Q: float np.ndarray
+            obs x k array of posterior probabilities p(z=k|x)
         inference_string: str
             run-specific directory location.
         param_MoM: np.ndarray
@@ -400,8 +403,11 @@ class GradientInference:
         self.n_samp_pars = global_parameters.n_samp_pars
 
         #Init weights
-
+        self.weights = np.ones(self.k)/self.k
         #Init posterior Q
+        self.Q = self._initialize_Q(search_data)
+
+        print(self.Q)
 
         self.inference_string = global_parameters.inference_string
         if self.gradient_params["init_pattern"] == "moments":
@@ -418,6 +424,26 @@ class GradientInference:
                 ]
             )
             warnings.resetwarnings()
+
+    def _initialize_Q(self,search_data):
+        """Initialize posterior values p(z=k|x).
+
+        Parameters
+        ----------
+        search_data: monod.extract_data.SearchData
+            SearchData object with the data to fit.
+
+        Returns
+        ----------
+        Q: np.ndarray
+            obs x k mixture components for p(z=k|x)
+
+        """
+        n = search_data.n_cells
+        Q=np.random.uniform(0,1,size=(n, self.k))
+        Q *= self.weights[None,:]
+        Q=Q/Q.sum(axis=(-1),keepdims=True)
+        return Q
 
     def optimize_gene(self, gene_index, model, search_data):
         """Fit the data for a single gene using KL divergence gradient descent.
