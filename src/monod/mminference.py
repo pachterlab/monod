@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
+from scipy.special import logsumexp, softmax
 from .preprocess import make_dir, log
 from .extract_data import SearchData
 from .cme_toolbox import CMEModel  # may be unnecessary
@@ -53,6 +54,8 @@ class InferenceParameters:
         CME model used for inference.
     k: int
         number of components in mixture model, default 10
+    epochs: int
+        number of epochs to run EM procedure for, default 100
     n_phys_pars: int
         number of biological model parameters.
     n_samp_pars: int
@@ -82,6 +85,7 @@ class InferenceParameters:
         dataset_string,
         model,
         k=10,
+        epochs=100,
         use_lengths=True,
         gradient_params={
             "max_iterations": 10,
@@ -110,6 +114,8 @@ class InferenceParameters:
             CME model used for inference.
         k: int
             number of components in mixture model, default 10
+        epochs: int
+            number of epochs to run EM procedure for, default 100
         use_lengths: bool, optional
             if True, the nascent Poisson model technical variation parameter is a
             coefficient multiplied by gene length.
@@ -147,6 +153,7 @@ class InferenceParameters:
 
         #k mixture components
         self.k = k
+        self.epochs = epochs
 
         self.n_phys_pars = model.get_num_params()
         self.n_samp_pars = len(self.samp_ub)  # this will always be 2 for now
@@ -239,6 +246,7 @@ class InferenceParameters:
                     range(self.n_grid_points),
                     [[search_data, self.model]] * self.n_grid_points,
                     [self.k] * self.n_grid_points,
+                    [self.epochs] * self.n_grid_points,
                 ),
                 num_cores=num_cores,
                 num_entries=self.n_grid_points,
@@ -254,6 +262,7 @@ class InferenceParameters:
                     range(self.n_grid_points),
                     [[search_data, self.model]] * self.n_grid_points,
                     [self.k] * self.n_grid_points,
+                    [self.epochs] * self.n_grid_points,
                 )
             ]
             log.info("Non-parallelized grid scan complete.")
@@ -285,8 +294,8 @@ class InferenceParameters:
             entry 2: int
                 number of mixture components
         """
-        point_index, (search_data, model), k = inputs
-        grad_inference = GradientInference(self, model, search_data, point_index, k)
+        point_index, (search_data, model), k, epochs = inputs
+        grad_inference = GradientInference(self, model, search_data, point_index, k, epochs)
         grad_inference.fit_all_genes(model, search_data)
 
 
@@ -301,6 +310,8 @@ class GradientInference:
         the index of the current point, within [0, n_grid_points).
     k: int
         number of components in mixture model
+    epochs: int
+        number of epochs for EM
     regressor: np.ndarray
         gene-specific technical variation parameter values at the current grid point.
         these values will be different for each gene if use_lengths=True in the
@@ -326,7 +337,7 @@ class GradientInference:
         method of moments estimates for all genes under the current technical variation parameters.
     """
 
-    def __init__(self, global_parameters, model, search_data, point_index, k):
+    def __init__(self, global_parameters, model, search_data, point_index, k, epochs):
         """Initialize a GradientInference object.
 
         Parameters
@@ -341,6 +352,8 @@ class GradientInference:
             the index of the current point, within [0, n_grid_points).
         k: int
             number of components in mixture model
+        epochs: int
+            number of epochs for EM
 
         Sets
         ----
@@ -369,8 +382,8 @@ class GradientInference:
             number of technical variation model parameters.
         weights: list of floats
             p(z=k) values
-        Q: float np.ndarray
-            obs x k array of posterior probabilities p(z=k|x)
+        theta: dict 
+            dict of (param_estimates,kld,obj_fun,d_time) for each k component 
         inference_string: str
             run-specific directory location.
         param_MoM: np.ndarray
@@ -398,6 +411,7 @@ class GradientInference:
         self.grid_point = global_parameters.sampl_vals[point_index]
         self.point_index = point_index
         self.k = k
+        self.epochs = epochs
         self.regressor = regressor
         self.grad_bnd = global_parameters.grad_bnd
         self.gradient_params = global_parameters.gradient_params
@@ -408,6 +422,7 @@ class GradientInference:
 
         #Init weights
         self.weights = np.ones(self.k)/self.k
+        self.theta = None
 
         self.inference_string = global_parameters.inference_string
         if self.gradient_params["init_pattern"] == "moments":
@@ -425,6 +440,9 @@ class GradientInference:
             )
             warnings.resetwarnings()
 
+    def _get_parameters(self):
+        return self.theta.copy(), self.weights.copy()
+    
     def _initialize_Q(self,search_data):
         """Initialize posterior values p(z=k|x).
 
@@ -546,8 +564,30 @@ class GradientInference:
 
         return dict(zip(inds,datas))
     
-    def _m_step(self,model,search_data,Q): # ****** FILL IN ******
-        """Initialize posterior values p(z=k|x).
+    def _m_step(self,model,k_dict,Q,EPS=1e-6): # ****** FILL IN ******
+        """Update values for the k component weights and parameters theta_k.
+
+        Parameters
+        ----------
+        model: monod.cme_toolbox.CMEModel
+            CME model used for inference.
+        k_dict: SearchData dict
+            dict, with k (keys) and SearchData objects (values)
+        Q: np.ndarray
+            obs x k mixture components for p(z=k|x)
+
+        """
+        #Update weights
+        self.weights = EPS+np.sum(Q,axis=0)
+        self.weights /= self.weights.sum()
+
+        #Get optimal parameters
+        all_outs = [self.iterate_over_genes(model, k_dict[key]) for key in list(k_dict.keys())]
+        self.theta = dict(zip(list(k_dict.keys()),all_outs))
+        return
+    
+    def _e_step(self,model,search_data,EPS=1e-15): # ****** FILL IN ******
+        """Update posterior p(z=k|x).
 
         Parameters
         ----------
@@ -555,19 +595,48 @@ class GradientInference:
             CME model used for inference.
         search_data: monod.extract_data.SearchData
             SearchData object with the data to fit.
+
+        Returns
+        ----------  
         Q: np.ndarray
             obs x k mixture components for p(z=k|x)
 
-        Returns
-        ----------
-        k_search_out: list of np.ndarray
-            output of iterate_over_genes() for each k component
-
         """
-        outputs = []
+        #Get params for each k
+        if search_data.hist_type == "grid":
+            raise ValueError("Mixture model not yet implemented for grid hist type")
+        elif search_data.hist_type == "unique":
+            n_cells = search_data.n_cells
+            logL = np.zeros((n_cells,self.k))
+            
+            for k in list(self.theta.keys()):
+                params, klds, obj_fun, d_time = self.theta[k]
+                logL_k = np.zeros(n_cells)
 
-        return outputs
+                for gene_index in range(search_data.n_genes):
+                    S = search_data.layers[1][gene_index]
+                    U = search_data.layers[0][gene_index]
+                    x = np.array([U,S])
 
+                    if gene_index == 0:
+                        print('Param shape: ', params[gene_index].shape)
+
+                    proposal = model.eval_model_pss(params[gene_index], search_data.M[:, gene_index], self.regressor[gene_index])
+                    proposal[proposal < EPS] = EPS
+
+                    if gene_index == 0:
+                        print('Proposal shape: ', proposal.shape)
+
+                    proposal = proposal[tuple(x)]
+                    logL_k += np.log(proposal) #logL for each obs, per gene
+
+                logL[:,k] = logL_k
+                
+            logL += np.log(self.weights)[None,:]
+            Q = softmax(logL, axis=1)
+            lower_bound = np.mean(logsumexp(a=logL, axis=1))
+
+        return Q, lower_bound
 
 
 
@@ -690,17 +759,23 @@ class GradientInference:
         
         #Init posterior Q
         Q = self._initialize_Q(search_data)
+        print('Init self.weights: ', self.weights)
 
         #Partition search_data based on Q
-        print('Making Partition')
-        print()
         k_dict = self._part_search_data(search_data,Q)
-        print('k_dict: ', k_dict)
+        self._m_step(model,k_dict,Q)
+
+        print('mstep self.weights: ', self.weights)
         print()
+        print('mstep self.theta: ', self.theta)
+
+        #fit() (e_step and m_step) for self.epochs + partitions again --> k_dict
+        Q, lower_bound = self._e_step(model,search_data)
+
+
         #FOR TEST
-        print('Test Partition')
-        search_out = self.iterate_over_genes(model, k_dict[0])
-        print('search_out: ',search_out)
+        #search_out = self.iterate_over_genes(model, k_dict[0])
+
 
         #m_step
         #search_out = self.iterate_over_genes(model, search_data)
