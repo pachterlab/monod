@@ -694,7 +694,7 @@ class GradientInference:
         #Partition search_data based on Q
         print('Making Partition')
         print()
-        k_dict = self._part_search_data(self,search_data,Q,EPS=1e-6,padding=None)
+        k_dict = self._part_search_data(search_data,Q)
         print('k_dict: ', k_dict)
         print()
         #FOR TEST
