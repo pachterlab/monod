@@ -187,7 +187,6 @@ class InferenceParameters:
         self.sampl_vals = list(zip(X, Y))
         self.n_grid_points = len(X)
 
-        print(self.n_grid_points)
 
     def store_inference_parameters(self, inference_parameter_string):
         """This helper method attempts to save the InferenceParameters object.
@@ -238,7 +237,7 @@ class InferenceParameters:
                 iterable=zip(
                     range(self.n_grid_points),
                     [[search_data, self.model]] * self.n_grid_points,
-                    itertools.repeat(self.k, self.n_grid_points),
+                    [self.k] * self.n_grid_points,
                 ),
                 num_cores=num_cores,
                 num_entries=self.n_grid_points,
