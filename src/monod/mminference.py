@@ -238,34 +238,35 @@ class InferenceParameters:
 
         t1 = time.time()
         warnings.filterwarnings("ignore", category=DeprecationWarning)
-        if num_cores > 1:
-            log.info("Starting parallelized grid scan.")
-            parallelize(
-                function=self.par_fun,
-                iterable=zip(
-                    range(self.n_grid_points),
-                    [[search_data, self.model]] * self.n_grid_points,
-                    [self.k] * self.n_grid_points,
-                    [self.epochs] * self.n_grid_points,
-                ),
-                num_cores=num_cores,
-                num_entries=self.n_grid_points,
-                completion_message="Parallelized grid scan complete.",
-                termination_message="The scan has been manually terminated.",
-                error_message="The scan has been terminated due to computation issues. Please check MoM estimates.",
+        # if num_cores > 1:
+        #     log.info("Starting parallelized grid scan.") # ***** Maybe only parallelize if n_grid_points > 4x4  ***** 
+        #     parallelize(
+        #         function=self.par_fun,
+        #         iterable=zip(
+        #             range(self.n_grid_points),
+        #             [[search_data, self.model]] * self.n_grid_points,
+        #             [self.k] * self.n_grid_points,
+        #             [self.epochs] * self.n_grid_points,
+        #         ),
+        #         num_cores=num_cores,
+        #         num_entries=self.n_grid_points,
+        #         completion_message="Parallelized grid scan complete.",
+        #         termination_message="The scan has been manually terminated.",
+        #         error_message="The scan has been terminated due to computation issues. Please check MoM estimates.",
+        #     )
+        # else:
+        log.info("Starting non-parallelized grid scan.")
+        [
+            self.par_fun(x)
+            for x in zip(
+                range(self.n_grid_points),
+                [[search_data, self.model]] * self.n_grid_points,
+                [self.k] * self.n_grid_points,
+                [self.epochs] * self.n_grid_points,
+                [num_cores] * self.n_grid_points,
             )
-        else:
-            log.info("Starting non-parallelized grid scan.")
-            [
-                self.par_fun(x)
-                for x in zip(
-                    range(self.n_grid_points),
-                    [[search_data, self.model]] * self.n_grid_points,
-                    [self.k] * self.n_grid_points,
-                    [self.epochs] * self.n_grid_points,
-                )
-            ]
-            log.info("Non-parallelized grid scan complete.")
+        ]
+        log.info("Non-parallelized grid scan complete.")
 
 
         # # ****** UNCOMMENT WHEN READY TO UPDATE CODE ******  
@@ -294,9 +295,9 @@ class InferenceParameters:
             entry 2: int
                 number of mixture components
         """
-        point_index, (search_data, model), k, epochs = inputs
+        point_index, (search_data, model), k, epochs, num_cores = inputs
         grad_inference = GradientInference(self, model, search_data, point_index, k, epochs)
-        grad_inference.fit_all_genes(model, search_data)
+        grad_inference.fit_all_genes(model, search_data, num_cores)
 
 
 class GradientInference:
@@ -564,7 +565,7 @@ class GradientInference:
 
         return dict(zip(inds,datas))
     
-    def _m_step(self,model,k_dict,Q,EPS=1e-6): # ****** FILL IN ******
+    def _m_step(self,model,k_dict,Q,EPS=1e-6,num_cores=1):
         """Update values for the k component weights and parameters theta_k.
 
         Parameters
@@ -581,10 +582,54 @@ class GradientInference:
         self.weights = EPS+np.sum(Q,axis=0)
         self.weights /= self.weights.sum()
 
+
         #Get optimal parameters
-        all_outs = [self.iterate_over_genes(model, k_dict[key]) for key in list(k_dict.keys())]
-        self.theta = dict(zip(list(k_dict.keys()),all_outs))
+        if num_cores > 1: # ****** PARALLELIZE *****
+            ks = len(list(k_dict.keys()))
+
+            log.info("Starting parallelized MLE param fits for EM.") 
+            all_outs = parallelize(
+                function=self._fit_fun,
+                iterable=zip(
+                    [model] * ks,
+                    list(k_dict.keys()),
+                    [k_dict] * ks,
+                ),
+                num_cores=num_cores,
+                num_entries=ks,
+                completion_message="Parallelized MLE fits complete.",
+                termination_message="The M step has been manually terminated.",
+                error_message="The M step has been terminated due to computation issues. Please check MoM estimates.",
+            )
+            print('ALL_OUTS: ', all_outs)
+            print()
+            out_keys, out_params = zip(*all_outs)
+            print('out_keys: ', out_keys)
+            print('out_params: ', out_params)
+
+            self.theta = dict(zip(out_keys, out_params))
+        else:
+            all_outs = [self.iterate_over_genes(model, k_dict[key]) for key in list(k_dict.keys())] 
+            self.theta = dict(zip(list(k_dict.keys()),all_outs))
+
         return
+    
+    def _fit_fun(self, inputs):
+        """Helper method for the M step parallelization procedure.
+
+        Parameters
+        ----------
+        inputs: tuple
+            entry 0: monod.cme_toolbox.CMEModel
+                CME model used for inference.
+            entry 1: list
+                list of k mixture components
+            entry 2: list of dicts
+                list of dicts with SearchData obj for each k component
+        """
+        model, key, k_dict = inputs
+        return key, self.iterate_over_genes(model, k_dict[key])
+
     
     def _e_step(self,model,search_data,EPS=1e-15): # ****** FILL IN ******
         """Update posterior p(z=k|x).
@@ -618,14 +663,8 @@ class GradientInference:
                     U = search_data.layers[0][gene_index]
                     x = np.array([U,S])
 
-                    if gene_index == 0:
-                        print('Param shape: ', params[gene_index].shape)
-
                     proposal = model.eval_model_pss(params[gene_index], search_data.M[:, gene_index], self.regressor[gene_index])
                     proposal[proposal < EPS] = EPS
-
-                    if gene_index == 0:
-                        print('Proposal shape: ', proposal.shape)
 
                     proposal = proposal[tuple(x)]
                     logL_k += np.log(proposal) #logL for each obs, per gene
@@ -745,8 +784,8 @@ class GradientInference:
 
         return param_estimates, klds, obj_func, d_time
 
-    def fit_all_genes(self, model, search_data):
-        """Wraps iterate_over_genes and stores the results on disk.
+    def fit_all_genes(self, model, search_data, num_cores=1):
+        """Wraps iterate_over_genes and EM procedure, and stores the results on disk.
 
         Parameters
         ----------
@@ -759,17 +798,14 @@ class GradientInference:
         
         #Init posterior Q
         Q = self._initialize_Q(search_data)
-        print('Init self.weights: ', self.weights)
-
         #Partition search_data based on Q
         k_dict = self._part_search_data(search_data,Q)
-        self._m_step(model,k_dict,Q)
+        self._m_step(model,k_dict,Q,num_cores)
 
-        print('mstep self.weights: ', self.weights)
-        print()
         print('mstep self.theta: ', self.theta)
-
-        #fit() (e_step and m_step) for self.epochs + partitions again --> k_dict
+        print()
+        print('mstep self.weights: ', self.weights)
+        #fit() (e_step and m_step) for self.epochs + partitions again --> new k_dict
         Q, lower_bound = self._e_step(model,search_data)
 
 
