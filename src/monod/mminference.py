@@ -238,8 +238,9 @@ class InferenceParameters:
 
         t1 = time.time()
         warnings.filterwarnings("ignore", category=DeprecationWarning)
-        # if num_cores > 1:
-        #     log.info("Starting parallelized grid scan.") # ***** Maybe only parallelize if n_grid_points > 4x4  ***** 
+        # ***** Assuming no parallelized grid search for now ***** 
+        # if num_cores > 1: 
+        #     log.info("Starting parallelized grid scan.") 
         #     parallelize(
         #         function=self.par_fun,
         #         iterable=zip(
@@ -441,8 +442,22 @@ class GradientInference:
             )
             warnings.resetwarnings()
 
-    def _get_parameters(self):
-        return self.theta.copy(), self.weights.copy()
+    def _get_parameters(self,search_data):
+        #param_estimates, klds, obj_func, d_time
+        theta = self.theta.copy()
+        params = np.zeros((search_data.n_genes,self.n_phys_pars,self.k))
+        kl = np.zeros((search_data.n_genes,self.k))
+        obj = np.zeros(self.k)
+        t = np.zeros(self.k)
+
+        for k in list(theta.keys()):
+            param_estimates, klds, obj_func, d_time = theta[k]
+            params[:,:,k] = param_estimates
+            kl[:,k] = klds
+            obj[k] = obj_func
+            t[k] = d_time
+
+        return params, kl, obj, t, self.weights.copy()
     
     def _initialize_Q(self,search_data):
         """Initialize posterior values p(z=k|x).
@@ -588,7 +603,7 @@ class GradientInference:
 
             log.info("Starting parallelized MLE param fits for EM.") 
             all_outs = parallelize(
-                function=self._fit_fun,
+                function=self._m_par_fun,
                 iterable=zip(
                     [model] * ks,
                     list(k_dict.keys()),
@@ -610,7 +625,7 @@ class GradientInference:
 
         return
     
-    def _fit_fun(self, inputs):
+    def _m_par_fun(self, inputs):
         """Helper method for the M step parallelization procedure.
 
         Parameters
@@ -693,17 +708,23 @@ class GradientInference:
         """
 
         #E-step, partition, m_step
-        for i in range(self.epochs):
-            log.info("EM Epoch "+str(i)+'/'+str(self.epochs)+': ')
+        all_bounds = []
 
-            Q, lower_bound = self._e_step(model,search_data)
-            k_dict = self._part_search_data(search_data,Q)
+        if self.epochs < 1:
+            raise ValueError("No. of epochs must be an int > 0")
+        else:
+            for i in range(self.epochs):
+                log.info("EM Epoch "+str(i+1)+'/'+str(self.epochs)+': ')
 
-            self._m_step(model,k_dict,Q,num_cores=num_cores)
-            print('mstep self.weights: ', self.weights)
-            print('logL: ', lower_bound)
-        
-        return Q, lower_bound
+                Q, lower_bound = self._e_step(model,search_data)
+                k_dict = self._part_search_data(search_data,Q)
+
+                self._m_step(model,k_dict,Q,num_cores=num_cores)
+                print('mstep self.weights: ', self.weights)
+                print('logL: ', lower_bound)
+                all_bounds += [lower_bound]
+            
+            return Q, lower_bound, all_bounds
 
 
 
@@ -829,34 +850,32 @@ class GradientInference:
         #Partition search_data based on Q
         k_dict = self._part_search_data(search_data,Q)
 
+        log.info("M Step Initial Run: ")
         self._m_step(model,k_dict,Q,num_cores=num_cores)
 
-        print('mstep self.theta: ', self.theta)
-        print()
-        print('mstep self.weights: ', self.weights)
-
-        #fit() (e_step and m_step) for self.epochs + partitions again --> new k_dict
-        Q, lower_bound = self._fit(model,search_data,num_cores=num_cores) #self._e_step(model,search_data)
-
-
-        #FOR TEST
-        #search_out = self.iterate_over_genes(model, k_dict[0])
-
+        #Do EM procedure over epochs
+        Q, lower_bound, all_bounds = self._fit(model,search_data,num_cores=num_cores) 
 
         #m_step
         #search_out = self.iterate_over_genes(model, search_data)
 
-        #fit() (e_step and m_step)
+        #Save theta (params,klds,obj_fun,d_time,weights), aic , assignments
+        aic = -2*(lower_bound * search_data.n_cells ) + 2*(self.n_phys_pars * search_data.n_genes * self.k + self.k - 1)
 
+        search_out = self._get_parameters(search_data)
+        assigns = np.argmax(Q, axis=1)
 
-        # results = GridPointResults(  #****** Update how stored ****** 
-        #     *search_out,
-        #     self.regressor,
-        #     self.grid_point,
-        #     self.point_index,
-        #     self.inference_string,
-        # )
-        # results.store_grid_point_results()
+        results = GridPointResults(  #****** Update how stored ****** 
+            *search_out,
+            aic,
+            assigns,
+            all_bounds,
+            self.regressor,
+            self.grid_point,
+            self.point_index,
+            self.inference_string,
+        )
+        results.store_grid_point_results()
 
 
 
@@ -906,6 +925,14 @@ class GridPointResults:
         sum of klds; total error at the current grid point.
     d_time: float
         runtime in seconds.
+    weights: np.ndarray
+        weights for mixture components (k,)
+    aic: float
+        final AIC statistic for model fit
+    assigns: np.ndarray
+        final k components assignments for each cell (n_cells,)
+    all_bounds: float list
+        all lower bound values for each EM epoch
     regressor: np.ndarray
         gene-specific technical variation parameter values at the current grid point.
         these values will be different for each gene if use_lengths=True in the
@@ -925,6 +952,10 @@ class GridPointResults:
         klds,
         obj_func,
         d_time,
+        weights,
+        aic,
+        assigns,
+        all_bounds,
         regressor,
         grid_point,
         point_index,
@@ -939,6 +970,11 @@ class GridPointResults:
         self.grid_point = grid_point
         self.point_index = point_index
         self.inference_string = inference_string
+
+        self.weights = weights
+        self.aic = aic
+        self.assigns = assigns
+        self.all_bounds = all_bounds
 
     def store_grid_point_results(self):
         """This helper method attempts to store the grid point results to disk as a grid_point_X.gp object."""
