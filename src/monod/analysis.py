@@ -111,6 +111,7 @@ def plot_params_for_pair(
     meta="12",
     xlabel="dataset 1",
     ylabel="dataset 2",
+    savefig=True
 ):
     """Plot the inferred physical parameters at the sampling parameter optimum for a matched pair of datasets.
 
@@ -220,11 +221,12 @@ def plot_params_for_pair(
             ax1[i].plot(xl, xl, "r--", linewidth=2)
     fig1.tight_layout()
 
-    fig_string = sr1.batch_analysis_string + "/pair_parameter_comparison_{}.png".format(
-        meta
-    )
-    plt.savefig(fig_string, dpi=450)
-    log.info("Figure stored to {}.".format(fig_string))
+    if savefig:
+        fig_string = sr1.batch_analysis_string + "/pair_parameter_comparison_{}.png".format(
+            meta
+        )
+        plt.savefig(fig_string, dpi=450)
+        log.info("Figure stored to {}.".format(fig_string))
 
 
 def find_most_concordant_samp(sr1, sr2):
