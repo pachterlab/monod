@@ -297,7 +297,6 @@ class InferenceParameters:
         """
         point_index, (search_data, model), k, epochs, num_cores = inputs
         grad_inference = GradientInference(self, model, search_data, point_index, k, epochs)
-        print('par_fun num_cores: ',num_cores)
         grad_inference.fit_all_genes(model, search_data, num_cores)
 
 
@@ -583,8 +582,6 @@ class GradientInference:
         self.weights = EPS+np.sum(Q,axis=0)
         self.weights /= self.weights.sum()
 
-        print('num_cores: ',num_cores)
-
         #Get optimal parameters
         if num_cores > 1: # ****** PARALLELIZE *****
             ks = len(list(k_dict.keys()))
@@ -802,8 +799,8 @@ class GradientInference:
         Q = self._initialize_Q(search_data)
         #Partition search_data based on Q
         k_dict = self._part_search_data(search_data,Q)
-        print('orig num_cores: ',num_cores)
-        self._m_step(model,k_dict,Q,num_cores)
+
+        self._m_step(model,k_dict,Q,num_cores=num_cores)
 
         print('mstep self.theta: ', self.theta)
         print()
