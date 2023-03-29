@@ -600,11 +600,8 @@ class GradientInference:
                 termination_message="The M step has been manually terminated.",
                 error_message="The M step has been terminated due to computation issues. Please check MoM estimates.",
             )
-            print('ALL_OUTS: ', all_outs)
-            print()
+
             out_keys, out_params = zip(*all_outs)
-            print('out_keys: ', out_keys)
-            print('out_params: ', out_params)
 
             self.theta = dict(zip(out_keys, out_params))
         else:
@@ -630,7 +627,7 @@ class GradientInference:
         return key, self.iterate_over_genes(model, k_dict[key])
 
     
-    def _e_step(self,model,search_data,EPS=1e-15): # ****** FILL IN ******
+    def _e_step(self,model,search_data,EPS=1e-15): 
         """Update posterior p(z=k|x).
 
         Parameters
@@ -674,6 +671,38 @@ class GradientInference:
             Q = softmax(logL, axis=1)
             lower_bound = np.mean(logsumexp(a=logL, axis=1))
 
+        return Q, lower_bound
+    
+    def _fit(self,model,search_data,EPS=1e-15,num_cores=1): # ****** FILL IN ******
+        """Update posterior p(z=k|x).
+
+        Parameters
+        ----------
+        model: monod.cme_toolbox.CMEModel
+            CME model used for inference.
+        search_data: monod.extract_data.SearchData
+            SearchData object with the data to fit.
+
+        Returns
+        ----------  
+        Q: np.ndarray
+            obs x k mixture components for p(z=k|x)
+        lower_bound: float
+            log-likelihood lower bound
+
+        """
+
+        #E-step, partition, m_step
+        for i in range(self.epochs):
+            log.info("EM Epoch "+str(i)+'/'+str(self.epochs)+': ')
+
+            Q, lower_bound = self._e_step(model,search_data)
+            k_dict = self._part_search_data(search_data,Q)
+
+            self._m_step(model,k_dict,Q,num_cores=num_cores)
+            print('mstep self.weights: ', self.weights)
+            print('logL: ', lower_bound)
+        
         return Q, lower_bound
 
 
@@ -805,8 +834,9 @@ class GradientInference:
         print('mstep self.theta: ', self.theta)
         print()
         print('mstep self.weights: ', self.weights)
+
         #fit() (e_step and m_step) for self.epochs + partitions again --> new k_dict
-        Q, lower_bound = self._e_step(model,search_data)
+        Q, lower_bound = self._fit(model,search_data,num_cores=num_cores) #self._e_step(model,search_data)
 
 
         #FOR TEST
