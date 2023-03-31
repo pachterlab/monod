@@ -443,7 +443,24 @@ class GradientInference:
             warnings.resetwarnings()
 
     def _get_parameters(self,search_data):
-        #param_estimates, klds, obj_func, d_time
+        """Get inferred parameter results for storage.
+
+        Parameters
+        ----------
+        search_data: monod.extract_data.SearchData
+            SearchData object with the data to fit.
+
+        Returns
+        ----------
+        params: np.ndarray
+            n_genes x n_phys_pars x k parameters
+        kl: np.ndarray
+            n_genes x k klds
+        obj: np.ndarray
+            k, kld sums
+        t: np.ndarray
+            k, d_times
+        """
         theta = self.theta.copy()
         params = np.zeros((search_data.n_genes,self.n_phys_pars,self.k))
         kl = np.zeros((search_data.n_genes,self.k))
@@ -722,6 +739,7 @@ class GradientInference:
                 self._m_step(model,k_dict,Q,num_cores=num_cores)
                 print('mstep self.weights: ', self.weights)
                 print('logL: ', lower_bound)
+                print()
                 all_bounds += [lower_bound]
             
             return Q, lower_bound, all_bounds
@@ -760,7 +778,20 @@ class GradientInference:
         if (
             self.gradient_params["init_pattern"] == "moments"
         ):  # this can be extended to other initialization patterns, like latin squares
-            x0[0] = self.param_MoM[gene_index]  # ****** MAYBE CHANGE TO BASED ON SEARCH_DATA *****
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            param_MoM = np.asarray(
+                [
+                    model.get_MoM(
+                        search_data.moments[i],
+                        self.phys_lb,
+                        self.phys_ub,
+                        self.regressor[i],
+                    )
+                    for i in range(search_data.n_genes)
+                ]
+            )
+            warnings.resetwarnings()
+            x0[0] = param_MoM[gene_index] #self.param_MoM[gene_index]  # ****** MAYBE CHANGE TO BASED ON SEARCH_DATA *****
         x = x0[0]
         err = np.inf
         ERR_THRESH = 0.99
@@ -860,7 +891,7 @@ class GradientInference:
         #search_out = self.iterate_over_genes(model, search_data)
 
         #Save theta (params,klds,obj_fun,d_time,weights), aic , assignments
-        aic = -2*(lower_bound * search_data.n_cells ) + 2*(self.n_phys_pars * search_data.n_genes * self.k + self.k - 1)
+        aic = lower_bound - (self.n_phys_pars * search_data.n_genes * self.k + self.k - 1)/search_data.n_cells
 
         search_out = self._get_parameters(search_data)
         assigns = np.argmax(Q, axis=1)
