@@ -318,8 +318,8 @@ def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15,b
         log_P = torch.log(predicted+eps).detach().cpu().numpy()
         return(log_P)
     else:
-        ypred_cond = torch.log()ypred_cond
-        predicted = prob_nascent * ypred_cond.reshape((prob_nascent.shape))
+        ypred_cond = torch.log(ypred_cond)
+        predicted = prob_nascent + ypred_cond.reshape((prob_nascent.shape))
         log_P = predicted.detach().cpu().numpy()
         return(log_P)
 
