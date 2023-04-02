@@ -308,16 +308,18 @@ def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15,b
     m = m.reshape(-1,1)
     
     # get conditional probabilites
-    ypred_cond = get_ypred_at_RT(pv,w_,hyp_,n,m,norm,eps=eps)
 
     # multiply conditionals P(m|n) by P(n)
     if not bypass: 
+
+        ypred_cond = get_ypred_at_RT(pv,w_,hyp_,n,m,norm)
         prob_nascent = torch.exp(prob_nascent)
 
         predicted = prob_nascent * ypred_cond.reshape((prob_nascent.shape))
         log_P = torch.log(predicted+eps).detach().cpu().numpy()
         return(log_P)
     else: #doesn't really matter, it turns out
+        ypred_cond = get_ypred_at_RT(pv,w_,hyp_,n,m,norm,eps=eps)
         ypred_cond = torch.log(ypred_cond)
         predicted = prob_nascent + ypred_cond.reshape((prob_nascent.shape))
         log_P = predicted.detach().cpu().numpy()
