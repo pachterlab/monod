@@ -239,7 +239,7 @@ def get_ypred_at_RT(p,w,hyp,n,m,norm,eps=1e-8):
     return Y
 
 
-def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
+def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15,bypass=False):
     ''' Calculates probability for bursty model given the most accurate trained model.
       -----------------------------------
       n,m
@@ -311,13 +311,17 @@ def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
     ypred_cond = get_ypred_at_RT(pv,w_,hyp_,n,m,norm)
 
     # multiply conditionals P(m|n) by P(n)
-    prob_nascent = torch.exp(prob_nascent)
+    if not bypass: 
+        prob_nascent = torch.exp(prob_nascent)
 
-    predicted = prob_nascent * ypred_cond.reshape((prob_nascent.shape))
-    log_P = torch.log(predicted+eps).detach().cpu().numpy()
-
-
-    return(log_P)
+        predicted = prob_nascent * ypred_cond.reshape((prob_nascent.shape))
+        log_P = torch.log(predicted+eps).detach().cpu().numpy()
+        return(log_P)
+    else:
+        ypred_cond = torch.log()ypred_cond
+        predicted = prob_nascent * ypred_cond.reshape((prob_nascent.shape))
+        log_P = predicted.detach().cpu().numpy()
+        return(log_P)
 
 
 
