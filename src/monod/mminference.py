@@ -682,7 +682,10 @@ class GradientInference:
             n_cells = search_data.n_cells
             logL = np.zeros((n_cells,self.k))
             
+            print('E-step num keys: ', list(self.theta.keys()))
+
             for k in list(self.theta.keys()):
+                
                 params, klds, obj_fun, d_time = self.theta[k]
                 logL_k = np.zeros(n_cells)
 
@@ -698,10 +701,12 @@ class GradientInference:
                     logL_k += np.log(proposal) #logL for each obs, per gene
 
                 logL[:,k] = logL_k
-                
+
+            print('LogL MATRIX: ',logL) 
             logL += np.log(self.weights)[None,:]
             Q = softmax(logL, axis=1)
             lower_bound = np.mean(logsumexp(a=logL, axis=1))
+            print('LogL MATRIX AFTER: ',logL) 
 
         return Q, lower_bound, logL, self.weights
     
