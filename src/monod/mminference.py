@@ -683,8 +683,6 @@ class GradientInference:
         elif search_data.hist_type == "unique":
             n_cells = search_data.n_cells
             logL = np.zeros((n_cells,self.k))
-            
-            print('E-step num keys: ', list(self.theta.keys()))
 
             for k in list(self.theta.keys()):
                 
@@ -704,11 +702,10 @@ class GradientInference:
 
                 logL[:,k] = logL_k
 
-            print('LogL MATRIX: ',logL) 
             logL += np.log(self.weights)[None,:]
             Q = softmax(logL, axis=1)
             lower_bound = np.mean(logsumexp(a=logL, axis=1))
-            print('LogL MATRIX AFTER: ',logL) 
+
 
         return Q, lower_bound, logL, self.weights
     
