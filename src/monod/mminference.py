@@ -424,7 +424,7 @@ class GradientInference:
 
         #Init weights
         self.weights = np.ones(self.k)/self.k
-        self.theta = None
+        self.theta = {}
 
         self.inference_string = global_parameters.inference_string
         if self.gradient_params["init_pattern"] == "moments":
@@ -634,7 +634,7 @@ class GradientInference:
             )
 
             out_keys, out_params = zip(*all_outs)
-
+            
             for o in range(len(out_keys)):
                 self.theta[out_keys[o]] = out_params[o]  #Update only relevant ks
         else:
