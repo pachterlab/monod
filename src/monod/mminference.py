@@ -474,7 +474,7 @@ class GradientInference:
             obj[k] = obj_func
             t[k] = d_time
 
-        return params, kl, obj, t, self.weights.copy()
+        return params, kl, obj, t, self.weights.copy(), self.test_logL, self.test_ws  #****** REMOVE LAST TWO******
     
     def _initialize_Q(self,search_data):
         """Initialize posterior values p(z=k|x).
@@ -703,7 +703,7 @@ class GradientInference:
             Q = softmax(logL, axis=1)
             lower_bound = np.mean(logsumexp(a=logL, axis=1))
 
-        return Q, lower_bound
+        return Q, lower_bound, logL, self.weights
     
     def _fit(self,model,search_data,EPS=1e-15,num_cores=1): # ****** FILL IN ******
         """Update posterior p(z=k|x).
@@ -733,7 +733,7 @@ class GradientInference:
             for i in range(self.epochs):
                 log.info("EM Epoch "+str(i+1)+'/'+str(self.epochs)+': ')
 
-                Q, lower_bound = self._e_step(model,search_data)
+                Q, lower_bound, self.test_logL, self.test_ws = self._e_step(model,search_data) # ******** REMOVE logL, self.weights after checks done *******
                 k_dict = self._part_search_data(search_data,Q)
 
                 self._m_step(model,k_dict,Q,num_cores=num_cores)
@@ -984,6 +984,8 @@ class GridPointResults:
         obj_func,
         d_time,
         weights,
+        test_logL, #*****REMOVE ********
+        test_ws,
         aic,
         assigns,
         all_bounds,
@@ -997,6 +999,10 @@ class GridPointResults:
         self.klds = klds
         self.obj_func = obj_func
         self.d_time = d_time
+
+        self.test_logL = test_logL #****** REMOVE ******
+        self.test_ws = test_ws
+
         self.regressor = regressor
         self.grid_point = grid_point
         self.point_index = point_index
@@ -1006,6 +1012,8 @@ class GridPointResults:
         self.aic = aic
         self.assigns = assigns
         self.all_bounds = all_bounds
+
+    
 
     def store_grid_point_results(self):
         """This helper method attempts to store the grid point results to disk as a grid_point_X.gp object."""
