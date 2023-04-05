@@ -635,10 +635,12 @@ class GradientInference:
 
             out_keys, out_params = zip(*all_outs)
 
-            self.theta = dict(zip(out_keys, out_params))
+            for o in range(len(out_keys)):
+                self.theta[out_keys[o]] = out_params[o]  #Update only relevant ks
         else:
             all_outs = [self.iterate_over_genes(model, k_dict[key]) for key in list(k_dict.keys())] 
-            self.theta = dict(zip(list(k_dict.keys()),all_outs))
+            for o in range(len(list(k_dict.keys()))):
+                self.theta[list(k_dict.keys())[o]] = all_outs[o]
 
         return
     
