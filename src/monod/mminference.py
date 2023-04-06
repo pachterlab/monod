@@ -11,6 +11,7 @@ from .cme_toolbox import CMEModel  # may be unnecessary
 import multiprocessing
 import os
 import itertools
+from sklearn.cluster import KMeans
 
 # lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
 import warnings
@@ -492,19 +493,21 @@ class GradientInference:
         """
         n = search_data.n_cells
 
-        # #Test init Q with S corrs
-        # S = search_data.layers[1,:,:]
-        # corrs = np.corrcoef(S.T) #cellxcell (COV)
+        #Test init Q with S corrs
+        S = search_data.layers[1,:,:]
+        corrs = np.corrcoef(S.T) #cellxcell (COV)
+        kmeans = KMeans(n_clusters=self.k, random_state=0).fit(corrs)
+        labs = kmeans.labels_
         # out = np.linalg.eigh(corrs)
         # vs =  out[1]
 
         # Q=vs[:,0:self.k]
         # Q=(Q-np.min(Q,axis=0))/(np.max(Q,axis=0)-np.min(Q,axis=0)) +1e-12
 
-        Q = np.zeros((n, self.k))
-        Q[0:500,:] = np.random.uniform(0,1,size=(self.k))
-        Q[500:1000,:] = np.random.uniform(0,1,size=(self.k))
-        Q[1000:1500,:] = np.random.uniform(0,1,size=(self.k))
+        Q = np.zeros((n, self.k))+0.3
+        for ind in range(self.k):
+            inds = labs==ind
+            Q[inds,ind] = 0.7
 
         #Q=np.random.uniform(0,1,size=(n, self.k))
         
