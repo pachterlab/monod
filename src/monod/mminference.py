@@ -517,9 +517,9 @@ class GradientInference:
 
 
         #Select k with max post for each obs
-        #max_ks = np.argmax(Q, axis=1)  
-        options = range(self.k)
-        max_ks = np.array([np.random.choice(options,1,list(Q[p,:])) for p in range(Q.shape[0])]).squeeze()
+        max_ks = np.argmax(Q, axis=1)  
+        # options = range(self.k)
+        # max_ks = np.array([np.random.choice(options,1,list(Q[p,:])) for p in range(Q.shape[0])]).squeeze()
 
         for k in np.unique(max_ks):
             #Select which obs in k 
