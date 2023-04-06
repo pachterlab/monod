@@ -491,7 +491,14 @@ class GradientInference:
 
         """
         n = search_data.n_cells
-        Q=np.random.uniform(0,1,size=(n, self.k))
+        #Test init Q with S corrs
+        S = search_data.layers[1,:,:]
+        corrs = np.corrcoef(S.T) #cellxcell (COV)
+        out = np.linalg.eig(corrs)
+        vs =  out[1]
+
+        #Q=np.random.uniform(0,1,size=(n, self.k))
+        Q=vs[:,0:self.k]
         Q *= self.weights[None,:]
         Q=Q/Q.sum(axis=(-1),keepdims=True)
         return Q
