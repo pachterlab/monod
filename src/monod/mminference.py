@@ -498,7 +498,7 @@ class GradientInference:
         vs =  out[1]
 
         #Q=np.random.uniform(0,1,size=(n, self.k))
-        Q=vs[:,0:self.k]
+        Q=vs[:,0:self.k]+1e-12
         Q *= self.weights[None,:]
         Q=Q/Q.sum(axis=(-1),keepdims=True)
         return Q
