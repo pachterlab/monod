@@ -503,7 +503,7 @@ class GradientInference:
         ----------
         search_data: monod.extract_data.SearchData
             SearchData object with the data to fit.
-        Q: self.Q
+        Q: posterior values
             Posterior probs of k mixture components
 
         Returns
@@ -517,7 +517,10 @@ class GradientInference:
 
 
         #Select k with max post for each obs
-        max_ks = np.argmax(Q, axis=1)  
+        #max_ks = np.argmax(Q, axis=1)  
+        options = range(self.k)
+        max_ks = np.array([np.random.choice(options,1,list(Q[p,:])) for p in range(Q.shape[0])]).squeeze()
+
         for k in np.unique(max_ks):
             #Select which obs in k 
             obs_inds = max_ks == k
