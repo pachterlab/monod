@@ -493,16 +493,14 @@ class GradientInference:
         """
         n = search_data.n_cells
 
-        #Test init Q with S corrs
+        #Test init Q with S
         S = search_data.layers[1,:,:]
-        corrs = np.corrcoef(S.T) #cellxcell (COV)
-        kmeans = KMeans(n_clusters=self.k, random_state=0).fit(corrs)
-        labs = kmeans.labels_
+        #corrs = np.corrcoef(S.T) #cellxcell (COV)
         # out = np.linalg.eigh(corrs)
         # vs =  out[1]
+        kmeans = KMeans(n_clusters=self.k, random_state=0).fit(S.T)
+        labs = kmeans.labels_
 
-        # Q=vs[:,0:self.k]
-        # Q=(Q-np.min(Q,axis=0))/(np.max(Q,axis=0)-np.min(Q,axis=0)) +1e-12
 
         Q = np.zeros((n, self.k))+0.3
         for ind in range(self.k):
