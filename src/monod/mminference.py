@@ -752,6 +752,7 @@ class GradientInference:
 
         #E-step, partition, m_step
         all_bounds = []
+        all_klds = []
 
         if self.epochs < 1:
             raise ValueError("No. of epochs must be an int > 0")
@@ -763,12 +764,18 @@ class GradientInference:
                 k_dict = self._part_search_data(search_data,Q)
 
                 self._m_step(model,k_dict,Q,num_cores=num_cores)
+                kl = np.zeros((search_data.n_genes,self.k))
+                for k in range(self.k):
+                    params, klds, obj_fun, d_time = self.theta[k]
+                    kl[:,k] = klds
+                   
+                all_klds += [kl]
                 print('mstep self.weights: ', self.weights)
                 print('logL: ', lower_bound)
                 print()
                 all_bounds += [lower_bound]
             
-            return Q, lower_bound, all_bounds
+            return Q, lower_bound, all_bounds, all_klds
 
 
 
@@ -911,7 +918,7 @@ class GradientInference:
         self._m_step(model,k_dict,Q,num_cores=num_cores)
 
         #Do EM procedure over epochs
-        Q, lower_bound, all_bounds = self._fit(model,search_data,num_cores=num_cores) 
+        Q, lower_bound, all_bounds, all_klds = self._fit(model,search_data,num_cores=num_cores) 
 
         #m_step
         #search_out = self.iterate_over_genes(model, search_data)
@@ -927,6 +934,7 @@ class GradientInference:
             aic,
             assigns,
             all_bounds,
+            all_klds,
             self.regressor,
             self.grid_point,
             self.point_index,
@@ -990,6 +998,8 @@ class GridPointResults:
         final k components assignments for each cell (n_cells,)
     all_bounds: float list
         all lower bound values for each EM epoch
+    all_klds: np.array list
+        all kld values for each EM epoch
     regressor: np.ndarray
         gene-specific technical variation parameter values at the current grid point.
         these values will be different for each gene if use_lengths=True in the
@@ -1015,6 +1025,7 @@ class GridPointResults:
         aic,
         assigns,
         all_bounds,
+        all_klds,
         regressor,
         grid_point,
         point_index,
@@ -1038,6 +1049,7 @@ class GridPointResults:
         self.aic = aic
         self.assigns = assigns
         self.all_bounds = all_bounds
+        self.all_klds = all_klds
 
     
 
