@@ -12,6 +12,7 @@ import multiprocessing
 import os
 import itertools
 from sklearn.cluster import KMeans, SpectralClustering
+from sklearn.metrics.pairwise import cosine_similarity
 
 # lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
 import warnings
@@ -495,12 +496,10 @@ class GradientInference:
 
         #Test init Q with S
         S = search_data.layers[1,:,:]
-        corrs = np.corrcoef(S.T) - np.eye(S.shape[1]) #cellxcell (COV)
-        clustering = SpectralClustering(self.k,affinity='precomputed',assign_labels='discretize').fit(corrs)
+        #corrs = np.corrcoef(S.T) #cellxcell (COV)
+        cos = cosine_similarity(S.T) - np.eye(S.shape[1]) 
+        clustering = SpectralClustering(self.k,affinity='precomputed',assign_labels='discretize').fit(cos)
         labs = clustering.labels_
-
-        # out = np.linalg.eigh(corrs)
-        # vs =  out[1]
 
         # kmeans = KMeans(n_clusters=self.k, random_state=0).fit(corrs)
         # labs = kmeans.labels_
