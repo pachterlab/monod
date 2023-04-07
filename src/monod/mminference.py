@@ -11,7 +11,7 @@ from .cme_toolbox import CMEModel  # may be unnecessary
 import multiprocessing
 import os
 import itertools
-from sklearn.cluster import KMeans, AgglomerativeClustering
+from sklearn.cluster import KMeans, SpectralClustering
 
 # lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
 import warnings
@@ -495,8 +495,8 @@ class GradientInference:
 
         #Test init Q with S
         S = search_data.layers[1,:,:]
-        corrs = np.corrcoef(S.T) #cellxcell (COV)
-        clustering = AgglomerativeClustering(self.k,'precomputed').fit(1-corrs)
+        corrs = np.corrcoef(S.T) - np.eye(S.shape[1]) #cellxcell (COV)
+        clustering = SpectralClustering(self.k,affinity='precomputed',assign_labels='discretize').fit(corrs)
         labs = clustering.labels_
 
         # out = np.linalg.eigh(corrs)
