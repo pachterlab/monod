@@ -496,9 +496,9 @@ class GradientInference:
         #Test init Q with S
         S = search_data.layers[1,:,:]
         corrs = np.corrcoef(S.T) #cellxcell (COV)
-        clustering = AgglomerativeClustering(metric='precomputed').fit(1-corrs)
+        clustering = AgglomerativeClustering(self.k,'precomputed').fit(1-corrs)
         labs = clustering.labels_
-        
+
         # out = np.linalg.eigh(corrs)
         # vs =  out[1]
 
