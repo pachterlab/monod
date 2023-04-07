@@ -11,7 +11,7 @@ from .cme_toolbox import CMEModel  # may be unnecessary
 import multiprocessing
 import os
 import itertools
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, AgglomerativeClustering
 
 # lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
 import warnings
@@ -495,11 +495,15 @@ class GradientInference:
 
         #Test init Q with S
         S = search_data.layers[1,:,:]
-        #corrs = np.corrcoef(S.T) #cellxcell (COV)
+        corrs = np.corrcoef(S.T) #cellxcell (COV)
+        clustering = AgglomerativeClustering(metric='precomputed').fit(1-corrs)
+        labs = clustering.labels_
+        
         # out = np.linalg.eigh(corrs)
         # vs =  out[1]
-        kmeans = KMeans(n_clusters=self.k, random_state=0).fit(S.T)
-        labs = kmeans.labels_
+
+        # kmeans = KMeans(n_clusters=self.k, random_state=0).fit(corrs)
+        # labs = kmeans.labels_
 
 
         Q = np.zeros((n, self.k))+0.3
@@ -536,6 +540,7 @@ class GradientInference:
         #Select k with max post for each obs
         max_ks = np.argmax(Q, axis=1)  
         # options = range(self.k)
+        # #Can select based on probability, maybe for initial epoch
         # max_ks = np.array([np.random.choice(options,1,list(Q[p,:])) for p in range(Q.shape[0])]).squeeze()
 
         for k in np.unique(max_ks):
