@@ -505,7 +505,8 @@ class GradientInference:
         # labs = kmeans.labels_
 
 
-        Q = np.zeros((n, self.k))+0.3
+        #Q = np.zeros((n, self.k))+0.3
+        Q=np.random.uniform(0,1,size=(n, self.k))
         for ind in range(self.k):
             inds = labs==ind
             Q[inds,ind] = 0.7
