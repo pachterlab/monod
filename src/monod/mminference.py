@@ -476,7 +476,7 @@ class GradientInference:
             obj[k] = obj_func
             t[k] = d_time
 
-        return params, kl, obj, t, self.weights.copy(), self.test_logL, self.test_ws  #****** REMOVE LAST TWO******
+        return params, kl, obj, t, self.weights.copy()  #****** REMOVE LAST TWO******
     
     def _initialize_Q(self,search_data):
         """Initialize posterior values p(z=k|x).
@@ -729,9 +729,10 @@ class GradientInference:
             logL += np.log(self.weights)[None,:]
             Q = softmax(logL, axis=1)
             lower_bound = np.mean(logsumexp(a=logL, axis=1))
+            q_func = np.sum(Q*logL) #p(x,z;theta)
 
 
-        return Q, lower_bound, logL, self.weights
+        return Q, lower_bound, q_func #logL
     
     def _fit(self,model,search_data,EPS=1e-15,num_cores=1): # ****** FILL IN ******
         """Update posterior p(z=k|x).
@@ -753,7 +754,7 @@ class GradientInference:
         """
 
         #E-step, partition, m_step
-        all_bounds = []
+        all_qs = []
         all_klds = []
 
         if self.epochs < 1:
@@ -762,7 +763,7 @@ class GradientInference:
             for i in range(self.epochs):
                 log.info("EM Epoch "+str(i+1)+'/'+str(self.epochs)+': ')
 
-                Q, lower_bound, self.test_logL, self.test_ws = self._e_step(model,search_data) # ******** REMOVE logL, self.weights after checks done *******
+                Q, lower_bound, q_func = self._e_step(model,search_data) # ******** REMOVE logL, self.weights after checks done *******
                 k_dict = self._part_search_data(search_data,Q)
 
                 self._m_step(model,k_dict,Q,num_cores=num_cores)
@@ -773,11 +774,11 @@ class GradientInference:
                    
                 all_klds += [kl]
                 print('mstep self.weights: ', self.weights)
-                print('logL: ', lower_bound)
+                print('Q Function: ', q_func) #was logL
                 print()
-                all_bounds += [lower_bound]
+                all_qs += [q_func]
             
-            return Q, lower_bound, all_bounds, all_klds
+            return Q, lower_bound, all_qs, all_klds
 
 
 
@@ -920,7 +921,7 @@ class GradientInference:
         self._m_step(model,k_dict,Q,num_cores=num_cores)
 
         #Do EM procedure over epochs
-        Q, lower_bound, all_bounds, all_klds = self._fit(model,search_data,num_cores=num_cores) 
+        Q, lower_bound, all_qs, all_klds = self._fit(model,search_data,num_cores=num_cores) 
 
         #m_step
         #search_out = self.iterate_over_genes(model, search_data)
@@ -935,7 +936,7 @@ class GradientInference:
             *search_out,
             aic,
             assigns,
-            all_bounds,
+            all_qs,
             all_klds,
             self.regressor,
             self.grid_point,
@@ -998,8 +999,8 @@ class GridPointResults:
         final AIC statistic for model fit
     assigns: np.ndarray
         final k components assignments for each cell (n_cells,)
-    all_bounds: float list
-        all lower bound values for each EM epoch
+    all_qs: float list
+        all Q function values for each EM epoch
     all_klds: np.array list
         all kld values for each EM epoch
     regressor: np.ndarray
@@ -1022,11 +1023,9 @@ class GridPointResults:
         obj_func,
         d_time,
         weights,
-        test_logL, #*****REMOVE ********
-        test_ws,
         aic,
         assigns,
-        all_bounds,
+        all_qs,
         all_klds,
         regressor,
         grid_point,
@@ -1039,9 +1038,6 @@ class GridPointResults:
         self.obj_func = obj_func
         self.d_time = d_time
 
-        self.test_logL = test_logL #****** REMOVE ******
-        self.test_ws = test_ws
-
         self.regressor = regressor
         self.grid_point = grid_point
         self.point_index = point_index
@@ -1050,7 +1046,7 @@ class GridPointResults:
         self.weights = weights
         self.aic = aic
         self.assigns = assigns
-        self.all_bounds = all_bounds
+        self.all_qs = all_qs
         self.all_klds = all_klds
 
     
