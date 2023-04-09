@@ -11,12 +11,14 @@ import torch.nn.functional as F
 
 def bursty_none_logL(p,x):
     """Compute the log-likelihood of data microstates.
+
     Parameters
     ----------
     p: np.ndarray
         log10 biological parameters.
     x: int np.ndarray
         microstates in the experimental data histogram, a Nstates x 2 array.
+
     Returns
     -------
     log_proposal: float np.ndarray
@@ -33,12 +35,15 @@ def bursty_none_logL(p,x):
 
 def bursty_none_grid(p,lm):
     """Evaluate the PMF of the model over a grid at a set of parameters.
+
     Parameters
     ----------
     p: np.ndarray
         log10 biological parameters.
     limits: list of int
         grid size for PMF evaluation, size n_species.
+
+
     Returns
     -------
     Pss: np.ndarray
@@ -55,12 +60,14 @@ def bursty_none_grid(p,lm):
 
 def bursty_none_logL_10(p,x):
     """Compute the log-likelihood of data microstates using the 10 basis neural approximation..
+
     Parameters
     ----------
     p: np.ndarray
         log10 biological parameters.
     x: int np.ndarray
         microstates in the experimental data histogram, a Nstates x 2 array.
+
     Returns
     -------
     log_proposal: float np.ndarray
@@ -71,19 +78,21 @@ def bursty_none_logL_10(p,x):
     n = x[:,0]
     m = x[:,1]
     
-    return log_prob_nnNB(p, n, m)
-    # return log_prob_nnNB(p, n, m, ind = True)
+    return log_prob_nnNB(p, n, m, ind = True)
     
 
 
 def bursty_none_grid_10(p,lm):
     """Evaluate the PMF of the model over a grid at a set of parameters using the 10 basis neural approximation.
+
     Parameters
     ----------
     p: np.ndarray
         log10 biological parameters.
     limits: list of int
         grid size for PMF evaluation, size n_species.
+
+
     Returns
     -------
     Pss: np.ndarray
@@ -92,8 +101,7 @@ def bursty_none_grid_10(p,lm):
     p = 10**p
     n,m = np.arange(lm[0]),np.arange(lm[1])
     
-    Pss = np.exp(log_prob_nnNB(p,n,m))
-    # Pss = np.exp(log_prob_nnNB(p,n,m,ind=False))
+    Pss = np.exp(log_prob_nnNB(p,n,m,ind=False))
     
     Pss = Pss / np.sum(Pss)
 
@@ -500,3 +508,7 @@ def get_ypred_log_1NB(vecs,m,s_mean,s_var):
                 - m[filt] * torch.log(r_cond[filt]+mean_cond[filt]+eps) + mean_cond[filt]
     
     return(y_)
+
+
+
+
