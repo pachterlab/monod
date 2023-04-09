@@ -11,14 +11,12 @@ import torch.nn.functional as F
 
 def bursty_none_logL(p,x):
     """Compute the log-likelihood of data microstates.
-
     Parameters
     ----------
     p: np.ndarray
         log10 biological parameters.
     x: int np.ndarray
         microstates in the experimental data histogram, a Nstates x 2 array.
-
     Returns
     -------
     log_proposal: float np.ndarray
@@ -35,15 +33,12 @@ def bursty_none_logL(p,x):
 
 def bursty_none_grid(p,lm):
     """Evaluate the PMF of the model over a grid at a set of parameters.
-
     Parameters
     ----------
     p: np.ndarray
         log10 biological parameters.
     limits: list of int
         grid size for PMF evaluation, size n_species.
-
-
     Returns
     -------
     Pss: np.ndarray
@@ -60,14 +55,12 @@ def bursty_none_grid(p,lm):
 
 def bursty_none_logL_10(p,x):
     """Compute the log-likelihood of data microstates using the 10 basis neural approximation..
-
     Parameters
     ----------
     p: np.ndarray
         log10 biological parameters.
     x: int np.ndarray
         microstates in the experimental data histogram, a Nstates x 2 array.
-
     Returns
     -------
     log_proposal: float np.ndarray
@@ -84,15 +77,12 @@ def bursty_none_logL_10(p,x):
 
 def bursty_none_grid_10(p,lm):
     """Evaluate the PMF of the model over a grid at a set of parameters using the 10 basis neural approximation.
-
     Parameters
     ----------
     p: np.ndarray
         log10 biological parameters.
     limits: list of int
         grid size for PMF evaluation, size n_species.
-
-
     Returns
     -------
     Pss: np.ndarray
@@ -239,7 +229,7 @@ def get_ypred_at_RT(p,w,hyp,n,m,norm,eps=1e-8):
     return Y
 
 
-def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15,bypass=False):
+def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
     ''' Calculates probability for bursty model given the most accurate trained model.
       -----------------------------------
       n,m
@@ -308,22 +298,16 @@ def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15,b
     m = m.reshape(-1,1)
     
     # get conditional probabilites
+    ypred_cond = get_ypred_at_RT(pv,w_,hyp_,n,m,norm)
 
     # multiply conditionals P(m|n) by P(n)
-    if not bypass: 
-        #the usual procedure
-        ypred_cond = get_ypred_at_RT(pv,w_,hyp_,n,m,norm)
-        prob_nascent = torch.exp(prob_nascent)
+    prob_nascent = torch.exp(prob_nascent)
 
-        predicted = prob_nascent * ypred_cond.reshape((prob_nascent.shape))
-        log_P = torch.log(predicted+eps).detach().cpu().numpy()
-        return(log_P)
-    else: # what if we do mult in logdomain? doesn't really matter, it turns out
-        ypred_cond = get_ypred_at_RT(pv,w_,hyp_,n,m,norm,eps=eps)
-        ypred_cond = torch.log(ypred_cond)
-        predicted = prob_nascent + ypred_cond.reshape((prob_nascent.shape))
-        log_P = predicted.detach().cpu().numpy()
-        return(log_P)
+    predicted = prob_nascent * ypred_cond.reshape((prob_nascent.shape))
+    log_P = torch.log(predicted+eps).detach().cpu().numpy()
+
+
+    return(log_P)
 
 
 
@@ -514,8 +498,3 @@ def get_ypred_log_1NB(vecs,m,s_mean,s_var):
                 - m[filt] * torch.log(r_cond[filt]+mean_cond[filt]+eps) + mean_cond[filt]
     
     return(y_)
-
-
-
-
-
