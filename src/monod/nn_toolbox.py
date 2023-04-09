@@ -71,7 +71,8 @@ def bursty_none_logL_10(p,x):
     n = x[:,0]
     m = x[:,1]
     
-    return log_prob_nnNB(p, n, m, ind = True)
+    return log_prob_nnNB(p, n, m)
+    # return log_prob_nnNB(p, n, m, ind = True)
     
 
 
@@ -91,7 +92,8 @@ def bursty_none_grid_10(p,lm):
     p = 10**p
     n,m = np.arange(lm[0]),np.arange(lm[1])
     
-    Pss = np.exp(log_prob_nnNB(p,n,m,ind=False))
+    Pss = np.exp(log_prob_nnNB(p,n,m))
+    # Pss = np.exp(log_prob_nnNB(p,n,m,ind=False))
     
     Pss = Pss / np.sum(Pss)
 
