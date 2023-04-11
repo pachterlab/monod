@@ -496,16 +496,20 @@ class GradientInference:
 
         #Test init Q with S
         S = search_data.layers[1,:,:]
+        S_t = S.T
+        tots = np.sum(S_t,axis=1)
+        divids = (1e4/tots)[:,None]
+        S_t = S_t*divids
+        S_t = np.log1p(S_t)
+
+        kmeans = KMeans(n_clusters=self.k, random_state=0).fit(S_t)
+        labs = kmeans.labels_
         #corrs = np.corrcoef(S.T) #cellxcell (COV)
-        cos = cosine_similarity(S.T) - np.eye(S.shape[1]) 
-        clustering = SpectralClustering(self.k,affinity='precomputed',assign_labels='discretize').fit(cos)
-        labs = clustering.labels_
+        # cos = cosine_similarity(S.T) - np.eye(S.shape[1]) 
+        # clustering = SpectralClustering(self.k,affinity='precomputed',assign_labels='discretize').fit(cos)
+        # labs = clustering.labels_
 
-        # kmeans = KMeans(n_clusters=self.k, random_state=0).fit(corrs)
-        # labs = kmeans.labels_
-
-
-        #Q = np.zeros((n, self.k))+(0.3/(self.k-1))
+        #Bias Q towards initial cluster assignments
         Q=np.random.uniform(0,1,size=(n, self.k))
         for ind in range(self.k):
             inds = labs==ind
@@ -730,7 +734,7 @@ class GradientInference:
             logL += np.log(self.weights)[None,:]
             Q = softmax(logL, axis=1)
             lower_bound = np.mean(logsumexp(a=logL, axis=1))
-            q_func = np.sum(Q*logL) #p(x,z;theta)
+            q_func = np.sum(Q*logL) #p(x,z;theta), maybe make indicator function?
 
 
         return Q, lower_bound, q_func #logL
