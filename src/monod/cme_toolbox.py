@@ -148,13 +148,25 @@ class CMEModel:
         if self.bio_model == "Constitutive":
             param_str += [r"$\log_{10} \beta$", r"$\log_{10} \gamma$"]
         elif self.bio_model == "Delay":
-            param_str += [r"$\log_{10} b$", r"$\log_{10} \beta$", r"$\log_{10} \tau^{-1}$"]
+            param_str += [
+                r"$\log_{10} b$",
+                r"$\log_{10} \beta$",
+                r"$\log_{10} \tau^{-1}$",
+            ]
         elif self.bio_model == "DelayedSplicing":
-            param_str += [r"$\log_{10} b$", r"$\log_{10} \tau^{-1}$", r"$\log_{10} \gamma$"]
+            param_str += [
+                r"$\log_{10} b$",
+                r"$\log_{10} \tau^{-1}$",
+                r"$\log_{10} \gamma$",
+            ]
         elif self.bio_model == "Bursty":
             param_str += [r"$\log_{10} b$", r"$\log_{10} \beta$", r"$\log_{10} \gamma$"]
         elif self.bio_model == "Extrinsic":
-            param_str += [r"$\log_{10} \alpha$", r"$\log_{10} \beta$", r"$\log_{10} \gamma$"]
+            param_str += [
+                r"$\log_{10} \alpha$",
+                r"$\log_{10} \beta$",
+                r"$\log_{10} \gamma$",
+            ]
         elif self.bio_model == "CIR":
             param_str += [r"$\log_{10} b$", r"$\log_{10} \beta$", r"$\log_{10} \gamma$"]
         else:
@@ -163,12 +175,11 @@ class CMEModel:
                     self.available_biomodels
                 )
             )
-        if self.amb_model == 'Equal':
-            param_str += [r'$\log_{10} p$']
-        elif self.amb_model == 'Unequal':
-            param_str += [r'$\log_{10} p_N$',r'$\log_{10} p_M$']
+        if self.amb_model == "Equal":
+            param_str += [r"$\log_{10} p$"]
+        elif self.amb_model == "Unequal":
+            param_str += [r"$\log_{10} p_N$", r"$\log_{10} p_M$"]
         return param_str
-
 
     def get_num_params(self):
         """Return the number of parameters for the model instance.
