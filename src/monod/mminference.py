@@ -932,10 +932,12 @@ class GradientInference:
         #search_out = self.iterate_over_genes(model, search_data)
 
         #Save theta (params,klds,obj_fun,d_time,weights), aic , assignments
-        aic = lower_bound - (self.n_phys_pars * search_data.n_genes * self.k + self.k - 1)/search_data.n_cells
-
         search_out = self._get_parameters(search_data)
         assigns = np.argmax(Q, axis=1)
+
+        num_comp = len(np.unique(assigns))
+        aic = lower_bound - (self.n_phys_pars * search_data.n_genes * num_comp + num_comp - 1)/search_data.n_cells
+
 
         results = GridPointResults(  #****** Update how stored ****** 
             *search_out,
