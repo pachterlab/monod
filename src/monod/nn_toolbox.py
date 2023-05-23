@@ -204,7 +204,7 @@ def generate_grid(logmean_cond,logstd_cond,norm):
 
     return translin
 
-def get_ypred_at_RT(p,w,hyp,n,m,norm,eps=1e-8):
+def get_ypred_at_RT(p,w,hyp,n,m,norm,eps=1e-19):
     '''Given a parameter vector (tensor) and weights (tensor), and hyperparameter,
     calculates ypred (Y), or approximate probability. Calculates over array of nascent (n) and mature (m) values.
     '''
@@ -246,7 +246,7 @@ def get_ypred_at_RT(p,w,hyp,n,m,norm,eps=1e-8):
     return Y
 
 
-def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-15):
+def log_prob_nnNB(p : np.array, n: np.array, m: np.array,  eps : float = 1e-19):
     ''' Calculates probability for bursty model given the most accurate trained model.
       -----------------------------------
       n,m
