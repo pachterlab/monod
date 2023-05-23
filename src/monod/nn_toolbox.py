@@ -79,7 +79,7 @@ def bursty_none_logL_10(p,x):
     m = x[:,1]
     
     n,m = np.meshgrid(n,m)
-    Pss = np.exp(log_prob_nnNB(p,n.T,m.T))
+    Pss = np.exp(log_prob_nnNB(p,n,m))
     
     Pss = Pss / np.sum(Pss)
     
