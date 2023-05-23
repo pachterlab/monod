@@ -98,8 +98,12 @@ def bursty_none_grid_10(p,lm):
     Pss: np.ndarray
         the steady-state model PMF over a grid (0,...,limits[0]-1) x (0,...,limits[1]-1). NOT log of PMF.
     """
+    
     p = 10**p
     n,m = np.arange(lm[0]),np.arange(lm[1])
+    
+    n,m = np.meshgrid(n,m)
+    Pss = np.exp(log_prob_nnNB(p,n.T,m.T))
     
     Pss = np.exp(log_prob_nnNB(p,n,m,ind=False))
     
