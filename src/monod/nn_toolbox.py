@@ -78,7 +78,7 @@ def bursty_none_logL_10(p,x):
     n = x[:,0]
     m = x[:,1]
     
-    Pss = np.exp(log_prob_nnNB(p,n,m))
+    Pss = log_prob_nnNB(p,n,m)
     
     return Pss
     
