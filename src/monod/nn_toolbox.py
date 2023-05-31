@@ -29,7 +29,7 @@ def bursty_none(p,x):
     n = x[:,0]
     m = x[:,1]
     
-    return log_prob_1NB(p, n, m, grid = False).flatten()
+    return np.exp(log_prob_1NB(p, n, m, grid = False)).flatten()
     
 
 
@@ -78,7 +78,7 @@ def bursty_none_10(p,x):
     n = x[:,0]
     m = x[:,1]
     
-    Pss = log_prob_nnNB(p,n,m)
+    Pss = np.exp(log_prob_nnNB(p,n,m))
     
     return Pss
     
