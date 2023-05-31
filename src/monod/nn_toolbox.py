@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def bursty_none_logL(p,x):
+def bursty_none(p,x):
     """Compute the log-likelihood of data microstates.
 
     Parameters
@@ -58,7 +58,7 @@ def bursty_none_grid(p,lm):
 
     return Pss
 
-def bursty_none_logL_10(p,x):
+def bursty_none_10(p,x):
     """Compute the log-likelihood of data microstates using the 10 basis neural approximation..
 
     Parameters
