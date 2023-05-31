@@ -66,7 +66,7 @@ class CMEModel:
         fixed_quad_T=10,
         quad_order=60,
         quad_vec_T=np.inf,
-        use_grid=False
+        use_grid=True
     ):
         """Initialize the CMEModel instance.
 
