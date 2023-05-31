@@ -242,7 +242,7 @@ class CMEModel:
             proposal = proposal[tuple(x.T)]
             logL = np.log(proposal)
             return np.sum(logL)
-       elif (hist_type == "unique") and (not self.use_grid):
+        elif (hist_type == "unique") and (not self.use_grid):
             x, f = data
             proposal = self.eval_model_pss(p, x = x, limits = None, samp = samp)
             proposal[proposal < EPS] = EPS
