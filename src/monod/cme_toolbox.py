@@ -146,9 +146,9 @@ class CMEModel:
         self.quad_vec_T = quad_vec_T
         self.quad_method = quad_method
         self.use_grid = use_grid
-        if ('nn' not in self.quad_method) and (self.use_grid):
+        if ('nn' not in self.quad_method) and (not self.use_grid):
             raise ValueError(
-                f"Grid evaluation not supported for {self.quad_method}. Please set use_grid = False."
+                f"Microstate evaluation not supported for {self.quad_method}. Please set use_grid = True."
                 )
 
     def get_log_name_str(self):
