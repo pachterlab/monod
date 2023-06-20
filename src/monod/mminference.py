@@ -290,7 +290,7 @@ class InferenceParameters:
         full_result_strings = []
         for i in range(self.k):
             results = SearchResults(self, search_data, i)
-            results.aggregate_grid_points(clear=False)
+            results.aggregate_grid_points(clean=False)
             if results.save == True:
                 full_result_string = results.store_on_disk()
                 full_result_strings += [full_result_string]
@@ -1187,7 +1187,7 @@ class SearchResults:
         # pull in small amount of non-cell-specific info from search data
         self.n_genes = search_data.n_genes
         self.n_cells = search_data.n_cells 
-        self.assign = assign
+    
         self.gene_log_lengths = search_data.gene_log_lengths
         self.gene_names = search_data.gene_names
 
