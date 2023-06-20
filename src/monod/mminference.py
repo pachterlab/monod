@@ -1737,7 +1737,7 @@ class SearchResults:
 
         """
         t1 = time.time()
-        search_data =  self._subset_search_data(search_data)
+        #search_data =  self._subset_search_data(search_data) #Already subset
         hist_type = get_hist_type(search_data)
 
         csqarr = []
