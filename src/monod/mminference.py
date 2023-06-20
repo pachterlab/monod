@@ -258,6 +258,8 @@ class InferenceParameters:
         #         error_message="The scan has been terminated due to computation issues. Please check MoM estimates.",
         #     )
         # else:
+        if self.n_grid_points > 1:
+            raise ValueError("Multiple grid points not implemented yet for meK-Means")
         log.info("Starting non-parallelized grid scan.")
         [
             self.par_fun(x)
@@ -281,6 +283,23 @@ class InferenceParameters:
         # t2 = time.time()
         # log.info("Runtime: {:.1f} seconds.".format(t2 - t1))
         # return full_result_string
+
+
+        #Loop through assignments, and save each k results
+        warnings.resetwarnings()
+        full_result_strings = []
+        for i in range(self.k):
+            results = SearchResults(self, search_data, i)
+            results.aggregate_grid_points(clear=False)
+            if results.save == True:
+                full_result_string = results.store_on_disk()
+                full_result_strings += [full_result_string]
+
+        t2 = time.time()
+        log.info("Runtime: {:.1f} seconds.".format(t2 - t1))
+        return full_result_strings
+
+ 
 
     def par_fun(self, inputs):
         """Helper method for the grid point parallelization procedure.
@@ -739,7 +758,7 @@ class GradientInference:
 
         return Q, lower_bound, q_func #logL
     
-    def _fit(self,model,search_data,EPS=1e-15,num_cores=1): # ****** FILL IN ******
+    def _fit(self,model,search_data,EPS=1e-15,num_cores=1): 
         """Update posterior p(z=k|x).
 
         Parameters
@@ -768,7 +787,7 @@ class GradientInference:
             for i in range(self.epochs):
                 log.info("EM Epoch "+str(i+1)+'/'+str(self.epochs)+': ')
 
-                Q, lower_bound, q_func = self._e_step(model,search_data) # ******** REMOVE logL, self.weights after checks done *******
+                Q, lower_bound, q_func = self._e_step(model,search_data) 
                 k_dict = self._part_search_data(search_data,Q)
 
                 self._m_step(model,k_dict,Q,num_cores=num_cores)
@@ -993,13 +1012,13 @@ class GridPointResults:
     Attributes
     ----------
     param_estimates: np.ndarray
-        optimal biological parameter values for each gene, an n_genes x n_phys_pars array.
+        optimal biological parameter values for each gene, an n_genes x n_phys_pars x k array.
     klds: np.ndarray
-        Kullback-Leibler divergence of the model for each gene at param_estimates.
+        Kullback-Leibler divergence of the model for each gene at param_estimates, n_genes x k.
     obj_func: float
-        sum of klds; total error at the current grid point.
+        sum of klds; total error at the current grid point, (k,).
     d_time: float
-        runtime in seconds.
+        runtime in seconds, (k,).
     weights: np.ndarray
         weights for mixture components (k,)
     aic: float
@@ -1007,9 +1026,9 @@ class GridPointResults:
     assigns: np.ndarray
         final k components assignments for each cell (n_cells,)
     all_qs: float list
-        all Q function values for each EM epoch
+        all Q function values for each EM epoch, list of gene x k
     all_klds: np.array list
-        all kld values for each EM epoch
+        all kld values for each EM epoch, list of gene x k
     regressor: np.ndarray
         gene-specific technical variation parameter values at the current grid point.
         these values will be different for each gene if use_lengths=True in the
@@ -1149,7 +1168,7 @@ class SearchResults:
     ####################################
     #   Construction and I/O methods   #
     ####################################
-    def __init__(self, inference_parameters, search_data):
+    def __init__(self, inference_parameters, search_data, assign): #pass in assign
         """Creates a SearchResults object.
 
         Parameters
@@ -1167,7 +1186,8 @@ class SearchResults:
 
         # pull in small amount of non-cell-specific info from search data
         self.n_genes = search_data.n_genes
-        self.n_cells = search_data.n_cells
+        self.n_cells = search_data.n_cells 
+        self.assign = assign
         self.gene_log_lengths = search_data.gene_log_lengths
         self.gene_names = search_data.gene_names
 
@@ -1176,17 +1196,29 @@ class SearchResults:
         self.obj_func = []
         self.d_time = []
         self.regressor = []
+        self.assigns = assign
 
-    def aggregate_grid_points(self):
+        self.save = False #Save output if assign corresponds to a k with cells
+
+        #Add mixture properties, pass in assignment and use to filter gp results
+        self.weights = []
+        self.aic = []
+        # self.assigns = assigns #Set assign, for filename , do above, move n_cells down
+        self.all_qs = []
+        self.all_klds = []
+        self.filt = []
+
+    def aggregate_grid_points(self,clean=True):#Pass in assign and search_data, clean=False
         """This helper method concatenates all of the grid point results.
 
         The method runs append_grid_point for all grid points, then removes the original grid point files.
         """
         for point_index in range(self.sp.n_grid_points):
             self.append_grid_point(point_index)
-        self.clean_up()
+        
+        self.clean_up(clean)
 
-    def append_grid_point(self, point_index):
+    def append_grid_point(self, point_index): #Pass in assign and search_data, set new self.n_cells
         """This helper method updates the result attributes from a GridPointResult object stored on disk.
 
         Parameters
@@ -1199,30 +1231,52 @@ class SearchResults:
         )
         with open(grid_point_result_string, "rb") as ipfs:
             grid_point_results = pickle.load(ipfs)
-            self.param_estimates += [grid_point_results.param_estimates]
-            self.klds += [grid_point_results.klds]
-            self.obj_func += [grid_point_results.obj_func]
-            self.d_time += [grid_point_results.d_time]
-            self.regressor += [grid_point_results.regressor]
+            #Subset results based on assignments
+            if self.assigns in np.unique(grid_point_results.assigns):
+                self.save = True 
 
-    def clean_up(self):
+                self.param_estimates += [grid_point_results.param_estimates[:,:,self.assigns]]
+                self.klds += [grid_point_results.klds[:,self.assigns]]
+                self.obj_func += [grid_point_results.obj_func[self.assigns]]
+                self.d_time += [grid_point_results.d_time[self.assigns]]
+                self.regressor += [grid_point_results.regressor]
+
+                self.aic += [grid_point_results.aic]
+                self.weights += [grid_point_results.weights[self.assigns]]
+                self.all_qs += [grid_point_results.all_qs]
+                self.all_klds += [[i[:,self.assigns] for i in grid_point_results.all_klds]]
+
+                self.filt = grid_point_results.assigns == self.assigns
+
+                self.n_cells = np.sum(self.filt)
+           
+
+    def clean_up(self,clean=True):
         """This helper method removes temporary files and finalizes the SearchResults object.
 
         The GridPointResult objects are erased from disk, the attributes are converted to
         np.ndarrays, and a directory for analysis figures is created.
         """
-        for point_index in range(self.sp.n_grid_points):
-            os.remove(self.inference_string + "/grid_point_" + str(point_index) + ".gp")
-        log.info("All grid point data cleaned from disk.")
+        if clean:
+            for point_index in range(self.sp.n_grid_points):
+                os.remove(self.inference_string + "/grid_point_" + str(point_index) + ".gp")
+            log.info("All grid point data cleaned from disk.")
+
         self.param_estimates = np.asarray(self.param_estimates)
         self.klds = np.asarray(self.klds)
         self.obj_func = np.asarray(self.obj_func)
         self.d_time = np.asarray(self.d_time)
         self.regressor = np.asarray(self.regressor)
 
-        analysis_figure_string = self.inference_string + "/analysis_figures"
-        self.analysis_figure_string = analysis_figure_string
-        make_dir(analysis_figure_string)
+        self.aic = np.asarray(self.aic)
+        self.weights = np.asarray(self.weights)
+        self.all_qs = np.asarray(self.all_qs)
+        self.all_klds = np.asarray(self.all_klds)
+
+        if self.save:
+            analysis_figure_string = self.inference_string + "/analysis_figures_"+str(self.assigns)
+            self.analysis_figure_string = analysis_figure_string
+            make_dir(analysis_figure_string)
 
     def store_on_disk(self):
         """This helper method attempts to store the SearchResults object to disk.
@@ -1232,8 +1286,9 @@ class SearchResults:
         full_result_string: str
             file location.
         """
+        
         try:
-            full_result_string = self.inference_string + "/grid_scan_results.res"
+            full_result_string = self.inference_string + "/grid_scan_results_"+str(self.assigns)+".res" #Add assign
             with open(full_result_string, "wb") as srfs:
                 pickle.dump(self, srfs)
             log.debug("Grid scan results stored to {}.".format(full_result_string))
@@ -1257,7 +1312,7 @@ class SearchResults:
             file location.
         """
         try:
-            upd_result_string = self.inference_string + "/grid_scan_results_upd.res"
+            upd_result_string = self.inference_string + "/grid_scan_results_"+str(self.assigns)+"_upd.res"
             with open(upd_result_string, "wb") as srfs:
                 pickle.dump(self, srfs)
             log.debug("Updated results stored to {}.".format(upd_result_string))
@@ -1271,6 +1326,92 @@ class SearchResults:
     ####################################
     #         Analysis methods         #
     ####################################
+
+    def _subset_search_data(self,search_data,EPS=1e-6,padding=None):
+        """Returns search_data counts after in specified cluster.
+
+        Parameters
+        ----------
+        search_data: monod.extract_data.SearchData
+            SearchData object with the data to fit.
+        assign: int
+            Which of the k clusters to select cells from
+
+        Returns
+        ----------
+        SearchData object
+            SearchData object for cells in assigned k (self.assigns)
+        """
+        layers = search_data.layers[:,:,self.filt]
+        n_cells = self.n_cells
+
+        gene_names = search_data.gene_names
+        n_genes = len(gene_names)
+
+        S = layers[1,:,:]
+        U = layers[0,:,:]
+        l = [U,S]
+        if padding is None:
+            padding = np.asarray([10] * len(l))
+
+        M = np.amax(l, axis=2) + padding[:, None]
+
+        hist = []
+        moments = []
+        for gene_index in range(n_genes):
+            if search_data.hist_type == "grid":
+                H, xedges, yedges = np.histogramdd(
+                    *[x[gene_index] for x in l],
+                    bins=[np.arange(x[gene_index] + 1) - 0.5 for x in M],
+                    density=True
+                )
+            elif search_data.hist_type == "unique":
+                unique, unique_counts = np.unique(
+                    np.vstack([x[gene_index] for x in l]).T, axis=0, return_counts=True
+                )
+                frequencies = unique_counts / n_cells
+                unique = unique.astype(int)
+                H = (unique, frequencies)
+
+            hist.append(H)
+
+            moments.append(
+                {
+                    "S_mean": S[gene_index].mean(),
+                    "U_mean": U[gene_index].mean(),
+                    "S_var": S[gene_index].var(),
+                    "U_var": U[gene_index].var(),
+                }
+            )
+        
+
+        #Remake SearchData object
+        attr_names = [
+            "M",
+            "hist",
+            "moments",
+            "gene_log_lengths",
+            "n_genes",
+            "gene_names",
+            "n_cells",
+            "layers",
+            "hist_type",
+        ]
+
+        
+        sub_data = SearchData(
+            attr_names,
+            M,
+            hist,
+            moments,
+            search_data.gene_log_lengths,
+            n_genes,
+            gene_names,
+            n_cells,
+            layers,
+            search_data.hist_type,
+        )
+        return sub_data
 
     def find_sampling_optimum(self, gene_filter=None, discard_rejected=False):
         """Identify and set the technical parameter optimum by minimizing the total KLD.
@@ -1596,7 +1737,7 @@ class SearchResults:
 
         """
         t1 = time.time()
-
+        search_data =  self._subset_search_data(search_data)
         hist_type = get_hist_type(search_data)
 
         csqarr = []
@@ -1746,6 +1887,7 @@ class SearchResults:
         import numdifftools  # this will fail if numdifftools has not been evaluted.
 
         gene_index, search_data = inputs
+        search_data = self._subset_search_data(search_data)
         hist_type = get_hist_type(search_data)
         # if hasattr(search_data, "hist_type") and search_data.hist_type == "unique":
         #     hist_type = "unique"
@@ -1978,6 +2120,8 @@ class SearchResults:
         overwrite: bool, optional
             whether to retain the optimum obtained at the end of the procedure.
         """
+        search_data = self._subset_search_data(search_data)
+
         if viz:
             fig1, ax1 = plt.subplots(nrows=szfig[0], ncols=szfig[1], figsize=figsize)
         log.info(
@@ -2203,6 +2347,8 @@ class SearchResults:
             else:
                 logscale = False
 
+        search_data = self._subset_search_data(search_data)
+
         (nrows, ncols) = sz
         fig1, ax1 = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize)
 
@@ -2285,6 +2431,8 @@ class SearchResults:
         Output:
         logL: a vector of size n_genes containing model log-likelihoods.
         """
+        search_data = self._subset_search_data(search_data)
+
         hist_type = get_hist_type(search_data)
         logL = np.zeros(self.n_genes)
         for gene_index in range(self.n_genes):
