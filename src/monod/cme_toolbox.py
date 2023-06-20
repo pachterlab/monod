@@ -202,7 +202,7 @@ class CMEModel:
             numpars += 2
         return numpars
 
-    def eval_model_logL(self, p, limits, samp, data, hist_type="unique", EPS=1e-15):
+    def eval_model_logL(self, p, limits, samp, data,n_cells, hist_type="unique", EPS=1e-15):
         """Compute the log-likelihood of data under a set of parameters.
 
         Parameters
@@ -241,7 +241,7 @@ class CMEModel:
             proposal = self.eval_model_pss(p, limits, samp)
             proposal[proposal < EPS] = EPS
             proposal = proposal[tuple(x.T)]
-            logL = np.log(proposal)
+            logL = np.log(proposal)*f*n_cells
             return np.sum(logL)
 
     def eval_model_kld(self, p, limits, samp, data, hist_type="unique", EPS=1e-15):
