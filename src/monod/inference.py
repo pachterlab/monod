@@ -1983,3 +1983,4 @@ def plot_hist_and_fit(
     )
     ax1.plot(np.arange(sd.M[lind, i_]), Pa, color=fitcolor, linestyle=linestyle)
     ax1.set_xlim([-0.5, sd.layers[lind, i_].max() + 2.5])
+
