@@ -10,7 +10,8 @@ from scipy import integrate
 
 from scipy.fft import irfftn
 
-from .nn_toolbox import bursty_none, bursty_none_grid, bursty_none_10, bursty_none_grid_10
+from .nn_toolbox import bursty_none_grid_nn_10, bursty_none_logL_microstate, bursty_none_grid_microstate
+
 
 
 class CMEModel:
@@ -51,10 +52,13 @@ class CMEModel:
         quadrature method to use.
         if 'fixed_quad', use Gaussian quadrature via scipy.integrate.fixed_quad.
         if 'quad_vec', use adaptive integration via scipy.integrate.quad_vec.
-        if 'nn_10', use the neural KWR approximator with 10 basis functions.
-    use_grid: bool
-        whether to evaluate model_pss over grid or for individual microstates.
-        only an option when 'quad_method' is 'nn_10' or 'nn'. 
+        if 'nn_10', use KWR neural network with 10 basis functions. 
+        if 'nn_microstate', use microstate neural network. 
+        if 'nn_custom', use an input custom neural network.
+        
+    FOR TESTING DIFFERENT MODELS: 
+    likelihood_function : the likelihood function to use 
+
     """
 
     def __init__(
@@ -66,7 +70,9 @@ class CMEModel:
         fixed_quad_T=10,
         quad_order=60,
         quad_vec_T=np.inf,
-        use_grid=True
+        # NEW for testing out different models
+        bursty_none_logL_custom = None,
+        bursty_none_grid_custom = None,
     ):
         """Initialize the CMEModel instance.
 
@@ -89,16 +95,19 @@ class CMEModel:
             quadrature method to use.
             if 'fixed_quad', use Gaussian quadrature via scipy.integrate.fixed_quad.
             if 'quad_vec', use adaptive integration via scipy.integrate.quad_vec.
-            if 'nn_10', use the neural KWR approximator with 10 basis functions.
+            if 'nn_10', use the neural network with 10 npdf trained on normalized KLD between distributions. 
+            if 'nn_microstate', use the neural network trained on hellinger distance between joint microstates (unnormalized). 
+            if 'nn_custom', use the logL and KLD functions passed in. 
         fixed_quad_T: float, optional
             time horizon used for integration with Gaussian quadature.
         quad_order: int, optional
             Gaussian quadrature order.
         quad_vec_T: float or np.inf, optional
             time horizon used for adaptive integration.
-        use_grid: bool
-            whether to evaluate model_pss over grid or for individual microstates.
-            only an option when 'quad_method' is 'nn_10' or 'nn'. 
+        bursty_none_logL_custom:
+            function to solve for log likelihood function is using a neural network method. 
+        bursty_none_grid_custom:
+            function to solve PSS over grid if using a neural network method.
         """
         self.bio_model = bio_model
         self.available_biomodels = (
@@ -112,16 +121,27 @@ class CMEModel:
         self.available_seqmodels = ("None", "Bernoulli", "Poisson")
         self.available_ambmodels = ("None", "Equal", "Unequal")
         self.amb_model = amb_model
+        self.quad_method = quad_method
         if seq_model in ["None", None, "Null"]:
             self.seq_model = "None"
         else:
             self.seq_model = seq_model
         self.set_integration_parameters(
-            fixed_quad_T, quad_order, quad_vec_T, quad_method, use_grid
+            fixed_quad_T, quad_order, quad_vec_T, quad_method
         )
+        
+        if self.quad_method == 'nn_10':
+            self.bursty_none_logL_custom = None
+            self.bursty_none_grid_custom = bursty_none_grid_nn_10
+        elif self.quad_method == 'nn_microstate':
+            self.bursty_none_logL_custom = bursty_none_logL_microstate
+            self.bursty_none_grid_custom = bursty_none_grid_microstate
+        else:
+            self.bursty_none_logL_custom = bursty_none_logL_custom
+            self.bursty_none_grid_custom = bursty_none_grid_custom
 
     def set_integration_parameters(
-        self, fixed_quad_T, quad_order, quad_vec_T, quad_method, use_grid
+        self, fixed_quad_T, quad_order, quad_vec_T, quad_method
     ):
         """Set quadrature parameters.
 
@@ -137,21 +157,14 @@ class CMEModel:
             quadrature method to use.
             if 'fixed_quad', use Gaussian quadrature via scipy.integrate.fixed_quad.
             if 'quad_vec', use adaptive integration via scipy.integrate.quad_vec.
-        use_grid: bool
-            whether to evaluate model_pss over grid or for individual microstates.
-            only an option when 'quad_method' is 'nn_10' or 'nn'.
+            if 'nn_10', use KWR neural network with 10 npdf.
+            if 'nn_microstate', use microstate neural network. 
+            if 'nn_custom', use custom input neural network. 
         """
         self.fixed_quad_T = fixed_quad_T
         self.quad_order = quad_order
         self.quad_vec_T = quad_vec_T
         self.quad_method = quad_method
-        self.use_grid = use_grid
-        if self.use_grid:
-            print('GRID EVALUATION IS SET')
-        if ('nn' not in self.quad_method) and (not self.use_grid):
-            raise ValueError(
-                f"Microstate evaluation not supported for {self.quad_method}. Please set use_grid = True."
-                )
 
     def get_log_name_str(self):
         """Return the names of log-parameters for the model instance.
@@ -202,7 +215,7 @@ class CMEModel:
             numpars += 2
         return numpars
 
-    def eval_model_logL(self, p, limits, samp, data, hist_type="unique", EPS=1e-15):
+    def eval_model_logL(self, p, limits, samp, data, n_cells, hist_type="unique", EPS=1e-15):
         """Compute the log-likelihood of data under a set of parameters.
 
         Parameters
@@ -210,8 +223,7 @@ class CMEModel:
         p: np.ndarray
             log10 biological parameters.
         limits: list of int
-            grid size for PMF evaluation, size n_species, if applicable.
-            BYPASSED if a neural approximator is used for self.quad_method and self.use_grid = False. 
+            grid size for PMF evaluation, size n_species.
         samp: None or np.ndarray
             sampling parameters, if applicable.
         data: tuple or np.ndarray
@@ -237,20 +249,29 @@ class CMEModel:
             # proposal = proposal[filt]
             # d = data * np.log(data / proposal)
             # return np.sum(d)
-        elif (hist_type == "unique") and (self.use_grid):
+        elif hist_type == "unique":
             x, f = data
-            proposal = self.eval_model_pss(p, limits, samp)
-            proposal[proposal < EPS] = EPS
-            proposal = proposal[tuple(x.T)]
-            logL = np.log(proposal)
-            return np.sum(logL)
-        elif (hist_type == "unique") and (not self.use_grid):
-            x, f = data
-            proposal = self.eval_model_pss(p, x = x, limits = None, samp = samp)
-            proposal[proposal < EPS] = EPS
-            logL = np.log(proposal)
-            return np.sum(logL)
-            
+            if (
+                (self.quad_method != "nn_custom")
+                and (self.quad_method != "nn_microstate")
+            ):
+                proposal = self.eval_model_pss(p, limits, samp)
+                proposal[proposal < EPS] = EPS
+                proposal = proposal[tuple(x.T)]
+                logL = np.log(proposal)*f*n_cells
+                return np.sum(logL)
+            elif (
+                (self.quad_method == "nn_custom" or self.quad_method == "nn_microstate")
+                and (self.bio_model == "Bursty")
+                and (self.seq_model == "None")
+            ):
+                #cneural JOINT method microstate timing
+                log_EPS = np.log(EPS)
+                log_proposal = self.bursty_none_logL_custom(p,x)
+                log_proposal[log_proposal < log_EPS] = log_EPS 
+                logL = log_proposal*f*n_cells
+
+                return np.sum(logL)
 
     def eval_model_kld(self, p, limits, samp, data, hist_type="unique", EPS=1e-15):
         """Compute the Kullback-Leibler divergence between data and a fit.
@@ -261,7 +282,6 @@ class CMEModel:
             log10 biological parameters.
         limits: list of int
             grid size for PMF evaluation, size n_species.
-            BYPASSED if a neural approximator is used for self.quad_method and self.use_grid = False. 
         samp: None or np.ndarray
             sampling parameters, if applicable.
         data: tuple or np.ndarray
@@ -272,6 +292,8 @@ class CMEModel:
             "unique" is the preferred method for histogram generation, as it requires less memory to store.
         EPS: float, optional
             minimum allowed proposal probability mass. anything below this value is rounded up to EPS.
+            
+        Note: if quad method is nn_microstate, it will use microstate timing. 
 
         Returns
         -------
@@ -286,51 +308,28 @@ class CMEModel:
             proposal = proposal[filt]
             d = data * np.log(data / proposal)
             return np.sum(d)
-        elif (hist_type == "unique") and (self.use_grid):
+        elif hist_type == "unique":
             x, f = data
-            proposal = self.eval_model_pss(p, limits, samp)
-            proposal[proposal < EPS] = EPS
-            proposal = proposal[tuple(x.T)]
-            d = f * np.log(f / proposal)
-            return np.sum(d)
-        elif (hist_type == "unique") and (not self.use_grid):
-            x, f = data
-            proposal = self.eval_model_pss(p, limits = None, samp = samp, x = x)
-            proposal[proposal < EPS] = EPS
-            d = f * np.log(f / proposal)
-            return np.sum(d)
-            
-#             if (
-#                 (self.quad_method == "nn")
-#                 and (self.bio_model == "Bursty")
-#                 and (self.seq_model == "None")
-#             ):
-                #neural method
-#                 log_EPS = np.log(EPS)
-#                 log_proposal = bursty_none_logL(p,x)
-#                 log_proposal[log_proposal < log_EPS] = log_EPS # <--- May be unnecessary.
-#                 d = f * (np.log(f) - log_proposal) # <--- I believe it's correct.
-#                 return np.sum(d)
-#             elif (
-#                 (self.quad_method == "nn_10")
-#                 and (self.bio_model == "Bursty")
-#                 and (self.seq_model == "None")
-#             ):
-#                 #neural method
-#                 log_EPS = np.log(EPS)
-#                 log_proposal = bursty_none_logL_10(p,x)
-#                 log_proposal[log_proposal < log_EPS] = log_EPS # <--- May be unnecessary.
-#                 d = f * (np.log(f) - log_proposal) # <--- I believe it's correct.
-#                 return np.sum(d)
-#             else:
-#                 #non-neural method
-#                 proposal = self.eval_model_pss(p, limits, samp)
-#                 proposal[proposal < EPS] = EPS
-#                 proposal = proposal[tuple(x.T)]
-#                 d = f * np.log(f / proposal)
-#                 return np.sum(d)
+            if (
+                (self.quad_method == "nn_custom" or self.quad_method == "nn_microstate")
+                and (self.bio_model == "Bursty")
+                and (self.seq_model == "None")
+            ):
+                # neural method, MICROSTATE
+                log_EPS = np.log(EPS)
+                log_proposal = self.bursty_none_logL_custom(p,x)
+                log_proposal[log_proposal < log_EPS] = log_EPS # <--- May be unnecessary.
+                d = f * (np.log(f) - log_proposal) # <--- I believe it's correct.
+                return np.sum(d)
+            else:
+                # non-neural method OR nn_10, which only has support on grid
+                proposal = self.eval_model_pss(p, limits, samp)
+                proposal[proposal < EPS] = EPS
+                proposal = proposal[tuple(x.T)]
+                d = f * np.log(f / proposal)
+                return np.sum(d)
 
-    def eval_model_pss(self, p, limits, samp = None, x = None):
+    def eval_model_pss(self, p, limits, samp=None):
         """Evaluate the PMF of the model over a grid at a set of parameters.
 
         Parameters
@@ -339,40 +338,23 @@ class CMEModel:
             log10 biological parameters.
         limits: list of int
             grid size for PMF evaluation, size n_species.
-            BYPASSED if a neural approximator is used for self.quad_method and self.use_grid = False. 
         samp: None or np.ndarray, optional
             sampling parameters, if applicable.
-        x : np.ndarray
-            microstates over which to evaluate PMF, size number of unique microstates, if applicable.
-            only necessary when a neural approximator is used for self.quad_method and self.use_grid = True. 
 
         Returns
         -------
         Pss: np.ndarray
-            the steady-state model PMF over a grid size limits[0] by limits[1] if self.use_grid = True.
-            the steady-state model PMF over microstates if self.use_grid = False. 
+            the steady-state model PMF over a grid.
         """
+        # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
+        # It will be implemented in a future version.
 
         if (
-            (self.quad_method == "nn")
+            ("nn" in self.quad_method)
             and (self.bio_model == "Bursty")
             and (self.seq_model == "None")
         ):
-            return bursty_none_grid(p, limits)
-        elif (
-            (self.quad_method == "nn_10")
-            and (self.bio_model == "Bursty")
-            and (self.seq_model == "None")
-            and (self.use_grid)
-        ):
-            return bursty_none_grid_10(p,limits)
-        elif (
-            (self.quad_method == "nn_10")
-            and (self.bio_model == "Bursty")
-            and (self.seq_model == "None")
-            and (not self.use_grid)
-        ):
-            return bursty_none_10(p,x)
+            return self.bursty_none_grid_custom(p, limits)
         else:
 
             if (self.amb_model != "None") and (len(limits) == 2):
