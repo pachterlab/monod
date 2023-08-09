@@ -1133,6 +1133,20 @@ class SearchResults:
         an n_grid_pts x n_genes array.
         these values will be different for each gene if use_lengths=True in the
         InferenceParameters constructor.
+    weights: float 
+        weight of mixture component for assigned cluster (k)
+    aic: float
+        negative AIC score for the final model fit (over all cells)
+    assigns: int
+        assigned cluster k
+    all_qs: float np.ndarray
+        array of Q function values at each epoch (over all cells)
+    all_kld: float np.ndarray
+        array of KLD values at each epoch (over cells in cluster k)
+    filt: boolean np.array
+        boolean filter array for cells in assigned cluster k (i.e. k=assigns)
+    save: boolean
+        boolean to save SearchResults object to disk
     analysis_figure_string: str
         directory for analysis figures.
 
