@@ -301,7 +301,7 @@ class CMEModel:
             d = f * np.log(f / proposal)
             return np.sum(d)
 
-    def eval_model_pss(self, p, limits, samp=None):
+    def eval_model_pss(self, p, limits, samp=None, T=None):
         """Evaluate the PMF of the model over a grid at a set of parameters.
 
         Parameters
@@ -312,22 +312,14 @@ class CMEModel:
             grid size for PMF evaluation, size n_species.
         samp: None or np.ndarray, optional
             sampling parameters, if applicable.
+        T: None or float, optional
+            integration upper bound. Only used for bursty model.
 
         Returns
         -------
         Pss: np.ndarray
             the steady-state model PMF over a grid.
         """
-        # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
-        # It will be implemented in a future version.
-
-        # if (
-        #     (self.quad_method == "nn")
-        #     and (self.bio_model == "Bursty")
-        #     and (self.seq_model == "None")
-        # ):
-        #     return basic_ml_bivariate(p, limits)
-        # else:
 
         if (self.amb_model != "None") and (len(limits) == 2):
             raise ValueError("Please specify a limit for the ambiguous species.")
@@ -372,7 +364,7 @@ class CMEModel:
                 )
             )
 
-        gf = self.eval_model_pgf(p, g)
+        gf = self.eval_model_pgf(p, g, T)
         gf = np.exp(gf)
         gf = gf.reshape(tuple(mx))
         Pss = irfftn(gf, s=tuple(limits))
@@ -380,7 +372,7 @@ class CMEModel:
         Pss = Pss.squeeze()
         return Pss
 
-    def eval_model_pgf(self, p_, g):
+    def eval_model_pgf(self, p_, g, T=None):
         """Evaluate the log-PGF of the model over the complex unit sphere at a set of parameters.
 
         Parameters
@@ -403,10 +395,11 @@ class CMEModel:
             b, beta, gamma = p
             fun = lambda x: self.burst_intfun(x, g, b, beta, gamma)
             if self.quad_method == "quad_vec":
-                T = self.quad_vec_T * (1 / beta + 1 / gamma + 1)
+                T = self.quad_vec_T * (1 / beta + 1 / gamma + 1) if (T is None) else T
                 gf = scipy.integrate.quad_vec(fun, 0, T)[0]
             elif self.quad_method == "fixed_quad":
-                T = self.fixed_quad_T * (1 / beta + 1 / gamma + 1)
+                # T = self.fixed_quad_T * (1 / beta + 1 / gamma + 1)
+                T = self.fixed_quad_T * (1 / beta + 1 / gamma + 1) if (T is None) else T
                 gf = scipy.integrate.fixed_quad(fun, 0, T, n=self.quad_order)[0]
             else:
                 raise ValueError("Please use one of the specified quadrature methods.")
