@@ -274,17 +274,6 @@ class InferenceParameters:
         log.info("Non-parallelized grid scan complete.")
 
 
-        # # ****** UNCOMMENT WHEN READY TO UPDATE CODE ******  
-        # warnings.resetwarnings()
-        # results = SearchResults(self, search_data)
-        # results.aggregate_grid_points()
-        # full_result_string = results.store_on_disk()
-
-        # t2 = time.time()
-        # log.info("Runtime: {:.1f} seconds.".format(t2 - t1))
-        # return full_result_string
-
-
         #Loop through assignments, and save each k results
         warnings.resetwarnings()
         full_result_strings = []
@@ -481,6 +470,9 @@ class GradientInference:
             k, kld sums
         t: np.ndarray
             k, d_times
+        self.weights:
+            k, mixture weights 
+
         """
         theta = self.theta.copy()
         params = np.zeros((search_data.n_genes,self.n_phys_pars,self.k))
@@ -495,7 +487,7 @@ class GradientInference:
             obj[k] = obj_func
             t[k] = d_time
 
-        return params, kl, obj, t, self.weights.copy()  #****** REMOVE LAST TWO******
+        return params, kl, obj, t, self.weights.copy()  
     
     def _initialize_Q(self,search_data):
         """Initialize posterior values p(z=k|x).
@@ -513,7 +505,7 @@ class GradientInference:
         """
         n = search_data.n_cells
 
-        #Test init Q with S
+        #Init Q with S K-Means clusters for now
         S = search_data.layers[1,:,:]
         S_t = S.T
         tots = np.sum(S_t,axis=1)
@@ -523,18 +515,12 @@ class GradientInference:
 
         kmeans = KMeans(n_clusters=self.k, random_state=0).fit(S_t)
         labs = kmeans.labels_
-        #corrs = np.corrcoef(S.T) #cellxcell (COV)
-        # cos = cosine_similarity(S.T) - np.eye(S.shape[1]) 
-        # clustering = SpectralClustering(self.k,affinity='precomputed',assign_labels='discretize').fit(cos)
-        # labs = clustering.labels_
 
         #Bias Q towards initial cluster assignments
         Q=np.random.uniform(0,1,size=(n, self.k))
         for ind in range(self.k):
             inds = labs==ind
             Q[inds,ind] = 0.9
-
-        #Q=np.random.uniform(0,1,size=(n, self.k))
         
         Q *= self.weights[None,:]
         Q=Q/Q.sum(axis=(-1),keepdims=True)
@@ -684,7 +670,7 @@ class GradientInference:
             out_keys, out_params = zip(*all_outs)
             
             for o in range(len(out_keys)):
-                self.theta[out_keys[o]] = out_params[o]  #Update only relevant ks
+                self.theta[out_keys[o]] = out_params[o]  #Update only relevant/assigned ks
         else:
             all_outs = [self.iterate_over_genes(model, k_dict[key]) for key in list(k_dict.keys())] 
             for o in range(len(list(k_dict.keys()))):
@@ -751,12 +737,12 @@ class GradientInference:
                 logL[:,k] = logL_k
 
             logL += np.log(self.weights)[None,:]
-            Q = softmax(logL, axis=1)
+            Q = softmax(logL, axis=1) #Posterior
             lower_bound = np.mean(logsumexp(a=logL, axis=1))
-            q_func = np.sum(Q*logL) #p(x,z;theta), maybe make indicator function?
+            q_func = np.sum(Q*logL) #Full EM Q-function (Q(theta|theta_t))
 
 
-        return Q, lower_bound, q_func #logL
+        return Q, lower_bound, q_func 
     
     def _fit(self,model,search_data,EPS=1e-15,num_cores=1): 
         """Update posterior p(z=k|x).
@@ -774,6 +760,10 @@ class GradientInference:
             obs x k mixture components for p(z=k|x)
         lower_bound: float
             log-likelihood lower bound
+        all_qs: list
+            1 x epochs, list of Q(theta|theta_t) values at each epoch
+        all_klds: list
+            1 x epochs, list of cellxk KLD matrices at each epoch
 
         """
 
@@ -798,7 +788,7 @@ class GradientInference:
                    
                 all_klds += [kl]
                 print('mstep self.weights: ', self.weights)
-                print('Q Function: ', q_func) #was logL
+                print('Q Function: ', q_func) 
                 print()
                 all_qs += [q_func]
             
@@ -851,7 +841,7 @@ class GradientInference:
                 ]
             )
             warnings.resetwarnings()
-            x0[0] = param_MoM[gene_index] #self.param_MoM[gene_index]  # ****** MAYBE CHANGE TO BASED ON SEARCH_DATA *****
+            x0[0] = param_MoM[gene_index] #self.param_MoM[gene_index] 
         x = x0[0]
         err = np.inf
         ERR_THRESH = 0.99
@@ -862,7 +852,7 @@ class GradientInference:
         for restart in range(self.gradient_params["num_restarts"]):
             res_arr = scipy.optimize.minimize(
                 lambda x: model.eval_model_kld(
-                    p=x,  # limits=[search_data.M[gene_index],search_data.N[gene_index]],\
+                    p=x,  
                     limits=search_data.M[:, gene_index],
                     samp=self.regressor[gene_index],
                     data=search_data.hist[gene_index],
@@ -1182,7 +1172,7 @@ class SearchResults:
     ####################################
     #   Construction and I/O methods   #
     ####################################
-    def __init__(self, inference_parameters, search_data, assign): #pass in assign
+    def __init__(self, inference_parameters, search_data, assign): 
         """Creates a SearchResults object.
 
         Parameters
@@ -1210,19 +1200,19 @@ class SearchResults:
         self.obj_func = []
         self.d_time = []
         self.regressor = []
-        self.assigns = assign
+        self.assigns = assign #Which state or mixture component k
 
         self.save = False #Save output if assign corresponds to a k with cells
 
         #Add mixture properties, pass in assignment and use to filter gp results
         self.weights = []
         self.aic = []
-        # self.assigns = assigns #Set assign, for filename , do above, move n_cells down
+        
         self.all_qs = []
         self.all_klds = []
         self.filt = []
 
-    def aggregate_grid_points(self,clean=True):#Pass in assign and search_data, clean=False
+    def aggregate_grid_points(self,clean=True):
         """This helper method concatenates all of the grid point results.
 
         The method runs append_grid_point for all grid points, then removes the original grid point files.
@@ -1232,7 +1222,7 @@ class SearchResults:
         
         self.clean_up(clean)
 
-    def append_grid_point(self, point_index): #Pass in assign and search_data, set new self.n_cells
+    def append_grid_point(self, point_index): 
         """This helper method updates the result attributes from a GridPointResult object stored on disk.
 
         Parameters
@@ -1302,7 +1292,7 @@ class SearchResults:
         """
         
         try:
-            full_result_string = self.inference_string + "/grid_scan_results_"+str(self.assigns)+".res" #Add assign
+            full_result_string = self.inference_string + "/grid_scan_results_"+str(self.assigns)+".res" #Add assign, which k component
             with open(full_result_string, "wb") as srfs:
                 pickle.dump(self, srfs)
             log.debug("Grid scan results stored to {}.".format(full_result_string))
