@@ -652,13 +652,13 @@ class GradientInference:
         if num_cores > 1: # ****** PARALLELIZE *****
             ks = len(list(k_dict.keys()))
 
-            log.info("Starting parallelized MLE param fits for EM.") 
+            log.info("Starting parallelized MLE param fits for EM.")  #[k_dict] * ks
             all_outs = parallelize(
                 function=self._m_par_fun,
                 iterable=zip(
                     [model] * ks,
                     list(k_dict.keys()),
-                    [k_dict] * ks,
+                    [k_dict[k] for k in k_dict.keys()],
                 ),
                 num_cores=num_cores,
                 num_entries=ks,
@@ -691,8 +691,8 @@ class GradientInference:
             entry 2: list of dicts
                 list of dicts with SearchData obj for each k component
         """
-        model, key, k_dict = inputs
-        return key, self.iterate_over_genes(model, k_dict[key])
+        model, key, k_dict = inputs #k_dict[key]
+        return key, self.iterate_over_genes(model, k_dict)
 
     
     def _e_step(self,model,search_data,EPS=1e-15): 
