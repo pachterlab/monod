@@ -657,7 +657,7 @@ def identify_annotated_genes(gene_names, feat_dict):
     n_gen_tot = len(gene_names)
     sel_ind_annot = [k for k in range(len(gene_names)) if gene_names[k] in feat_dict]
 
-    NAMES = [gene_names[k] for k in range(len(sel_ind_annot))]
+    NAMES = [gene_names[k] for k in sel_ind_annot]
     COUNTS = collections.Counter(NAMES)
     sel_ind = [x for x in sel_ind_annot if COUNTS[gene_names[x]] == 1]
 
