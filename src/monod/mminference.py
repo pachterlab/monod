@@ -512,6 +512,7 @@ class GradientInference:
         divids = (1e4/tots)[:,None]
         S_t = S_t*divids
         S_t = np.log1p(S_t)
+        S_t[np.isnan(S_t)] = 0
 
         kmeans = KMeans(n_clusters=self.k, random_state=0).fit(S_t)
         labs = kmeans.labels_
