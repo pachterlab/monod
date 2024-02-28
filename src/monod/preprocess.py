@@ -48,12 +48,12 @@ def construct_batch(
     seed=2813308004,
     viz=True,
     filt_param={
-        "min_U_mean": 0.01,
-        "min_S_mean": 0.01,
-        "max_U_max": 400,
-        "max_S_max": 400,
-        "min_U_max": 3,
-        "min_S_max": 3,
+        "min_mod1_mean": 0.01,
+        "min_mod2_mean": 0.01,
+        "max_mod1_max": 400,
+        "max_mod2_max": 400,
+        "min_mod1_max": 3,
+        "min_mod2_max": 3,
     },
     attribute_names=[("unspliced", "spliced"), "gene_name", "barcode"],
     meta="batch",
@@ -90,9 +90,10 @@ def construct_batch(
         whether to visualize and store spliced and unspliced count statistics.
     filt_param: dict, optional
         parameters used to select genes with sufficient data to fit.
-        'min_U_mean' and 'min_S_mean': lowest allowable count mean.
-        'max_U_max' and 'max_S_max': highest allowable count maximum.
-        'min_U_max' and 'min_S_max': lowest allowable count maximum.
+        N.B. mod1 is usually unspliced, mod2 usually spliced.
+        'min_mod1_mean' and 'min_mod2_mean': lowest allowable count mean.
+        'max_mod1_max' and 'max_mod2_max': highest allowable count maximum.
+        'min_mod1_max' and 'min_mod2_max': lowest allowable count maximum.
     attribute_names: length-3 tuple, optional
         entry 0: layers to use (typically 'unspliced' and 'spliced').
         entry 1: variable name (typically 'gene_name')
@@ -183,12 +184,13 @@ def construct_batch(
         # initialize the gene length array.
         len_arr = np.array([transcriptome_dict[k] for k in gene_names])
 
-        S = layers[1]
-        U = layers[0]
-        gene_exp_filter = threshold_by_expression(S, U, filt_param)
+        mod2 = layers[1] # usually spliced
+        mod1 = layers[0] # usually unspliced
+        gene_exp_filter = threshold_by_expression(mod2, mod1, filt_param)
+        
         if viz:
-            var_name = ("S", "U")
-            var_arr = (S.mean(1), U.mean(1))
+            var_name = attribute_names[0] # e.g. ("S", "U")
+            var_arr = (mod2.mean(1), mod1.mean(1))
 
             fig1, ax1 = plt.subplots(nrows=1, ncols=2, figsize=(12, 4))
             for i in range(2):
@@ -365,17 +367,17 @@ def filter_by_gene(filter, *args):
         out += [arg[filter].squeeze()]
     return tuple(out)
 
-
+## TODO: this would need adaptation for >2 modalities.
 def threshold_by_expression(
-    S,
-    U,
+    mod2,
+    mod1,
     filt_param={
-        "min_U_mean": 0.01,
-        "min_S_mean": 0.01,
-        "max_U_max": 350,
-        "max_S_max": 350,
-        "min_U_max": 4,
-        "min_S_max": 4,
+        "min_mod1_mean": 0.01,
+        "min_mod2_mean": 0.01,
+        "max_mod1_max": 350,
+        "max_mod2_max": 350,
+        "min_mod1_max": 4,
+        "min_mod2_max": 4,
     },
 ):
     """Convenience function for filtering genes.
@@ -386,29 +388,30 @@ def threshold_by_expression(
 
     Parameters
     ----------
-    S: np.ndarray
-         genes x cells spliced count matrix.
-    U: np.ndarray
-         genes x cells unspliced count matrix.
+    mod2: np.ndarray
+         genes x cells, modality 2 (usually spliced count matrix).
+    mod1: np.ndarray
+         genes x cells, modality 1 (usually unspliced count matrix).
 
     Returns
     -------
     gene_exp_filter: bool np.ndarray
         genes that meet the expression thresholds.
     """
-    S_max = S.max(1)
-    U_max = U.max(1)
-    S_mean = S.mean(1)
-    U_mean = U.mean(1)
+    mod2_max = mod2.max(1)
+    mod1_max = mod1.max(1)
+    mod2_mean = mod2.mean(1)
+    mod1_mean = mod1.mean(1)
 
     gene_exp_filter = (
-        (U_mean > filt_param["min_U_mean"])
-        & (S_mean > filt_param["min_S_mean"])
-        & (U_max < filt_param["max_U_max"])
-        & (S_max < filt_param["max_S_max"])
-        & (U_max > filt_param["min_U_max"])
-        & (S_max > filt_param["min_S_max"])
+        (mod1_mean > filt_param["min_mod1_mean"])
+        & (mod2_mean > filt_param["min_mod2_mean"])
+        & (mod1_max < filt_param["max_mod1_max"])
+        & (mod2_max < filt_param["max_mod2_max"])
+        & (mod1_max > filt_param["min_mod1_max"])
+        & (mod2_max > filt_param["min_mod2_max"])
     )
+    
     log.info(str(np.sum(gene_exp_filter)) + " genes retained after expression filter.")
     return gene_exp_filter
 
@@ -549,24 +552,24 @@ def import_h5ad(filename, attribute_names, cf=None):
     Note row/column convention is opposite loompy.
     Conventions as in import_raw.
     """
-    spliced_layer, unspliced_layer, gene_attr, cell_attr = attribute_names
+    mod2_layer, mod1_layer, gene_attr, cell_attr = attribute_names
     warnings.filterwarnings("ignore", category=DeprecationWarning)
     ds = ad.read_h5ad(filename, backed="r")
     if cf is None:
         cf = np.ones(ds.shape[0], dtype=bool)
     # ds = ds[cf]
-    S = ds[cf].layers[spliced_layer].T
-    U = ds[cf].layers[unspliced_layer].T
-    if scipy.sparse.issparse(S):
-        S = np.asarray(S.todense())
-        U = np.asarray(U.todense())
+    mod2 = ds[cf].layers[mod2_layer].T  # usually spliced
+    mod1 = ds[cf].layers[mod1_layer].T  # usually unspliced
+    if scipy.sparse.issparse(mod2):
+        mod2 = np.asarray(mod2.todense())
+        mod1 = np.asarray(mod1.todense())
     # gene_names = ds.var[gene_attr].to_numpy()
     gene_names = ds.var_names.to_numpy()
-    nCells = S.shape[1]
+    nCells = mod2.shape[1]
     warnings.resetwarnings()
-    return S, U, gene_names, nCells
+    return mod2, mod1, gene_names, nCells
 
-
+# Since this is deprecated and assumes spliced, unspliced filenames, no need to update.
 def import_mtx(dir_name):
     """
     Imports mtx files with spliced and unspliced RNA counts via anndata object.
@@ -674,7 +677,7 @@ def identify_annotated_genes(gene_names, feat_dict):
     ann_filt[sel_ind] = True
     return ann_filt
 
-
+# same for ATAC?
 def knee_plot(X, ax1=None, thr=None, viz=False):
     """
     Plot the knee plot for a gene x cell dataset.
