@@ -189,7 +189,9 @@ def construct_batch(
         gene_exp_filter = threshold_by_expression(mod2, mod1, filt_param)
         
         if viz:
-            var_name = attribute_names[0] # e.g. ("S", "U")
+            # Use first letters of the modalities as names in visualization.
+            mod1_name, mod2_name = attribute_names[0]
+            var_name = (mod2_name[0].upper(), mod1_name[0].upper()) # e.g. ("S", "U")
             var_arr = (mod2.mean(1), mod1.mean(1))
 
             fig1, ax1 = plt.subplots(nrows=1, ncols=2, figsize=(12, 4))
