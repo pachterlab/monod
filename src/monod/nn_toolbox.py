@@ -114,14 +114,14 @@ class MLP(nn.Module):
 
 try:
     package_resources = importlib_resources.files("monod")
-    model_path = os.path.join(package_resources,'trained_models/best_model_MODEL.zip')
-    model_microstate_path = os.path.join(package_resources,"trained_models/learn_weights_scale_joint_hellinger_5npdf_2hl_512hu_100bs_0.001lr_update_256")
+    model_path = os.path.join(package_resources,'models/best_model_MODEL.zip')
+    model_microstate_path = os.path.join(package_resources,"models/learn_weights_scale_joint_hellinger_5npdf_2hl_512hu_100bs_0.001lr_update_256")
 
 except:
     import sys
-    package_resources = importlib_resources.files("trained_models")
+    package_resources = importlib_resources.files("models")
     model_path = os.path.join(package_resources,'best_model_MODEL.zip')
-    model_microstate_path = os.path.join(package_resources,"trained_models/learn_weights_scale_joint_hellinger_5npdf_2hl_512hu_100bs_0.001lr_update_256")
+    model_microstate_path = os.path.join(package_resources,"models/learn_weights_scale_joint_hellinger_5npdf_2hl_512hu_100bs_0.001lr_update_256")
 
 
 # load in model for 10 basis functions
