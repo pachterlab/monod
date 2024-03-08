@@ -356,19 +356,33 @@ class MLP_weights_scale(nn.Module):
         return w_pred,scaled_means,scaled_stds
 
 # load in microstate model
-model_microstate5 = MLP_weights_scale(input_size = 4+5*2,
-                            npdf = 5,
+# model_microstate5 = MLP_weights_scale(input_size = 4+5*2,
+#                             npdf = 5,
+#                             num_layers = 2,
+#                             num_units = 512,
+#                             activate = "relu",
+#                             final_activation = "sigmoid",
+#                             max_mv = "update",
+#                             max_val = 5.0,
+#                             )
+# model_microstate5.load_state_dict(torch.load(model_microstate_path))
+# model_microstate5.eval()
+# model_microstate5.to(torch.device(device))
+
+model_microstate3 = MLP_weights_scale(input_size = 4+3*2,
+                            npdf = 3,
                             num_layers = 2,
-                            num_units = 512,
+                            num_units = 256,
                             activate = "relu",
                             final_activation = "sigmoid",
                             max_mv = "update",
                             max_val = 5.0,
                             )
 
-model_microstate5.load_state_dict(torch.load(model_microstate_path))
-model_microstate5.eval()
-model_microstate5.to(torch.device(device))
+
+model_microstate3.load_state_dict(torch.load(model_microstate_path))
+model_microstate3.eval()
+model_microstate3.to(torch.device(device))
     
 
 
@@ -465,7 +479,7 @@ def eval_cond_P_joint_(m,weights,cond_means,cond_stds,grid):
         return(Y)
     
 
-def get_prob_joint(p,n_values,m_values,model=model_microstate5,npdf=5,grid=True):
+def get_prob_joint(p,n_values,m_values,model=model_microstate3,npdf=3,grid=True):
     
     ''' Gets probability for grid of size (len(n_values),len(m_values)) if grid == True, or individual microstates if grid == False. 
     --------------
