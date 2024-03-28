@@ -239,15 +239,14 @@ def construct_batch(
                 exp_fractions[gene_loc[0]] = 0
                 n_genes_enforced += 1
                 selected_genes_filter[gene_loc[0]] = True
-
         q = np.quantile(
-            exp_fractions, 1 - (n_genes - n_genes_enforced) / len(exp_fractions)
+		exp_fractions, 1 - (n_genes - n_genes_enforced) / len(exp_fractions)
         )
         selected_genes_filter[exp_fractions > q] = True
         np.random.seed(seed)
         random_genes = np.where(exp_fractions == q)[0]
         random_genes_sel = np.random.choice(
-            random_genes, n_genes - selected_genes_filter.sum(), replace=False
+            	random_genes, n_genes - selected_genes_filter.sum(), replace=False
         )
         selected_genes_filter[random_genes_sel] = True
 
@@ -657,7 +656,7 @@ def identify_annotated_genes(gene_names, feat_dict):
     n_gen_tot = len(gene_names)
     sel_ind_annot = [k for k in range(len(gene_names)) if gene_names[k] in feat_dict]
 
-    NAMES = [gene_names[k] for k in range(len(sel_ind_annot))]
+    NAMES = [gene_names[k] for k in sel_ind_annot]
     COUNTS = collections.Counter(NAMES)
     sel_ind = [x for x in sel_ind_annot if COUNTS[gene_names[x]] == 1]
 

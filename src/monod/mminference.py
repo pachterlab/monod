@@ -505,13 +505,15 @@ class GradientInference:
         """
         n = search_data.n_cells
 
-        #Init Q with S K-Means clusters for now
+        #Init Q with U+S K-Means clusters for now
         S = search_data.layers[1,:,:]
-        S_t = S.T
+        U = search_data.layers[0,:,:]
+        S_t = S.T+U.T
         tots = np.sum(S_t,axis=1)
         divids = (1e4/tots)[:,None]
         S_t = S_t*divids
         S_t = np.log1p(S_t)
+        S_t[np.isnan(S_t)] = 0
 
         kmeans = KMeans(n_clusters=self.k, random_state=0).fit(S_t)
         labs = kmeans.labels_
@@ -652,13 +654,13 @@ class GradientInference:
         if num_cores > 1: # ****** PARALLELIZE *****
             ks = len(list(k_dict.keys()))
 
-            log.info("Starting parallelized MLE param fits for EM.") 
+            log.info("Starting parallelized MLE param fits for EM.")  #[k_dict] * ks
             all_outs = parallelize(
                 function=self._m_par_fun,
                 iterable=zip(
                     [model] * ks,
                     list(k_dict.keys()),
-                    [k_dict] * ks,
+                    [k_dict[k] for k in k_dict.keys()],
                 ),
                 num_cores=num_cores,
                 num_entries=ks,
@@ -691,8 +693,8 @@ class GradientInference:
             entry 2: list of dicts
                 list of dicts with SearchData obj for each k component
         """
-        model, key, k_dict = inputs
-        return key, self.iterate_over_genes(model, k_dict[key])
+        model, key, k_dict = inputs #k_dict[key]
+        return key, self.iterate_over_genes(model, k_dict)
 
     
     def _e_step(self,model,search_data,EPS=1e-15): 
