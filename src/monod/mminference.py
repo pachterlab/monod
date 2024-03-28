@@ -505,9 +505,10 @@ class GradientInference:
         """
         n = search_data.n_cells
 
-        #Init Q with S K-Means clusters for now
+        #Init Q with U+S K-Means clusters for now
         S = search_data.layers[1,:,:]
-        S_t = S.T
+        U = search_data.layers[0,:,:]
+        S_t = S.T+U.T
         tots = np.sum(S_t,axis=1)
         divids = (1e4/tots)[:,None]
         S_t = S_t*divids

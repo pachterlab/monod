@@ -239,15 +239,14 @@ def construct_batch(
                 exp_fractions[gene_loc[0]] = 0
                 n_genes_enforced += 1
                 selected_genes_filter[gene_loc[0]] = True
-
         q = np.quantile(
-            exp_fractions, 1 - (n_genes - n_genes_enforced) / len(exp_fractions)
+		exp_fractions, 1 - (n_genes - n_genes_enforced) / len(exp_fractions)
         )
         selected_genes_filter[exp_fractions > q] = True
         np.random.seed(seed)
         random_genes = np.where(exp_fractions == q)[0]
         random_genes_sel = np.random.choice(
-            random_genes, n_genes - selected_genes_filter.sum(), replace=False
+            	random_genes, n_genes - selected_genes_filter.sum(), replace=False
         )
         selected_genes_filter[random_genes_sel] = True
 
