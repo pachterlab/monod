@@ -281,7 +281,9 @@ class SearchData:
         for j in range(len(input_data)):
             setattr(self, attr_names[j], input_data[j])
 
-    def get_noise_decomp(self, sizefactor="pf", lognormalize=True, pcount=0, which_variance_measure='CV2'):
+    def get_noise_decomp(
+        self, sizefactor="pf", lognormalize=True, pcount=0, which_variance_measure="CV2"
+    ):
         """
         This method performs normalization and variance stabilization on the raw data, and
         reports the fractions of normalized variance retained and removed as a result of the process.
@@ -312,13 +314,12 @@ class SearchData:
         S = np.copy(self.layers[1])
         U = np.copy(self.layers[0])
 
-        if which_variance_measure == 'CV2':
-            var_fun = lambda X: X.var(1) / (X.mean(1)**2)
-        elif which_variance_measure == 'var':
+        if which_variance_measure == "CV2":
+            var_fun = lambda X: X.var(1) / (X.mean(1) ** 2)
+        elif which_variance_measure == "var":
             var_fun = lambda X: X.var(1)
-        elif which_variance_measure == 'Fano':
+        elif which_variance_measure == "Fano":
             var_fun = lambda X: X.var(1) / (X.mean(1))
-
 
         var_S = var_fun(S)
         var_U = var_fun(U)
