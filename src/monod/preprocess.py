@@ -14,7 +14,7 @@ import warnings
 import scipy
 from scipy import sparse
 
-code_ver_global = "027"  # bumping up version April 2024
+code_ver_global = "029"  # bumping up version April 2024
 
 ########################
 ## Debug and error logging
