@@ -8,6 +8,7 @@ src/monod/cme_toolbox.py
 src/monod/drivers.py
 src/monod/extract_data.py
 src/monod/inference.py
+src/monod/mminference.py
 src/monod/plot_aesthetics.py
 src/monod/preprocess.py
 src/monod.egg-info/PKG-INFO
