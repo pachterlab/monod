@@ -80,7 +80,7 @@ class CMEModel:
         seq_model: str
             type of sequencing model describing technical variation.
         amb_model: str, optional
-            type of model describing ambiguity in RNA assignements.
+            type of model describing ambiguity in RNA assignments.
         quad_method: str, optional
             quadrature method to use.
             if 'fixed_quad', use Gaussian quadrature via scipy.integrate.fixed_quad.
@@ -100,6 +100,7 @@ class CMEModel:
             "Constitutive",
             "CIR",
             "DelayedSplicing",
+            "ProteinBursty"
         )
         self.available_seqmodels = ("None", "Bernoulli", "Poisson")
         self.available_ambmodels = ("None", "Equal", "Unequal")
@@ -169,6 +170,10 @@ class CMEModel:
             ]
         elif self.bio_model == "CIR":
             param_str += [r"$\log_{10} b$", r"$\log_{10} \beta$", r"$\log_{10} \gamma$"]
+
+        elif self.bio_model == "ProteinBursty":
+            param_str += [r"$\log_{10} b$", r"$\log_{10} \beta$", r"$\log_{10} \gamma$", r"$\log_{10} k_p$", r"$\log_{10} \gamma_p$"]
+            
         else:
             raise ValueError(
                 "Please select a biological noise model from {}.".format(
@@ -194,6 +199,8 @@ class CMEModel:
         numpars = 0
         if self.bio_model == "Constitutive":
             numpars += 2
+        elif self.bio_model == "ProteinBursty":
+            numpars += 5
         else:
             numpars += 3
         if self.amb_model == "Equal":
@@ -380,6 +387,7 @@ class CMEModel:
         Pss = Pss.squeeze()
         return Pss
 
+    # TODO: Add ProteinBursty
     def eval_model_pgf(self, p_, g):
         """Evaluate the log-PGF of the model over the complex unit sphere at a set of parameters.
 
@@ -563,6 +571,28 @@ class CMEModel:
             gamma = b / moments["S_mean"]
             x0 = np.asarray([b, beta, gamma])
 
+        if self.bio_model == "ProteinBursty":
+            try:
+                b = moments["U_var"] / moments["U_mean"] - 1
+            except:
+                b = 1  # safe for U_mean = U_var = 0
+            if self.seq_model == "Bernoulli":
+                b /= samp[0]
+            elif self.seq_model == "Poisson":
+                b = b / samp[0] - 1
+
+            b = np.clip(b, lb[0], ub[0])
+            beta = b / moments["U_mean"]
+            gamma = b / moments["S_mean"]
+
+            # TODO: add protein moments to the list of moments.
+            # Define r = k_p/gamma_p
+            r = moments["P_mean"]*gamma/b
+            C = moments["UP_covar"]
+            gamma_p = C*(beta + gamma)*beta/(b**2*r - C*(beta + gamma))
+            k_p = r*gamma_p
+            x0 = np.asarray([b, beta, gamma, k_p, gamma_p])
+
         elif self.bio_model == "Delay":
             b = moments["U_var"] / moments["U_mean"] - 1
 
@@ -626,6 +656,7 @@ class CMEModel:
             )  # last resort -- makes it nondeterministic though
         return x0
 
+    # TODO: Add ProteinBursty
     def eval_model_noise(self, p_, samp=None):
         """Compute CV2 fractions due to intrinsic, extrinsic, and technical noise.
 
