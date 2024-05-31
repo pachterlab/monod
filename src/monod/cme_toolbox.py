@@ -448,6 +448,9 @@ class CMEModel:
             else:
                 raise ValueError("Please use one of the specified quadrature methods.")
             gf /= 2
+        elif self.bio_model == "ProteinBursty":  # bursty production
+            gf = self.protein_pgf(g, p)
+
         else:
             raise ValueError(
                 "Please select a biological noise model from {}.".format(
@@ -455,6 +458,68 @@ class CMEModel:
                 )
             )
         return gf  # this is the log-generating function
+    
+    def protein_pgf(self, g, p):
+        """Evaluates the log generating function.
+
+        It is a helper function for the protein biological model.
+
+        Parameters
+        ----------
+        g: np.ndarray
+            complex PGF arguments, adjusted for sampling.
+        p: float array of length 5
+            (b, beta, gamma, k_p, gamma_p)
+
+        Returns
+        -------
+        phi: np.ndarray
+            log gf.
+        """
+        def u_tilda_ode(u, t, param):
+            """
+            Solve the characteristics ODE
+            """
+            # u (n_species, n_grids)
+            b, beta, gamma, k_p, gamma_p = param
+            du = np.zeros_like(u)
+            du[0] = beta * (u[1]-u[0])
+            du[1] = - gamma * u[1] + k_p * u[2] * (u[1]+1)
+            du[2] = - gamma_p * u[2]
+            return du
+        
+        # Vectorized RK4 implementation
+        def RK4(x, f, t, step_size, param):
+            j1 = f(x, t, param)
+            j2 = f(x + (step_size/2)*j1, t + (step_size/2), param)   
+            j3 = f(x + (step_size/2)*j2, t + (step_size/2), param)   
+            j4 = f(x + (step_size)*j3, t + (step_size), param)  
+            
+            x_new = x + (step_size/6)*(j1 + 2*j2 + 2*j3 + j4)
+            return x_new
+            
+        b, beta, gamma, k_p, gamma_p = p
+        
+        min_fudge, max_fudge = 1, 1    # Determine integration time scale
+        dt = np.min(1/params)*min_fudge
+        #t_max = np.max(1/params)*max_fudge
+        #num_tsteps = int(np.ceil(t_max/dt))
+    
+        t = 0
+        u_tilde = np.array(u, dtype=np.complex64)
+        phi = b*u_tilde[0]/(1-b*u_tilde[0])*dt/2
+        
+        # Solve ODE using RK4 method 
+        while np.max(np.abs(u_tilde))>1e-3:
+            t += dt
+            u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, params)
+            phi += b*u_tilde[0]/(1-b*u_tilde[0])*dt
+            
+        u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, params)
+        phi += b*u_tilde[0]/(1-b*u_tilde[0])*dt/2
+    
+        #gf = np.exp(phi)    # get generating function
+        return phi
 
     def cir_intfun(self, x, g, b, beta, gamma):
         """Evaluates the inverse Gaussian-driven CME process integrand at time x.
