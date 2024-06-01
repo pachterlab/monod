@@ -185,7 +185,8 @@ def construct_batch(
             # Use first letters of the modalities as names in visualization.
             # mod1_name, mod2_name = attribute_names[0]
             
-            mod_names = attribute_names[0]
+            mod_names = attribute_names[0][0]
+            print(attribute_names, mod_names)
             # var_name = (mod2_name[0].upper(), mod1_name[0].upper()) # e.g. ("S", "U")
             # NB reversed order here.
             var_name = tuple([name[0].upper() for name in mod_names[::-1]])
@@ -368,7 +369,7 @@ def filter_by_gene(filter, *args):
 
 def threshold_by_expression(
     mods,
-    filt_param = [ 'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]  },
+    filt_param = { 'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]  },
 ):
     """Convenience function for filtering genes.
 
@@ -389,7 +390,7 @@ def threshold_by_expression(
     mod_maxes = [mod.max(1) for mod in mods]
     mod_means = [mod.mean(1) for mod in mods]
     
-    gene_exp_filter = np.ones_like(mods[0], dtype=bool)
+    gene_exp_filter = np.ones_like(mods[0][:,0], dtype=bool)
 
     for i in range(len(mods)):
         gene_exp_filter &= (mod_means[i] > filt_param['min_means'][i])
