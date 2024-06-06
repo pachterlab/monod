@@ -4,14 +4,19 @@ import numpy as np
 import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
-from .preprocess import make_dir, log
-from .cme_toolbox import CMEModel  # may be unnecessary
+
+import sys
+sys.path.insert(0, '/home/cat/monod/src/monod')
+# execfile("src/monod/cme_toolbox.py")
+
+from preprocess import make_dir, log
+from cme_toolbox import CMEModel  # may be unnecessary
 import multiprocessing
 import os
 
 # lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
 import warnings
-from .plot_aesthetics import aesthetics
+from plot_aesthetics import aesthetics
 
 from tqdm import tqdm
 
@@ -59,6 +64,7 @@ class InferenceParameters:
         run-specific directory location within dataset_string.
     sampl_vals: list of lists of floats
         list of grid points.
+    
     X: np.ndarray
         grid point values representing unspliced RNA sampling parameters.
     Y: np.ndarray
@@ -144,7 +150,14 @@ class InferenceParameters:
             run_meta = "_" + run_meta
 
         self.dataset_string = dataset_string
-        inference_string = f"{dataset_string}/{model.bio_model}_{model.seq_model}_{gridsize[0]:.0f}x{gridsize[1]:.0f}{run_meta}"
+        
+        
+        inference_string = f"{dataset_string}/{model.bio_model}_{model.seq_model}_"
+        for i in range(len(gridsize)):
+            inference_string += f"{gridsize[i]:.0f}x"
+        inference_string = inference_string[:-1]
+        inference_string += f"{run_meta}"
+        
         make_dir(inference_string)
         self.inference_string = inference_string
         inference_parameter_string = inference_string + "/parameters.pr"
@@ -157,24 +170,19 @@ class InferenceParameters:
         ----
         sampl_vals: list of lists of floats
             list of grid points.
-        X: np.ndarray
-            grid point values representing unspliced RNA sampling parameters.
-        Y: np.ndarray
-            grid point values representing spliced RNA sampling parameters.
+        grid_values_sampl: list of np.ndarrays
+            grid point values representing sampling parameters for each modality.
         n_grid_pts: int
             total number of grid points to evaluate.
         """
-        X, Y = np.meshgrid(
-            np.linspace(self.samp_lb[0], self.samp_ub[0], self.gridsize[0]),
-            np.linspace(self.samp_lb[1], self.samp_ub[1], self.gridsize[1]),
-            indexing="ij",
-        )
-        X = X.flatten()
-        Y = Y.flatten()
-        self.X = X
-        self.Y = Y
-        self.sampl_vals = list(zip(X, Y))
-        self.n_grid_points = len(X)
+        linspaces = [np.linspace(self.samp_lb[i], self.samp_ub[i], self.gridsize[i]) for i in range(len(self.gridsize))]
+        grid_values_sampl = np.meshgrid(*linspaces, indexing="ij")
+        
+        grid_values_sampl = [i.flatten() for i in grid_values_sampl]
+        self.grid_values_sampl = grid_values_sampl
+        
+        self.sampl_vals = list(zip(*grid_values_sampl))
+        self.n_grid_points = len(grid_values_sampl[0])
 
     def store_inference_parameters(self, inference_parameter_string):
         """This helper method attempts to save the InferenceParameters object.
@@ -418,6 +426,7 @@ class GradientInference:
         err: float
             Kullback-Leibler divergence of the model at x, relative to data.
         """
+        print('optimizing')
         x0 = (
             np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
             * (self.phys_ub - self.phys_lb)
@@ -1003,7 +1012,9 @@ class SearchResults:
         fig1, ax1 = plt.subplots(nrows=1, ncols=num_params, figsize=figsize)
 
         # identify genes to plot, extract their data
+        print(gene_filter)
         gene_filter = self.get_bool_filt(gene_filter, discard_rejected)
+        print(gene_filter)
         param_data = self.phys_optimum[gene_filter, :]
 
         for i in range(num_params):
@@ -1138,7 +1149,6 @@ class SearchResults:
 
         """
         t1 = time.time()
-
         hist_type = get_hist_type(search_data)
 
         csqarr = []
@@ -1163,10 +1173,25 @@ class SearchResults:
                 counts = np.concatenate(
                     (search_data.n_cells * search_data.hist[gene_index][1], [0])
                 )
-                expect_freq = expect_freq[
-                    search_data.hist[gene_index][0][:, 0],
-                    search_data.hist[gene_index][0][:, 1],
-                ]
+                # print(search_data.hist)
+                number_of_modalities = len(search_data.hist[gene_index][0][0])
+                if number_of_modalities == 2:
+                    expect_freq = expect_freq[
+                        search_data.hist[gene_index][0][:, 0],
+                        search_data.hist[gene_index][0][:, 1],
+                    ]
+                elif number_of_modalities == 3:
+                    expect_freq = expect_freq[
+                        search_data.hist[gene_index][0][:, 0],
+                        search_data.hist[gene_index][0][:, 1],
+                        search_data.hist[gene_index][0][:, 2]
+                    ]
+                
+
+                # expect_freq = expect_freq[ [
+                #     search_data.hist[gene_index][0][:, i] for i in range(len(search_data.hist[gene_index][0][0]))
+                # ]]
+
                 expect_freq = np.concatenate(
                     (expect_freq, [search_data.n_cells - expect_freq.sum()])
                 )
@@ -1303,6 +1328,7 @@ class SearchResults:
             )
         )
         hess = Hfun(self.phys_optimum[gene_index])
+        
         return hess
 
     def compute_sigma(self, search_data, num_cores=1):
@@ -1417,9 +1443,14 @@ class SearchResults:
         for samp_num in range(Nsamp):
             for i_ in range(Ntries):
                 axloc = (samp_num, i_)
-                gene_filter = np.random.choice(
-                    self.n_genes, resamp_vec[samp_num], replace=False
-                )
+                if resamp_vec[samp_num] <= self.n_genes:
+                    gene_filter = np.random.choice(
+                        self.n_genes, resamp_vec[samp_num], replace=False
+                    )
+                else:
+                    gene_filter = np.random.choice(
+                        self.n_genes, self.n_genes, replace=False
+                    )
                 subsampled_samp_optimum = self.find_sampling_optimum(gene_filter)
                 self.plot_landscape(ax1[axloc], gene_filter=gene_filter, hideticks=True)
 
@@ -1455,9 +1486,14 @@ class SearchResults:
             axloc = samp_num
             subsampled_samp_optimum_array = []
             for i__ in range(Ntries):
-                gene_filter = np.random.choice(
-                    self.n_genes, resamp_vec[samp_num], replace=False
-                )
+                if resamp_vec[samp_num] <= self.n_genes:
+                    gene_filter = np.random.choice(
+                        self.n_genes, resamp_vec[samp_num], replace=False
+                    )
+                else:
+                    gene_filter = np.random.choice(
+                        self.n_genes, self.n_genes, replace=False
+                    )
                 subsampled_samp_optimum = self.find_sampling_optimum(gene_filter)
                 subsampled_samp_optimum_array.append(subsampled_samp_optimum)
             subsampled_samp_optimum_array = np.asarray(subsampled_samp_optimum_array)
@@ -1604,7 +1640,9 @@ class SearchResults:
         fig1, ax1 = plt.subplots(nrows=1, ncols=num_params, figsize=figsize)
 
         gene_filter = self.get_bool_filt(gene_filter_, discard_rejected=False)
+        print(gene_filter)
         gene_filter_rej = np.zeros(self.n_genes, dtype=bool)
+        print(gene_filter)
 
         if distinguish_rej:  # default
             filt_rej = self.get_bool_filt(gene_filter_, discard_rejected=True)
@@ -1635,6 +1673,12 @@ class SearchResults:
 
                 lfun = lambda x, a, b: a * x + b
                 if plot_fit:
+                    print(self.gene_log_lengths)
+                    print(self.phys_optimum[:, i])
+                    print(self.sigma[:, i])
+                    print(gene_filter)
+                    print(self.gene_log_lengths[gene_filter])
+                    print(self.phys_optimum[gene_filter, i])
                     popt, pcov = scipy.optimize.curve_fit(
                         lfun,
                         self.gene_log_lengths[gene_filter],
@@ -1724,9 +1768,9 @@ class SearchResults:
         figsize: tuple of floats, optional
             figure dimensions.
         marg: str, optional
-            if 'nascent': plot unspliced RNA marginal.
-            if 'mature': plot spliced RNA marginal.
-            if 'joint': plot the bivariate distribution.
+            if 'unspliced', 'spliced', 'protein' etc., plot marginal for this modality.
+            if 'joint': plot the bivariate distribution for spliced or unspliced
+            if tuple of modality strings, plot the bivariate distribution for these modalities.
         logscale: None or bool, optional
             whether to plot probabilities or log-probabilities.
             by default, True for 'joint', False for marginals.
@@ -1740,7 +1784,7 @@ class SearchResults:
         """
 
         if logscale is None:
-            if marg == "joint":
+            if marg == "joint" or type(marg)==tuple:
                 logscale = True
             else:
                 logscale = False
@@ -1768,10 +1812,13 @@ class SearchResults:
         j_ = 0
         for i_ in genes_to_plot:
             lm = np.copy(search_data.M[:, i_])
-            if marg == "mature":
-                lm[0] = 1
-            if marg == "nascent":
-                lm[1] = 1
+            # TODO: generalize by adding attribute names as attribute of e.g. CMEModel
+            attributes = ['unspliced', 'spliced', 'protein']
+            for i in range(3):
+                if marg == attributes[i]:
+                    lm[:i] = 1
+                    lm[i+1:]=1
+                    
             axloc = np.unravel_index(j_, sz) if (sz[0] > 1 and sz[1] > 1) else j_
 
             samp = self.regressor_optimum[i_]
@@ -1782,7 +1829,7 @@ class SearchResults:
                     Pa[Pa < 1e-10] = 1e-10
                     Pa = np.log10(Pa)
 
-                ax1[axloc].imshow(Pa.T, aspect="auto", cmap="summer")
+                ax1[axloc].imshow(Pa.sum(axis=2).T, aspect="auto", cmap="summer")
                 ax1[axloc].invert_yaxis()
 
                 jitter_magn = 0.1

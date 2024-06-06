@@ -2,8 +2,12 @@ import numpy as np
 import csv
 import matplotlib.pyplot as plt
 import pickle
+import sys
 
-from .preprocess import (
+sys.path.insert(0, 'monod/src/monod')
+
+
+from monod.preprocess import (
     code_ver_global,
     filter_by_gene,
     make_dir,
@@ -89,10 +93,11 @@ def extract_data(
     # genome.
     # if this is ever necessary, just make a different reference list.
     annotation_filter = identify_annotated_genes(gene_names, transcriptome_dict)
+    print(annotation_filter)
     *layers, gene_names = filter_by_gene(annotation_filter, *layers, gene_names)
 
     # initialize the gene length array.
-    len_arr = np.array([transcriptome_dict[k] for k in gene_names])
+    len_arr = np.array([transcriptome_dict[k.capitalize()] for k in gene_names])
 
     gene_result_list_file = dir_string + "/genes.csv"
     try:
@@ -130,6 +135,7 @@ def extract_data(
             ax1[i].set_ylabel("log10 (mean " + var_name[i] + " + 0.001)")
 
     gene_names = list(gene_names)
+    print(gene_names)
     gene_filter = [gene_names.index(gene) for gene in analysis_gene_list]
     gene_names = np.asarray(gene_names)
     *layers, gene_names, len_arr = filter_by_gene(
@@ -180,6 +186,12 @@ def extract_data(
 
         mom_dict = {f"mod{i+1}_mean": mods[i][gene_index].mean() for i in range(len(mods))}
         mom_dict.update({f"mod{i+1}_var": mods[i][gene_index].var() for i in range(len(mods))})
+        mod_pairs = []
+        for i in range(len(mods)):
+            for j in range(i+1, len(mods)):
+                mod_pairs += [(i,j)]
+        # Add covariances
+        mom_dict.update({f"mod{i[0]+1}_mod{i[1]+1}_covar": np.cov(np.array([mods[i[0]][gene_index], mods[i[1]][gene_index]]))[0][1] for i in mod_pairs})
         
         moments.append(
             mom_dict
@@ -258,6 +270,7 @@ class SearchData:
     moments: list of dict
         length-n_genes list containing moments for each gene.
         moments include 'mod2_mean', 'mod1_mean', 'mod2_var', 'mod1_var', and are used to define MoM estimates.
+        Also covariances in form 'mod1_mod2_covar'
     gene_log_lengths: float np.ndarray
         log lengths of analyzed genes.
     n_genes: int
