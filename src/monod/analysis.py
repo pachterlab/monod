@@ -1,8 +1,11 @@
-from .cme_toolbox import CMEModel
-from .inference import SearchResults, plot_hist_and_fit
-from .extract_data import SearchData, normalize_count_matrix
-from .preprocess import make_dir, log
-from .plot_aesthetics import aesthetics
+import sys
+sys.path.insert(0, '/home/cat/monod/src/monod')
+
+from cme_toolbox import CMEModel
+from inference import SearchResults, plot_hist_and_fit
+from extract_data import SearchData, normalize_count_matrix
+from preprocess import make_dir, log
+from plot_aesthetics import aesthetics
 import pickle
 import scipy
 from scipy import stats

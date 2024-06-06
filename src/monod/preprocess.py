@@ -48,7 +48,7 @@ def construct_batch(
     seed=2813308004,
     viz=True,
     filt_param = {'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]  },
-    attribute_names=[("unspliced", "spliced"), "gene_name", "barcode"],
+    attribute_names = [("unspliced", "spliced"), "gene_name", "barcode"],
     meta="batch",
     datestring=datetime.now(pytz.timezone("US/Pacific")).strftime("%y%m%d"),
     creator="gg",
@@ -176,17 +176,18 @@ def construct_batch(
                 )
 
         # initialize the gene length array.
-        len_arr = np.array([transcriptome_dict[k] for k in gene_names])
+        # N.B. the transcriptome dictionary has genes in capitalized forms: e.g. Cd3d
+        len_arr = np.array([transcriptome_dict[k.capitalize()] for k in gene_names])
 
         mods = layers # usually unspliced, spliced
         gene_exp_filter = threshold_by_expression(mods, filt_param)
+        print(np.shape(gene_exp_filter))
         
         if viz:
             # Use first letters of the modalities as names in visualization.
             # mod1_name, mod2_name = attribute_names[0]
             
             mod_names = attribute_names[0][0]
-            print(attribute_names, mod_names)
             # var_name = (mod2_name[0].upper(), mod1_name[0].upper()) # e.g. ("S", "U")
             # NB reversed order here.
             var_name = tuple([name[0].upper() for name in mod_names[::-1]])
@@ -219,7 +220,8 @@ def construct_batch(
         dataset_dir_string = dir_string + "/" + dataset_names[dataset_index]
         make_dir(dataset_dir_string)
         dataset_strings.append(dataset_dir_string)
-
+        
+    print(expression_filter_array)
     exp_fractions = expression_filter_array.mean(0)
     if exp_filter_threshold is None:  # no-tuning
         n_genes_enforced = 0
@@ -242,10 +244,12 @@ def construct_batch(
                 exp_fractions[gene_loc[0]] = 0
                 n_genes_enforced += 1
                 selected_genes_filter[gene_loc[0]] = True
-
-        q = np.quantile(
-            exp_fractions, 1 - (n_genes - n_genes_enforced) / len(exp_fractions)
-        )
+        print(exp_fractions)
+        # q = np.quantile(
+        #     exp_fractions, 1 - (n_genes - n_genes_enforced) / len(exp_fractions)
+        # )
+        q = 0
+        print(q)
         selected_genes_filter[exp_fractions > q] = True
         np.random.seed(seed)
         random_genes = np.where(exp_fractions == q)[0]
@@ -392,6 +396,7 @@ def threshold_by_expression(
     mod_means = [mod.mean(1) for mod in mods]
     
     gene_exp_filter = np.ones_like(mods[0][:,0], dtype=bool)
+    print(np.shape(gene_exp_filter))
 
     for i in range(len(mods)):
         gene_exp_filter &= (mod_means[i] > filt_param['min_means'][i])
@@ -644,8 +649,9 @@ def identify_annotated_genes(gene_names, feat_dict):
     ann_filt: bool np.ndarray
         boolean filter of genes that have annotations.
     """
+    print('THIS')
     n_gen_tot = len(gene_names)
-    sel_ind_annot = [k for k in range(len(gene_names)) if gene_names[k] in feat_dict]
+    sel_ind_annot = [k for k in range(len(gene_names)) if gene_names[k].capitalize() in feat_dict]
 
     NAMES = [gene_names[k] for k in range(len(sel_ind_annot))]
     COUNTS = collections.Counter(NAMES)

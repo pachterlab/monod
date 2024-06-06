@@ -325,6 +325,7 @@ class CMEModel:
         Pss: np.ndarray
             the steady-state model PMF over a grid.
         """
+        # print('using new cme')
         # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
         # It will be implemented in a future version.
 
@@ -341,12 +342,21 @@ class CMEModel:
 
         u = []
         mx = np.copy(limits)
+        # Why do we do this?
         mx[-1] = mx[-1] // 2 + 1
+        mx[-1] = 10
+        mx[0], mx[1], mx[2] = 2,2,2
+
         for i in range(len(mx)):
-            l = np.arange(mx[i])
+            if False:
+                l = np.arange(0, mx[i], 10)
+                print(l)
+            else:
+                l = np.arange(mx[i])
             u_ = np.exp(-2j * np.pi * l / limits[i]) - 1
             u.append(u_)
         g = np.meshgrid(*[u_ for u_ in u], indexing="ij")
+
         for i in range(len(mx)):
             g[i] = g[i].flatten()
         g = np.asarray(g)[:, :, None]
@@ -366,10 +376,14 @@ class CMEModel:
             g = g_
             p = np.copy(p[:-1])
 
+        # For now add zero for protein sampling parameter.
+        num_excess = np.shape(g)[0] - len(samp)
+        samp_use = np.array([i for i in samp]+[0]*num_excess)
+        
         if self.seq_model == "Poisson":
-            g = np.exp((np.power(10, samp))[:, None, None] * g) - 1
+            g = np.exp((np.power(10, samp_use))[:, None, None] * g) - 1
         elif self.seq_model == "Bernoulli":
-            g *= np.asarray(samp)[:, None, None]
+            g *= np.asarray(samp_use)[:, None, None]
         elif self.seq_model == "None":
             pass
         else:
@@ -387,7 +401,6 @@ class CMEModel:
         Pss = Pss.squeeze()
         return Pss
 
-    # TODO: Add ProteinBursty
     def eval_model_pgf(self, p_, g):
         """Evaluate the log-PGF of the model over the complex unit sphere at a set of parameters.
 
@@ -448,6 +461,7 @@ class CMEModel:
             else:
                 raise ValueError("Please use one of the specified quadrature methods.")
             gf /= 2
+
         elif self.bio_model == "ProteinBursty":  # bursty production
             gf = self.protein_pgf(g, p)
 
@@ -483,9 +497,9 @@ class CMEModel:
             # u (n_species, n_grids)
             b, beta, gamma, k_p, gamma_p = param
             du = np.zeros_like(u)
-            du[0] = beta * (u[1]-u[0])
-            du[1] = - gamma * u[1] + k_p * u[2] * (u[1]+1)
-            du[2] = - gamma_p * u[2]
+            du[0] = beta * (u[1]-u[0]) # Unspliced
+            du[1] = - gamma * u[1] + k_p * u[2] * (u[1]+1) # Spliced
+            du[2] = - gamma_p * u[2] # Proteins
             return du
         
         # Vectorized RK4 implementation
@@ -501,21 +515,22 @@ class CMEModel:
         b, beta, gamma, k_p, gamma_p = p
         
         min_fudge, max_fudge = 1, 1    # Determine integration time scale
-        dt = np.min(1/params)*min_fudge
+        dt = np.min(1/p)*min_fudge
         #t_max = np.max(1/params)*max_fudge
         #num_tsteps = int(np.ceil(t_max/dt))
     
         t = 0
+        u = g-1
         u_tilde = np.array(u, dtype=np.complex64)
         phi = b*u_tilde[0]/(1-b*u_tilde[0])*dt/2
         
         # Solve ODE using RK4 method 
         while np.max(np.abs(u_tilde))>1e-3:
             t += dt
-            u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, params)
+            u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, p)
             phi += b*u_tilde[0]/(1-b*u_tilde[0])*dt
             
-        u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, params)
+        u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, p)
         phi += b*u_tilde[0]/(1-b*u_tilde[0])*dt/2
     
         #gf = np.exp(phi)    # get generating function
@@ -615,15 +630,17 @@ class CMEModel:
         x0: np.ndarray
             log10 biological parameter estimates.
         """
-
         lb = 10**lb_log
         ub = 10**ub_log
         if self.seq_model == "Poisson":
             samp = 10**samp
 
+        U_var, U_mean = moments['mod1_var'], moments['mod1_mean']
+        S_var, S_mean = moments['mod2_var'], moments['mod2_mean']
+
         if self.bio_model == "Bursty" or self.bio_model == "CIR":
             try:
-                b = moments["U_var"] / moments["U_mean"] - 1
+                b = U_var / U_mean - 1
             except:
                 b = 1  # safe for U_mean = U_var = 0
             if self.seq_model == "Bernoulli":
@@ -632,13 +649,14 @@ class CMEModel:
                 b = b / samp[0] - 1
 
             b = np.clip(b, lb[0], ub[0])
-            beta = b / moments["U_mean"]
-            gamma = b / moments["S_mean"]
+            beta = b / U_mean
+            gamma = b / S_mean
             x0 = np.asarray([b, beta, gamma])
 
         if self.bio_model == "ProteinBursty":
+            U_var, U_mean, S_mean, P_mean, UP_covar = moments["mod1_var"], moments["mod1_mean"], moments["mod2_mean"], moments["mod3_mean"], moments["mod1_mod3_covar"]
             try:
-                b = moments["U_var"] / moments["U_mean"] - 1
+                b = U_var / U_mean - 1
             except:
                 b = 1  # safe for U_mean = U_var = 0
             if self.seq_model == "Bernoulli":
@@ -647,19 +665,19 @@ class CMEModel:
                 b = b / samp[0] - 1
 
             b = np.clip(b, lb[0], ub[0])
-            beta = b / moments["U_mean"]
-            gamma = b / moments["S_mean"]
+            beta = b / U_mean
+            gamma = b / S_mean
 
             # TODO: add protein moments to the list of moments.
             # Define r = k_p/gamma_p
-            r = moments["P_mean"]*gamma/b
-            C = moments["UP_covar"]
+            r = P_mean*gamma/b
+            C = UP_covar
             gamma_p = C*(beta + gamma)*beta/(b**2*r - C*(beta + gamma))
             k_p = r*gamma_p
             x0 = np.asarray([b, beta, gamma, k_p, gamma_p])
 
         elif self.bio_model == "Delay":
-            b = moments["U_var"] / moments["U_mean"] - 1
+            b = U_var / U_mean - 1
 
             if self.seq_model == "Bernoulli":
                 b /= samp[0]
@@ -667,45 +685,49 @@ class CMEModel:
                 b = b / samp[0] - 1
 
             b = np.clip(b, lb[0], ub[0])
-            beta = b / moments["U_mean"]
-            tauinv = b / moments["S_mean"]
+            beta = b / U_mean
+            tauinv = b / S_mean
             x0 = np.asarray([b, beta, tauinv])
 
         elif self.bio_model == "DelayedSplicing":
             # b = moments["S_var"] / moments["S_mean"] - 1
-            b = (moments["U_var"] / moments["U_mean"] - 1) / 2
+            b = (U_var / U_mean - 1) / 2
             b = np.clip(b, lb[0], ub[0])
-            tauinv = b / moments["U_mean"]
-            gamma = b / moments["S_mean"]
+            tauinv = b / U_mean
+            gamma = b / S_mean
             x0 = np.asarray([b, tauinv, gamma])
 
             if self.seq_model != "None":
                 raise ValueError("Not implemented yet!")
 
         elif self.bio_model == "Constitutive":
-            beta = 1 / moments["U_mean"]
-            gamma = 1 / moments["S_mean"]
+            beta = 1 / U_mean
+            gamma = 1 / S_mean
             x0 = np.asarray([beta, gamma])
 
         elif self.bio_model == "Extrinsic":
             if self.seq_model == "Poisson":
-                alpha = moments["U_mean"] ** 2 / (
-                    moments["U_var"] - moments["U_mean"] * (1 + samp[0])
+                alpha = U_mean ** 2 / (
+                    U_var - U_mean * (1 + samp[0])
                 )
             else:
-                alpha = moments["U_mean"] ** 2 / (moments["U_var"] - moments["U_mean"])
+                alpha = U_mean ** 2 / (U_var - U_mean)
 
-            beta = alpha / moments["U_mean"]
-            gamma = alpha / moments["S_mean"]
+            beta = alpha / U_mean
+            gamma = alpha / S_mean
             x0 = np.asarray([alpha, beta, gamma])
         else:
             raise ValueError("Please select from implemented models.")
 
+
         if self.seq_model in ("Bernoulli", "Poisson"):
             if self.bio_model == "Constitutive":
                 x0 *= samp
+            elif self.bio_model == "ProteinBursty":
+                x0[1:3] = x0[1:3]*samp
             else:
                 x0[1:] = x0[1:] * samp
+
         if self.amb_model == "Equal":  # basic
             x0 = np.concatenate((x0, [0.1]))  # just make a guess
         elif self.amb_model == "Unequal":
