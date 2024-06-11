@@ -177,7 +177,11 @@ def construct_batch(
 
         # initialize the gene length array.
         # N.B. the transcriptome dictionary has genes in capitalized forms: e.g. Cd3d
-        len_arr = np.array([transcriptome_dict[k.capitalize()] for k in gene_names])
+        capitalize = False
+        if capitalize:
+            len_arr = np.array([transcriptome_dict[k.capitalize()] for k in gene_names])
+        else:
+            len_arr = np.array([transcriptome_dict[k] for k in gene_names])
 
         mods = layers # usually unspliced, spliced
         gene_exp_filter = threshold_by_expression(mods, filt_param)
@@ -651,7 +655,11 @@ def identify_annotated_genes(gene_names, feat_dict):
     """
     print('THIS')
     n_gen_tot = len(gene_names)
-    sel_ind_annot = [k for k in range(len(gene_names)) if gene_names[k].capitalize() in feat_dict]
+    capitalize = False
+    if capitalize:
+        sel_ind_annot = [k for k in range(len(gene_names)) if gene_names[k].capitalize() in feat_dict]
+    else:
+        sel_ind_annot = [k for k in range(len(gene_names)) if gene_names[k] in feat_dict]
 
     NAMES = [gene_names[k] for k in range(len(sel_ind_annot))]
     COUNTS = collections.Counter(NAMES)
