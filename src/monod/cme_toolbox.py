@@ -584,8 +584,10 @@ class CMEModel:
             gamma = b / moments["S_mean"]
             x0 = np.asarray([b, tauinv, gamma])
 
-            if self.seq_model != "None":
-                raise ValueError("Not implemented yet!")
+            if self.seq_model == "Bernoulli":
+                b /= 2*samp[0]
+            elif self.seq_model == "Poisson":
+                b = b / samp[0] - (1/2)
 
         elif self.bio_model == "Constitutive":
             beta = 1 / moments["U_mean"]
