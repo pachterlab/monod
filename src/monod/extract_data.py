@@ -97,7 +97,13 @@ def extract_data(
     *layers, gene_names = filter_by_gene(annotation_filter, *layers, gene_names)
 
     # initialize the gene length array.
-    len_arr = np.array([transcriptome_dict[k.capitalize()] for k in gene_names])
+    # For mouse transcripts, gene names are Capitalized, for human, they are ALL CAPS.
+    capitalize = False
+    if capitalize:
+        len_arr = np.array([transcriptome_dict[k.capitalize()] for k in gene_names])
+    else:
+        len_arr = np.array([transcriptome_dict[k] for k in gene_names])
+
 
     gene_result_list_file = dir_string + "/genes.csv"
     try:
