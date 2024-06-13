@@ -3,11 +3,14 @@ import csv
 import matplotlib.pyplot as plt
 import pickle
 import sys
+from datetime import datetime
+import pytz
 
 sys.path.insert(0, 'monod/src/monod')
 
 
 from monod.preprocess import (
+    construct_batch,
     code_ver_global,
     filter_by_gene,
     make_dir,
@@ -22,6 +25,57 @@ from monod.preprocess import (
 ## Main code
 ########################
 
+
+def extract_comb(
+    dataset_filepaths,
+    transcriptome_filepath,
+    dataset_names,
+    batch_id=1,
+    n_genes=100,
+    seed=2813308004,
+    viz=True,
+    filt_param={'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]  },
+    attribute_names=[("unspliced", "spliced"), "gene_name", "barcode"],
+    meta="batch",
+    datestring=datetime.now(pytz.timezone("US/Pacific")).strftime("%y%m%d"),
+    creator="gg",
+    code_ver=code_ver_global,
+    batch_location=".",
+    cf=None,
+    exp_filter_threshold=1,
+    genes_to_fit=[],
+):
+    """
+    Same arguments as construct_batch. 
+    Creates directories, and returns list of search_data objects for each dataset.
+    """
+
+    dir_string,  dataset_strings = construct_batch(dataset_filepaths,
+    transcriptome_filepath,
+    dataset_names,
+    batch_id=batch_id,
+    n_genes=n_genes,
+    seed=seed,
+    viz=viz,
+    filt_param =filt_param,
+    attribute_names = attribute_names,
+    meta=meta,
+    datestring=datestring,
+    creator=creator,
+    code_ver=code_ver,
+    batch_location=batch_location,
+    cf=cf,
+    exp_filter_threshold=exp_filter_threshold,
+    genes_to_fit=genes_to_fit)
+
+    search_data_objects = []
+    for i in range(len(loom_filepaths)):
+        search_data_object = extract_data(loom_filepaths[i], transcriptome_filepath, dataset_names[i],
+                        dataset_strings[i], dir_string, dataset_attr_names=attribute_names)
+        search_data_objects += [search_data_object]
+
+    return search_data_objects, dataset_strings
+    
 
 def extract_data(
     dataset_filepath,
