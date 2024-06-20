@@ -627,13 +627,13 @@ def get_transcriptome(transcriptome_filepath, repeat_thr=15):
 
     The repeat dictionary is not used in this version of the code.
     """
-    repeat_dict = {}
+    #repeat_dict = {}
     len_dict = {}
-    thr_ind = repeat_thr - 3
+    #thr_ind = repeat_thr - 3
     with open(transcriptome_filepath, "r") as file:
         for line in file.readlines():
             d = [i for i in line.split(" ") if i]
-            repeat_dict[d[0]] = int(d[thr_ind])
+            #repeat_dict[d[0]] = int(d[thr_ind])
             len_dict[d[0]] = int(d[1])
     return len_dict
 
