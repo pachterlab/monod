@@ -5,10 +5,6 @@ import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
 
-import sys
-sys.path.insert(0, '/home/cat/monod/src/monod')
-# execfile("src/monod/cme_toolbox.py")
-
 from preprocess import make_dir, log
 from cme_toolbox import CMEModel  # may be unnecessary
 import multiprocessing
