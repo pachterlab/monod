@@ -325,7 +325,7 @@ class CMEModel:
         Pss: np.ndarray
             the steady-state model PMF over a grid.
         """
-        # print('using new cme')
+        print('eval_model_pss')
         # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
         # It will be implemented in a future version.
 
@@ -490,6 +490,7 @@ class CMEModel:
         phi: np.ndarray
             log gf.
         """
+        print("protein_pgf:", np.shape(g),p)
         def u_tilda_ode(u, t, param):
             """
             Solve the characteristics ODE
