@@ -5,10 +5,6 @@ import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
 
-import sys
-sys.path.insert(0, '/home/cat/monod/src/monod')
-# execfile("src/monod/cme_toolbox.py")
-
 from preprocess import make_dir, log
 from cme_toolbox import CMEModel  # may be unnecessary
 import multiprocessing
@@ -439,7 +435,7 @@ class GradientInference:
         x = x0[0]
         err = np.inf
         ERR_THRESH = 0.99
-
+        print("MoM:",x)
         # print(hist_type)
         hist_type = get_hist_type(search_data)
 
@@ -491,7 +487,7 @@ class GradientInference:
             runtime in seconds.
         """
         t1 = time.time()
-
+        
         param_estimates, klds = zip(
             *[
                 self.optimize_gene(gene_index, model, search_data)

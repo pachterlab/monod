@@ -6,10 +6,7 @@ import sys
 from datetime import datetime
 import pytz
 
-sys.path.insert(0, 'monod/src/monod')
-
-
-from monod.preprocess import (
+from preprocess import (
     construct_batch,
     code_ver_global,
     filter_by_gene,
