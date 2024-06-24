@@ -422,7 +422,6 @@ class GradientInference:
         err: float
             Kullback-Leibler divergence of the model at x, relative to data.
         """
-        print('optimizing')
         x0 = (
             np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
             * (self.phys_ub - self.phys_lb)
@@ -432,10 +431,10 @@ class GradientInference:
             self.gradient_params["init_pattern"] == "moments"
         ):  # this can be extended to other initialization patterns, like latin squares
             x0[0] = self.param_MoM[gene_index]
-        x = x0[0]
+        #x = x0[0]
         err = np.inf
         ERR_THRESH = 0.99
-        print("MoM:",x)
+        print('optimizing gene', gene_index, 'with initial value',10**x0)
         # print(hist_type)
         hist_type = get_hist_type(search_data)
 
@@ -452,7 +451,7 @@ class GradientInference:
                 bounds=self.grad_bnd,
                 options={
                     "maxiter": self.gradient_params["max_iterations"],
-                    "disp": False,
+                    "disp": True,
                 },
             )
             if (
