@@ -283,7 +283,6 @@ class CMEModel:
             data = data[filt]
             proposal = proposal[filt]
             d = data * np.log(data / proposal)
-            return np.sum(d)
         elif hist_type == "unique":
             x, f = data
             # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
@@ -306,7 +305,8 @@ class CMEModel:
             proposal[proposal < EPS] = EPS
             proposal = proposal[tuple(x.T)]
             d = f * np.log(f / proposal)
-            return np.sum(d)
+        print(p,np.sum(d))
+        return np.sum(d)
 
     def eval_model_pss(self, p, limits, samp=None):
         """Evaluate the PMF of the model over a grid at a set of parameters.
@@ -325,7 +325,7 @@ class CMEModel:
         Pss: np.ndarray
             the steady-state model PMF over a grid.
         """
-        print('eval_model_pss')
+
         # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
         # It will be implemented in a future version.
 
@@ -342,24 +342,15 @@ class CMEModel:
 
         u = []
         mx = np.copy(limits)
-        # Why do we do this?
         mx[-1] = mx[-1] // 2 + 1
-        mx[-1] = 10
-        mx[0], mx[1], mx[2] = 2,2,2
-
         for i in range(len(mx)):
-            if False:
-                l = np.arange(0, mx[i], 10)
-                print(l)
-            else:
-                l = np.arange(mx[i])
+            l = np.arange(mx[i])
             u_ = np.exp(-2j * np.pi * l / limits[i]) - 1
             u.append(u_)
         g = np.meshgrid(*[u_ for u_ in u], indexing="ij")
-
         for i in range(len(mx)):
             g[i] = g[i].flatten()
-        g = np.asarray(g)[:, :, None]
+        g = np.asarray(g)[:,:,None]
 
         if self.amb_model == "Unequal":
             g_ = np.zeros((2, g.shape[1], g.shape[2]), dtype=np.complex128)
@@ -377,8 +368,11 @@ class CMEModel:
             p = np.copy(p[:-1])
 
         # For now add zero for protein sampling parameter.
-        num_excess = np.shape(g)[0] - len(samp)
-        samp_use = np.array([i for i in samp]+[0]*num_excess)
+        if samp == None:
+            samp_use = np.array([0] * np.shape(g)[0])
+        else:
+            num_excess = np.shape(g)[0] - len(samp)
+            samp_use = np.array([i for i in samp]+[0]*num_excess)
         
         if self.seq_model == "Poisson":
             g = np.exp((np.power(10, samp_use))[:, None, None] * g) - 1
@@ -392,7 +386,7 @@ class CMEModel:
                     self.available_seqmodels
                 )
             )
-
+            
         gf = self.eval_model_pgf(p, g)
         gf = np.exp(gf)
         gf = gf.reshape(tuple(mx))
@@ -490,7 +484,7 @@ class CMEModel:
         phi: np.ndarray
             log gf.
         """
-        print("protein_pgf:", np.shape(g),p)
+
         def u_tilda_ode(u, t, param):
             """
             Solve the characteristics ODE
@@ -517,16 +511,15 @@ class CMEModel:
         
         min_fudge, max_fudge = 1, 1    # Determine integration time scale
         dt = np.min(1/p)*min_fudge
-        #t_max = np.max(1/params)*max_fudge
+        t_max = np.max(1/p)*max_fudge
         #num_tsteps = int(np.ceil(t_max/dt))
     
         t = 0
-        u = g-1
-        u_tilde = np.array(u, dtype=np.complex64)
+        u_tilde = np.array(g, dtype=np.complex64)
         phi = b*u_tilde[0]/(1-b*u_tilde[0])*dt/2
         
         # Solve ODE using RK4 method 
-        while np.max(np.abs(u_tilde))>1e-3:
+        while t <= t_max or np.max(np.abs(u_tilde))>1e-6:
             t += dt
             u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, p)
             phi += b*u_tilde[0]/(1-b*u_tilde[0])*dt
@@ -596,7 +589,6 @@ class CMEModel:
         _: np.ndarray
             integrand value.
         """
-
         if np.isclose(beta, gamma):  # compute prefactors for the ODE characteristics.
             c_1 = g[0]  # nascent
             c_2 = x * beta * g[1]
@@ -654,7 +646,7 @@ class CMEModel:
             gamma = b / S_mean
             x0 = np.asarray([b, beta, gamma])
 
-        if self.bio_model == "ProteinBursty":
+        elif self.bio_model == "ProteinBursty":
             U_var, U_mean, S_mean, P_mean, UP_covar = moments["mod1_var"], moments["mod1_mean"], moments["mod2_mean"], moments["mod3_mean"], moments["mod1_mod3_covar"]
             try:
                 b = U_var / U_mean - 1
