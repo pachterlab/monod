@@ -428,7 +428,7 @@ class CMEModel:
         if self.seq_model == "Poisson":
             g = np.exp((np.power(10, samp_use))[:, None] * g) - 1
         elif self.seq_model == "Bernoulli":
-            g *= np.asarray(np.power(10, samp_use))[:, None, None]
+            g *= np.asarray(np.power(10, samp_use))[:, None]
         elif self.seq_model == "None":
             pass
         else:
