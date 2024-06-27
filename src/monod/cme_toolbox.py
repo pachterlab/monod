@@ -351,8 +351,12 @@ class CMEModel:
             proposal[proposal < EPS] = EPS
             proposal = proposal[tuple(x.T)]
             d = f * np.log(f / proposal)
-        # print(p,np.sum(d))
-        ('hi')
+
+        elif hist_type == "none":
+            proposal = self.eval_model_pss(p, limits, samp)
+            proposal[proposal < EPS] = EPS
+            d = -np.log(pss[np.arange(len(data[0])), *data])
+
         return np.sum(d)
 
     def eval_model_pss(self, p, limits, samp=None):
@@ -397,8 +401,8 @@ class CMEModel:
         g = np.meshgrid(*[u_ for u_ in u], indexing="ij")
         for i in range(len(mx)):
             g[i] = g[i].flatten()
-        g = np.asarray(g)[:,:,None]
-
+        g = np.asarray(g)
+        
         if self.amb_model == "Unequal":
             g_ = np.zeros((2, g.shape[1], g.shape[2]), dtype=np.complex128)
             p_amb = np.power(10, p[-2:])
@@ -422,10 +426,9 @@ class CMEModel:
             samp_use = np.array([i for i in samp]+[0]*num_excess)
         
         if self.seq_model == "Poisson":
-            g = np.exp((np.power(10, samp_use))[:, None, None] * g) - 1
+            g = np.exp((np.power(10, samp_use))[:, None] * g) - 1
         elif self.seq_model == "Bernoulli":
-            g *= np.asarray(samp_use)[:, None, None]
-            # should this be np.power(10, samp_use)?
+            g *= np.asarray(np.power(10, samp_use))[:, None, None]
         elif self.seq_model == "None":
             pass
         else:
@@ -533,7 +536,7 @@ class CMEModel:
         phi: np.ndarray
             log gf.
         """
-
+        
         def u_tilda_ode(u, t, param):
             """
             Solve the characteristics ODE
@@ -560,7 +563,7 @@ class CMEModel:
         
         min_fudge, max_fudge = 1, 1    # Determine integration time scale
         dt = np.min(1/p)*min_fudge
-        t_max = np.max(1/p)*max_fudge
+        #t_max = np.max(1/p)*max_fudge
         #num_tsteps = int(np.ceil(t_max/dt))
     
         t = 0
@@ -568,14 +571,14 @@ class CMEModel:
         phi = b*u_tilde[0]/(1-b*u_tilde[0])*dt/2
         
         # Solve ODE using RK4 method 
-        while t <= t_max or np.max(np.abs(u_tilde))>1e-6:
+        while np.max(np.abs(u_tilde))>1e-3:
             t += dt
             u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, p)
             phi += b*u_tilde[0]/(1-b*u_tilde[0])*dt
             
         u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, p)
         phi += b*u_tilde[0]/(1-b*u_tilde[0])*dt/2
-    
+        
         #gf = np.exp(phi)    # get generating function
         return phi
 
@@ -603,6 +606,7 @@ class CMEModel:
         _: np.ndarray
             integrand value.
         """
+        g = np.asarray(g)[:, :, None]
         if np.isclose(beta, gamma):  # compute prefactors for the ODE characteristics.
             c_1 = g[0]  # nascent
             c_2 = x * beta * g[1]
@@ -638,6 +642,7 @@ class CMEModel:
         _: np.ndarray
             integrand value.
         """
+        g = np.asarray(g)[:, :, None]
         if np.isclose(beta, gamma):  # compute prefactors for the ODE characteristics.
             c_1 = g[0]  # nascent
             c_2 = x * beta * g[1]
