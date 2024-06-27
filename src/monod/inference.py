@@ -264,9 +264,9 @@ class InferenceParameters:
         # warnings.resetwarnings()
         results = SearchResults(self, search_data)
         results.aggregate_grid_points()
-        print('before')
+
         full_result_string = results.store_on_disk()
-        print('after')
+
 
         t2 = time.time()
         log.info("Runtime: {:.1f} seconds.".format(t2 - t1))
@@ -450,10 +450,9 @@ class GradientInference:
         #x = x0[0]
         err = np.inf
         ERR_THRESH = 0.99
-        # print('optimizing gene', gene_index, 'with initial value',10**x0)
-        # print(hist_type)
+        log.debug('Optimizing gene %d with initial value %s', gene_index, np.array2string(10**x0))
+        
         hist_type = get_hist_type(search_data)
-
         for restart in range(self.gradient_params["num_restarts"]):
             res_arr = scipy.optimize.minimize(
                 lambda x: model.eval_model_kld(
@@ -478,6 +477,7 @@ class GradientInference:
         if not (np.isfinite(x).all()):
             log.warning("Gene index: " + str(gene_index))
             raise ValueError("Search failed. Please check input data.")
+        log.debug('Optimized parameters for gene %d is %s', gene_index, np.array2string(10**x))
         return x, err
 
     def iterate_over_genes(self, model, search_data):
@@ -505,7 +505,7 @@ class GradientInference:
         
         param_estimates, klds = zip(
             *[
-                self.optimize_gene(gene_index, model, search_data)
+                self.optimize_gene(gene_index=gene_index, model=model, search_data=search_data)
                 for gene_index in range(search_data.n_genes)
             ]
         )
@@ -530,7 +530,8 @@ class GradientInference:
             SearchData object with the data to fit.
 
         """
-        search_out = self.iterate_over_genes(model, search_data)
+        
+        search_out = self.iterate_over_genes(model=model, search_data=search_data)
         results = GridPointResults(
             *search_out,
             self.regressor,
@@ -560,11 +561,11 @@ def get_hist_type(search_data):
     Returns
     -------
     hist_type: str
-        flavor of histogram used to generate search_data, either "unique" or "grid".
+        flavor of histogram used to generate search_data, either "unique" or "grid" or "none".
     """
 
-    if hasattr(search_data, "hist_type") and search_data.hist_type == "unique":
-        hist_type = "unique"
+    if hasattr(search_data, "hist_type") and search_data.hist_type == "unique" or "none":
+        hist_type = search_data.hist_type
     else:
         hist_type = "grid"
     return hist_type

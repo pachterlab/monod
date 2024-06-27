@@ -238,7 +238,7 @@ def extract_data(
             H = (unique, frequencies)
             
         elif hist_type == "none":
-            H = np.array([x[gene_index] for x in layers])
+            H = [x[gene_index] for x in layers]
 
         hist.append(H)
 
