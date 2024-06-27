@@ -72,11 +72,6 @@ class InferenceParameters:
 
     def __init__(
         self,
-        phys_lb,
-        phys_ub,
-        samp_lb,
-        samp_ub,
-        gridsize,
         dataset_string,
         model,
         use_lengths=True,
@@ -86,6 +81,11 @@ class InferenceParameters:
             "num_restarts": 1,
         },
         run_meta="",
+        phys_lb=None,
+        phys_ub=None,
+        samp_lb=None,
+        samp_ub=None,
+        gridsize=None,
     ):
         """Initialize the InferenceParameters instance.
 
@@ -117,6 +117,20 @@ class InferenceParameters:
         run_meta: str, optional
             any additional metadata to append to the run directory name.
         """
+        # Set biophysical parameter values to defaults.
+        if phys_lb is None:
+            phys_lb = model.bio_bounds['phys_lb']
+        if phys_ub is None:
+            phys_ub = model.bio_bounds['phys_ub']
+
+        # Set technical sequencing parameter values to defaults.
+        if samp_lb is None:
+            samp_lb = model.seq_bounds['samp_lb']
+        if samp_ub is None:
+            samp_ub = model.seq_bounds['samp_ub']
+        if gridsize is None:
+            gridsize = model.seq_bounds['gridsize']
+        
         self.gradient_params = gradient_params
         self.phys_lb = np.array(phys_lb)
         self.phys_ub = np.array(phys_ub)
@@ -203,7 +217,7 @@ class InferenceParameters:
                 )
             )
 
-    def fit_all_grid_points(self, num_cores, search_data):
+    def fit_all_grid_points(self, search_data, num_cores=1):
         """Fits the search data for all genes over all grid points.
 
         Parameters
@@ -247,10 +261,12 @@ class InferenceParameters:
             ]
             log.info("Non-parallelized grid scan complete.")
 
-        warnings.resetwarnings()
+        # warnings.resetwarnings()
         results = SearchResults(self, search_data)
         results.aggregate_grid_points()
+
         full_result_string = results.store_on_disk()
+
 
         t2 = time.time()
         log.info("Runtime: {:.1f} seconds.".format(t2 - t1))
@@ -422,7 +438,6 @@ class GradientInference:
         err: float
             Kullback-Leibler divergence of the model at x, relative to data.
         """
-        print('optimizing')
         x0 = (
             np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
             * (self.phys_ub - self.phys_lb)
@@ -432,13 +447,12 @@ class GradientInference:
             self.gradient_params["init_pattern"] == "moments"
         ):  # this can be extended to other initialization patterns, like latin squares
             x0[0] = self.param_MoM[gene_index]
-        x = x0[0]
+        #x = x0[0]
         err = np.inf
         ERR_THRESH = 0.99
-
-        # print(hist_type)
+        log.debug('Optimizing gene %d with initial value %s', gene_index, np.array2string(10**x0))
+        
         hist_type = get_hist_type(search_data)
-
         for restart in range(self.gradient_params["num_restarts"]):
             res_arr = scipy.optimize.minimize(
                 lambda x: model.eval_model_kld(
@@ -463,6 +477,7 @@ class GradientInference:
         if not (np.isfinite(x).all()):
             log.warning("Gene index: " + str(gene_index))
             raise ValueError("Search failed. Please check input data.")
+        log.debug('Optimized parameters for gene %d is %s', gene_index, np.array2string(10**x))
         return x, err
 
     def iterate_over_genes(self, model, search_data):
@@ -487,10 +502,10 @@ class GradientInference:
             runtime in seconds.
         """
         t1 = time.time()
-
+        
         param_estimates, klds = zip(
             *[
-                self.optimize_gene(gene_index, model, search_data)
+                self.optimize_gene(gene_index=gene_index, model=model, search_data=search_data)
                 for gene_index in range(search_data.n_genes)
             ]
         )
@@ -515,7 +530,8 @@ class GradientInference:
             SearchData object with the data to fit.
 
         """
-        search_out = self.iterate_over_genes(model, search_data)
+        
+        search_out = self.iterate_over_genes(model=model, search_data=search_data)
         results = GridPointResults(
             *search_out,
             self.regressor,
@@ -545,11 +561,11 @@ def get_hist_type(search_data):
     Returns
     -------
     hist_type: str
-        flavor of histogram used to generate search_data, either "unique" or "grid".
+        flavor of histogram used to generate search_data, either "unique" or "grid" or "none".
     """
 
-    if hasattr(search_data, "hist_type") and search_data.hist_type == "unique":
-        hist_type = "unique"
+    if hasattr(search_data, "hist_type") and search_data.hist_type == "unique" or "none":
+        hist_type = search_data.hist_type
     else:
         hist_type = "grid"
     return hist_type
@@ -783,7 +799,7 @@ class SearchResults:
             full_result_string = self.inference_string + "/grid_scan_results.res"
             with open(full_result_string, "wb") as srfs:
                 pickle.dump(self, srfs)
-            log.debug("Grid scan results stored to {}.".format(full_result_string))
+            log.info("Grid scan results stored to {}.".format(full_result_string))
         except:
             log.error(
                 "Grid scan results could not be stored to {}.".format(
@@ -1008,9 +1024,7 @@ class SearchResults:
         fig1, ax1 = plt.subplots(nrows=1, ncols=num_params, figsize=figsize)
 
         # identify genes to plot, extract their data
-        print(gene_filter)
         gene_filter = self.get_bool_filt(gene_filter, discard_rejected)
-        print(gene_filter)
         param_data = self.phys_optimum[gene_filter, :]
 
         for i in range(num_params):
@@ -1636,9 +1650,7 @@ class SearchResults:
         fig1, ax1 = plt.subplots(nrows=1, ncols=num_params, figsize=figsize)
 
         gene_filter = self.get_bool_filt(gene_filter_, discard_rejected=False)
-        print(gene_filter)
         gene_filter_rej = np.zeros(self.n_genes, dtype=bool)
-        print(gene_filter)
 
         if distinguish_rej:  # default
             filt_rej = self.get_bool_filt(gene_filter_, discard_rejected=True)
@@ -1669,12 +1681,12 @@ class SearchResults:
 
                 lfun = lambda x, a, b: a * x + b
                 if plot_fit:
-                    print(self.gene_log_lengths)
-                    print(self.phys_optimum[:, i])
-                    print(self.sigma[:, i])
-                    print(gene_filter)
-                    print(self.gene_log_lengths[gene_filter])
-                    print(self.phys_optimum[gene_filter, i])
+                    # print(self.gene_log_lengths)
+                    # print(self.phys_optimum[:, i])
+                    # print(self.sigma[:, i])
+                    # print(gene_filter)
+                    # print(self.gene_log_lengths[gene_filter])
+                    # print(self.phys_optimum[gene_filter, i])
                     popt, pcov = scipy.optimize.curve_fit(
                         lfun,
                         self.gene_log_lengths[gene_filter],
@@ -1808,10 +1820,13 @@ class SearchResults:
         j_ = 0
         for i_ in genes_to_plot:
             lm = np.copy(search_data.M[:, i_])
+            
             # TODO: generalize by adding attribute names as attribute of e.g. CMEModel
-            attributes = ['unspliced', 'spliced', 'protein']
-            for i in range(3):
-                if marg == attributes[i]:
+            # attributes = ['unspliced', 'spliced', 'protein']
+            self.modalities = self.model.model_modalities
+            num_modalities = len(self.modalities)
+            for i in range(num_modalities):
+                if marg == self.modalities[i]:
                     lm[:i] = 1
                     lm[i+1:]=1
                     
@@ -1825,7 +1840,13 @@ class SearchResults:
                     Pa[Pa < 1e-10] = 1e-10
                     Pa = np.log10(Pa)
 
-                ax1[axloc].imshow(Pa.sum(axis=2).T, aspect="auto", cmap="summer")
+                if num_modalities==2:
+                    ax1[axloc].imshow(Pa.T, aspect="auto", cmap="summer")
+                elif num_modalities==3:
+                    ax1[axloc].imshow(Pa.sum(axis=2).T, aspect="auto", cmap="summer")
+                else:
+                    log.error('Joint distribution plot only implemented for 2 or 3 modalities')
+                    
                 ax1[axloc].invert_yaxis()
 
                 jitter_magn = 0.1

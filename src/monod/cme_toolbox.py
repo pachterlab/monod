@@ -11,7 +11,7 @@ from scipy import integrate
 from scipy.fft import irfftn
 
 # from .nn_toolbox import basic_ml_bivariate, ml_microstate_logP
-
+from preprocess import log
 
 class CMEModel:
     """Stores and evaluates biological and technical variation models.
@@ -104,6 +104,37 @@ class CMEModel:
         )
         self.available_seqmodels = ("None", "Bernoulli", "Poisson")
         self.available_ambmodels = ("None", "Equal", "Unequal")
+
+        # Define the modalities used for each model.
+        CMEModel.available_model_modalities = {"Delay":['unspliced', 'spliced'],
+            "Bursty":['unspliced', 'spliced'],
+            "Extrinsic":['unspliced', 'spliced'],
+            "Constitutive":['unspliced', 'spliced'],
+            "CIR":['unspliced', 'spliced'],
+            "DelayedSplicing":['unspliced', 'spliced'],
+            "ProteinBursty":['unspliced', 'spliced', 'protein']}
+        
+        try:
+            self.model_modalities = CMEModel.available_model_modalities[self.bio_model]
+        except KeyError:
+            log.error("Modalities unknown for model: {}".format(self.bio_model))
+            
+            
+        # Define the parameter bounds used for each biophysical model.
+        # TODO: check reasonableness of these bounds.
+        CMEModel.available_bio_bounds = {"Delay":{'phys_lb':[-1.0, -1.8, -1.8 ], 'phys_ub':[4.2, 2.5, 3.5]},
+            "Bursty":{'phys_lb':[-1.0, -1.8, -1.8 ], 'phys_ub':[4.2, 2.5, 3.5]},
+            "Extrinsic":{'phys_lb':[-1.0, -1.8, -1.8 ], 'phys_ub':[4.2, 2.5, 3.5]},
+            "Constitutive":{'phys_lb':[-1.8, -1.8 ], 'phys_ub':[2.5, 3.5]},
+            "CIR":{'phys_lb':[-1.0, -1.8, -1.8 ], 'phys_ub':[4.2, 2.5, 3.5]},
+            "DelayedSplicing":{'phys_lb':[-1.0, -1.8, -1.8 ], 'phys_ub':[4.2, 2.5, 3.5]},
+            "ProteinBursty":{'phys_lb':[-1.0, -1.8, -1.8, -1.8, -1.8], 'phys_ub':[4.2, 2.5, 3.5, 3.5, 3.5]}}
+        
+        try:
+            self.bio_bounds = CMEModel.available_bio_bounds[self.bio_model]
+        except KeyError:
+            log.info("Biophysical bounds unknown for model: {}".format(self.bio_model))
+
         self.amb_model = amb_model
         if seq_model in ["None", None, "Null"]:
             self.seq_model = "None"
@@ -112,6 +143,20 @@ class CMEModel:
         self.set_integration_parameters(
             fixed_quad_T, quad_order, quad_vec_T, quad_method
         )
+
+        # Define the parameter bounds used for each technical noise model.
+        # TODO: check reasonableness of these bounds.
+        CMEModel.available_seq_bounds = {"None":{'samp_lb':[1, 1],'samp_ub':[1, 1],'gridsize':[1, 1]}, 
+                                         "Bernoulli":{'samp_lb':[-8, -3], 'samp_ub':[-5, 0],'gridsize':[6, 7]}, 
+                                         "Poisson":{'samp_lb':[-8, -3], 'samp_ub':[-5, 0],'gridsize':[6, 7]}}
+        
+        try:
+            self.seq_bounds = CMEModel.available_seq_bounds[self.seq_model]
+        except KeyError:
+            log.info("Technical sequencing bounds unknown for model: {}".format(self.seq_model))
+        
+        # Get all biological and technical parameters.
+        self.param_str = self.get_log_name_str()
 
     def set_integration_parameters(
         self, fixed_quad_T, quad_order, quad_vec_T, quad_method
@@ -180,6 +225,7 @@ class CMEModel:
                     self.available_biomodels
                 )
             )
+        
         if self.amb_model == "Equal":
             param_str += [r"$\log_{10} p$"]
         elif self.amb_model == "Unequal":
@@ -251,7 +297,7 @@ class CMEModel:
             logL = np.log(proposal)*f*n_cells
             return np.sum(logL)
 
-    def eval_model_kld(self, p, limits, samp, data, hist_type="unique", EPS=1e-15):
+    def eval_model_kld(self, p, limits, samp, data, hist_type, EPS=1e-15):
         """Compute the Kullback-Leibler divergence between data and a fit.
 
         Parameters
@@ -266,6 +312,7 @@ class CMEModel:
             experimental data histogram.
         hist_type: str, optional
             if "grid": the search data histogram was generated using np.histogramdd.
+            if "none": the counts were stored.
             if "unique": the search data histogram was generated using np.unique.
             "unique" is the preferred method for histogram generation, as it requires less memory to store.
         EPS: float, optional
@@ -276,14 +323,15 @@ class CMEModel:
         kld: float
             Kullback-Leibler divergence.
         """
+        proposal = self.eval_model_pss(p, limits, samp)
+        proposal[proposal < EPS] = EPS
+
         if hist_type == "grid":
-            proposal = self.eval_model_pss(p, limits, samp)
-            proposal[proposal < EPS] = EPS
             filt = data > 0
             data = data[filt]
             proposal = proposal[filt]
             d = data * np.log(data / proposal)
-            return np.sum(d)
+            
         elif hist_type == "unique":
             x, f = data
             # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
@@ -302,11 +350,15 @@ class CMEModel:
             #     # raise ValueError
             #     return np.sum(d)
             # else:
-            proposal = self.eval_model_pss(p, limits, samp)
-            proposal[proposal < EPS] = EPS
             proposal = proposal[tuple(x.T)]
             d = f * np.log(f / proposal)
-            return np.sum(d)
+
+        elif hist_type == "none":
+            d = -np.log([proposal[tuple(idx)] for idx in np.array(data,dtype=int).T])
+        
+        #log.debug('The KL divergence with parameter %s is %f', np.array2string(10**p),np.sum(d))
+
+        return np.sum(d)
 
     def eval_model_pss(self, p, limits, samp=None):
         """Evaluate the PMF of the model over a grid at a set of parameters.
@@ -325,7 +377,7 @@ class CMEModel:
         Pss: np.ndarray
             the steady-state model PMF over a grid.
         """
-        # print('using new cme')
+
         # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
         # It will be implemented in a future version.
 
@@ -342,25 +394,16 @@ class CMEModel:
 
         u = []
         mx = np.copy(limits)
-        # Why do we do this?
         mx[-1] = mx[-1] // 2 + 1
-        mx[-1] = 10
-        mx[0], mx[1], mx[2] = 2,2,2
-
         for i in range(len(mx)):
-            if False:
-                l = np.arange(0, mx[i], 10)
-                print(l)
-            else:
-                l = np.arange(mx[i])
+            l = np.arange(mx[i])
             u_ = np.exp(-2j * np.pi * l / limits[i]) - 1
             u.append(u_)
         g = np.meshgrid(*[u_ for u_ in u], indexing="ij")
-
         for i in range(len(mx)):
             g[i] = g[i].flatten()
-        g = np.asarray(g)[:, :, None]
-
+        g = np.asarray(g)
+        
         if self.amb_model == "Unequal":
             g_ = np.zeros((2, g.shape[1], g.shape[2]), dtype=np.complex128)
             p_amb = np.power(10, p[-2:])
@@ -377,13 +420,14 @@ class CMEModel:
             p = np.copy(p[:-1])
 
         # For now add zero for protein sampling parameter.
-        num_excess = np.shape(g)[0] - len(samp)
-        samp_use = np.array([i for i in samp]+[0]*num_excess)
+        if samp is not None:
+            num_excess = np.shape(g)[0] - len(samp)
+            samp_use = np.array([i for i in samp]+[0]*num_excess)
         
         if self.seq_model == "Poisson":
-            g = np.exp((np.power(10, samp_use))[:, None, None] * g) - 1
+            g = np.exp((np.power(10, samp_use))[:, None] * g) - 1
         elif self.seq_model == "Bernoulli":
-            g *= np.asarray(samp_use)[:, None, None]
+            g *= np.asarray(np.power(10, samp_use))[:, None]
         elif self.seq_model == "None":
             pass
         else:
@@ -392,7 +436,7 @@ class CMEModel:
                     self.available_seqmodels
                 )
             )
-
+            
         gf = self.eval_model_pgf(p, g)
         gf = np.exp(gf)
         gf = gf.reshape(tuple(mx))
@@ -449,6 +493,7 @@ class CMEModel:
             b, tauinv, gamma = p
             tau = 1 / tauinv
             gf = tau * b * g[0] / (1 - b * g[0]) - 1 / gamma * np.log(1 - b * g[1])
+            
         elif self.bio_model == "CIR":  # CIR-like:
             b, beta, gamma = p
             fun = lambda x: self.cir_intfun(x, g, b, beta, gamma)
@@ -490,6 +535,7 @@ class CMEModel:
         phi: np.ndarray
             log gf.
         """
+        
         def u_tilda_ode(u, t, param):
             """
             Solve the characteristics ODE
@@ -516,12 +562,11 @@ class CMEModel:
         
         min_fudge, max_fudge = 1, 1    # Determine integration time scale
         dt = np.min(1/p)*min_fudge
-        #t_max = np.max(1/params)*max_fudge
+        #t_max = np.max(1/p)*max_fudge
         #num_tsteps = int(np.ceil(t_max/dt))
     
         t = 0
-        u = g-1
-        u_tilde = np.array(u, dtype=np.complex64)
+        u_tilde = np.array(g, dtype=np.complex64)
         phi = b*u_tilde[0]/(1-b*u_tilde[0])*dt/2
         
         # Solve ODE using RK4 method 
@@ -532,7 +577,7 @@ class CMEModel:
             
         u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, p)
         phi += b*u_tilde[0]/(1-b*u_tilde[0])*dt/2
-    
+        
         #gf = np.exp(phi)    # get generating function
         return phi
 
@@ -560,6 +605,7 @@ class CMEModel:
         _: np.ndarray
             integrand value.
         """
+        g = np.asarray(g)[:, :, None]
         if np.isclose(beta, gamma):  # compute prefactors for the ODE characteristics.
             c_1 = g[0]  # nascent
             c_2 = x * beta * g[1]
@@ -595,7 +641,7 @@ class CMEModel:
         _: np.ndarray
             integrand value.
         """
-
+        g = np.asarray(g)[:, :, None]
         if np.isclose(beta, gamma):  # compute prefactors for the ODE characteristics.
             c_1 = g[0]  # nascent
             c_2 = x * beta * g[1]
@@ -653,7 +699,7 @@ class CMEModel:
             gamma = b / S_mean
             x0 = np.asarray([b, beta, gamma])
 
-        if self.bio_model == "ProteinBursty":
+        elif self.bio_model == "ProteinBursty":
             U_var, U_mean, S_mean, P_mean, UP_covar = moments["mod1_var"], moments["mod1_mean"], moments["mod2_mean"], moments["mod3_mean"], moments["mod1_mod3_covar"]
             try:
                 b = U_var / U_mean - 1
@@ -673,7 +719,9 @@ class CMEModel:
             r = P_mean*gamma/b
             C = UP_covar
             gamma_p = C*(beta + gamma)*beta/(b**2*r - C*(beta + gamma))
-            k_p = r*gamma_p
+            gamma_p = np.clip(gamma_p, lb[4], ub[4])
+            k_p = np.clip(r*gamma_p, lb[3], ub[3])
+            gammap = k_p/r
             x0 = np.asarray([b, beta, gamma, k_p, gamma_p])
 
         elif self.bio_model == "Delay":

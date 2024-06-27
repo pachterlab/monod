@@ -6,10 +6,7 @@ import sys
 from datetime import datetime
 import pytz
 
-sys.path.insert(0, 'monod/src/monod')
-
-
-from monod.preprocess import (
+from preprocess import (
     construct_batch,
     code_ver_global,
     filter_by_gene,
@@ -27,7 +24,7 @@ from monod.preprocess import (
 
 
 def extract_comb(
-    dataset_filepaths,
+    loom_filepaths,
     transcriptome_filepath,
     dataset_names,
     batch_id=1,
@@ -40,7 +37,7 @@ def extract_comb(
     datestring=datetime.now(pytz.timezone("US/Pacific")).strftime("%y%m%d"),
     creator="gg",
     code_ver=code_ver_global,
-    batch_location=".",
+    batch_location="./fits",
     cf=None,
     exp_filter_threshold=1,
     genes_to_fit=[],
@@ -50,7 +47,7 @@ def extract_comb(
     Creates directories, and returns list of search_data objects for each dataset.
     """
 
-    dir_string,  dataset_strings = construct_batch(dataset_filepaths,
+    dir_string,  dataset_strings = construct_batch(loom_filepaths,
     transcriptome_filepath,
     dataset_names,
     batch_id=batch_id,
@@ -106,7 +103,7 @@ def extract_data(
         batch directory location.
     viz: bool, optional
         whether to visualize and store spliced and unspliced count statistics.
-    attribute_names: length-3 tuple, optional
+    dataset_attr_names: length-3 tuple, optional
         entry 0: layers to use (typically 'unspliced' and 'spliced').
         entry 1: variable name (typically 'gene_name')
         entry 2: observation name (typically 'barcode')
@@ -147,7 +144,6 @@ def extract_data(
     # genome.
     # if this is ever necessary, just make a different reference list.
     annotation_filter = identify_annotated_genes(gene_names, transcriptome_dict)
-    print(annotation_filter)
     *layers, gene_names = filter_by_gene(annotation_filter, *layers, gene_names)
 
     # initialize the gene length array.
@@ -195,7 +191,6 @@ def extract_data(
             ax1[i].set_ylabel("log10 (mean " + var_name[i] + " + 0.001)")
 
     gene_names = list(gene_names)
-    print(gene_names)
     gene_filter = [gene_names.index(gene) for gene in analysis_gene_list]
     gene_names = np.asarray(gene_names)
     *layers, gene_names, len_arr = filter_by_gene(
@@ -241,6 +236,9 @@ def extract_data(
             frequencies = unique_counts / n_cells
             unique = unique.astype(int)
             H = (unique, frequencies)
+            
+        elif hist_type == "none":
+            H = [x[gene_index] for x in layers]
 
         hist.append(H)
 
