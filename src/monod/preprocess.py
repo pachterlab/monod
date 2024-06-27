@@ -53,7 +53,7 @@ def construct_batch(
     datestring=datetime.now(pytz.timezone("US/Pacific")).strftime("%y%m%d"),
     creator="gg",
     code_ver=code_ver_global,
-    batch_location=".",
+    batch_location="./fits",
     cf=None,
     exp_filter_threshold=1,
     genes_to_fit=[],
@@ -123,6 +123,14 @@ def construct_batch(
     """
     
     log.info("Beginning data preprocessing and filtering.")
+    # Create batch location folder if it doesn't already exist.
+    try:
+        os.mkdir(batch_location)
+        log.info("Directory " + batch_location + " created.")
+    except OSError as error:
+        log.info(
+            "Batch location " + batch_location + " already exists."
+        )
     dir_string = (
         batch_location.rstrip("/")
         + "/"
@@ -652,7 +660,6 @@ def identify_annotated_genes(gene_names, feat_dict):
     ann_filt: bool np.ndarray
         boolean filter of genes that have annotations.
     """
-    print('THIS')
     n_gen_tot = len(gene_names)
     capitalize = False
     if capitalize:

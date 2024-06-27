@@ -104,6 +104,37 @@ class CMEModel:
         )
         self.available_seqmodels = ("None", "Bernoulli", "Poisson")
         self.available_ambmodels = ("None", "Equal", "Unequal")
+
+        # Define the modalities used for each model.
+        CMEModel.available_model_modalities = {"Delay":['unspliced', 'spliced'],
+            "Bursty":['unspliced', 'spliced'],
+            "Extrinsic":['unspliced', 'spliced'],
+            "Constitutive":['unspliced', 'spliced'],
+            "CIR":['unspliced', 'spliced'],
+            "DelayedSplicing":['unspliced', 'spliced'],
+            "ProteinBursty":['unspliced', 'spliced', 'protein']}
+        
+        try:
+            self.model_modalities = CMEModel.available_model_modalities[self.bio_model]
+        except KeyError:
+            log.error("Modalities unknown for model: {}".format(self.bio_model))
+            
+            
+        # Define the parameter bounds used for each biophysical model.
+        # TODO: check reasonableness of these bounds.
+        CMEModel.available_bio_bounds = {"Delay":{'phys_lb':[-1.0, -1.8, -1.8 ], 'phys_ub':[4.2, 2.5, 3.5]},
+            "Bursty":{'phys_lb':[-1.0, -1.8, -1.8 ], 'phys_ub':[4.2, 2.5, 3.5]},
+            "Extrinsic":{'phys_lb':[-1.0, -1.8, -1.8 ], 'phys_ub':[4.2, 2.5, 3.5]},
+            "Constitutive":{'phys_lb':[-1.8, -1.8 ], 'phys_ub':[2.5, 3.5]},
+            "CIR":{'phys_lb':[-1.0, -1.8, -1.8 ], 'phys_ub':[4.2, 2.5, 3.5]},
+            "DelayedSplicing":{'phys_lb':[-1.0, -1.8, -1.8 ], 'phys_ub':[4.2, 2.5, 3.5]},
+            "ProteinBursty":{'phys_lb':[-1.0, -1.8, -1.8, -1.8, -1.8], 'phys_ub':[4.2, 2.5, 3.5, 3.5, 3.5]}}
+        
+        try:
+            self.bio_bounds = CMEModel.available_bio_bounds[self.bio_model]
+        except KeyError:
+            log.info("Biophysical bounds unknown for model: {}".format(self.bio_model))
+
         self.amb_model = amb_model
         if seq_model in ["None", None, "Null"]:
             self.seq_model = "None"
@@ -112,6 +143,20 @@ class CMEModel:
         self.set_integration_parameters(
             fixed_quad_T, quad_order, quad_vec_T, quad_method
         )
+
+        # Define the parameter bounds used for each technical noise model.
+        # TODO: check reasonableness of these bounds.
+        CMEModel.available_seq_bounds = {"None":{'samp_lb':[1, 1],'samp_ub':[1, 1],'gridsize':[1, 1]}, 
+                                         "Bernoulli":{'samp_lb':[-8, -3], 'samp_ub':[-5, 0],'gridsize':[6, 7]}, 
+                                         "Poisson":{'samp_lb':[-8, -3], 'samp_ub':[-5, 0],'gridsize':[6, 7]}}
+        
+        try:
+            self.seq_bounds = CMEModel.available_seq_bounds[self.seq_model]
+        except KeyError:
+            log.info("Technical sequencing bounds unknown for model: {}".format(self.seq_model))
+        
+        # Get all biological and technical parameters.
+        self.param_str = self.get_log_name_str()
 
     def set_integration_parameters(
         self, fixed_quad_T, quad_order, quad_vec_T, quad_method
@@ -180,6 +225,7 @@ class CMEModel:
                     self.available_biomodels
                 )
             )
+        
         if self.amb_model == "Equal":
             param_str += [r"$\log_{10} p$"]
         elif self.amb_model == "Unequal":
@@ -305,7 +351,8 @@ class CMEModel:
             proposal[proposal < EPS] = EPS
             proposal = proposal[tuple(x.T)]
             d = f * np.log(f / proposal)
-        print(p,np.sum(d))
+        # print(p,np.sum(d))
+        ('hi')
         return np.sum(d)
 
     def eval_model_pss(self, p, limits, samp=None):
@@ -368,7 +415,7 @@ class CMEModel:
             p = np.copy(p[:-1])
 
         # For now add zero for protein sampling parameter.
-        if samp == None:
+        if samp is None:
             samp_use = np.array([0] * np.shape(g)[0])
         else:
             num_excess = np.shape(g)[0] - len(samp)
@@ -443,6 +490,7 @@ class CMEModel:
             b, tauinv, gamma = p
             tau = 1 / tauinv
             gf = tau * b * g[0] / (1 - b * g[0]) - 1 / gamma * np.log(1 - b * g[1])
+            
         elif self.bio_model == "CIR":  # CIR-like:
             b, beta, gamma = p
             fun = lambda x: self.cir_intfun(x, g, b, beta, gamma)
