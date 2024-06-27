@@ -193,7 +193,7 @@ def construct_batch(
 
         mods = layers # usually unspliced, spliced
         gene_exp_filter = threshold_by_expression(mods, filt_param)
-        print(np.shape(gene_exp_filter))
+        #print(np.shape(gene_exp_filter))
         
         if viz:
             # Use first letters of the modalities as names in visualization.
@@ -233,7 +233,7 @@ def construct_batch(
         make_dir(dataset_dir_string)
         dataset_strings.append(dataset_dir_string)
         
-    print(expression_filter_array)
+    #print(expression_filter_array)
     exp_fractions = expression_filter_array.mean(0)
     if exp_filter_threshold is None:  # no-tuning
         n_genes_enforced = 0
@@ -261,6 +261,7 @@ def construct_batch(
 		exp_fractions, 1 - (n_genes - n_genes_enforced) / len(exp_fractions)
         )
 
+        q = 0
         selected_genes_filter[exp_fractions > q] = True
         np.random.seed(seed)
         random_genes = np.where(exp_fractions == q)[0]
@@ -407,7 +408,7 @@ def threshold_by_expression(
     mod_means = [mod.mean(1) for mod in mods]
     
     gene_exp_filter = np.ones_like(mods[0][:,0], dtype=bool)
-    print(np.shape(gene_exp_filter))
+    #print(np.shape(gene_exp_filter))
 
     for i in range(len(mods)):
         gene_exp_filter &= (mod_means[i] > filt_param['min_means'][i])

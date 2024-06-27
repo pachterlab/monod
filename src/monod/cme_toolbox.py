@@ -11,7 +11,7 @@ from scipy import integrate
 from scipy.fft import irfftn
 
 # from .nn_toolbox import basic_ml_bivariate, ml_microstate_logP
-
+from preprocess import log
 
 class CMEModel:
     """Stores and evaluates biological and technical variation models.
@@ -297,7 +297,7 @@ class CMEModel:
             logL = np.log(proposal)*f*n_cells
             return np.sum(logL)
 
-    def eval_model_kld(self, p, limits, samp, data, hist_type="unique", EPS=1e-15):
+    def eval_model_kld(self, p, limits, samp, data, hist_type, EPS=1e-15):
         """Compute the Kullback-Leibler divergence between data and a fit.
 
         Parameters
@@ -312,6 +312,7 @@ class CMEModel:
             experimental data histogram.
         hist_type: str, optional
             if "grid": the search data histogram was generated using np.histogramdd.
+            if "none": the counts were stored.
             if "unique": the search data histogram was generated using np.unique.
             "unique" is the preferred method for histogram generation, as it requires less memory to store.
         EPS: float, optional
@@ -322,13 +323,15 @@ class CMEModel:
         kld: float
             Kullback-Leibler divergence.
         """
+        proposal = self.eval_model_pss(p, limits, samp)
+        proposal[proposal < EPS] = EPS
+
         if hist_type == "grid":
-            proposal = self.eval_model_pss(p, limits, samp)
-            proposal[proposal < EPS] = EPS
             filt = data > 0
             data = data[filt]
             proposal = proposal[filt]
             d = data * np.log(data / proposal)
+            
         elif hist_type == "unique":
             x, f = data
             # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
@@ -347,15 +350,13 @@ class CMEModel:
             #     # raise ValueError
             #     return np.sum(d)
             # else:
-            proposal = self.eval_model_pss(p, limits, samp)
-            proposal[proposal < EPS] = EPS
             proposal = proposal[tuple(x.T)]
             d = f * np.log(f / proposal)
 
         elif hist_type == "none":
-            proposal = self.eval_model_pss(p, limits, samp)
-            proposal[proposal < EPS] = EPS
-            d = -np.log(pss[np.arange(len(data[0])), *data])
+            d = -np.log([proposal[tuple(idx)] for idx in np.array(data,dtype=int).T])
+        
+        #log.debug('The KL divergence with parameter %s is %f', np.array2string(10**p),np.sum(d))
 
         return np.sum(d)
 
@@ -419,9 +420,7 @@ class CMEModel:
             p = np.copy(p[:-1])
 
         # For now add zero for protein sampling parameter.
-        if samp is None:
-            samp_use = np.array([0] * np.shape(g)[0])
-        else:
+        if samp is not None:
             num_excess = np.shape(g)[0] - len(samp)
             samp_use = np.array([i for i in samp]+[0]*num_excess)
         
@@ -720,7 +719,9 @@ class CMEModel:
             r = P_mean*gamma/b
             C = UP_covar
             gamma_p = C*(beta + gamma)*beta/(b**2*r - C*(beta + gamma))
-            k_p = r*gamma_p
+            gamma_p = np.clip(gamma_p, lb[4], ub[4])
+            k_p = np.clip(r*gamma_p, lb[3], ub[3])
+            gammap = k_p/r
             x0 = np.asarray([b, beta, gamma, k_p, gamma_p])
 
         elif self.bio_model == "Delay":
