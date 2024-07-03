@@ -86,6 +86,7 @@ class InferenceParameters:
         samp_lb=None,
         samp_ub=None,
         gridsize=None,
+        cell_size=None
     ):
         """Initialize the InferenceParameters instance.
 
@@ -142,8 +143,8 @@ class InferenceParameters:
             log.info(
                 "Sequencing model set to None. All sampling parameters set to null."
             )
-            samp_lb = [1, 1]
-            samp_ub = [1, 1]
+            samp_lb = [0, 0]
+            samp_ub = [0, 0]
             gridsize = [1, 1]
 
         self.samp_lb = np.array(samp_lb)
@@ -152,6 +153,9 @@ class InferenceParameters:
 
         self.construct_grid()
         self.model = model
+        if model.seq_model == "Cellwise_Poisson":
+            assert cell_size is not None, "Cellwise Poisson sequencing model requires cell size"
+        self.model.cell_size = cell_size
 
         self.n_phys_pars = model.get_num_params()
         self.n_samp_pars = len(self.samp_ub)  # this will always be 2 for now
@@ -450,7 +454,7 @@ class GradientInference:
         #x = x0[0]
         err = np.inf
         ERR_THRESH = 0.99
-        log.debug('Optimizing gene %d with initial value %s', gene_index, np.array2string(10**x0))
+        #log.debug('Optimizing gene %d with initial value %s', gene_index, np.array2string(10**x0))
         
         hist_type = get_hist_type(search_data)
         for restart in range(self.gradient_params["num_restarts"]):
@@ -477,7 +481,7 @@ class GradientInference:
         if not (np.isfinite(x).all()):
             log.warning("Gene index: " + str(gene_index))
             raise ValueError("Search failed. Please check input data.")
-        log.debug('Optimized parameters for gene %d is %s', gene_index, np.array2string(10**x))
+        #log.debug('Optimized parameters for gene %d is %s', gene_index, np.array2string(10**x))
         return x, err
 
     def iterate_over_genes(self, model, search_data):
@@ -516,7 +520,7 @@ class GradientInference:
 
         t2 = time.time()
         d_time = t2 - t1
-
+        #log.debug('Optimized parameters are\n%s', np.array2string(10**param_estimates))
         return param_estimates, klds, obj_func, d_time
 
     def fit_all_genes(self, model, search_data):

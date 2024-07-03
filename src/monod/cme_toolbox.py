@@ -102,7 +102,7 @@ class CMEModel:
             "DelayedSplicing",
             "ProteinBursty"
         )
-        self.available_seqmodels = ("None", "Bernoulli", "Poisson")
+        self.available_seqmodels = ("None", "Bernoulli", "Poisson", "Cellwise_Poisson")
         self.available_ambmodels = ("None", "Equal", "Unequal")
 
         # Define the modalities used for each model.
@@ -148,7 +148,8 @@ class CMEModel:
         # TODO: check reasonableness of these bounds.
         CMEModel.available_seq_bounds = {"None":{'samp_lb':[1, 1],'samp_ub':[1, 1],'gridsize':[1, 1]}, 
                                          "Bernoulli":{'samp_lb':[-8, -3], 'samp_ub':[-5, 0],'gridsize':[6, 7]}, 
-                                         "Poisson":{'samp_lb':[-8, -3], 'samp_ub':[-5, 0],'gridsize':[6, 7]}}
+                                         "Poisson":{'samp_lb':[-8, -3], 'samp_ub':[-5, 0],'gridsize':[6, 7]},
+                                         "Cellwise_Poisson":{'samp_lb':[-8, -3], 'samp_ub':[-5, 0],'gridsize':[6, 7]}}
         
         try:
             self.seq_bounds = CMEModel.available_seq_bounds[self.seq_model]
@@ -325,40 +326,43 @@ class CMEModel:
         """
         proposal = self.eval_model_pss(p, limits, samp)
         proposal[proposal < EPS] = EPS
-
-        if hist_type == "grid":
-            filt = data > 0
-            data = data[filt]
-            proposal = proposal[filt]
-            d = data * np.log(data / proposal)
-            
-        elif hist_type == "unique":
-            x, f = data
-            # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
-            # It will be implemented in a future version.
-            # if (
-            #     (self.quad_method == "nn")
-            #     and (self.bio_model == "Bursty")
-            #     and (self.seq_model == "None")
-            # ):
-            #     log_EPS = np.log(EPS)
-            #     log_proposal = ml_microstate_logP(p, x)
-            #     filt = (log_proposal < log_EPS) | (~np.isfinite(log_proposal))
-            #     log_proposal[filt] = log_EPS
-            #     d = f * (np.log(f) - log_proposal)
-            #     # print(np.sum(d))
-            #     # raise ValueError
-            #     return np.sum(d)
-            # else:
-            proposal = proposal[tuple(x.T)]
-            d = f * np.log(f / proposal)
-
-        elif hist_type == "none":
-            d = -np.log([proposal[tuple(idx)] for idx in np.array(data,dtype=int).T])
-        
-        #log.debug('The KL divergence with parameter %s is %f', np.array2string(10**p),np.sum(d))
-
-        return np.sum(d)
+        if self.seq_model == "Cellwise_Poisson":
+            assert hist_type == "none", "Cellwise_Poisson requires hist_type == none"
+            d = -np.log([proposal[tuple(np.append(n,tuple(idx)))] for n,idx in enumerate(np.array(data,dtype=int).T)])
+            return np.mean(d)
+        else:
+            if hist_type == "grid":
+                filt = data > 0
+                data = data[filt]
+                proposal = proposal[filt]
+                d = data * np.log(data / proposal)
+                return np.sum(d)
+                
+            elif hist_type == "unique":
+                x, f = data
+                # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
+                # It will be implemented in a future version.
+                # if (
+                #     (self.quad_method == "nn")
+                #     and (self.bio_model == "Bursty")
+                #     and (self.seq_model == "None")
+                # ):
+                #     log_EPS = np.log(EPS)
+                #     log_proposal = ml_microstate_logP(p, x)
+                #     filt = (log_proposal < log_EPS) | (~np.isfinite(log_proposal))
+                #     log_proposal[filt] = log_EPS
+                #     d = f * (np.log(f) - log_proposal)
+                #     # print(np.sum(d))
+                #     # raise ValueError
+                #     return np.sum(d)
+                # else:
+                proposal = proposal[tuple(x.T)]
+                d = f * np.log(f / proposal)
+                return np.sum(d)
+    
+            elif hist_type == "none":
+                d = -np.log([proposal[tuple(idx)] for idx in np.array(data,dtype=int).T])  
+                return np.mean(d)
 
     def eval_model_pss(self, p, limits, samp=None):
         """Evaluate the PMF of the model over a grid at a set of parameters.
@@ -426,6 +430,12 @@ class CMEModel:
         
         if self.seq_model == "Poisson":
             g = np.exp((np.power(10, samp_use))[:, None] * g) - 1
+        elif self.seq_model == "Cellwise_Poisson":
+            if self.cell_size is None:
+                raise ValueError("Please provide cell size for a cellwise Poisson technical noise model")
+            else:
+                cellwise_samp_use = np.power(10,samp_use)[:, None] * self.cell_size[None,:]
+                g = np.exp( cellwise_samp_use[:, :, None] * g[:, None,:]) - 1
         elif self.seq_model == "Bernoulli":
             g *= np.asarray(np.power(10, samp_use))[:, None]
         elif self.seq_model == "None":
@@ -439,7 +449,10 @@ class CMEModel:
             
         gf = self.eval_model_pgf(p, g)
         gf = np.exp(gf)
-        gf = gf.reshape(tuple(mx))
+        if self.cell_size is None:
+            gf = gf.reshape(tuple(mx))
+        else:
+            gf = gf.reshape(tuple(np.append(len(self.cell_size), mx)))
         Pss = irfftn(gf, s=tuple(limits))
         Pss = np.abs(Pss) / np.sum(np.abs(Pss))
         Pss = Pss.squeeze()
@@ -605,7 +618,7 @@ class CMEModel:
         _: np.ndarray
             integrand value.
         """
-        g = np.asarray(g)[:, :, None]
+        g = np.expand_dims(g, axis=-1)
         if np.isclose(beta, gamma):  # compute prefactors for the ODE characteristics.
             c_1 = g[0]  # nascent
             c_2 = x * beta * g[1]
@@ -641,7 +654,7 @@ class CMEModel:
         _: np.ndarray
             integrand value.
         """
-        g = np.asarray(g)[:, :, None]
+        g = np.expand_dims(g, axis=-1)
         if np.isclose(beta, gamma):  # compute prefactors for the ODE characteristics.
             c_1 = g[0]  # nascent
             c_2 = x * beta * g[1]
