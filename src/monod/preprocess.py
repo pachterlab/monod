@@ -257,11 +257,11 @@ def construct_batch(
                 n_genes_enforced += 1
                 selected_genes_filter[gene_loc[0]] = True
         #print(exp_fractions)
-        # q = np.quantile(
-        #     exp_fractions, 1 - (n_genes - n_genes_enforced) / len(exp_fractions)
-        # )
-        q = 0
-        #print(q)
+        
+        # q was set to zero in this branch previously.
+        q = np.quantile(
+            exp_fractions, 1 - (n_genes - n_genes_enforced) / len(exp_fractions)
+ 
         selected_genes_filter[exp_fractions > q] = True
         np.random.seed(seed)
         random_genes = np.where(exp_fractions == q)[0]
