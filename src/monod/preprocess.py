@@ -262,6 +262,7 @@ def construct_batch(
         )
 
         q = 0
+ 
         selected_genes_filter[exp_fractions > q] = True
         np.random.seed(seed)
         random_genes = np.where(exp_fractions == q)[0]
