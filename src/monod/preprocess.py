@@ -256,7 +256,9 @@ def construct_batch(
                 exp_fractions[gene_loc[0]] = 0
                 n_genes_enforced += 1
                 selected_genes_filter[gene_loc[0]] = True
-
+        #print(exp_fractions)
+        
+        # q was set to zero in this branch previously.
         q = np.quantile(
 		exp_fractions, 1 - (n_genes - n_genes_enforced) / len(exp_fractions)
         )
