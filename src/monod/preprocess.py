@@ -493,9 +493,9 @@ def import_raw(filename, attribute_names, cf):
         if fn_extension == "loom":  # loom file
             return import_vlm(filename, attribute_names, cf)
         elif fn_extension == "h5ad":
-            raise ValueError(
-                "This functionality is unsupported in the current version of Monod."
-            )
+            # raise ValueError(
+            #     "This functionality is unsupported in the current version of Monod."
+            # )
             return import_h5ad(filename, attribute_names, cf)
         else:
             raise ValueError(
@@ -551,30 +551,38 @@ def process_h5ad(file, attribute_names, cf=None):
     warnings.resetwarnings()
     return layers, gene_names, nCells
 
-
-# the next three functions are obsolete and should not be called in the current version.
 def import_h5ad(filename, attribute_names, cf=None):
-    """
-    Imports an anndata file with spliced and unspliced RNA counts.
-    Note row/column convention is opposite loompy.
-    Conventions as in import_raw.
-    """
-    mod2_layer, mod1_layer, gene_attr, cell_attr = attribute_names
-    warnings.filterwarnings("ignore", category=DeprecationWarning)
+
     ds = ad.read_h5ad(filename, backed="r")
-    if cf is None:
-        cf = np.ones(ds.shape[0], dtype=bool)
-    # ds = ds[cf]
-    mod2 = ds[cf].layers[mod2_layer].T  # usually spliced
-    mod1 = ds[cf].layers[mod1_layer].T  # usually unspliced
-    if scipy.sparse.issparse(mod2):
-        mod2 = np.asarray(mod2.todense())
-        mod1 = np.asarray(mod1.todense())
-    # gene_names = ds.var[gene_attr].to_numpy()
-    gene_names = ds.var_names.to_numpy()
-    nCells = mod2.shape[1]
-    warnings.resetwarnings()
-    return mod2, mod1, gene_names, nCells
+
+    layers, gene_names, nCells = process_h5ad(ds, attribute_names)
+
+    return layers, gene_names, nCells
+
+
+# # the next three functions are obsolete and should not be called in the current version.
+# def import_h5ad(filename, attribute_names, cf=None):
+#     """
+#     Imports an anndata file with spliced and unspliced RNA counts.
+#     Note row/column convention is opposite loompy.
+#     Conventions as in import_raw.
+#     """
+#     mod2_layer, mod1_layer, gene_attr, cell_attr = attribute_names
+#     warnings.filterwarnings("ignore", category=DeprecationWarning)
+#     ds = ad.read_h5ad(filename, backed="r")
+#     if cf is None:
+#         cf = np.ones(ds.shape[0], dtype=bool)
+#     # ds = ds[cf]
+#     mod2 = ds[cf].layers[mod2_layer].T  # usually spliced
+#     mod1 = ds[cf].layers[mod1_layer].T  # usually unspliced
+#     if scipy.sparse.issparse(mod2):
+#         mod2 = np.asarray(mod2.todense())
+#         mod1 = np.asarray(mod1.todense())
+#     # gene_names = ds.var[gene_attr].to_numpy()
+#     gene_names = ds.var_names.to_numpy()
+#     nCells = mod2.shape[1]
+#     warnings.resetwarnings()
+#     return mod2, mod1, gene_names, nCells
 
 # Since this is deprecated and assumes spliced, unspliced filenames, no need to update.
 def import_mtx(dir_name):
