@@ -731,7 +731,11 @@ class SearchResults:
         # pull in small amount of non-cell-specific info from search data
         self.n_genes = search_data.n_genes
         self.n_cells = search_data.n_cells
-        self.gene_log_lengths = search_data.gene_log_lengths
+        try:
+            self.gene_log_lengths = search_data.gene_log_lengths
+        except AttributeError:
+            self.gene_log_lengths = None
+            
         self.gene_names = search_data.gene_names
 
         self.param_estimates = []
@@ -1644,6 +1648,9 @@ class SearchResults:
         distinguish_rej: bool, optional
              whether to distinguish the genes in the rejected_genes attribute by color.
         """
+        if not self.gene_log_lengths:
+            log.error('No gene lengths given, length-dependence cannot be plotted.')
+            
         num_params = self.sp.n_phys_pars
         figsize = figsize or (4 * num_params, 4)
 

@@ -25,8 +25,8 @@ from preprocess import (
 
 def extract_comb(
     loom_filepaths,
-    transcriptome_filepath,
     dataset_names,
+    transcriptome_filepath=None,
     batch_id=1,
     n_genes=100,
     seed=2813308004,
@@ -48,8 +48,8 @@ def extract_comb(
     """
 
     dir_string,  dataset_strings = construct_batch(loom_filepaths,
-    transcriptome_filepath,
     dataset_names,
+    transcriptome_filepath=transcriptome_filepath,
     batch_id=batch_id,
     n_genes=n_genes,
     seed=seed,
@@ -67,8 +67,9 @@ def extract_comb(
 
     search_data_objects = []
     for i in range(len(loom_filepaths)):
-        search_data_object = extract_data(loom_filepaths[i], transcriptome_filepath, dataset_names[i],
-                        dataset_strings[i], dir_string, dataset_attr_names=attribute_names)
+        
+        search_data_object = extract_data(loom_filepaths[i], dataset_names[i],
+                        dataset_strings[i], dir_string, transcriptome_filepath=transcriptome_filepath, dataset_attr_names=attribute_names)
         search_data_objects += [search_data_object]
 
     return search_data_objects, dataset_strings
@@ -76,10 +77,10 @@ def extract_comb(
 
 def extract_data(
     dataset_filepath,
-    transcriptome_filepath,
     dataset_name,
     dataset_string,
     dir_string,
+    transcriptome_filepath=None,
     viz=True,
     dataset_attr_names=[("unspliced", "spliced"), "gene_name", "barcode"],
     padding=None,
@@ -132,7 +133,9 @@ def extract_data(
     log.info("Beginning data extraction.")
     log.info("Dataset: " + dataset_name)
 
-    transcriptome_dict = get_transcriptome(transcriptome_filepath)
+    if transcriptome_filepath:
+        transcriptome_dict = get_transcriptome(transcriptome_filepath)
+        
     layers, gene_names, n_cells = import_raw(dataset_filepath, dataset_attr_names, cf)
 
     if padding is None:
@@ -143,16 +146,18 @@ def extract_data(
     # though I do not see the purpose of analyzing genes that not in the
     # genome.
     # if this is ever necessary, just make a different reference list.
-    annotation_filter = identify_annotated_genes(gene_names, transcriptome_dict)
-    *layers, gene_names = filter_by_gene(annotation_filter, *layers, gene_names)
+    
+    if transcriptome_filepath:
+        annotation_filter = identify_annotated_genes(gene_names, transcriptome_dict)
+        *layers, gene_names = filter_by_gene(annotation_filter, *layers, gene_names)
 
-    # initialize the gene length array.
-    # For mouse transcripts, gene names are Capitalized, for human, they are ALL CAPS.
-    capitalize = False
-    if capitalize:
-        len_arr = np.array([transcriptome_dict[k.capitalize()] for k in gene_names])
-    else:
-        len_arr = np.array([transcriptome_dict[k] for k in gene_names])
+        # initialize the gene length array.
+        # For mouse transcripts, gene names are Capitalized, for human, they are ALL CAPS.
+        capitalize = False
+        if capitalize:
+            len_arr = np.array([transcriptome_dict[k.capitalize()] for k in gene_names])
+        else:
+            len_arr = np.array([transcriptome_dict[k] for k in gene_names])
 
 
     gene_result_list_file = dir_string + "/genes.csv"
@@ -167,7 +172,7 @@ def extract_data(
         )
         # raise an error here in the next version.
 
-    if viz:
+    if viz and transcriptome_filepath:
         mods = layers # usually unspliced, spliced
         
         mod_names = dataset_attr_names[0] # default 'unspliced', 'spliced'
@@ -193,32 +198,42 @@ def extract_data(
     gene_names = list(gene_names)
     gene_filter = [gene_names.index(gene) for gene in analysis_gene_list]
     gene_names = np.asarray(gene_names)
-    *layers, gene_names, len_arr = filter_by_gene(
-        gene_filter, *layers, gene_names, len_arr
-    )
+
+    if transcriptome_filepath:
+        *layers, gene_names, len_arr = filter_by_gene(
+            gene_filter, *layers, gene_names, len_arr
+        )
+    else: 
+        *layers, gene_names = filter_by_gene(
+            gene_filter, *layers, gene_names
+        )
 
     mods = layers 
 
     if viz:
-        for i in range(len(mods)):
-            var_arr = tuple([mod.mean(1) for mod in mods][::-1])
-            ax1[i].scatter(
-                np.log10(len_arr),
-                np.log10(var_arr[i] + 0.001),
-                s=5,
-                c="firebrick",
-                alpha=0.9,
-            )
         dataset_diagnostics_dir_string = dataset_string + "/diagnostic_figures"
         make_dir(dataset_diagnostics_dir_string)
-        plt.savefig(
-            dataset_diagnostics_dir_string + "/{}.png".format(dataset_name), dpi=450
-        )
+
+        if transcriptome_filepath:
+            for i in range(len(mods)):
+                var_arr = tuple([mod.mean(1) for mod in mods][::-1])
+                ax1[i].scatter(
+                    np.log10(len_arr),
+                    np.log10(var_arr[i] + 0.001),
+                    s=5,
+                    c="firebrick",
+                    alpha=0.9,
+                )
+            
+            plt.savefig(
+                dataset_diagnostics_dir_string + "/{}.png".format(dataset_name), dpi=450
+            )
 
     n_genes = len(gene_names)
     M = np.amax(layers, axis=2) + padding[:, None]
 
-    gene_log_lengths = np.log10(len_arr)
+    if transcriptome_filepath:
+        gene_log_lengths = np.log10(len_arr)
 
     hist = []
     moments = []
@@ -259,7 +274,6 @@ def extract_data(
         "M",
         "hist",
         "moments",
-        "gene_log_lengths",
         "n_genes",
         "gene_names",
         "n_cells",
@@ -268,18 +282,22 @@ def extract_data(
     ]
 
     layers = np.asarray(layers)
-    search_data = SearchData(
-        attr_names,
+
+    attr_values = [
         M,
         hist,
         moments,
-        gene_log_lengths,
         n_genes,
         gene_names,
         n_cells,
         layers,
-        hist_type,
-    )
+        hist_type]
+
+    if transcriptome_filepath:
+        attr_names += ['gene_log_lengths']
+        attr_values += [gene_log_lengths]
+    
+    search_data = SearchData(attr_names, *attr_values)
 
     search_data_string = dataset_string + "/raw.sd"
     store_search_data(search_data, search_data_string)

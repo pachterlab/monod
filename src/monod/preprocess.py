@@ -41,8 +41,8 @@ logging.config.dictConfig(
 
 def construct_batch(
     dataset_filepaths,
-    transcriptome_filepath,
     dataset_names,
+    transcriptome_filepath=None,
     batch_id=1,
     n_genes=100,
     seed=2813308004,
@@ -148,7 +148,10 @@ def construct_batch(
     if type(attribute_names[-1]) is str:
         attribute_names = [attribute_names] * n_datasets
 
-    transcriptome_dict = get_transcriptome(transcriptome_filepath)
+    if transcriptome_filepath:
+        transcriptome_dict = get_transcriptome(transcriptome_filepath)
+    else:
+        log.info('No transcriptome filepath given. Length information is not available, so some functionality is unavailable.')
 
     for dataset_index in range(n_datasets):
         dataset_filepath = dataset_filepaths[dataset_index]
@@ -170,8 +173,11 @@ def construct_batch(
         # though I do not see the purpose of analyzing genes that not in the
         # genome.
         # if this is ever necessary, just make a different reference list.
-        annotation_filter = identify_annotated_genes(gene_names, transcriptome_dict)
-        *layers, gene_names = filter_by_gene(annotation_filter, *layers, gene_names)
+        
+        if transcriptome_filepath:
+            annotation_filter = identify_annotated_genes(gene_names, transcriptome_dict)
+            *layers, gene_names = filter_by_gene(annotation_filter, *layers, gene_names)
+            
         if dataset_index == 0:  # this presupposes the data are well-structured
             gene_name_reference = np.copy(gene_names)
             expression_filter_array = np.zeros(
@@ -186,16 +192,18 @@ def construct_batch(
         # initialize the gene length array.
         # N.B. the transcriptome dictionary has genes in capitalized forms: e.g. Cd3d
         capitalize = False
-        if capitalize:
-            len_arr = np.array([transcriptome_dict[k.capitalize()] for k in gene_names])
-        else:
-            len_arr = np.array([transcriptome_dict[k] for k in gene_names])
+
+        if transcriptome_filepath: 
+            if capitalize:
+                len_arr = np.array([transcriptome_dict[k.capitalize()] for k in gene_names])
+            else:
+                len_arr = np.array([transcriptome_dict[k] for k in gene_names])
 
         mods = layers # usually unspliced, spliced
         gene_exp_filter = threshold_by_expression(mods, filt_param)
         #print(np.shape(gene_exp_filter))
         
-        if viz:
+        if viz and transcriptome_filepath:
             # Use first letters of the modalities as names in visualization.
             # mod1_name, mod2_name = attribute_names[0]
             
