@@ -53,7 +53,6 @@ class CMEModel:
         if 'quad_vec', use adaptive integration via scipy.integrate.quad_vec.
 
     """
-
     def __init__(
         self,
         bio_model,
@@ -105,7 +104,7 @@ class CMEModel:
         self.available_seqmodels = ("None", "Bernoulli", "Poisson")
         self.available_ambmodels = ("None", "Equal", "Unequal")
 
-        # Define the modalities used for each model.
+        # Define the modalities used for each model, and their order.
         CMEModel.available_model_modalities = {"Delay":['unspliced', 'spliced'],
             "Bursty":['unspliced', 'spliced'],
             "Extrinsic":['unspliced', 'spliced'],
@@ -118,6 +117,22 @@ class CMEModel:
             self.model_modalities = CMEModel.available_model_modalities[self.bio_model]
         except KeyError:
             log.error("Modalities unknown for model: {}".format(self.bio_model))
+
+        # Define the expression filter each biophysical model.
+        # TODO: check reasonableness of these.
+        CMEModel.available_filter_bounds = {"Delay":{'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]},
+            "Bursty":{'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]},
+            "Extrinsic":{'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]},
+            "Constitutive":{'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]},
+            "CIR":{'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]},
+            "DelayedSplicing":{'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]},
+            "ProteinBursty":{'min_means':[0.01, 0.01, 1], 'max_maxes':[350, 350, 1000], 'min_maxes':[4,4, 10]}}
+        
+        try:
+            self.filter_bounds = CMEModel.available_filter_bounds[self.bio_model]
+            
+        except KeyError:
+            log.info("Biophysical bounds unknown for model: {}".format(self.bio_model))
             
             
         # Define the parameter bounds used for each biophysical model.
@@ -132,6 +147,7 @@ class CMEModel:
         
         try:
             self.bio_bounds = CMEModel.available_bio_bounds[self.bio_model]
+            
         except KeyError:
             log.info("Biophysical bounds unknown for model: {}".format(self.bio_model))
 
@@ -681,8 +697,9 @@ class CMEModel:
         if self.seq_model == "Poisson":
             samp = 10**samp
 
-        U_var, U_mean = moments['mod1_var'], moments['mod1_mean']
-        S_var, S_mean = moments['mod2_var'], moments['mod2_mean']
+        # These can be defined per model (just happen to be shared by multiple models here).
+        U_var, U_mean = moments['MOM_unspliced_var'], moments['MOM_unspliced_mean']
+        S_var, S_mean = moments['MOM_spliced_var'], moments['MOM_spliced_mean']
 
         if self.bio_model == "Bursty" or self.bio_model == "CIR":
             try:
@@ -700,7 +717,7 @@ class CMEModel:
             x0 = np.asarray([b, beta, gamma])
 
         elif self.bio_model == "ProteinBursty":
-            U_var, U_mean, S_mean, P_mean, UP_covar = moments["mod1_var"], moments["mod1_mean"], moments["mod2_mean"], moments["mod3_mean"], moments["mod1_mod3_covar"]
+            U_var, U_mean, S_mean, P_mean, UP_covar = moments["MOM_unspliced_var"], moments["MOM_unspliced_mean"], moments["MOM_spliced_mean"], moments["MOM_protein_mean"], moments["MOM_unspliced_protein_covar"]
             try:
                 b = U_var / U_mean - 1
             except:
