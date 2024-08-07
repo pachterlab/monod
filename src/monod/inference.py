@@ -9,18 +9,297 @@ from preprocess import make_dir, log
 from cme_toolbox import CMEModel  # may be unnecessary
 import multiprocessing
 import os
+from extract_data import extract_data
 
 # lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
 import warnings
 from plot_aesthetics import aesthetics
 
 from tqdm import tqdm
+code_ver_global = "029"  # bumping up version April 2024
 
 # from tqdm.contrib.concurrent import process_map  # or thread_map
-
-
 # warnings.filterwarnings("ignore", category=DeprecationWarning) #let's do more gargeted stuff...
 
+def perform_inference(h5ad_filepath,
+    model,
+    output_directory=None,
+    transcriptome_filepath=None,
+    n_genes=100,
+    seed=2813308004,
+    viz=True,
+    filt_param=None,
+    modality_name_dict=None,
+    batch_location="./fits",
+    cf=None,
+    code_ver=code_ver_global,
+    exp_filter_threshold=1,
+    genes_to_fit=[],
+    gradient_params={
+        "max_iterations": 10,
+        "init_pattern": "moments",
+        "num_restarts": 1},
+    use_lengths=False,
+    run_meta="",
+    phys_lb=None,
+    phys_ub=None,
+    samp_lb=None,
+    samp_ub=None,
+    gridsize=None,
+    exclude_sigma=False):
+    '''
+    Load and filter data from h5ad file.
+    Run inference procedure for the desired model, save parameters, uncertainty from Hessian and AIC values automatically.
+    '''
+    dataset_string = ''.join(h5ad_filepath.split('/')[-1].split('.')[:-1])
+    if not output_directory:
+        output_directory = dataset_string
+    make_dir(output_directory)
+    
+    monod_adata = extract_data(h5ad_filepath,
+    model,
+    dataset_name=output_directory,
+    transcriptome_filepath=transcriptome_filepath,
+    n_genes=n_genes,
+    seed=seed,
+    viz=viz,
+    filt_param=filt_param,
+    modality_name_dict=modality_name_dict,
+    batch_location=batch_location,
+    cf=cf,
+    code_ver=code_ver,
+    exp_filter_threshold=exp_filter_threshold,
+    genes_to_fit=genes_to_fit, hist_type='unique')
+    log.info('Data extracted')
+
+    # Filter adata for selected genes.
+    monod_adata = monod_adata[:, monod_adata.var['selected_genes'].astype(bool)]
+    
+    search_data = searchdata_from_adata(monod_adata)
+    log.info('Search data created')
+    
+    inference_parameters = InferenceParameters(
+        dataset_string,
+        model,
+        use_lengths=use_lengths,
+        gradient_params=gradient_params,
+        run_meta=run_meta,
+        phys_lb=phys_lb,
+        phys_ub=phys_ub,
+        samp_lb=samp_lb,
+        samp_ub=samp_ub,
+        gridsize=gridsize)
+    log.info('Global inference parameters set.')
+    
+    # Fit the model at all values of technical parameters, and save the location of the results.
+    search_result = inference_parameters.fit_all_grid_points(search_data)
+    log.info('Grid points fit.')
+    search_result.find_sampling_optimum(discard_rejected=False)
+    parameters_per_gene = search_result.phys_optimum
+    log.info('Optimal parameters found.')
+    num_params = search_result.model.get_num_params()
+
+    # Load the AnnData object into memory if it is in backed mode
+    if monod_adata.isbacked:
+        monod_adata = monod_adata.to_memory()
+
+    # Save parameter results to adata.
+    for i in range(num_params):
+        param_name = search_result.model.param_str[i]
+        param_values = parameters_per_gene[:,i]
+        monod_adata.var['param_' + param_name] = param_values
+    log.info('Optimal parameters saved.')
+    
+    # Save AIC values to adata.
+    AIC_per_gene(search_result, monod_adata)
+    log.info('AIC values calculated.')
+
+    if not exclude_sigma:
+        # Save uncertainties from Hessian.
+        search_result.compute_sigma(search_data,num_cores=1)
+        sigmas = search_result.sigma
+        
+        for i in range(num_params):
+            param_name = search_result.model.param_str[i]
+            sigmas = parameters_per_gene[:,i]
+            monod_adata.var['sigma_' + param_name] = sigmas#[:,i]  
+
+        log.info('Uncertainties per gene calculated.')
+
+    return monod_adata
+
+def searchdata_from_adata(adata):
+
+    n_genes = adata.n_vars
+    layers = [adata.layers[layer_name] for layer_name in adata.layers.keys()]
+
+    M = adata.uns['M']
+
+    hist = adata.uns['hist']
+
+    moments = get_gene_moments(adata)
+
+    try:
+        gene_log_lengths = adata.var['log_lengths']
+    except KeyError:
+        gene_log_lengths = None
+
+    gene_names = adata.var
+
+    n_cells = adata.n_obs
+
+    # Hard code for now.
+    # hist_type = get_hist_type_adata(adata)
+    hist_type = 'unique'
+
+    attr_names = [
+        "M",
+        "hist",
+        "moments",
+        "n_genes",
+        "gene_names",
+        "n_cells",
+        "layers",
+        "hist_type",
+    ]
+
+    attr_values = [M, hist, moments, n_genes, gene_names, n_cells, layers, hist_type]
+    
+    search_data = SearchData(attr_names, *attr_values)
+    
+    return search_data
+
+
+def get_gene_moments(adata):
+    
+    # Specify the columns you want to extract
+    columns_of_interest = [i for i in adata.var.columns if 'MOM' in i]
+    
+    # Ensure the columns exist in adata.var
+    for col in columns_of_interest:
+        if col not in adata.var.columns:
+            raise ValueError(f"Column '{col}' does not exist in adata.var")
+    
+    # Extract the selected columns
+    selected_data = adata.var[columns_of_interest]
+    
+    # Convert the DataFrame to a list of dictionaries
+    list_of_dicts = selected_data.to_dict(orient='records')
+    
+    return list_of_dicts
+
+
+def get_gene_moments_single(adata, gene_index):
+
+    # Create an empty dictionary to store the gene attributes
+    gene_moment_dict = {}
+    
+    # Iterate through each column in adata.var and add it to the dictionary
+    for column in adata.var.columns:
+        if 'MOM_' in column:
+            gene_moment_dict[column[4:]] = adata.var[column].tolist()[gene_index]
+
+    return gene_moment_dict
+
+# Use class to make inference faster.
+class SearchData:
+    """Container for data for for inference, visualization, and testing.
+
+    Attributes
+    ----------
+    attr_names: tuple of str
+
+    layers: int np.ndarray
+        raw data from the layers of interest, size n_species x n_genes x n_cells.
+    M: int np.ndarray
+        grid size for PMF evaluation, size n_species x n_genes.
+    hist: tuple or np.ndarray
+        histogram of raw data, used to evaluate divergences.
+        if tuple, generated by np.unique.
+        if np.ndarray, generated by np.histogramdd.
+    moments: list of dict
+        length-n_genes list containing moments for each gene.
+        moments include 'mod2_mean', 'mod1_mean', 'mod2_var', 'mod1_var', and are used to define MoM estimates.
+        Also covariances in form 'mod1_mod2_covar'
+    gene_log_lengths: float np.ndarray
+        log lengths of analyzed genes.
+    n_genes: int
+        number of genes to analyze.
+    gene_names: str np.ndarray
+        list of genes to analyze.
+    n_cells: int
+        number of cells in the dataset.
+    hist_type: str
+        metadata defining the type of histogram.
+    """
+
+    def __init__(self, attr_names, *input_data):
+        """Creates a SearchData object from raw data.
+
+        Parameters
+        ----------
+        attr_names: tuple
+            list of attributes to store, provided in extract_data.
+        *input_data
+            attributes to store, as enumerated in the class definition.
+        """
+        for j in range(len(input_data)):
+            setattr(self, attr_names[j], input_data[j])
+            
+
+def AIC_per_gene(search_result, monod_adata):
+    """
+    Computes the AIC value for each gene for a single model.
+
+    Parameters
+    ----------
+    search_result : SearchResult
+        The search result object containing model fitting information.
+    adata : anndata.AnnData
+        The AnnData object containing the gene expression data.
+
+    Returns
+    -------
+    np.ndarray
+        The AIC values for each gene.
+    """
+    search_data = searchdata_from_adata(monod_adata)
+    n_cells = monod_adata.n_obs
+    # Calculate the log-likelihood for each gene
+    logL = search_result.get_logL(search_data, n_cells)
+    
+    # Calculate the number of parameters
+    n_params = search_result.sp.n_phys_pars
+    
+    # Calculate AIC for each gene
+    AIC = 2 * n_params - 2 * logL
+
+    monod_adata.var['AIC'] = AIC
+    
+    return AIC
+
+def get_hist_type(search_data):
+    """A helper function for backwards compatibility.
+
+    If the histogram type is not specified in the SearchData object, assume it is the legacy
+    type "grid".
+
+    Parameters
+    ----------
+    search_data: monod.extract_data.SearchData
+        SearchData object with the data to fit.
+
+    Returns
+    -------
+    hist_type: str
+        flavor of histogram used to generate search_data, either "unique" or "grid" or "none".
+    """
+
+    if hasattr(search_data, "hist_type") and search_data.hist_type == "unique" or "none":
+        hist_type = search_data.hist_type
+    else:
+        hist_type = "grid"
+    return hist_type
 
 class InferenceParameters:
     """Stores parameters and distributes the multi-grid point inference procedure.
@@ -161,7 +440,6 @@ class InferenceParameters:
 
         self.dataset_string = dataset_string
         
-        
         inference_string = f"{dataset_string}/{model.bio_model}_{model.seq_model}_"
         for i in range(len(gridsize)):
             inference_string += f"{gridsize[i]:.0f}x"
@@ -270,7 +548,8 @@ class InferenceParameters:
 
         t2 = time.time()
         log.info("Runtime: {:.1f} seconds.".format(t2 - t1))
-        return full_result_string
+        
+        return results
 
     def par_fun(self, inputs):
         """Helper method for the grid point parallelization procedure.
@@ -541,33 +820,34 @@ class GradientInference:
         )
         results.store_grid_point_results()
 
-
 ########################
 ## Helper functions
 ########################
 
 
-def get_hist_type(search_data):
+def get_hist_type_adata(monod_adata):
     """A helper function for backwards compatibility.
 
-    If the histogram type is not specified in the SearchData object, assume it is the legacy
+    If the histogram type is not specified in the anndata object, assume it is the legacy
     type "grid".
 
     Parameters
     ----------
-    search_data: monod.extract_data.SearchData
-        SearchData object with the data to fit.
+    monod_adata: Anndata
+        anndata object with the data to fit.
 
     Returns
     -------
     hist_type: str
-        flavor of histogram used to generate search_data, either "unique" or "grid" or "none".
+        flavor of histogram used to generate monod_adata, either "unique" or "grid" or "none".
     """
-
-    if hasattr(search_data, "hist_type") and search_data.hist_type == "unique" or "none":
-        hist_type = search_data.hist_type
+    
+    if "hist_type" in monod_adata.uns and monod_adata.uns["hist_type"] in {"unique", "none"}:
+        hist_type = monod_adata.uns["hist_type"]
+        
     else:
         hist_type = "grid"
+        
     return hist_type
 
 
@@ -1756,6 +2036,7 @@ class SearchResults:
             ax1[i].set_ylabel(self.model.get_log_name_str()[i])
             if axis_search_bounds:
                 ax1[i].set_ylim([self.sp.phys_lb[i], self.sp.phys_ub[i]])
+        
         fig1.tight_layout()
         fig_string = self.analysis_figure_string + "/length_dependence.png"
         plt.savefig(fig_string, dpi=450)
@@ -1886,7 +2167,7 @@ class SearchResults:
             log.info("Figure stored to {}.".format(fig_string))
 
     # the next two functions are useful for model selection, but are not currently in use.
-    def get_logL(self, search_data, EPS=1e-20, offs=0):
+    def get_logL(self, search_data, n_cells, EPS=1e-20, offs=0):
         """
         This method calculates the log-likelihood for all genes at the sampling parameter optimum.
 
@@ -1900,12 +2181,14 @@ class SearchResults:
         """
         hist_type = get_hist_type(search_data)
         logL = np.zeros(self.n_genes)
+
         for gene_index in range(self.n_genes):
             logL[gene_index] = self.model.eval_model_logL(
                 p=self.phys_optimum[gene_index],
                 limits=search_data.M[:, gene_index] + offs,
                 samp=self.regressor_optimum[gene_index],
                 data=search_data.hist[gene_index],
+                n_cells=n_cells,
                 hist_type=hist_type,
                 EPS=EPS,
             )
@@ -2006,7 +2289,7 @@ def parallelize(
 
 def plot_hist_and_fit(
     ax1,
-    sd,
+    monod_adata,
     i_,
     Pa,
     marg="nascent",
@@ -2021,8 +2304,8 @@ def plot_hist_and_fit(
     ----------
     ax: matplotlib.axes.Axes
         axes to plot into.
-    sd: monod.extract_data.SearchData
-        SearchData object with the fit data.
+    monod_adata: anndata
+        anndata object with the fit data.
     i_: int
         gene index to plot.
     Pa: float np.ndarray
@@ -2039,15 +2322,19 @@ def plot_hist_and_fit(
         model fit line style in a matplotlib-compatible format.
     """
 
-    if marg == "nascent":
+    # Identify layer index of the layer we want to gain the marginal of.
+    layer_names = [i for i in monod_adata.layers.keys()]
+    for i in range(len(layer_names)):
+        if marg==layer_names[i]:
+            lind = i
+    # Otherwise use first modality.
+    else:
         lind = 0
-    elif marg == "mature":
-        lind = 1
-    elif marg == "ambiguous":
-        lind = 2
+    marg_name = layer_names[lind]
+        
     ax1.hist(
-        sd.layers[lind, i_],
-        bins=np.arange(sd.M[lind, i_]) - 0.5,
+        monod_adata.layers[marg_name][:, i_],
+        bins=np.arange(monod_adata.uns['M'][lind, i_]) - 0.5,
         density=True,
         color=facecolor,
         alpha=facealpha,

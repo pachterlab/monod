@@ -5,88 +5,59 @@ import pickle
 import sys
 from datetime import datetime
 import pytz
+import scanpy as sc
+import anndata
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+import loompy as lp  # will be necessary later, probably
+import anndata as ad
+import os
+import collections
+import warnings
+import scipy
+from scipy import sparse
+import pandas as pd
+code_ver_global = "029"  # bumping up version April 2024
 
-from preprocess import (
-    construct_batch,
-    code_ver_global,
-    filter_by_gene,
-    make_dir,
-    import_raw,
-    process_h5ad,
-    get_transcriptome,
-    identify_annotated_genes,
-    log,
+import logging, sys
+
+logging.basicConfig(stream=sys.stdout)
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+import logging.config
+
+logging.config.dictConfig(
+    {
+        "version": 1,
+        "disable_existing_loggers": True,
+    }
 )
 
 ########################
 ## Main code
 ########################
 
-
-def extract_comb(
-    loom_filepaths,
-    dataset_names,
+def extract_data(
+    h5ad_filepath,
+    model,
+    dataset_name=None,
     transcriptome_filepath=None,
-    batch_id=1,
     n_genes=100,
     seed=2813308004,
     viz=True,
-    filt_param={'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]  },
-    attribute_names=[("unspliced", "spliced"), "gene_name", "barcode"],
-    meta="batch",
-    datestring=datetime.now(pytz.timezone("US/Pacific")).strftime("%y%m%d"),
-    creator="gg",
-    code_ver=code_ver_global,
+    filt_param=None,
+    modality_name_dict=None,
     batch_location="./fits",
     cf=None,
+    code_ver=code_ver_global,
     exp_filter_threshold=1,
     genes_to_fit=[],
+    hist_type = 'grid',
+    padding=None
 ):
-    """
-    Same arguments as construct_batch. 
-    Creates directories, and returns list of search_data objects for each dataset.
-    """
-
-    dir_string,  dataset_strings = construct_batch(loom_filepaths,
-    dataset_names,
-    transcriptome_filepath=transcriptome_filepath,
-    batch_id=batch_id,
-    n_genes=n_genes,
-    seed=seed,
-    viz=viz,
-    filt_param =filt_param,
-    attribute_names = attribute_names,
-    meta=meta,
-    datestring=datestring,
-    creator=creator,
-    code_ver=code_ver,
-    batch_location=batch_location,
-    cf=cf,
-    exp_filter_threshold=exp_filter_threshold,
-    genes_to_fit=genes_to_fit)
-
-    search_data_objects = []
-    for i in range(len(loom_filepaths)):
-        
-        search_data_object = extract_data(loom_filepaths[i], dataset_names[i],
-                        dataset_strings[i], dir_string, transcriptome_filepath=transcriptome_filepath, dataset_attr_names=attribute_names)
-        search_data_objects += [search_data_object]
-
-    return search_data_objects, dataset_strings
-    
-
-def extract_data(
-    dataset_filepath,
-    dataset_name,
-    dataset_string,
-    dir_string,
-    transcriptome_filepath=None,
-    viz=True,
-    dataset_attr_names=[("unspliced", "spliced"), "gene_name", "barcode"],
-    padding=None,
-    cf=None,
-    hist_type="unique",
-):
+    log.debug('working')
     """Extract data for selected genes from a single dataset.
 
     Parameters
@@ -127,19 +98,28 @@ def extract_data(
     Returns
     -------
     search_data: SearchData object.
-
     """
-
     log.info("Beginning data extraction.")
     log.info("Dataset: " + dataset_name)
 
+    if not filt_param:
+        filt_param = model.filter_bounds
+
+    # If no mapping given, assume that the layers are named according to the conventional modalities for the model
+    # e.g. 'spliced', 'unspliced'
+    if not modality_name_dict:
+        modality_name_dict = {v:v for v in model.model_modalities}
+
     if transcriptome_filepath:
         transcriptome_dict = get_transcriptome(transcriptome_filepath)
-        
-    layers, gene_names, n_cells = import_raw(dataset_filepath, dataset_attr_names, cf)
+    else:
+        transcriptome_dict = None
 
+    # Import h5ad.
+    monod_adata = import_h5ad(h5ad_filepath)
+    
     if padding is None:
-        padding = np.asarray([10] * len(layers))
+        padding = np.asarray([10] * len(monod_adata.layers))
 
     # identify genes that are in the length annotations. discard all the rest.
     # for models without length-based sequencing, this may not be necessary
@@ -148,105 +128,191 @@ def extract_data(
     # if this is ever necessary, just make a different reference list.
     
     if transcriptome_filepath:
-        annotation_filter = identify_annotated_genes(gene_names, transcriptome_dict)
-        *layers, gene_names = filter_by_gene(annotation_filter, *layers, gene_names)
+        
+        # Add gene attribute indicating whether each gene's length is included in the transcriptome,
+        # and add an attribute called 'lengths' containing the lengths, and log_lengths.
+        monod_adata = add_gene_lengths(monod_adata, transcriptome_dict, attribute_name='length_given')
+        
+        # Filter the data based on whether the length is given.
+        gene_filter = monod_adata.var['length_given'] == 1
+        monod_adata = monod_adata[:, gene_filter].copy()
 
-        # initialize the gene length array.
-        # For mouse transcripts, gene names are Capitalized, for human, they are ALL CAPS.
-        capitalize = False
-        if capitalize:
-            len_arr = np.array([transcriptome_dict[k.capitalize()] for k in gene_names])
-        else:
-            len_arr = np.array([transcriptome_dict[k] for k in gene_names])
+    # Filter genes, then pick a number of random genes to make up the total desired number of genes.
+    monod_adata = process_adata(monod_adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes, transcriptome_dict=transcriptome_dict)
 
+    gene_names, n_cells = monod_adata.var.index, len(monod_adata.obs.index)
 
-    gene_result_list_file = dir_string + "/genes.csv"
-    try:
-        with open(gene_result_list_file, newline="") as f:
-            reader = csv.reader(f)
-            analysis_gene_list = list(reader)[0]
-        log.info("Gene list extracted from {}.".format(gene_result_list_file))
-    except:
-        log.error(
-            "Gene list could not be extracted from {}.".format(gene_result_list_file)
+    # Extract layers
+    layers = [monod_adata.layers[layer_name] for layer_name in monod_adata.layers.keys()]
+
+    # Compute maximum expression value across cells for each gene and each layer
+    max_values = np.amax(layers, axis=1)  # Shape: (n_genes, n_layers)
+
+    # Define default padding if None
+    if padding is None:
+        padding = [10] * max_values.shape[1]  # One padding value per layer
+    
+    # Ensure padding is a column vector
+    padding = np.asarray(padding)[:, None]
+
+    # Add padding to the maximum values
+    M = max_values + padding
+    monod_adata.uns['M'] = M
+    
+    hist = make_histogram(monod_adata, hist_type, M)
+    monod_adata.uns['hist'] = hist
+    monod_adata.uns['hist_type'] = hist_type
+
+    monod_adata = add_moments(monod_adata)
+    monod_adata.uns['model'] = model
+
+    # Save adata?
+    
+    return monod_adata
+
+# TODO make work.
+def add_moments(adata, modality_name_dict=None, cov_matrix_key='layer_covariances'):
+    """
+    Compute and add mean and variance for each gene within each layer to `adata.var`, 
+    and add covariances between layers for each gene to `adata.var`.
+
+    Parameters
+    ----------
+    adata: anndata.AnnData
+        AnnData object with layers containing gene expression data.
+    cov_matrix_key: str, optional
+        Key under which the covariance matrix will be stored in `adata.uns`.
+
+    Returns
+    -------
+    adata: anndata.AnnData
+        AnnData object with moments and layer covariances added to `adata.var` and `adata.uns`.
+    """
+    layers = adata.layers.keys()
+    n_layers = len(layers)
+    n_genes = adata.n_vars
+
+    # If no mapping specified, assume layers are named the same as CME model modalities.
+    if not modality_name_dict:
+        modality_name_dict = {v:v for v in layers}
+    
+    # Create DataFrame to store moments
+    moments_df = pd.DataFrame(index=adata.var.index)
+
+    # Compute mean and variance for each gene within each layer
+    for layer in layers:
+
+        modality_name = modality_name_dict[layer]
+        
+        mean_col = f"MOM_{modality_name}_mean"
+        var_col = f"MOM_{modality_name}_var"
+        
+        # # Calculate mean and variance for each layer
+        # moments_df[mean_col] = adata.layers[layer].mean(axis=0).flatten()
+        # moments_df[var_col] = adata.layers[layer].var(axis=0).flatten()
+
+        # Calculate mean and variance for each layer
+        adata.var[mean_col] = adata.layers[layer].mean(axis=0).flatten()
+        adata.var[var_col] = adata.layers[layer].var(axis=0).flatten()
+    
+    index = 0
+    for i in range(n_layers):
+        for j in range(i + 1, n_layers):
+            layer_i = [p for p in layers][i]
+            layer_j = [p for p in layers][j]
+            mod_i, mod_j = modality_name_dict[layer_i], modality_name_dict[layer_j]
+            layer_layer_string = f"MOM_cov_{mod_i}_{mod_j}"
+
+            gene_covars = []
+            for gene_index in range(n_genes):
+                covar = np.cov([adata.layers[layer_i][:, gene_index], adata.layers[layer_j][:, gene_index]])[0, 1]
+                # covariances[gene_index, index] = covar
+                gene_covars += [covar]
+
+            adata.var[layer_layer_string] = gene_covars
+            
+            index += 1
+
+    # # Add layer covariances DataFrame to adata.var
+    # covariances_df = pd.DataFrame(covariances, index=adata.var.index)
+    
+    # covariances_df.columns = [f"MOM_cov_{[p for p in layers][i]}_{[p for p in layers][j]}" for i in range(n_layers) for j in range(i + 1, n_layers)]
+    
+    # adata.var = adata.var.join(covariances_df)
+
+    # # Add the covariance matrix between layers to `adata.uns` (not needed?)
+    # adata.uns[cov_matrix_key] = covariances
+
+    return adata
+
+# TODO make work.
+def plot_vs_lengths(adata):
+    
+    mods = layers # usually unspliced, spliced
+    
+    mod_names = dataset_attr_names[0] # default 'unspliced', 'spliced'
+    
+    # Use first letter of names as labels (make sure modalities have different first letters.
+    mod_labels = [mod_name[0].upper() for mod_name in mod_names]
+    
+    var_name = tuple(mod_labels[::-1])
+    var_arr = tuple([mod.mean(1) for mod in mods][::-1])
+    
+    fig1, ax1 = plt.subplots(nrows=1, ncols=len(mods), figsize=(12, 4))
+    for i in range(len(mods)):
+        ax1[i].scatter(
+            np.log10(len_arr),
+            np.log10(var_arr[i] + 0.001),
+            s=3,
+            c="silver",
+            alpha=0.15,
         )
-        # raise an error here in the next version.
+        ax1[i].set_xlabel("log10 gene length")
+        ax1[i].set_ylabel("log10 (mean " + var_name[i] + " + 0.001)")
 
-    if viz and transcriptome_filepath:
-        mods = layers # usually unspliced, spliced
-        
-        mod_names = dataset_attr_names[0] # default 'unspliced', 'spliced'
-        
-        # Use first letter of names as labels (make sure modalities have different first letters.
-        mod_labels = [mod_name[0].upper() for mod_name in mod_names]
-        
-        var_name = tuple(mod_labels[::-1])
-        var_arr = tuple([mod.mean(1) for mod in mods][::-1])
-        
-        fig1, ax1 = plt.subplots(nrows=1, ncols=len(mods), figsize=(12, 4))
+# TODO make work.
+def plot_diagnostic(monod_adata):
+    dataset_diagnostics_dir_string = dataset_string + "/diagnostic_figures"
+    make_dir(dataset_diagnostics_dir_string)
+
+    if transcriptome_filepath:
         for i in range(len(mods)):
+            var_arr = tuple([mod.mean(1) for mod in mods][::-1])
             ax1[i].scatter(
                 np.log10(len_arr),
                 np.log10(var_arr[i] + 0.001),
-                s=3,
-                c="silver",
-                alpha=0.15,
+                s=5,
+                c="firebrick",
+                alpha=0.9,
             )
-            ax1[i].set_xlabel("log10 gene length")
-            ax1[i].set_ylabel("log10 (mean " + var_name[i] + " + 0.001)")
-
-    gene_names = list(gene_names)
-    gene_filter = [gene_names.index(gene) for gene in analysis_gene_list]
-    gene_names = np.asarray(gene_names)
-
-    if transcriptome_filepath:
-        *layers, gene_names, len_arr = filter_by_gene(
-            gene_filter, *layers, gene_names, len_arr
-        )
-    else: 
-        *layers, gene_names = filter_by_gene(
-            gene_filter, *layers, gene_names
+        
+        plt.savefig(
+            dataset_diagnostics_dir_string + "/{}.png".format(dataset_name), dpi=450
         )
 
-    mods = layers 
-
-    if viz:
-        dataset_diagnostics_dir_string = dataset_string + "/diagnostic_figures"
-        make_dir(dataset_diagnostics_dir_string)
-
-        if transcriptome_filepath:
-            for i in range(len(mods)):
-                var_arr = tuple([mod.mean(1) for mod in mods][::-1])
-                ax1[i].scatter(
-                    np.log10(len_arr),
-                    np.log10(var_arr[i] + 0.001),
-                    s=5,
-                    c="firebrick",
-                    alpha=0.9,
-                )
-            
-            plt.savefig(
-                dataset_diagnostics_dir_string + "/{}.png".format(dataset_name), dpi=450
-            )
-
-    n_genes = len(gene_names)
-    M = np.amax(layers, axis=2) + padding[:, None]
-
-    if transcriptome_filepath:
-        gene_log_lengths = np.log10(len_arr)
+# TODO make work. (Need to run for inference?)
+def make_histogram(monod_adata, hist_type, M):
 
     hist = []
-    moments = []
+    layers = [monod_adata.layers[layer_name] for layer_name in monod_adata.layers.keys()]
+    n_cells = monod_adata.n_obs
+    n_genes = monod_adata.n_vars
+    
     for gene_index in range(n_genes):
+        
         if hist_type == "grid":
-            H, xedges, yedges = np.histogramdd(
-                *[x[gene_index] for x in layers],
-                bins=[np.arange(x[gene_index] + 1) - 0.5 for x in M],
+            bins = [np.arange(x[gene_index] + 1) - 0.5 for x in M]
+            stacked_data = np.vstack([x[:,gene_index] for x in layers]).T
+            H, edges = np.histogramdd(
+                stacked_data,
+                bins=bins,
                 density=True
             )
+            xedges = edges[0]  # Assuming only one dimension for each bin
+            yedges = edges[1] 
         elif hist_type == "unique":
             unique, unique_counts = np.unique(
-                np.vstack([x[gene_index] for x in layers]).T, axis=0, return_counts=True
+                np.vstack([x[:,gene_index] for x in layers]).T, axis=0, return_counts=True
             )
             frequencies = unique_counts / n_cells
             unique = unique.astype(int)
@@ -257,210 +323,612 @@ def extract_data(
 
         hist.append(H)
 
-        mom_dict = {f"mod{i+1}_mean": mods[i][gene_index].mean() for i in range(len(mods))}
-        mom_dict.update({f"mod{i+1}_var": mods[i][gene_index].var() for i in range(len(mods))})
-        mod_pairs = []
-        for i in range(len(mods)):
-            for j in range(i+1, len(mods)):
-                mod_pairs += [(i,j)]
-        # Add covariances
-        mom_dict.update({f"mod{i[0]+1}_mod{i[1]+1}_covar": np.cov(np.array([mods[i[0]][gene_index], mods[i[1]][gene_index]]))[0][1] for i in mod_pairs})
+    return hist
+
+## Helper functions.
+# Don't need store_search_data function anymore, can just save adata object in the normal way.
+
+def get_noise_decomp(
+    adata, sizefactor="pf", lognormalize=True, pcount=0, which_variance_measure="CV2"
+):
+    """
+    This function performs normalization and variance stabilization on the raw data, and
+    reports the fractions of normalized variance retained and removed as a result of the process.
+    The (unspliced and spliced) species are analyzed independently.
+
+    Parameters
+    ----------
+    adata: anndata.AnnData
+        AnnData object with layers containing raw data (e.g., 'unspliced', 'spliced').
+    sizefactor: str, float, int, or None, optional
+        What size factor to use.
+        If 'pf', use proportional fitting; set the size of each cell to the mean size.
+        If int or float, use this number (e.g., 1e4 for cp10k).
+        If None, do not do size/depth normalization.
+    lognormalize: bool, optional
+        Whether to apply log(1+x) transformation.
+    pcount: int or float, optional
+        Pseudocount added in size normalization to ensure division by zero does not occur.
+    which_variance_measure: str, optional
+        Measure of variance to use ('CV2', 'var', 'Fano').
+
+    Returns
+    -------
+    adata: anndata.AnnData
+        AnnData object with additional columns in `adata.obs` containing the fraction of variance retained or discarded.
+    """
+
+    layers = adata.layers.keys()
+
+    for layer in layers:
+        # Copy the layer to a temporary AnnData object for normalization
+        temp_adata = anndata.AnnData(X=adata.layers[layer])
+
+        temp_adata = normalize_count_matrix(temp_adata, sizefactor=sizefactor, lognormalize=lognormalize, pcount=pcount)
+
+        # Compute variance before and after normalization
+        original_variance = var_fun(anndata.AnnData(X=adata.layers[layer]), which_variance_measure)
+        normalized_variance = var_fun(temp_adata, which_variance_measure)
+
+        # Store the results in the adata.obs
+        adata.obs[f'var_retained_{layer}'] = normalized_variance / original_variance
+        adata.obs[f'var_discarded_{layer}'] = 1 - adata.obs[f'var_retained_{layer}']
+
+    return adata
+
+
+def var_fun(adata, measure):
+    '''
+    Define a function to measure variance of gene count matrix.
+    '''    
+    if measure == "CV2":
+        mean = adata.X.mean(axis=1).A1
+        variance = adata.X.var(axis=1).A1
+        return variance / (mean ** 2)
+    elif measure == "var":
+        return adata.X.var(axis=1).A1
+    elif measure == "Fano":
+        mean = adata.X.mean(axis=1).A1
+        variance = adata.X.var(axis=1).A1
+        return variance / mean
+
+
+def normalize_count_matrix(
+    adata, sizefactor="pf", lognormalize=True, pcount=1, logbase=np.e
+):
+    """
+    This function performs normalization and variance stabilization on a raw data matrix in an AnnData object
+    using Scanpy's built-in functions.
+
+    Parameters
+    ----------
+    adata: anndata.AnnData
+        AnnData object with a gene x cell count matrix in adata.X.
+    sizefactor: str, float, int, or None, optional
+        What size factor to use.
+        If 'pf', use proportional fitting; set the size of each cell to the mean size.
+        If int or float, use this number (e.g., 1e4 for cp10k).
+        If None, do not do size/depth normalization.
+    lognormalize: bool, optional
+        Whether to apply log transformation.
+    pcount: int or float, optional
+        Pseudocount added in size normalization to ensure division by zero does not occur.
+    logbase: int or float
+        log base for scanpy.
+
+    Returns
+    -------
+    adata: anndata.AnnData
+        AnnData object with normalized and transformed count matrix in adata.X.
+    """
+    if sizefactor is not None:
+        if sizefactor == "pf":
+            sc.pp.normalize_total(adata, target_sum=adata.X.sum(0).mean(), inplace=True)
+        else:
+            sc.pp.normalize_total(adata, target_sum=sizefactor, inplace=True)
+
+    if lognormalize:
+        sc.pp.log1p(adata, base=logbase)
+    
+    return adata
+
+########################
+## Main code
+########################
+
+# From construct batch.
+    
         
-        moments.append(
-            mom_dict
+    if dataset_index == 0:  # this presupposes the data are well-structured
+        gene_name_reference = np.copy(gene_names)
+        expression_filter_array = np.zeros(
+            (n_datasets, len(gene_name_reference)), dtype=bool
         )
+    else:
+        if not np.all(gene_name_reference == gene_names):
+            raise ValueError(
+                "Gene names do not match: the data may not be consistently structured."
+            )
 
-    attr_names = [
-        "M",
-        "hist",
-        "moments",
-        "n_genes",
-        "gene_names",
-        "n_cells",
-        "layers",
-        "hist_type",
-    ]
+    
 
-    layers = np.asarray(layers)
 
-    attr_values = [
-        M,
-        hist,
-        moments,
-        n_genes,
-        gene_names,
-        n_cells,
-        layers,
-        hist_type]
+# TODO make work.
+def preprocess_viz(monod_adata, transcriptome_filepath):
 
     if transcriptome_filepath:
-        attr_names += ['gene_log_lengths']
-        attr_values += [gene_log_lengths]
-    
-    search_data = SearchData(attr_names, *attr_values)
+        # Use first letters of the modalities as names in visualization.
+        # mod1_name, mod2_name = attribute_names[0]
+        
+        mod_names = attribute_names[0][0]
+        # var_name = (mod2_name[0].upper(), mod1_name[0].upper()) # e.g. ("S", "U")
+        # NB reversed order here.
+        var_name = tuple([name[0].upper() for name in mod_names[::-1]])
+        # var_arr = (mod2.mean(1), mod1.mean(1))
+        var_arr = tuple([mod.mean(1) for mod in mods][::-1])
 
-    search_data_string = dataset_string + "/raw.sd"
-    store_search_data(search_data, search_data_string)
-    return search_data
-
+        fig1, ax1 = plt.subplots(nrows=1, ncols=len(mods), figsize=(12, 4))
+        for i in range(len(mods)):
+            ax1[i].scatter(
+                np.log10(len_arr)[~gene_exp_filter],
+                np.log10(var_arr[i][~gene_exp_filter] + 0.001),
+                s=3,
+                c="silver",
+                alpha=0.15,
+            )
+            ax1[i].scatter(
+                np.log10(len_arr[gene_exp_filter]),
+                np.log10(var_arr[i][gene_exp_filter] + 0.001),
+                s=3,
+                c="indigo",
+                alpha=0.3,
+            )
+            ax1[i].set_xlabel("log10 gene length")
+            ax1[i].set_ylabel("log10 (mean " + var_name[i] + " + 0.001)")
 
 ########################
 ## Helper functions
 ########################
-def store_search_data(search_data, search_data_string):
-    """Attempt to store a search data object to disk.
+
+
+def filter_by_gene(filter, *args):
+    """Convenience function to filter arrays by gene.
+
+    This function takes in a filter over genes,
+    then selects the entries of inputs that match the filter.
 
     Parameters
     ----------
-    search_data: SearchData
-        object to store.
-    search_data_string: str
-        desired disk location for the SearchData object.
+    filter: bool or int np.ndarray
+        filter over the gene dimension.
+    *args: variable number of np.ndarrays
+        np.ndarrays with dimension 0 that matches the filter dimension.
+
+    Returns
+    -------
+    tuple(out): tuple
+        tuple of filtered *args.
+
+    Examples
+    --------
+    >>> S_filt, U_filt = filter_by_gene(filter,S,U)
+    >>> assert((S_filt.shape[0]==filter.sum()) & (U_filt.shape[0]==filter.sum()))
+
     """
-    try:
-        with open(search_data_string, "wb") as sdfs:
-            pickle.dump(search_data, sdfs)
-        log.info("Search data stored to {}.".format(search_data_string))
-    except:
-        log.error("Search data could not be stored to {}.".format(search_data_string))
+    out = []
+    for arg in args:
+        out += [arg[filter].squeeze()]
+    return tuple(out)
 
+def add_gene_lengths(adata, length_dict, attribute_name='length_given', lengths_name='lengths'):
+    """
+    Adds a gene attribute to each gene in the AnnData object.
+    The attribute is set to 1 if the gene's name is found within the keys of the dictionary, and 0 otherwise.
+    Additionally, adds the values from the dictionary as a new attribute called 'lengths'.
 
-########################
-## Helper classes
-########################
-class SearchData:
-    """Container for data for for inference, visualization, and testing.
-
-    Attributes
+    Parameters
     ----------
-    attr_names: tuple of str
+    adata: anndata.AnnData
+        AnnData object containing gene expression data.
+    gene_dict: dict
+        Dictionary with gene names as keys and values as the new attribute to be added.
+    attribute_name: str, optional
+        Name of the attribute to be added to adata.var indicating presence in the dictionary.
+    lengths_name: str, optional
+        Name of the attribute to be added to adata.var containing the values from the dictionary.
 
-    layers: int np.ndarray
-        raw data from the layers of interest, size n_species x n_genes x n_cells.
-    M: int np.ndarray
-        grid size for PMF evaluation, size n_species x n_genes.
-    hist: tuple or np.ndarray
-        histogram of raw data, used to evaluate divergences.
-        if tuple, generated by np.unique.
-        if np.ndarray, generated by np.histogramdd.
-    moments: list of dict
-        length-n_genes list containing moments for each gene.
-        moments include 'mod2_mean', 'mod1_mean', 'mod2_var', 'mod1_var', and are used to define MoM estimates.
-        Also covariances in form 'mod1_mod2_covar'
-    gene_log_lengths: float np.ndarray
-        log lengths of analyzed genes.
+    Returns
+    -------
+    adata: anndata.AnnData
+        AnnData object with the new gene attributes added to adata.var.
+    """
+    # Initialize the attributes
+    adata.var[attribute_name] = adata.var_names.isin(gene_dict).astype(int)
+    adata.var[lengths_name] = adata.var_names.map(gene_dict).fillna(0).astype(float)
+    adata.var['log_lengths'] = np.log10(adata.var['lengths'])
+
+    log.info('Added lengths')
+    return adata
+
+def threshold_by_expression(adata, filt_param={'min_means': [0.01, 0.01], 
+                                               'max_maxes': [350, 350], 'min_maxes': [4, 4]}):
+    """
+    Filters genes in an AnnData object based on expression thresholds for each layer.
+
+    Parameters
+    ----------
+    adata: anndata.AnnData
+        AnnData object with gene expression data in layers.
+    filt_param: dict, optional
+        Dictionary with filtering parameters.
+        - 'min_means': Minimum mean expression for each modality.
+        - 'max_maxes': Maximum expression for each modality.
+        - 'min_maxes': Minimum expression for each modality.
+
+    Returns
+    -------
+    adata: anndata.AnnData
+        Filtered AnnData object with genes that meet the expression thresholds.
+    """
+
+    # Initialize gene filter to keep all genes
+    gene_exp_filter = np.ones(adata.n_vars, dtype=bool)
+    
+    # Iterate over each layer to apply filters
+    for i, layer in enumerate(adata.layers):
+        # Compute mean and max values directly from AnnData object
+        means = adata.layers[layer].mean(axis=0)
+        maxes = adata.layers[layer].max(axis=0)
+        
+        # Apply filtering criteria
+        layer_filter = (means > filt_param['min_means'][i]) & (maxes < filt_param['max_maxes'][i]) & (maxes > filt_param['min_maxes'][i])
+        
+        # Combine filters across layers
+        gene_exp_filter &= layer_filter
+
+    ## Do not remove filtered genes.
+    # # Update AnnData object with filtered genes
+    # adata = adata[:, gene_exp_filter].to_memory() #copy()
+    adata.var['gene_exp_filter'] = gene_exp_filter
+
+    # Log the number of genes retained
+    print(f"{np.sum(gene_exp_filter)} genes retained after expression filter.")
+    
+    return adata
+    
+
+def save_gene_list(dir_string, gene_list, filename):
+    """Store a list of genes to disk.
+
+    Parameters
+    ----------
+    dir_string: str
+        batch directory location.
+    gene_list: list of str
+        list of genes to store.
+    filename: str
+        file name string.
+    """
+    with open(dir_string + "/" + filename + ".csv", "w") as f:
+        writer = csv.writer(f)
+        writer.writerow(gene_list)
+
+
+
+def import_h5ad(filename, cf=None):
+
+    ds = ad.read_h5ad(filename, backed="r")
+
+    return ds
+
+def visualize_gene_filtering(adata, transcriptome_dict, modality_names):
+    """
+    Visualizes gene filtering results.
+    
+    Parameters
+    ----------
+    adata: anndata.AnnData
+        AnnData object with gene expression data in layers.
+    transcriptome_dict: dict
+        Dictionary with transcriptome data for gene lengths.
+    modality_names: list
+        List of attribute names for visualization.
+    """
+    gene_names = adata.var_names
+    len_arr = np.array([transcriptome_dict[k] for k in gene_names])
+    var_name = tuple([name[0].upper() for name in modality_names[::-1]])
+    var_arr = tuple([adata.layers[layer].mean(axis=0).A1 for layer in adata.layers][::-1])
+
+    fig1, ax1 = plt.subplots(nrows=1, ncols=len(adata.layers), figsize=(12, 4))
+    for i, layer in enumerate(adata.layers):
+        ax1[i].scatter(
+            np.log10(len_arr)[~adata.var['expression_filter'].values],
+            np.log10(var_arr[i][~adata.var['expression_filter'].values] + 0.001),
+            s=3,
+            c="silver",
+            alpha=0.15,
+        )
+        ax1[i].scatter(
+            np.log10(len_arr[adata.var['expression_filter'].values]),
+            np.log10(var_arr[i][adata.var['expression_filter'].values] + 0.001),
+            s=3,
+            c="indigo",
+            alpha=0.3,
+        )
+        ax1[i].set_xlabel("log10 gene length")
+        ax1[i].set_ylabel("log10 (mean " + var_name[i] + " + 0.001)")
+
+def process_adata(adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes, seed=5, dir_string='./fits', transcriptome_dict=None):
+    """
+    Processes a single AnnData object, applies expression filters, and stores the results in AnnData.
+
+    Parameters
+    ----------
+    adata: anndata.AnnData
+        AnnData object to be processed.
+    filt_param: dict
+        Filtering parameters for expression.
+    transcriptome_dict: dict
+        Dictionary with transcriptome data for gene lengths.
+    genes_to_fit: list
+        List of genes to be specifically included in the selection.
+    exp_filter_threshold: float or None
+        Threshold for expression filtering.
     n_genes: int
-        number of genes to analyze.
+        Number of genes to select.
+    seed: int
+        Random seed for reproducibility.
+    dir_string: str
+        Directory to save the gene list.
+
+    Returns
+    -------
+    adata: anndata.AnnData
+        Processed AnnData object with gene filters applied.
+    """
+    n_cells = adata.n_obs
+    log.info(f"{n_cells} cells detected.")
+    n_genes_original = adata.n_vars
+    
+    # Filter genes by expression
+    adata = threshold_by_expression(adata, filt_param)
+    gene_names = adata.var_names
+
+    # Add gene lengths.
+    if transcriptome_dict:
+        adata.var['length'] = [transcriptome_dict.get(gene, np.nan) for gene in gene_names]
+
+    gene_name_reference = np.copy(gene_names)
+    # Apply expression threshold filter
+    gene_exp_filter = adata.var['gene_exp_filter']
+
+    # Randomly select genes to meet the required n_genes.
+    n_vars = adata.n_vars
+    selected_genes_filter = np.zeros(n_vars, dtype=bool)
+    
+    enforced_genes = np.zeros(n_vars, dtype=bool)
+    for gene in genes_to_fit:
+        gene_loc = np.where(adata.var_names == gene)[0]
+        if len(gene_loc) == 0:
+            log.warning(f"Gene {gene} not found or has multiple entries in annotations.")
+        elif len(gene_loc) > 1:
+            log.error(f"Multiple entries found for gene {gene}: this should never happen.")
+        else:
+            gene_exp_filter[gene_loc[0]] = False
+            n_genes -= 1
+            enforced_genes[gene_loc[0]] = True
+
+    np.random.seed(seed)
+    sampling_gene_set = np.where(gene_exp_filter)[0]
+    if n_genes < len(sampling_gene_set):
+        gene_select_ind = np.random.choice(sampling_gene_set, n_genes, replace=False)
+        log.info(f"{n_genes} random genes selected.")
+    else:
+        gene_select_ind = sampling_gene_set
+        log.warning(f"{len(sampling_gene_set)} random genes selected: cannot satisfy query of {n_genes} genes.")
+    
+    selected_genes_filter[gene_select_ind] = True
+    selected_genes_filter[enforced_genes] = True
+
+    adata.var['selected_genes'] = selected_genes_filter
+    log.info(f"Total of {selected_genes_filter.sum()} genes selected.")
+    
+    return adata
+
+
+
+def get_transcriptome(transcriptome_filepath, repeat_thr=15):
+    """Imports transcriptome length/repeat statistics from a previously generated file.
+
+    Parameters
+    ----------
+    transcriptome_filepath: str
+        location of the transcriptome length reference.
+        this is a simple space-separated file.
+        The convention for each line is name - length - # of 5mers - # of 6mers -
+            .... - # of 50mers - # of repeats with more than 50 A bases in a row
+    repeat_thr: int
+        threshold for minimum repeat length to consider.
+        By default, this is 15, and so will return number of polyA stretches of
+        length 15 or more in the gene.
+
+    Returns
+    -------
+    len_dict: dict
+        dictionary with structure {gene name : gene length}
+
+    The repeat dictionary is not used in this version of the code.
+    """
+    #repeat_dict = {}
+    len_dict = {}
+    #thr_ind = repeat_thr - 3
+    with open(transcriptome_filepath, "r") as file:
+        for line in file.readlines():
+            d = [i for i in line.split(" ") if i]
+            #repeat_dict[d[0]] = int(d[thr_ind])
+            len_dict[d[0]] = int(d[1])
+    return len_dict
+
+
+def identify_annotated_genes(gene_names, feat_dict):
+    """Check which gene names are unique and have annotations in a feature dictionary.
+
+    Parameters
+    ----------
     gene_names: str np.ndarray
-        list of genes to analyze.
-    n_cells: int
-        number of cells in the dataset.
-    hist_type: str
-        metadata defining the type of histogram.
+        gene names from raw data file.
+    feat_dict: dict
+        annotation dictionary imported by get_transcriptome.
+
+    Returns
+    -------
+    ann_filt: bool np.ndarray
+        boolean filter of genes that have annotations.
     """
+    n_gen_tot = len(gene_names)
+    capitalize = False
+    if capitalize:
+        sel_ind_annot = [k for k in range(len(gene_names)) if gene_names[k].capitalize() in feat_dict]
+    else:
+        sel_ind_annot = [k for k in range(len(gene_names)) if gene_names[k] in feat_dict]
 
-    def __init__(self, attr_names, *input_data):
-        """Creates a SearchData object from raw data.
+    NAMES = [gene_names[k] for k in range(len(sel_ind_annot))]
+    COUNTS = collections.Counter(NAMES)
+    sel_ind = [x for x in sel_ind_annot if COUNTS[gene_names[x]] == 1]
 
-        Parameters
-        ----------
-        attr_names: tuple
-            list of attributes to store, provided in extract_data.
-        *input_data
-            attributes to store, as enumerated in the class definition.
-        """
-        for j in range(len(input_data)):
-            setattr(self, attr_names[j], input_data[j])
+    log.info(
+        str(len(gene_names))
+        + " features observed, "
+        + str(len(sel_ind_annot))
+        + " match genome annotations. "
+        + str(len(sel_ind))
+        + " were unique."
+    )
 
-    def get_noise_decomp(
-        self, sizefactor="pf", lognormalize=True, pcount=0, which_variance_measure="CV2"
-    ):
-        """
-        This method performs normalization and variance stabilization on the raw data, and
-        reports the fractions of normalized variance retained and removed as a result of the process.
-        The (unspliced and spliced) species are analyzed independently.
+    ann_filt = np.zeros(n_gen_tot, dtype=bool)
+    ann_filt[sel_ind] = True
+    return ann_filt
 
-        Parameters
-        ----------
-        sizefactor: str, float, int, or None, optional
-            what size factor to use.
-            If 'pf', use proportional fitting; set the size of each cell to the mean size.
-            If int or float, use this number (e.g., 1e4 for cp10k).
-            If None, do not do size/depth normalization.
-        lognormalize: bool, optional
-            whether to apply log(1+x) transformation.
-        pcount: int or float, optional
-            pseudocount added in size normalization to ensure division by zero does not occur.
-
-        Returns
-        f: float np.ndarray
-            array with size n_genes x 2 x 2, which contains the fraction of CV2 retained or discarded.
-            dim 0: gene index.
-            dim 1: variance fraction (retained, discarded).
-            dim 2: species (unspliced, spliced).
-
-        """
-        f = np.zeros((self.n_genes, 2, len(layers)))  # genes -- bio vs tech -- species
-        mods = [np.copy(self.layers[i]) for i in range(len(layers))] # usually unspliced, spliced
-
-        if which_variance_measure == "CV2":
-            var_fun = lambda X: X.var(1) / (X.mean(1) ** 2)
-        elif which_variance_measure == "var":
-            var_fun = lambda X: X.var(1)
-        elif which_variance_measure == "Fano":
-            var_fun = lambda X: X.var(1) / (X.mean(1))
-
-        var_mods = [var_fun(mod) for mod in mods]
-
-        mods = [normalize_count_matrix(mod, sizefactor, lognormalize, pcount) for mod in mods]
-
-        var_mod_norms = [var_fun(mod) for mod in mods]
-
-        # compute fraction of CV2 eliminated for unspliced and spliced
-        for i in range(len(mods)):
-            f[:, 0, i] = var_mod_norms[i] / var_mods[i]
-            f[:, 1, i] = 1 - f[:, 0, i]
-
-        return f
-
-
-def normalize_count_matrix(
-    X, sizefactor="pf", lognormalize=True, pcount=0, logbase="e"
-):
+# same for ATAC?
+def knee_plot(X, ax1=None, thr=None, viz=False):
     """
-    This helper function performs normalization and variance stabilization on a raw data matrix X.
+    Plot the knee plot for a gene x cell dataset.
 
     Parameters
     ----------
     X: np.ndarray
         gene x cell count matrix.
-    sizefactor: str, float, int, or None, optional
-        what size factor to use.
-        If 'pf', use proportional fitting; set the size of each cell to the mean size.
-        If int or float, use this number (e.g., 1e4 for cp10k).
-        If None, do not do size/depth normalization.
-    lognormalize: bool, optional
-        whether to apply log(1+x) transformation.
-    pcount: int or float, optional
-        pseudocount added in size normalization to ensure division by zero does not occur.
-    logbase: str or int
-        If 'e', use log base e.
-        If 2 or 10, use the corresponding integer base.
+    ax1: matplotlib.axes.Axes, optional
+        axes to plot into.
+    thr: float or int, optional
+        minimum molecule count cutoff.
+    viz: bool, optional
+        whether to visualize the knee plot.
 
     Returns
-    X: np.ndarray
-        normalized and transformed count matrix.
+    -------
+    cf: bool np.ndarray
+        cells that meet the minimum molecule count cutoff.
     """
 
-    if sizefactor is not None:
-        if sizefactor == "pf":
-            sizefactor = X.sum(0).mean()
-        X = X / (X.sum(0)[None, :] + pcount) * sizefactor
-    if lognormalize:
-        if logbase == "e":
-            X = np.log(X + 1)
-        elif logbase == 2:
-            X = np.log2(X + 1)
-        elif logbase == 10:
-            X = np.log10(X + 1)
-    return X
+    umi_sum = X.sum(0)
+    n_cells = len(umi_sum)
+    umi_rank = np.argsort(umi_sum)
+    usf = np.flip(umi_sum[umi_rank])
+    if viz:
+        ax1.plot(np.arange(n_cells), usf, "k")
+        ax1.set_xlabel("Cell rank")
+        ax1.set_ylabel("UMI count+1")
+        ax1.set_yscale("log")
+    if thr is not None:
+        cf = umi_sum > thr
+        rank_ = np.argmin(np.abs(usf - thr))
+        if viz:
+            ax1.plot([0, n_cells + 1], thr * np.ones(2), "r--")
+            ys = ax1.get_ylim()
+            ax1.plot(rank_ * np.ones(2), ys, "r--")
+        return cf
+
+
+# For multiple datasets, choose genes which pass the expression filter in the highest fraction of datasets 
+def select_genes_across_datasets(adata_list, filt_param, exp_filter_threshold, genes_to_fit, n_genes, seed):
+    n_datasets = len(adata_list)
+    expression_filter_array = np.zeros((n_datasets, adata_list[0].n_vars), dtype=bool)
+    gene_name_reference = adata_list[0].var_names
+
+    for dataset_index, adata in enumerate(adata_list):
+        log.info("Processing dataset: " + str(dataset_index))
+        
+        # Apply expression filter
+        adata = threshold_by_expression(adata, filt_param)
+        gene_exp_filter = adata.var['expression_filter'].values
+        expression_filter_array[dataset_index, :] = gene_exp_filter
+
+    exp_fractions = expression_filter_array.mean(axis=0)
+
+    if exp_filter_threshold is None:
+        n_genes_enforced = 0
+        selected_genes_filter = np.zeros(exp_fractions.shape, dtype=bool)
+        
+        for gene in genes_to_fit:
+            gene_loc = np.where(gene_name_reference == gene)[0]
+            if len(gene_loc) == 0:
+                log.warning(f"Gene {gene} not found or has multiple entries in annotations.")
+            elif len(gene_loc) > 1:
+                log.error(f"Multiple entries found for gene {gene}: this should never happen.")
+            else:
+                exp_fractions[gene_loc[0]] = 0
+                n_genes_enforced += 1
+                selected_genes_filter[gene_loc[0]] = True
+        
+        q = np.quantile(exp_fractions, 1 - (n_genes - n_genes_enforced) / len(exp_fractions))
+
+        selected_genes_filter[exp_fractions > q] = True
+        np.random.seed(seed)
+        random_genes = np.where(exp_fractions == q)[0]
+        
+        if random_genes.size > 0:
+            random_genes_sel = np.random.choice(random_genes, n_genes - selected_genes_filter.sum(), replace=False)
+            selected_genes_filter[random_genes_sel] = True
+
+        selected_genes = gene_name_reference[selected_genes_filter]
+        log.info(f"Total of {selected_genes_filter.sum()} genes selected.")
+        log.warning(f"Selecting {selected_genes_filter.sum()} genes required {q * 100:.1f}% dataset threshold.")
+    else:
+        exp_filter = exp_fractions >= exp_filter_threshold
+        log.info(f"Gene set size according to a {exp_filter_threshold * 100:.1f}% dataset threshold: {exp_filter.sum()}")
+        
+        enforced_genes = np.zeros(exp_filter.shape, dtype=bool)
+        for gene in genes_to_fit:
+            gene_loc = np.where(gene_name_reference == gene)[0]
+            if len(gene_loc) == 0:
+                log.warning(f"Gene {gene} not found or has multiple entries in annotations.")
+            elif len(gene_loc) > 1:
+                log.error(f"Multiple entries found for gene {gene}: this should never happen.")
+            else:
+                exp_filter[gene_loc[0]] = False
+                n_genes -= 1
+                enforced_genes[gene_loc[0]] = True
+
+        np.random.seed(seed)
+        sampling_gene_set = np.where(exp_filter)[0]
+        if n_genes < len(sampling_gene_set):
+            gene_select_ind = np.random.choice(sampling_gene_set, n_genes, replace=False)
+            log.info(f"{n_genes} random genes selected.")
+        else:
+            gene_select_ind = sampling_gene_set
+            log.warning(f"{len(sampling_gene_set)} random genes selected: cannot satisfy query of {n_genes} genes.")
+        
+        selected_genes_filter = np.zeros(exp_filter.shape, dtype=bool)
+        selected_genes_filter[gene_select_ind] = True
+        selected_genes_filter[enforced_genes] = True
+
+        selected_genes = gene_name_reference[selected_genes_filter]
+        sampling_gene_set = gene_name_reference[exp_filter]
+        log.info(f"Total of {selected_genes_filter.sum()} genes selected.")
+    
+    for adata in adata_list:
+        adata.var['selected_genes'] = selected_genes_filter
+
+    return adata_list
+
