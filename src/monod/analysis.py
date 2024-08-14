@@ -3,8 +3,8 @@ sys.path.insert(0, '/home/cat/monod/src/monod')
 
 from cme_toolbox import CMEModel
 from inference import SearchResults, plot_hist_and_fit
-from extract_data import SearchData, normalize_count_matrix
-from preprocess import make_dir, log
+# from extract_data import SearchData, normalize_count_matrix
+# from preprocess import make_dir, log
 from plot_aesthetics import aesthetics
 import pickle
 import scipy
@@ -18,6 +18,9 @@ import matplotlib.pyplot as plt
 ## Helper functions
 ########################
 
+
+
+    
 
 def load_search_results(full_result_string):
     """Attempt to load search results from disk.
@@ -437,6 +440,30 @@ def compare_AIC_weights(
     plt.savefig(fig_string, dpi=450)
     log.info("Figure stored to {}.".format(fig_string))
 
+def DE_parameters(adata1, adata2, modeltype="id",
+    gene_filter_=None,
+    discard_rejected=True,
+    use_sigma=True,
+    figsize=None,
+    meta="12",
+    viz=True,
+    pval_thr=0.001,
+    nit=10 ):
+
+    sr1, sr2 = adata1.uns['search_result'], adata2.uns['search_result']
+    
+    gn, gf, offs, resid = diffexp_pars(sr1, sr2, modeltype=modeltype,
+    gene_filter_=gene_filter_,
+    discard_rejected=discard_rejected,
+    use_sigma=use_sigma,
+    figsize=figsize,
+    meta=meta,
+    viz=viz,
+    pval_thr=pval_thr,
+    nit=nit)
+
+    return gn, gf, offs, resid
+    
 
 def diffexp_pars(
     sr1,
@@ -585,11 +612,13 @@ def diffexp_pars(
             ax.legend()
     if viz:
         fig1.tight_layout()
-        fig_string = f"{sr1.batch_analysis_string}/parameter_residuals_{meta}.png"
-        plt.savefig(fig_string, dpi=450)
-        log.info("Figure stored to {}.".format(fig_string))
+        # fig_string = f"{sr1.batch_analysis_string}/parameter_residuals_{meta}.png"
+        # plt.savefig(fig_string, dpi=450)
+        # log.info("Figure stored to {}.".format(fig_string))
 
     return gn, np.asarray(gf), np.asarray(offs), np.asarray(resid)
+
+# def diffexp_pars_plot(gn, gf, offs, resid)
 
 
 def linoffset(B, x, modeltype="id"):
@@ -637,6 +666,7 @@ def diffexp_fpi(
 
     This function uses the optimal physical and sampling parameters obtained for a pair of datasets
     to attempt to identify differentially expressed genes under a model of transcription, for a single stest statistic.
+    
     Specifically, it uses a fixed-point iteration (FPI) procedure to distinguish a set of genes with
     Gaussian aleatory variation from a set with systematic, high-magnitude deviations between the datasets.
 
@@ -712,6 +742,7 @@ def diffexp_fpi(
             resid = m2 - m1 * out.beta[1] - out.beta[0]
 
         fitparams = fitlaw.fit(resid[gf])
+
         x = np.linspace(resid.min(), resid.max(), 100)
         p = fitlaw.pdf(x, *fitparams)
         if j == 0 and viz:

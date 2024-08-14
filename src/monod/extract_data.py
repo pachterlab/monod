@@ -21,6 +21,10 @@ import pandas as pd
 code_ver_global = "029"  # bumping up version April 2024
 
 import logging, sys
+from scipy.sparse import csr_matrix
+from scipy.sparse import issparse
+
+
 
 logging.basicConfig(stream=sys.stdout)
 log = logging.getLogger()
@@ -110,6 +114,8 @@ def extract_data(
     if not modality_name_dict:
         modality_name_dict = {v:v for v in model.model_modalities}
 
+    desired_layers = [i for i in modality_name_dict.values()]
+
     if transcriptome_filepath:
         transcriptome_dict = get_transcriptome(transcriptome_filepath)
     else:
@@ -117,9 +123,58 @@ def extract_data(
 
     # Import h5ad.
     monod_adata = import_h5ad(h5ad_filepath)
+
+    # Check whether the given data is in sparse or numpy format.
+    layer_data = monod_adata.layers[[i for i in monod_adata.layers.keys()][0]]
+
+    layer_type = None
+    if issparse(layer_data):
+        layer_type = 'sparse'  # For sparse matrices
+    elif isinstance(layer_data, np.ndarray):
+        layer_type = 'numpy_array'
+    else:
+        pass 
+
+    if layer_type == 'sparse':
+        monod_adata = CSRDataset_to_arrays(monod_adata)
+        print('is sparse')
+    elif layer_type == 'numpy_array':
+        pass
+    else:
+        monod_adata = CSRDataset_to_arrays(monod_adata)
+        print('CSRDataset')
+
+
+    # Subset to the layers required in the model.
+    adata = monod_adata.to_memory()
+    
+    adata_subset = ad.AnnData(
+    X=adata.X.copy(),
+    obs=adata.obs.copy(),
+    var=adata.var.copy(),
+    obsm=adata.obsm.copy(),
+    varm=adata.varm.copy(),
+    obsp=adata.obsp.copy(),
+    varp=adata.varp.copy(),
+    uns=adata.uns.copy()
+)
+    # Ensure var and obs names are preserved
+    adata_subset.obs_names = adata.obs_names
+    adata_subset.var_names = adata.var_names
+
+    # Copy over only the desired layers
+    for layer in desired_layers:
+        if layer in adata.layers:
+            adata_subset.layers[layer] = adata.layers[layer].copy()
+
+    monod_adata = adata_subset.to_memory()
+
+    
+    monod_adata.uns['modality_name_dict'] = modality_name_dict
+    monod_adata.uns['model'] = model
     
     if padding is None:
-        padding = np.asarray([10] * len(monod_adata.layers))
+        padding = np.asarray([10] * len(desired_layers))
 
     # identify genes that are in the length annotations. discard all the rest.
     # for models without length-based sequencing, this may not be necessary
@@ -138,15 +193,18 @@ def extract_data(
         monod_adata = monod_adata[:, gene_filter].copy()
 
     # Filter genes, then pick a number of random genes to make up the total desired number of genes.
-    monod_adata = process_adata(monod_adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes, transcriptome_dict=transcriptome_dict)
+    monod_adata = process_adata(monod_adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes, transcriptome_dict=transcriptome_dict, seed=seed)
+
+    # Filter for selected genes.
+    monod_adata = monod_adata[:, monod_adata.var['selected_genes'].astype(bool)].to_memory()
 
     gene_names, n_cells = monod_adata.var.index, len(monod_adata.obs.index)
 
     # Extract layers
-    layers = [monod_adata.layers[layer_name] for layer_name in monod_adata.layers.keys()]
+    layers = np.array([monod_adata.layers[layer_name].T for layer_name in monod_adata.layers.keys() if layer_name in desired_layers]) # toarray
 
     # Compute maximum expression value across cells for each gene and each layer
-    max_values = np.amax(layers, axis=1)  # Shape: (n_genes, n_layers)
+    max_values = np.amax(layers, axis=2)  # Shape: (n_genes, n_layers)
 
     # Define default padding if None
     if padding is None:
@@ -157,9 +215,14 @@ def extract_data(
 
     # Add padding to the maximum values
     M = max_values + padding
-    monod_adata.uns['M'] = M
+    monod_adata.uns['M'] = M.astype(int)
     
     hist = make_histogram(monod_adata, hist_type, M)
+
+    # Load the AnnData object into memory if it is in backed mode
+    if monod_adata.isbacked:
+        monod_adata = monod_adata.to_memory()
+    
     monod_adata.uns['hist'] = hist
     monod_adata.uns['hist_type'] = hist_type
 
@@ -169,6 +232,60 @@ def extract_data(
     # Save adata?
     
     return monod_adata
+
+def sparse_to_arrays(adata):
+
+    # Assuming `adata` is your existing AnnData object
+    adata_dense_layers = ad.AnnData(
+        X=adata.X.copy(),
+        obs=adata.obs.copy(),
+        var=adata.var.copy(),
+        obsm=adata.obsm.copy(),
+        varm=adata.varm.copy(),
+        obsp=adata.obsp.copy(),
+        varp=adata.varp.copy(),
+        uns=adata.uns.copy()
+    )
+    
+    # Replace sparse layers with dense NumPy arrays
+    for layer in adata.layers:
+        if issparse(adata.layers[layer]):
+            adata_dense_layers.layers[layer] = adata.layers[layer].toarray()  # Convert to dense array
+        else:
+            adata_dense_layers.layers[layer] = adata.layers[layer].copy()  # Copy if already dense
+    
+    # Preserve obs_names and var_names
+    adata_dense_layers.obs_names = adata.obs_names
+    adata_dense_layers.var_names = adata.var_names
+
+    return adata_dense_layers
+
+def CSRDataset_to_arrays(adata):
+
+    # Assuming `adata` is your existing AnnData object
+    adata_dense_layers = ad.AnnData(
+        X=adata.X,
+        obs=adata.obs,
+        var=adata.var,
+        obsm=adata.obsm,
+        varm=adata.varm,
+        obsp=adata.obsp,
+        varp=adata.varp,
+        uns=adata.uns
+    )
+    
+    # Replace sparse layers with dense NumPy arrays
+    for layer in adata.layers:
+        if issparse(adata.layers[layer]):
+            adata_dense_layers.layers[layer] = adata.layers[layer].toarray()  # Convert to dense array
+        else:
+            adata_dense_layers.layers[layer] = adata.layers[layer].copy()  # Copy if already dense
+    
+    # Preserve obs_names and var_names
+    adata_dense_layers.obs_names = adata.obs_names
+    adata_dense_layers.var_names = adata.var_names
+
+    return adata_dense_layers
 
 # TODO make work.
 def add_moments(adata, modality_name_dict=None, cov_matrix_key='layer_covariances'):
@@ -212,8 +329,8 @@ def add_moments(adata, modality_name_dict=None, cov_matrix_key='layer_covariance
         # moments_df[var_col] = adata.layers[layer].var(axis=0).flatten()
 
         # Calculate mean and variance for each layer
-        adata.var[mean_col] = adata.layers[layer].mean(axis=0).flatten()
-        adata.var[var_col] = adata.layers[layer].var(axis=0).flatten()
+        adata.var[mean_col] = adata.layers[layer].mean(axis=0).flatten() # toarray
+        adata.var[var_col] = adata.layers[layer].var(axis=0).flatten() #toarray
     
     index = 0
     for i in range(n_layers):
@@ -225,7 +342,7 @@ def add_moments(adata, modality_name_dict=None, cov_matrix_key='layer_covariance
 
             gene_covars = []
             for gene_index in range(n_genes):
-                covar = np.cov([adata.layers[layer_i][:, gene_index], adata.layers[layer_j][:, gene_index]])[0, 1]
+                covar = np.cov([adata.layers[layer_i][:, gene_index], adata.layers[layer_j][:, gene_index]])[0, 1] # toarray
                 # covariances[gene_index, index] = covar
                 gene_covars += [covar]
 
@@ -294,7 +411,7 @@ def plot_diagnostic(monod_adata):
 def make_histogram(monod_adata, hist_type, M):
 
     hist = []
-    layers = [monod_adata.layers[layer_name] for layer_name in monod_adata.layers.keys()]
+    layers = [monod_adata.layers[layer_name] for layer_name in monod_adata.layers.keys()] # toarray
     n_cells = monod_adata.n_obs
     n_genes = monod_adata.n_vars
     
@@ -311,6 +428,7 @@ def make_histogram(monod_adata, hist_type, M):
             xedges = edges[0]  # Assuming only one dimension for each bin
             yedges = edges[1] 
         elif hist_type == "unique":
+            
             unique, unique_counts = np.unique(
                 np.vstack([x[:,gene_index] for x in layers]).T, axis=0, return_counts=True
             )
@@ -319,7 +437,7 @@ def make_histogram(monod_adata, hist_type, M):
             H = (unique, frequencies)
             
         elif hist_type == "none":
-            H = [x[gene_index] for x in layers]
+            H = [x[:, gene_index] for x in layers]
 
         hist.append(H)
 
@@ -570,15 +688,20 @@ def threshold_by_expression(adata, filt_param={'min_means': [0.01, 0.01],
     adata: anndata.AnnData
         Filtered AnnData object with genes that meet the expression thresholds.
     """
-
+    model = adata.uns['model']
+    modalities = [i for i in adata.uns['modality_name_dict'].values()]
+    
     # Initialize gene filter to keep all genes
     gene_exp_filter = np.ones(adata.n_vars, dtype=bool)
     
-    # Iterate over each layer to apply filters
-    for i, layer in enumerate(adata.layers):
-        # Compute mean and max values directly from AnnData object
-        means = adata.layers[layer].mean(axis=0)
-        maxes = adata.layers[layer].max(axis=0)
+    layers = [adata.layers[layer] for layer in adata.layers.keys() if layer in modalities] # toarray
+
+    # # Iterate over each layer to apply filters
+    for i in range(len(layers)):
+        layer = layers[i]
+    
+        means = layer.mean(axis=0)
+        maxes = layer.max(axis=0)
         
         # Apply filtering criteria
         layer_filter = (means > filt_param['min_means'][i]) & (maxes < filt_param['max_maxes'][i]) & (maxes > filt_param['min_maxes'][i])

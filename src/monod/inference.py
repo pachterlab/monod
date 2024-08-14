@@ -71,12 +71,12 @@ def perform_inference(h5ad_filepath,
     exp_filter_threshold=exp_filter_threshold,
     genes_to_fit=genes_to_fit, hist_type='unique')
     log.info('Data extracted')
-
+    
     # Filter adata for selected genes.
     monod_adata = monod_adata[:, monod_adata.var['selected_genes'].astype(bool)]
-    
+
     search_data = searchdata_from_adata(monod_adata)
-    log.info('Search data created')
+    log.info('Search data created.')
     
     inference_parameters = InferenceParameters(
         dataset_string,
@@ -114,6 +114,7 @@ def perform_inference(h5ad_filepath,
     AIC_per_gene(search_result, monod_adata)
     log.info('AIC values calculated.')
 
+
     if not exclude_sigma:
         # Save uncertainties from Hessian.
         search_result.compute_sigma(search_data,num_cores=1)
@@ -125,6 +126,10 @@ def perform_inference(h5ad_filepath,
             monod_adata.var['sigma_' + param_name] = sigmas#[:,i]  
 
         log.info('Uncertainties per gene calculated.')
+
+    # Also save entire objects to adata.
+    monod_adata.uns['search_data'] = search_data
+    monod_adata.uns['search_result'] = search_result
 
     return monod_adata
 
@@ -200,6 +205,49 @@ def get_gene_moments_single(adata, gene_index):
             gene_moment_dict[column[4:]] = adata.var[column].tolist()[gene_index]
 
     return gene_moment_dict
+
+
+def reject_genes(adata, viz=False,
+        EPS=1e-15,
+        threshold=0.05,
+        bonferroni=True,
+        reject_at_bounds=True,
+        bound_thr=0.01,
+        grouping_thr=5,
+        use_hellinger=True,
+        hellinger_thr=0.05):
+    '''
+    Perform chi-squared testing and add list of rejected genes to anndata object.
+    '''
+
+    search_data = adata.uns['search_data']
+    search_result = adata.uns['search_result']
+
+    csq, pval, hellinger = search_result.chisquare_testing(search_data,
+        viz=viz,
+        EPS=EPS,
+        threshold=threshold,
+        bonferroni=bonferroni,
+        reject_at_bounds=reject_at_bounds,
+        bound_thr=bound_thr,
+        grouping_thr=grouping_thr,
+        use_hellinger=use_hellinger,
+        hellinger_thr=hellinger_thr)
+
+    # Save chi-squared values, p-values, and rejected genes to adata.
+    adata.var['csq'] = csq
+    adata.var['pval'] = pval
+    adata.var['hellinger'] = hellinger
+    adata.var['rejected_genes'] = search_result.rejected_genes
+    
+    # Reset search_data and search_result.
+    adata.uns['search_data'] = search_data
+    adata.uns['search_result'] = search_result
+    adata.uns['rejection_index'] = search_result.rejection_index
+
+    # Return list of rejected genes.
+    return adata
+
 
 # Use class to make inference faster.
 class SearchData:
@@ -1384,7 +1432,7 @@ class SearchResults:
         This method performs two rounds of goodness-of-fit testing.
         First, it applies a chi-squared test to the distributions induced by biological parameter values
         at the sampling parameter optimum.
-        Optionally, it also rejectes genes that are too close to the search parameter bounds,
+        Optionally, it also rejects genes that are too close to the search parameter bounds,
         as they typically exhibit poor gradient descent performance or do not have enough counts to
         reliably estimate parameters.
         This is typically sufficient to reject genes with proposed distributions that are grossly
@@ -1448,6 +1496,7 @@ class SearchResults:
         csqarr = []
         hellinger = []
         for gene_index in range(self.n_genes):
+            # lm = search_data.M[:, gene_index]
             lm = search_data.M[:, gene_index]
             expect_freq = (
                 self.model.eval_model_pss(
@@ -1480,7 +1529,7 @@ class SearchResults:
                         search_data.hist[gene_index][0][:, 1],
                         search_data.hist[gene_index][0][:, 2]
                     ]
-                
+                print(counts, 'counts')
 
                 # expect_freq = expect_freq[ [
                 #     search_data.hist[gene_index][0][:, i] for i in range(len(search_data.hist[gene_index][0][0]))
@@ -1535,6 +1584,10 @@ class SearchResults:
             assert np.isclose(search_data.n_cells, counts.sum())
             assert np.isclose(search_data.n_cells, expect_freq.sum())
 
+            print(observed)
+            print(proposed)
+
+            # chi-squared takes only the number of biological parameters?
             csqarr += [
                 scipy.stats.mstats.chisquare(
                     observed,
@@ -1968,12 +2021,7 @@ class SearchResults:
 
                 lfun = lambda x, a, b: a * x + b
                 if plot_fit:
-                    # print(self.gene_log_lengths)
-                    # print(self.phys_optimum[:, i])
-                    # print(self.sigma[:, i])
-                    # print(gene_filter)
-                    # print(self.gene_log_lengths[gene_filter])
-                    # print(self.phys_optimum[gene_filter, i])
+                    
                     popt, pcov = scipy.optimize.curve_fit(
                         lfun,
                         self.gene_log_lengths[gene_filter],
@@ -2106,6 +2154,7 @@ class SearchResults:
             genes_to_plot = genes_to_plot[:nax]
 
         j_ = 0
+        print(genes_to_plot)
         for i_ in genes_to_plot:
             lm = np.copy(search_data.M[:, i_])
             

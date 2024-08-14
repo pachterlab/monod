@@ -265,6 +265,7 @@ class CMEModel:
             numpars += 5
         else:
             numpars += 3
+            
         if self.amb_model == "Equal":
             numpars += 1
         elif self.amb_model == "Unequal":
