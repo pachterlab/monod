@@ -136,7 +136,17 @@ def perform_inference(h5ad_filepath,
 def searchdata_from_adata(adata):
 
     n_genes = adata.n_vars
-    layers = [adata.layers[layer_name] for layer_name in adata.layers.keys()]
+
+    # NB the order of the layers here will be enforced to be the same as the order of the model 
+    # modalities defined in cme_toolbox.
+    modality_name_dict = adata.uns['modality_name_dict']
+    model = adata.uns['model']
+    print(adata.layers)
+    ordered_modalities = model.model_modalities
+    ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
+    print(ordered_layer_names)
+    
+    layers = [adata.layers[layer_name] for layer_name in ordered_layer_names]
 
     M = adata.uns['M']
 

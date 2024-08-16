@@ -114,8 +114,9 @@ def extract_data(
     if not modality_name_dict:
         modality_name_dict = {v:v for v in model.model_modalities}
 
-    desired_layers = [i for i in modality_name_dict.values()]
-
+    ordered_modalities = model.model_modalities
+    ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
+    
     if transcriptome_filepath:
         transcriptome_dict = get_transcriptome(transcriptome_filepath)
     else:
@@ -125,7 +126,7 @@ def extract_data(
     monod_adata = import_h5ad(h5ad_filepath)
 
     # Check whether the given data is in sparse or numpy format.
-    layer_data = monod_adata.layers[[i for i in monod_adata.layers.keys()][0]]
+    layer_data = monod_adata.layers[[i for i in ordered_layer_names][0]]
 
     layer_type = None
     if issparse(layer_data):
@@ -163,18 +164,17 @@ def extract_data(
     adata_subset.var_names = adata.var_names
 
     # Copy over only the desired layers
-    for layer in desired_layers:
+    for layer in ordered_layer_names:
         if layer in adata.layers:
             adata_subset.layers[layer] = adata.layers[layer].copy()
 
     monod_adata = adata_subset.to_memory()
 
-    
     monod_adata.uns['modality_name_dict'] = modality_name_dict
     monod_adata.uns['model'] = model
     
     if padding is None:
-        padding = np.asarray([10] * len(desired_layers))
+        padding = np.asarray([10] * len(ordered_layer_names))
 
     # identify genes that are in the length annotations. discard all the rest.
     # for models without length-based sequencing, this may not be necessary
@@ -201,7 +201,7 @@ def extract_data(
     gene_names, n_cells = monod_adata.var.index, len(monod_adata.obs.index)
 
     # Extract layers
-    layers = np.array([monod_adata.layers[layer_name].T for layer_name in monod_adata.layers.keys() if layer_name in desired_layers]) # toarray
+    layers = np.array([monod_adata.layers[layer_name].T for layer_name in ordered_layer_names]) # toarray
 
     # Compute maximum expression value across cells for each gene and each layer
     max_values = np.amax(layers, axis=2)  # Shape: (n_genes, n_layers)
@@ -217,18 +217,17 @@ def extract_data(
     M = max_values + padding
     monod_adata.uns['M'] = M.astype(int)
     
-    hist = make_histogram(monod_adata, hist_type, M)
-
     # Load the AnnData object into memory if it is in backed mode
     if monod_adata.isbacked:
         monod_adata = monod_adata.to_memory()
-    
-    monod_adata.uns['hist'] = hist
+
     monod_adata.uns['hist_type'] = hist_type
 
     monod_adata = add_moments(monod_adata)
     monod_adata.uns['model'] = model
 
+    hist = make_histogram(monod_adata, hist_type, M)
+    monod_adata.uns['hist'] = hist
     # Save adata?
     
     return monod_adata
@@ -287,7 +286,6 @@ def CSRDataset_to_arrays(adata):
 
     return adata_dense_layers
 
-# TODO make work.
 def add_moments(adata, modality_name_dict=None, cov_matrix_key='layer_covariances'):
     """
     Compute and add mean and variance for each gene within each layer to `adata.var`, 
@@ -299,27 +297,33 @@ def add_moments(adata, modality_name_dict=None, cov_matrix_key='layer_covariance
         AnnData object with layers containing gene expression data.
     cov_matrix_key: str, optional
         Key under which the covariance matrix will be stored in `adata.uns`.
+    modality_name_dict: dictionary
+        mapping of form {'modality_name':'anndata layer name'} for modality names as given in cme_toolbox,
+        and anndata layer names from the data.
 
     Returns
     -------
     adata: anndata.AnnData
         AnnData object with moments and layer covariances added to `adata.var` and `adata.uns`.
     """
-    layers = adata.layers.keys()
-    n_layers = len(layers)
+    layer_names = adata.layers.keys()
+    n_layers = len(layer_names)
     n_genes = adata.n_vars
 
     # If no mapping specified, assume layers are named the same as CME model modalities.
-    if not modality_name_dict:
-        modality_name_dict = {v:v for v in layers}
+    if modality_name_dict:
+        layer_name_to_modality = {v:k for k,v in modality_name_dict.items()}
+    else:
+        layer_name_to_modality = {v:v for v in layer_names}
+
     
     # Create DataFrame to store moments
     moments_df = pd.DataFrame(index=adata.var.index)
 
     # Compute mean and variance for each gene within each layer
-    for layer in layers:
+    for layer in layer_names:
 
-        modality_name = modality_name_dict[layer]
+        modality_name = layer_name_to_modality[layer]
         
         mean_col = f"MOM_{modality_name}_mean"
         var_col = f"MOM_{modality_name}_var"
@@ -335,9 +339,9 @@ def add_moments(adata, modality_name_dict=None, cov_matrix_key='layer_covariance
     index = 0
     for i in range(n_layers):
         for j in range(i + 1, n_layers):
-            layer_i = [p for p in layers][i]
-            layer_j = [p for p in layers][j]
-            mod_i, mod_j = modality_name_dict[layer_i], modality_name_dict[layer_j]
+            layer_i = [p for p in layer_names][i]
+            layer_j = [p for p in layer_names][j]
+            mod_i, mod_j = layer_name_to_modality[layer_i], layer_name_to_modality[layer_j]
             layer_layer_string = f"MOM_cov_{mod_i}_{mod_j}"
 
             gene_covars = []
@@ -407,11 +411,20 @@ def plot_diagnostic(monod_adata):
             dataset_diagnostics_dir_string + "/{}.png".format(dataset_name), dpi=450
         )
 
-# TODO make work. (Need to run for inference?)
 def make_histogram(monod_adata, hist_type, M):
 
+    # NB the order of the layers here will be enforced to be the same as the order of the model 
+    # modalities defined in cme_toolbox.
+    print([i for i in monod_adata.layers.keys()], 'previous ordering')
+    modality_name_dict = monod_adata.uns['modality_name_dict']
+    model = monod_adata.uns['model']
+    # print(adata.layers)
+    ordered_modalities = model.model_modalities
+    ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
+    print(ordered_layer_names, 'ordered for histogram')
+
     hist = []
-    layers = [monod_adata.layers[layer_name] for layer_name in monod_adata.layers.keys()] # toarray
+    layers = [monod_adata.layers[layer_name] for layer_name in ordered_layer_names] # toarray
     n_cells = monod_adata.n_obs
     n_genes = monod_adata.n_vars
     
@@ -689,12 +702,14 @@ def threshold_by_expression(adata, filt_param={'min_means': [0.01, 0.01],
         Filtered AnnData object with genes that meet the expression thresholds.
     """
     model = adata.uns['model']
-    modalities = [i for i in adata.uns['modality_name_dict'].values()]
-    
+    ordered_modalities = model.model_modalities
+    modality_name_dict = adata.uns['modality_name_dict']
+    ordered_layer_names = [modality_name_dict[mod] for mod in ordered_modalities]
+        
     # Initialize gene filter to keep all genes
     gene_exp_filter = np.ones(adata.n_vars, dtype=bool)
     
-    layers = [adata.layers[layer] for layer in adata.layers.keys() if layer in modalities] # toarray
+    layers = [adata.layers[layer] for layer in ordered_layer_names] # toarray
 
     # # Iterate over each layer to apply filters
     for i in range(len(layers)):
