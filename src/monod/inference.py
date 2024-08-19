@@ -38,7 +38,7 @@ def perform_inference(h5ad_filepath,
         "max_iterations": 10,
         "init_pattern": "moments",
         "num_restarts": 1},
-    use_lengths=False,
+    use_lengths=True,
     run_meta="",
     phys_lb=None,
     phys_ub=None,
@@ -76,6 +76,10 @@ def perform_inference(h5ad_filepath,
 
     search_data = searchdata_from_adata(monod_adata)
     log.info('Search data created.')
+
+    if not transcriptome_filepath:
+        use_lengths = False
+        log.info('Lengths have not been given so are not being used')
     
     inference_parameters = InferenceParameters(
         dataset_string,
@@ -88,6 +92,7 @@ def perform_inference(h5ad_filepath,
         samp_lb=samp_lb,
         samp_ub=samp_ub,
         gridsize=gridsize)
+    
     log.info('Global inference parameters set.')
     
     # Fit the model at all values of technical parameters, and save the location of the results.
@@ -153,11 +158,6 @@ def searchdata_from_adata(adata):
 
     moments = get_gene_moments(adata)
 
-    try:
-        gene_log_lengths = adata.var['log_lengths']
-    except KeyError:
-        gene_log_lengths = None
-
     gene_names = adata.var
 
     n_cells = adata.n_obs
@@ -178,6 +178,15 @@ def searchdata_from_adata(adata):
     ]
 
     attr_values = [M, hist, moments, n_genes, gene_names, n_cells, layers, hist_type]
+
+    try:
+        gene_log_lengths = adata.var['log_lengths']
+        attr_names += ['gene_log_lengths']
+        attr_values += [gene_log_lengths]
+        
+    except KeyError:
+        pass
+        
     
     search_data = SearchData(attr_names, *attr_values)
     
@@ -1538,7 +1547,6 @@ class SearchResults:
                         search_data.hist[gene_index][0][:, 1],
                         search_data.hist[gene_index][0][:, 2]
                     ]
-                print(counts, 'counts')
 
                 # expect_freq = expect_freq[ [
                 #     search_data.hist[gene_index][0][:, i] for i in range(len(search_data.hist[gene_index][0][0]))
@@ -1592,9 +1600,6 @@ class SearchResults:
             assert np.isclose(proposed.sum(), search_data.n_cells)
             assert np.isclose(search_data.n_cells, counts.sum())
             assert np.isclose(search_data.n_cells, expect_freq.sum())
-
-            print(observed)
-            print(proposed)
 
             # chi-squared takes only the number of biological parameters?
             csqarr += [

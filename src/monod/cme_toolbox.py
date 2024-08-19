@@ -2,7 +2,6 @@
 This script provides convenience functions for evaluating RNA distributions. 
 """
 
-
 import numpy as np
 
 import scipy
@@ -272,7 +271,7 @@ class CMEModel:
             numpars += 2
         return numpars
 
-    def eval_model_logL(selburst_intfunf, p, limits, samp, data,n_cells, hist_type="unique", EPS=1e-15):
+    def eval_model_logL(self, p, limits, samp, data,n_cells, hist_type="unique", EPS=1e-15):
         """Compute the log-likelihood of data under a set of parameters.
 
         Parameters

@@ -692,8 +692,8 @@ def add_gene_lengths(adata, length_dict, attribute_name='length_given', lengths_
         AnnData object with the new gene attributes added to adata.var.
     """
     # Initialize the attributes
-    adata.var[attribute_name] = adata.var_names.isin(gene_dict).astype(int)
-    adata.var[lengths_name] = adata.var_names.map(gene_dict).fillna(0).astype(float)
+    adata.var[attribute_name] = adata.var_names.isin(length_dict).astype(int)
+    adata.var[lengths_name] = adata.var_names.map(length_dict).fillna(0).astype(float)
     adata.var['log_lengths'] = np.log10(adata.var['lengths'])
 
     log.info('Added lengths')
