@@ -1995,7 +1995,9 @@ class SearchResults:
         distinguish_rej: bool, optional
              whether to distinguish the genes in the rejected_genes attribute by color.
         """
-        if not self.gene_log_lengths:
+        try: 
+            gene_log_lengths = self.gene_log_lengths
+        except AttributeError:
             log.error('No gene lengths given, length-dependence cannot be plotted.')
             
         num_params = self.sp.n_phys_pars

@@ -152,7 +152,7 @@ def extract_data(
     elif isinstance(layer_data, np.ndarray):
         layer_type = 'numpy_array'
     else:
-        pass 
+        pass
 
     if layer_type == 'sparse':
         monod_adata = CSRDataset_to_arrays(monod_adata)

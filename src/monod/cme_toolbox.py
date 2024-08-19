@@ -114,8 +114,15 @@ class CMEModel:
         
         try:
             self.model_modalities = CMEModel.available_model_modalities[self.bio_model]
+        
         except KeyError:
             log.error("Modalities unknown for model: {}".format(self.bio_model))
+
+        print('The expected modalities for this model are:', self.model_modalities)
+        print('If your anndata layers have different names, please give a modality dictionary of the form: modality_name_dict  = {\'spliced\':your_spliced_layer_name, \'unspliced\':your_unspliced_layer_name} ')
+
+        # TODO: make nascent and mature also detected automatically
+
 
         # Define the expression filter each biophysical model.
         # TODO: check reasonableness of these.
