@@ -39,6 +39,24 @@ logging.config.dictConfig(
     }
 )
 
+def make_dir(dir_string):
+    """Convenience function to create a directory.
+
+    Parameters
+    ----------
+    dir_string: str
+        directory location to create.
+    """
+    try:
+        os.mkdir(dir_string)
+        log.info("Directory " + dir_string + " created.")
+    except OSError as error:
+        log.info(
+            "Directory " + dir_string + " already exists."
+        )  # used to be warning, but should be ok for now
+
+
+
 ########################
 ## Main code
 ########################

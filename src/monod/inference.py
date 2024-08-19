@@ -5,11 +5,10 @@ import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
 
-from preprocess import make_dir, log
+from extract_data import make_dir, log, extract_data
 from cme_toolbox import CMEModel  # may be unnecessary
 import multiprocessing
 import os
-from extract_data import extract_data
 
 # lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
 import warnings

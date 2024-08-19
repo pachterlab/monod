@@ -11,7 +11,7 @@ from scipy import integrate
 from scipy.fft import irfftn
 
 # from .nn_toolbox import basic_ml_bivariate, ml_microstate_logP
-from preprocess import log
+from extract_data import log
 
 class CMEModel:
     """Stores and evaluates biological and technical variation models.

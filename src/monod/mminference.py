@@ -5,8 +5,7 @@ import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
 from scipy.special import logsumexp, softmax
-from .preprocess import make_dir, log
-from .extract_data import SearchData
+from .extract_data import make_dir, log, SearchData
 from .cme_toolbox import CMEModel  # may be unnecessary
 import multiprocessing
 import os
