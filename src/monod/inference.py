@@ -1617,6 +1617,7 @@ class SearchResults:
         pval = np.asarray(pval)
         hellinger = np.asarray(hellinger)
 
+        log.info('P-value threshold: ' + str(threshold) + ', Adjusted P-value threshold:' + str(threshold)+ ', Hellinger Threshold:' + str(hellinger_thr))
         if bonferroni:
             threshold /= self.n_genes
         self.rejected_genes = pval < threshold

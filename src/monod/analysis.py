@@ -9,6 +9,7 @@ from scipy import stats
 from scipy import odr
 import numpy as np
 import matplotlib.pyplot as plt
+from extract_data import log
 
 
 ########################
@@ -445,6 +446,10 @@ def DE_parameters(adata1, adata2, modeltype="id",
     viz=True,
     pval_thr=0.001,
     nit=10 ):
+
+    if not (adata1.var_names == adata2.var_names).all():
+        raise KeyError('Genes are not the same between datasets')
+        # log.error('Genes are not the same between datasets')
 
     sr1, sr2 = adata1.uns['search_result'], adata2.uns['search_result']
     

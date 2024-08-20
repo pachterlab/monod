@@ -773,8 +773,21 @@ def save_gene_list(dir_string, gene_list, filename):
 
 def import_h5ad(filename, cf=None):
 
-    ds = ad.read_h5ad(filename, backed="r")
+    with warnings.catch_warnings():
+        
+        warnings.simplefilter("ignore", UserWarning)
+        
+        # Load or process your AnnData object here
+        ds = ad.read_h5ad(filename, backed="r")
+        # Handle duplicates if necessary
+        if not ds.var_names.is_unique:
+            log.info("Duplicate variable names found. Making them unique...")
+            ds.var_names_make_unique()
 
+    # if not ds.var_names.is_unique:
+    #     print("Duplicate variable names found. Making them unique...")
+    #     ds.var_names_make_unique()
+        
     return ds
 
 def visualize_gene_filtering(adata, transcriptome_dict, modality_names):
@@ -870,7 +883,8 @@ def process_adata(adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes
         elif len(gene_loc) > 1:
             log.error(f"Multiple entries found for gene {gene}: this should never happen.")
         else:
-            gene_exp_filter[gene_loc[0]] = False
+            gene_exp_filter.loc[gene_loc[0]] = False
+            # gene_exp_filter[gene_loc[0]] = False
             n_genes -= 1
             enforced_genes[gene_loc[0]] = True
 
