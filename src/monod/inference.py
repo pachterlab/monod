@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
+import mminference
 
 from extract_data import make_dir, log, extract_data
 from cme_toolbox import CMEModel  # may be unnecessary
@@ -47,11 +48,17 @@ def perform_inference(h5ad_filepath,
     gridsize=None,
     exclude_sigma=False,
     poisson_average_log_length=5,
-    dataset_string=None):
+    dataset_string=None,
+    mek_means_params=None,
+                     num_cores=1):
     '''
     Load and filter data from h5ad file.
     Run inference procedure for the desired model, save parameters, uncertainty from Hessian and AIC values automatically.
     '''
+    
+    if mek_means_params:
+        k, epochs = mek_means_params
+    
     if not dataset_string:
         try:
             dataset_string = ''.join(h5ad_filepath.split('/')[-1].split('.')[:-1])
@@ -77,7 +84,7 @@ def perform_inference(h5ad_filepath,
     cf=cf,
     code_ver=code_ver,
     exp_filter_threshold=exp_filter_threshold,
-    genes_to_fit=genes_to_fit, hist_type='unique')
+    genes_to_fit=genes_to_fit, hist_type='unique', mek_means_params=mek_means_params)
     log.info('Data extracted')
     
     # Filter adata for selected genes.
@@ -89,29 +96,61 @@ def perform_inference(h5ad_filepath,
     if not transcriptome_filepath:
         use_lengths = False
         log.info('Lengths have not been given so are not being used')
-    
-    inference_parameters = InferenceParameters(
-        dataset_string,
-        model,
-        use_lengths=use_lengths,
-        gradient_params=gradient_params,
-        run_meta=run_meta,
-        phys_lb=phys_lb,
-        phys_ub=phys_ub,
-        samp_lb=samp_lb,
-        samp_ub=samp_ub,
-        gridsize=gridsize,
-    poisson_average_log_length=poisson_average_log_length)
+
+    if not mek_means_params:
+        inference_parameters = InferenceParameters(
+            dataset_string,
+            model,
+            use_lengths=use_lengths,
+            gradient_params=gradient_params,
+            run_meta=run_meta,
+            phys_lb=phys_lb,
+            phys_ub=phys_ub,
+            samp_lb=samp_lb,
+            samp_ub=samp_ub,
+            gridsize=gridsize,
+        poisson_average_log_length=poisson_average_log_length)
+
+    else:
+        inference_parameters = mminference.InferenceParameters(
+            dataset_string,
+            model,
+            use_lengths=use_lengths,
+            gradient_params=gradient_params,
+            run_meta=run_meta,
+            phys_lb=phys_lb,
+            phys_ub=phys_ub,
+            samp_lb=samp_lb,
+            samp_ub=samp_ub,
+            gridsize=gridsize,
+        poisson_average_log_length=poisson_average_log_length,
+        k=k, epochs=epochs)
     
     log.info('Global inference parameters set.')
-    
-    # Fit the model at all values of technical parameters, and save the location of the results.
-    search_result = inference_parameters.fit_all_grid_points(search_data)
-    log.info('Grid points fit.')
-    search_result.find_sampling_optimum(discard_rejected=False)
-    parameters_per_gene = search_result.phys_optimum
-    log.info('Optimal parameters found.')
-    num_params = search_result.model.get_num_params()
+
+    if not mek_means_params:
+        # Fit the model at all values of technical parameters, and save the location of the results.
+        search_result = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores)
+        log.info('Grid points fit.')
+        search_result.find_sampling_optimum(discard_rejected=False)
+        parameters_per_gene = search_result.phys_optimum
+        log.info('Optimal parameters found.')
+        num_params = search_result.model.get_num_params()
+
+    else:
+        # Fit the model at all values of technical parameters, and save the location of the results.
+        search_result_list = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores)
+        log.info('Grid points fit.')
+
+        cluster_params = {}
+        # Assume results are ordered according to desired cluster labels.
+        for i, sr in enumerate(search_result_list):
+            sr.find_sampling_optimum(discard_rejected=False)
+            parameters_per_gene = sr.phys_optimum
+            log.info('Optimal parameters found.')
+            cluster_params[i] = parameters_per_gene
+            
+        num_params = search_result_list[0].model.get_num_params()
 
     # Load the AnnData object into memory if it is in backed mode
     if monod_adata.isbacked:
@@ -120,12 +159,25 @@ def perform_inference(h5ad_filepath,
     # Save parameter results to adata.
     for i in range(num_params):
         param_name = search_result.model.param_str[i]
-        param_values = parameters_per_gene[:,i]
-        monod_adata.var['param_' + param_name] = param_values
+        
+        if not mek_means_params:
+            param_values = parameters_per_gene[:,i]
+            monod_adata.var['param_' + param_name] = param_values
+        else:
+            for j in cluster_params.keys():
+                param_values = cluster_params[j][:,i]
+                monod_adata.var["cluster_{}_param_".format(j) + param_name] = param_values
+                
     log.info('Optimal parameters saved.')
     
     # Save AIC values to adata.
-    AIC_per_gene(search_result, monod_adata)
+    if not mek_means_params:
+        AIC_per_gene(search_result, monod_adata)
+    else:
+        # AIC values from meK-Means are the same for all SRs.
+        AICs = search_result_list[0].aic
+        monod_adata.var['AIC'] = AICs
+    
     log.info('AIC values calculated.')
 
 
@@ -143,7 +195,10 @@ def perform_inference(h5ad_filepath,
 
     # Also save entire objects to adata.
     monod_adata.uns['search_data'] = search_data
-    monod_adata.uns['search_result'] = search_result
+    if not mek_means_params:
+        monod_adata.uns['search_result'] = search_result
+    else:
+        monod_adata.uns['search_result_list'] = search_result_list
 
     return monod_adata
 
@@ -196,7 +251,13 @@ def searchdata_from_adata(adata):
         
     except KeyError:
         pass
-        
+
+    try:
+        k, epochs = adata.uns['k'], adata.uns['epochs']
+        attr_names += ['k', 'epochs']
+        attr_values += [k, epochs]
+    except KeyError:
+        pass        
     
     search_data = SearchData(attr_names, *attr_values)
     
@@ -377,7 +438,6 @@ def get_hist_type(search_data):
         hist_type = "grid"
     return hist_type
 
-# TODO: add default average Poisson length addition.
 class InferenceParameters:
     """Stores parameters and distributes the multi-grid point inference procedure.
 
@@ -586,8 +646,8 @@ class InferenceParameters:
 
         Returns
         -------
-        full_result_string: str
-            disk location of the SearchResults object.
+        results: SearchResults object
+            Saves search_result to disk and returns it.
 
         """
 
