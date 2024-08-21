@@ -16,7 +16,27 @@ from extract_data import log
 ## Helper functions
 ########################
 
+def run_qc(monod_adata):
+    sr = monod_adata.uns['search_result']
+    sd = monod_adata.uns['search_data']
+    fig1,ax1 = plt.subplots(1,1)
+    sr.find_sampling_optimum()
+    sr.plot_landscape(ax1)
 
+    fig1,ax1 = plt.subplots(1,1)
+    sr.plot_KL(ax1)
+
+    sr.plot_gene_distributions(sd,marg='joint')
+
+    _=sr.chisquare_testing(sd)
+    sr.resample_opt_viz()
+    sr.resample_opt_mc_viz()
+    sr.chisq_best_param_correction(sd,viz=True) 
+
+    sr.compute_sigma(sd,num_cores=1) #colab has a hard time with multiprocessing
+    sr.plot_param_L_dep(plot_errorbars=True,plot_fit=True)
+    sr.plot_param_marg()
+    sr.update_on_disk()
 
 
 def load_search_results(full_result_string):
@@ -463,13 +483,16 @@ def DE_parameters(adata1, adata2, modeltype="id",
     pval_thr=pval_thr,
     nit=nit)
     
-       
     param_strings = adata1.uns['model'].get_log_name_str()
+    fold_changes = offs + resid
+
     for i, param in enumerate(param_strings):
         if modeltype=='id':
-            fold_changes = offs + resid
             adata2.var["FC_{}".format(param)] = fold_changes[i]
             adata1.var["FC_{}".format(param)] = -fold_changes[i]
+
+            # Save adjusted parameters, subtracting the offset from adata2
+            adata2.var["adj_{}".format(param)] = adata2.var["param_{}".format(param)] - offs[i]
     
         adj_fold_changes = resid[i]
 

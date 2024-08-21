@@ -58,7 +58,7 @@ def perform_inference(h5ad_filepath,
         except AttributeError:
             # For anndata, use the name of the anndata object.
             dataset_string = model.bio_model + '_' + model.seq_model
-            log.info("No dataset name given. Saving as {}".format(dataset_string))
+            log.info("No dataset name given (dataset_string=None). Saving as {}".format(dataset_string))
         
     if not output_directory:
         output_directory = dataset_string
@@ -160,7 +160,7 @@ def searchdata_from_adata(adata):
     ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
     print(ordered_layer_names)
     
-    layers = [adata.layers[layer_name] for layer_name in ordered_layer_names]
+    layers = np.array([adata.layers[layer_name] for layer_name in ordered_layer_names])
 
     M = adata.uns['M']
 
@@ -168,7 +168,7 @@ def searchdata_from_adata(adata):
 
     moments = get_gene_moments(adata)
 
-    gene_names = adata.var
+    gene_names = adata.var.index
 
     n_cells = adata.n_obs
 
@@ -2227,7 +2227,7 @@ class SearchResults:
                 jitter_magn = 0.1
                 jitter = np.random.randn(2, self.n_cells) * jitter_magn
                 ax1[axloc].scatter(
-                    *search_data.layers[:2, i_] + jitter, c="k", s=1, alpha=0.1
+                    *search_data.layers[:2, :, i_] + jitter, c="k", s=1, alpha=0.1
                 )
 
                 ax1[axloc].set_xlim([-0.5, search_data.M[0, i_] - 1.5])
