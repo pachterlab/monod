@@ -140,8 +140,12 @@ def extract_data(
     else:
         transcriptome_dict = None
 
-    # Import h5ad.
-    monod_adata = import_h5ad(h5ad_filepath)
+    # Import anndata from file, or use anndata object directly.
+    if type(h5ad_filepath) == str: 
+        # Import h5ad.
+        monod_adata = import_h5ad(h5ad_filepath)
+    else:
+        monod_adata = h5ad_filepath.copy()
 
     # Check whether the given data is in sparse or numpy format.
     layer_data = monod_adata.layers[[i for i in ordered_layer_names][0]]
@@ -213,9 +217,16 @@ def extract_data(
     # Filter genes, then pick a number of random genes to make up the total desired number of genes.
     monod_adata = process_adata(monod_adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes, transcriptome_dict=transcriptome_dict, seed=seed)
 
+    # Visualize selected and filtered genes before filtering.
+    if viz:
+        if transcriptome_filepath:
+            visualize_gene_filtering_lengths(monod_adata)
+        else:
+            visualize_gene_filtering(monod_adata)
+
     # Filter for selected genes.
     monod_adata = monod_adata[:, monod_adata.var['selected_genes'].astype(bool)].to_memory()
-
+    
     gene_names, n_cells = monod_adata.var.index, len(monod_adata.obs.index)
 
     # Extract layers
@@ -790,9 +801,9 @@ def import_h5ad(filename, cf=None):
         
     return ds
 
-def visualize_gene_filtering(adata, transcriptome_dict, modality_names):
+def visualize_gene_filtering_lengths(monod_adata):
     """
-    Visualizes gene filtering results.
+    Visualizes gene filtering results given lengths.
     
     Parameters
     ----------
@@ -803,29 +814,73 @@ def visualize_gene_filtering(adata, transcriptome_dict, modality_names):
     modality_names: list
         List of attribute names for visualization.
     """
-    gene_names = adata.var_names
-    len_arr = np.array([transcriptome_dict[k] for k in gene_names])
-    var_name = tuple([name[0].upper() for name in modality_names[::-1]])
-    var_arr = tuple([adata.layers[layer].mean(axis=0).A1 for layer in adata.layers][::-1])
+    gene_names = monod_adata.var_names
 
-    fig1, ax1 = plt.subplots(nrows=1, ncols=len(adata.layers), figsize=(12, 4))
-    for i, layer in enumerate(adata.layers):
+    try:
+        len_arr = monod_adata.var['log_lengths']
+    except AttributeError:
+        log.error('No gene lengths given')
+    modality_names = monod_adata.uns['model'].model_modalities
+    
+    # len_arr = np.array([transcriptome_dict[k] for k in gene_names])
+    var_name = tuple([name[0].upper() for name in modality_names[::-1]])
+    var_arr = tuple([monod_adata.layers[layer].mean(axis=0) for layer in monod_adata.layers][::-1])
+
+    fig1, ax1 = plt.subplots(nrows=1, ncols=len(monod_adata.layers), figsize=(12, 4))
+    for i, layer in enumerate(monod_adata.layers):
         ax1[i].scatter(
-            np.log10(len_arr)[~adata.var['expression_filter'].values],
-            np.log10(var_arr[i][~adata.var['expression_filter'].values] + 0.001),
+            len_arr[~monod_adata.var['selected_genes'].values],
+            np.log10(var_arr[i][~monod_adata.var['selected_genes'].values] + 0.001),
             s=3,
             c="silver",
             alpha=0.15,
         )
         ax1[i].scatter(
-            np.log10(len_arr[adata.var['expression_filter'].values]),
-            np.log10(var_arr[i][adata.var['expression_filter'].values] + 0.001),
+            len_arr[monod_adata.var['selected_genes'].values],
+            np.log10(var_arr[i][monod_adata.var['selected_genes'].values] + 0.001),
             s=3,
             c="indigo",
             alpha=0.3,
         )
         ax1[i].set_xlabel("log10 gene length")
         ax1[i].set_ylabel("log10 (mean " + var_name[i] + " + 0.001)")
+
+def visualize_gene_filtering(monod_adata):
+    """
+    Visualizes gene filtering results without lengths.
+    
+    Parameters
+    ----------
+    adata: anndata.AnnData
+        AnnData object with gene expression data in layers.
+    """
+    gene_names = monod_adata.var_names
+
+    modality_names = monod_adata.uns['model'].model_modalities
+    
+    # len_arr = np.array([transcriptome_dict[k] for k in gene_names])
+    var_name = tuple([name[0].upper() for name in modality_names[::-1]])
+    var_arr = tuple([monod_adata.layers[layer].mean(axis=0) for layer in monod_adata.layers][::-1])
+
+    fig1 = plt.figure(figsize=(5, 5))
+
+    # Show first two layers.        
+    plt.scatter(
+        np.log10(var_arr[0][~monod_adata.var['selected_genes'].values] + 0.001),
+        np.log10(var_arr[1][~monod_adata.var['selected_genes'].values] + 0.001),
+        s=3,
+        c="silver",
+        alpha=0.15,
+    )
+    plt.scatter(
+        np.log10(var_arr[0][monod_adata.var['selected_genes'].values] + 0.001),
+        np.log10(var_arr[1][monod_adata.var['selected_genes'].values] + 0.001),
+        s=3,
+        c="indigo",
+        alpha=0.3,
+    )
+    plt.xlabel("log10 (mean " + var_name[0] + " + 0.001)")
+    plt.ylabel("log10 (mean " + var_name[1] + " + 0.001)")
 
 def process_adata(adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes, seed=5, dir_string='./fits', transcriptome_dict=None):
     """

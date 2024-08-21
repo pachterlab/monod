@@ -45,12 +45,21 @@ def perform_inference(h5ad_filepath,
     samp_lb=None,
     samp_ub=None,
     gridsize=None,
-    exclude_sigma=False):
+    exclude_sigma=False,
+    poisson_average_log_length=5,
+    dataset_string=None):
     '''
     Load and filter data from h5ad file.
     Run inference procedure for the desired model, save parameters, uncertainty from Hessian and AIC values automatically.
     '''
-    dataset_string = ''.join(h5ad_filepath.split('/')[-1].split('.')[:-1])
+    if not dataset_string:
+        try:
+            dataset_string = ''.join(h5ad_filepath.split('/')[-1].split('.')[:-1])
+        except AttributeError:
+            # For anndata, use the name of the anndata object.
+            dataset_string = model.bio_model + '_' + model.seq_model
+            log.info("No dataset name given. Saving as {}".format(dataset_string))
+        
     if not output_directory:
         output_directory = dataset_string
     make_dir(output_directory)
@@ -91,7 +100,8 @@ def perform_inference(h5ad_filepath,
         phys_ub=phys_ub,
         samp_lb=samp_lb,
         samp_ub=samp_ub,
-        gridsize=gridsize)
+        gridsize=gridsize,
+    poisson_average_log_length=poisson_average_log_length)
     
     log.info('Global inference parameters set.')
     
@@ -367,6 +377,7 @@ def get_hist_type(search_data):
         hist_type = "grid"
     return hist_type
 
+# TODO: add default average Poisson length addition.
 class InferenceParameters:
     """Stores parameters and distributes the multi-grid point inference procedure.
 
@@ -431,6 +442,7 @@ class InferenceParameters:
         samp_lb=None,
         samp_ub=None,
         gridsize=None,
+        poisson_average_log_length=5
     ):
         """Initialize the InferenceParameters instance.
 
@@ -482,6 +494,7 @@ class InferenceParameters:
         self.grad_bnd = scipy.optimize.Bounds(phys_lb, phys_ub)
 
         self.use_lengths = use_lengths
+        self.poisson_average_log_length = poisson_average_log_length
 
         if model.seq_model == "None":
             log.info(
@@ -733,6 +746,12 @@ class GradientInference:
                 raise ValueError(
                     "Please select a technical noise model from {Poisson}, {Bernoulli}, {None}."
                 )
+
+        else:
+            # If no specific lengths given, multiply the unspliced sampling rate by an average length value for all genes.
+            if model.seq_model == "Poisson":
+                regressor[:, 0] += global_parameters.poisson_average_log_length
+            
         self.grid_point = global_parameters.sampl_vals[point_index]
         self.point_index = point_index
         self.regressor = regressor
@@ -1079,8 +1098,9 @@ class SearchResults:
         self.n_cells = search_data.n_cells
         try:
             self.gene_log_lengths = search_data.gene_log_lengths
+        # Do not define an attribute for gene_lengths if non is given.
         except AttributeError:
-            self.gene_log_lengths = None
+            pass
             
         self.gene_names = search_data.gene_names
 
@@ -1618,6 +1638,7 @@ class SearchResults:
         hellinger = np.asarray(hellinger)
 
         log.info('P-value threshold: ' + str(threshold) + ', Adjusted P-value threshold:' + str(threshold)+ ', Hellinger Threshold:' + str(hellinger_thr))
+        
         if bonferroni:
             threshold /= self.n_genes
         self.rejected_genes = pval < threshold

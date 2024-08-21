@@ -462,6 +462,19 @@ def DE_parameters(adata1, adata2, modeltype="id",
     viz=viz,
     pval_thr=pval_thr,
     nit=nit)
+    
+       
+    param_strings = adata1.uns['model'].get_log_name_str()
+    for i, param in enumerate(param_strings):
+        if modeltype=='id':
+            fold_changes = offs + resid
+            adata2.var["FC_{}".format(param)] = fold_changes[i]
+            adata1.var["FC_{}".format(param)] = -fold_changes[i]
+    
+        adj_fold_changes = resid[i]
+
+        adata2.var["adj_FC_{}".format(param)] = adj_fold_changes
+        adata1.var["adj_FC_{}".format(param)] = -adj_fold_changes
 
     return gn, gf, offs, resid
     
