@@ -50,7 +50,7 @@ def perform_inference(h5ad_filepath,
     poisson_average_log_length=5,
     dataset_string=None,
     mek_means_params=None,
-                     num_cores=1):
+                     num_cores=1, AIC_EPS=1e-20, AIC_offs=0):
     '''
     Load and filter data from h5ad file.
     Run inference procedure for the desired model, save parameters, uncertainty from Hessian and AIC values automatically.
@@ -128,6 +128,7 @@ def perform_inference(h5ad_filepath,
     
     log.info('Global inference parameters set.')
 
+    
     if not mek_means_params:
         # Fit the model at all values of technical parameters, and save the location of the results.
         search_result = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores)
@@ -158,12 +159,13 @@ def perform_inference(h5ad_filepath,
 
     # Save parameter results to adata.
     for i in range(num_params):
-        param_name = search_result.model.param_str[i]
         
         if not mek_means_params:
+            param_name = search_result.model.param_str[i]
             param_values = parameters_per_gene[:,i]
             monod_adata.var['param_' + param_name] = param_values
         else:
+            param_name = search_result_list[0].model.param_str[i]
             for j in cluster_params.keys():
                 param_values = cluster_params[j][:,i]
                 monod_adata.var["cluster_{}_param_".format(j) + param_name] = param_values
@@ -175,21 +177,35 @@ def perform_inference(h5ad_filepath,
         AIC_per_gene(search_result, monod_adata)
     else:
         # AIC values from meK-Means are the same for all SRs.
-        AICs = search_result_list[0].aic
+        AICs = get_AIC_mek_means(search_result_list, search_data, AIC_EPS=AIC_EPS, AIC_offs=AIC_offs)
+        print('AICs', AICs)
         monod_adata.var['AIC'] = AICs
     
     log.info('AIC values calculated.')
 
 
     if not exclude_sigma:
-        # Save uncertainties from Hessian.
-        search_result.compute_sigma(search_data,num_cores=1)
-        sigmas = search_result.sigma
-        
-        for i in range(num_params):
-            param_name = search_result.model.param_str[i]
-            sigmas = parameters_per_gene[:,i]
-            monod_adata.var['sigma_' + param_name] = sigmas#[:,i]  
+        if not mek_means_params:
+            # Save uncertainties from Hessian.
+            search_result.compute_sigma(search_data,num_cores=1)
+            all_sigmas = search_result.sigma
+            
+            for i in range(num_params):
+                param_name = search_result.model.param_str[i]
+                sigmas = all_sigmas[:,i]
+                monod_adata.var['sigma_' + param_name] = sigmas#[:,i]
+        else:
+            # Save uncertainties from Hessian.
+            for j, sr in enumerate(search_result_list):
+                
+                sd =  sr._subset_search_data(search_data)
+                sr.compute_sigma(search_data, num_cores=1)
+                all_sigmas = sr.sigma
+                
+                for i in range(num_params):
+                    param_name = sr.model.param_str[i]
+                    sigmas = all_sigmas[:,i]
+                    monod_adata.var["cluster_{}_sigma_".format(j) + param_name] = sigmas#[:,i]
 
         log.info('Uncertainties per gene calculated.')
 
@@ -240,9 +256,10 @@ def searchdata_from_adata(adata):
         "n_cells",
         "layers",
         "hist_type",
+        "layer_names"
     ]
 
-    attr_values = [M, hist, moments, n_genes, gene_names, n_cells, layers, hist_type]
+    attr_values = [M, hist, moments, n_genes, gene_names, n_cells, layers, hist_type, ordered_layer_names]
 
     try:
         gene_log_lengths = adata.var['log_lengths']
@@ -2372,6 +2389,23 @@ class SearchResults:
                 ]
             )
         return np.asarray(f).squeeze()
+
+def get_AIC_mek_means(search_result_list, search_data, AIC_EPS=1e-20, AIC_offs=0):
+
+    LL = np.zeros(search_result_list[0].n_genes)
+    
+    for sr in search_result_list:
+
+        n_cells = sr.n_cells
+        LL += sr.get_logL(search_data, EPS=AIC_EPS, offs=AIC_offs)
+
+    # Calculate the number of parameters
+    n_params = sr.sp.n_phys_pars
+    
+    # Calculate AIC for each gene
+    AIC = 2 * n_params - 2 * LL
+
+    return AIC
 
 
 def parallelize(

@@ -77,7 +77,8 @@ def extract_data(
     exp_filter_threshold=1,
     genes_to_fit=[],
     hist_type = 'grid',
-    padding=None
+    padding=None,
+    mek_means_params=None
 ):
     log.debug('working')
     """Extract data for selected genes from a single dataset.
@@ -123,6 +124,9 @@ def extract_data(
     """
     log.info("Beginning data extraction.")
     log.info("Dataset: " + dataset_name)
+
+    if mek_means_params:
+        k, epochs = mek_means_params
 
     if not filt_param:
         filt_param = model.filter_bounds
@@ -256,8 +260,12 @@ def extract_data(
     monod_adata.uns['model'] = model
 
     hist = make_histogram(monod_adata, hist_type, M)
+    
     monod_adata.uns['hist'] = hist
     # Save adata?
+    if mek_means_params:
+        monod_adata.uns['k'] = k
+        monod_adata.uns['epochs'] = epochs
     
     return monod_adata
 

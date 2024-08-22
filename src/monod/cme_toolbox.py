@@ -346,6 +346,9 @@ class CMEModel:
         kld: float
             Kullback-Leibler divergence.
         """
+        # print('p', p)
+        # print('limits', limits)
+        # print('samp', samp)
         proposal = self.eval_model_pss(p, limits, samp)
         proposal[proposal < EPS] = EPS
 

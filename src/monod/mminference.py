@@ -5,8 +5,9 @@ import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
 from scipy.special import logsumexp, softmax
-from .extract_data import make_dir, log, SearchData
-from .cme_toolbox import CMEModel  # may be unnecessary
+from extract_data import make_dir, log
+from inference import SearchData
+from cme_toolbox import CMEModel  # may be unnecessary
 import multiprocessing
 import os
 import itertools
@@ -15,7 +16,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 # lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
 import warnings
-from .plot_aesthetics import aesthetics
+from plot_aesthetics import aesthetics
 
 from tqdm import tqdm
 
@@ -78,15 +79,8 @@ class InferenceParameters:
 
     def __init__(
         self,
-        phys_lb,
-        phys_ub,
-        samp_lb,
-        samp_ub,
-        gridsize,
         dataset_string,
         model,
-        k=10,
-        epochs=100,
         use_lengths=True,
         gradient_params={
             "max_iterations": 10,
@@ -94,6 +88,14 @@ class InferenceParameters:
             "num_restarts": 1,
         },
         run_meta="",
+        phys_lb=None,
+        phys_ub=None,
+        samp_lb=None,
+        samp_ub=None,
+        gridsize=None,
+        poisson_average_log_length=5,
+        k=10,
+        epochs=100
     ):
         """Initialize the InferenceParameters instance.
 
@@ -113,10 +115,6 @@ class InferenceParameters:
             dataset-specific directory location.
         model: monod.cme_toolbox.CMEModel
             CME model used for inference.
-        k: int
-            number of components in mixture model, default 10
-        epochs: int
-            number of epochs to run EM procedure for, default 100
         use_lengths: bool, optional
             if True, the nascent Poisson model technical variation parameter is a
             coefficient multiplied by gene length.
@@ -129,12 +127,27 @@ class InferenceParameters:
         run_meta: str, optional
             any additional metadata to append to the run directory name.
         """
+        # Set biophysical parameter values to defaults.
+        if phys_lb is None:
+            phys_lb = model.bio_bounds['phys_lb']
+        if phys_ub is None:
+            phys_ub = model.bio_bounds['phys_ub']
+
+        # Set technical sequencing parameter values to defaults.
+        if samp_lb is None:
+            samp_lb = model.seq_bounds['samp_lb']
+        if samp_ub is None:
+            samp_ub = model.seq_bounds['samp_ub']
+        if gridsize is None:
+            gridsize = model.seq_bounds['gridsize']
+        
         self.gradient_params = gradient_params
         self.phys_lb = np.array(phys_lb)
         self.phys_ub = np.array(phys_ub)
         self.grad_bnd = scipy.optimize.Bounds(phys_lb, phys_ub)
 
         self.use_lengths = use_lengths
+        self.poisson_average_log_length = poisson_average_log_length
 
         if model.seq_model == "None":
             log.info(
@@ -151,8 +164,6 @@ class InferenceParameters:
         self.construct_grid()
         self.model = model
 
-
-        #k mixture components
         self.k = k
         self.epochs = epochs
 
@@ -163,12 +174,17 @@ class InferenceParameters:
             run_meta = "_" + run_meta
 
         self.dataset_string = dataset_string
-        inference_string = f"{dataset_string}/{model.bio_model}_{model.seq_model}_{gridsize[0]:.0f}x{gridsize[1]:.0f}{run_meta}"
+        
+        inference_string = f"{dataset_string}/{model.bio_model}_{model.seq_model}_"
+        for i in range(len(gridsize)):
+            inference_string += f"{gridsize[i]:.0f}x"
+        inference_string = inference_string[:-1]
+        inference_string += f"{run_meta}"
+        
         make_dir(inference_string)
         self.inference_string = inference_string
         inference_parameter_string = inference_string + "/parameters.pr"
         self.store_inference_parameters(inference_parameter_string)
-
 
     def construct_grid(self):
         """Creates a grid of points over the two-dimensional technical variation parameter domain.
@@ -177,24 +193,19 @@ class InferenceParameters:
         ----
         sampl_vals: list of lists of floats
             list of grid points.
-        X: np.ndarray
-            grid point values representing unspliced RNA sampling parameters.
-        Y: np.ndarray
-            grid point values representing spliced RNA sampling parameters.
+        grid_values_sampl: list of np.ndarrays
+            grid point values representing sampling parameters for each modality.
         n_grid_pts: int
             total number of grid points to evaluate.
         """
-        X, Y = np.meshgrid(
-            np.linspace(self.samp_lb[0], self.samp_ub[0], self.gridsize[0]),
-            np.linspace(self.samp_lb[1], self.samp_ub[1], self.gridsize[1]),
-            indexing="ij",
-        )
-        X = X.flatten()
-        Y = Y.flatten()
-        self.X = X
-        self.Y = Y
-        self.sampl_vals = list(zip(X, Y))
-        self.n_grid_points = len(X)
+        linspaces = [np.linspace(self.samp_lb[i], self.samp_ub[i], self.gridsize[i]) for i in range(len(self.gridsize))]
+        grid_values_sampl = np.meshgrid(*linspaces, indexing="ij")
+        
+        grid_values_sampl = [i.flatten() for i in grid_values_sampl]
+        self.grid_values_sampl = grid_values_sampl
+        
+        self.sampl_vals = list(zip(*grid_values_sampl))
+        self.n_grid_points = len(grid_values_sampl[0])    
 
 
     def store_inference_parameters(self, inference_parameter_string):
@@ -220,7 +231,7 @@ class InferenceParameters:
                 )
             )
 
-    def fit_all_grid_points(self, num_cores, search_data):
+    def fit_all_grid_points(self, search_data, num_cores=1):
         """Fits the search data for all genes over all grid points.
 
         Parameters
@@ -272,20 +283,21 @@ class InferenceParameters:
         ]
         log.info("Non-parallelized grid scan complete.")
 
-
         #Loop through assignments, and save each k results
         warnings.resetwarnings()
         full_result_strings = []
+        full_results = []
         for i in range(self.k):
             results = SearchResults(self, search_data, i)
             results.aggregate_grid_points(clean=False)
             if results.save == True:
                 full_result_string = results.store_on_disk()
                 full_result_strings += [full_result_string]
+                full_results += [results]
 
         t2 = time.time()
         log.info("Runtime: {:.1f} seconds.".format(t2 - t1))
-        return full_result_strings
+        return full_results
 
  
 
@@ -505,16 +517,18 @@ class GradientInference:
         n = search_data.n_cells
 
         #Init Q with U+S K-Means clusters for now
-        S = search_data.layers[1,:,:]
-        U = search_data.layers[0,:,:]
-        S_t = S.T+U.T
-        tots = np.sum(S_t,axis=1)
+        # Assume first two layers are spliced and unspliced (true for all models so far).
+        # S = 
+        # U = search_data.layers[0,:,:]
+        S_total = search_data.layers[0,:,:] + search_data.layers[1,:,:]
+        tots = np.sum(S_total,axis=1)
         divids = (1e4/tots)[:,None]
-        S_t = S_t*divids
-        S_t = np.log1p(S_t)
-        S_t[np.isnan(S_t)] = 0
+        S_total = S_total*divids
+        S_total = np.log1p(S_total)
+        S_total[np.isnan(S_total)] = 0
 
-        kmeans = KMeans(n_clusters=self.k, random_state=0).fit(S_t)
+        # KMeans input: (n_samples, n_features)
+        kmeans = KMeans(n_clusters=self.k, random_state=0).fit(S_total)
         labs = kmeans.labels_
 
         #Bias Q towards initial cluster assignments
@@ -546,57 +560,41 @@ class GradientInference:
         datas = []
         inds = []
 
-
         #Select k with max post for each obs
         max_ks = np.argmax(Q, axis=1)  
         # options = range(self.k)
         # #Can select based on probability, maybe for initial epoch
         # max_ks = np.array([np.random.choice(options,1,list(Q[p,:])) for p in range(Q.shape[0])]).squeeze()
+        
+        layer_names = search_data.layer_names
+        gene_names = search_data.gene_names
+        n_genes = len(gene_names)
+        n_layers = len(layer_names)
 
+        # Define default padding if None
+        if padding is None:
+            padding = [10] * n_layers  # One padding value per layer
+        
+        # Ensure padding is a column vector
+        padding = np.asarray(padding)[:, None]
+        
         for k in np.unique(max_ks):
             #Select which obs in k 
             obs_inds = max_ks == k
-            layers = search_data.layers[:,:,obs_inds]
+            layers = search_data.layers[:,obs_inds,:]
             n_cells = np.sum(obs_inds)
 
-            gene_names = search_data.gene_names
-            n_genes = len(gene_names)
+            new_layers = np.transpose(layers, axes=(0, 2, 1))
+            # Compute maximum expression value across cells for each gene and each layer
+            max_values = np.amax(new_layers, axis=2)  # Shape: (n_genes, n_layers)
+        
+            # Add padding to the maximum values
+            M = (max_values + padding).astype(int)
 
-            S = layers[1,:,:]
-            U = layers[0,:,:]
-            l = [U,S]
-            if padding is None:
-                padding = np.asarray([10] * len(l))
+            hist_type = search_data.hist_type
 
-            M = np.amax(l, axis=2) + padding[:, None]
-
-            hist = []
-            moments = []
-            for gene_index in range(n_genes):
-                if search_data.hist_type == "grid":
-                    H, xedges, yedges = np.histogramdd(
-                        *[x[gene_index] for x in l],
-                        bins=[np.arange(x[gene_index] + 1) - 0.5 for x in M],
-                        density=True
-                    )
-                elif search_data.hist_type == "unique":
-                    unique, unique_counts = np.unique(
-                        np.vstack([x[gene_index] for x in l]).T, axis=0, return_counts=True
-                    )
-                    frequencies = unique_counts / n_cells
-                    unique = unique.astype(int)
-                    H = (unique, frequencies)
-
-                hist.append(H)
-
-                moments.append(
-                    {
-                        "S_mean": S[gene_index].mean(),
-                        "U_mean": U[gene_index].mean(),
-                        "S_var": S[gene_index].var(),
-                        "U_var": U[gene_index].var(),
-                    }
-                )
+            hist = make_histogram(layers, layer_names, hist_type, M)
+            moments = get_moment_dicts(layers, layer_names)
             
 
             #Remake SearchData object
@@ -610,6 +608,7 @@ class GradientInference:
                 "n_cells",
                 "layers",
                 "hist_type",
+                "layer_names"
             ]
 
             
@@ -623,7 +622,8 @@ class GradientInference:
                 gene_names,
                 n_cells,
                 layers,
-                search_data.hist_type,
+                hist_type,
+                layer_names
             )
 
 
@@ -725,8 +725,8 @@ class GradientInference:
                 logL_k = np.zeros(n_cells)
 
                 for gene_index in range(search_data.n_genes):
-                    S = search_data.layers[1][gene_index]
-                    U = search_data.layers[0][gene_index]
+                    S = search_data.layers[1][:,gene_index].astype(int)
+                    U = search_data.layers[0][:,gene_index].astype(int)
                     x = np.array([U,S])
 
                     proposal = model.eval_model_pss(params[gene_index], search_data.M[:, gene_index], self.regressor[gene_index])
@@ -792,9 +792,10 @@ class GradientInference:
                 print('Q Function: ', q_func) 
                 print()
                 all_qs += [q_func]
+
+            final_k_dict = self._part_search_data(search_data,Q)
             
             return Q, lower_bound, all_qs, all_klds
-
 
 
     def optimize_gene(self, gene_index, model, search_data):
@@ -962,12 +963,123 @@ class GradientInference:
         )
         results.store_grid_point_results()
 
-
-
-
 ########################
 ## Helper functions
 ########################
+
+def make_histogram(layers, layer_names, hist_type, M):
+    """
+    Generate histograms based on the provided layers and layer names.
+
+    Parameters
+    ----------
+    layers : list of np.ndarray
+        List of arrays, each corresponding to a different layer (modality) of data.
+    layer_names : list of str
+        List of names corresponding to each layer in the same order as `layers`.
+    hist_type : str
+        Type of histogram to generate ("grid", "unique", or "none").
+    M : list of np.ndarray
+        List of arrays specifying the bin structure for histogram calculation.
+
+    Returns
+    -------
+    hist : list
+        A list where each entry corresponds to a histogram for a specific gene.
+    """
+
+
+    hist = []
+    n_cells = layers[0].shape[0]  # Assuming all layers have the same number of cells
+    n_genes = layers[0].shape[1]  # Assuming all layers have the same number of genes
+
+    for gene_index in range(n_genes):
+        
+        if hist_type == "grid":
+            bins = [np.arange(x[gene_index] + 1) - 0.5 for x in M]
+            stacked_data = np.vstack([x[:, gene_index] for x in layers]).T
+            H, edges = np.histogramdd(
+                stacked_data,
+                bins=bins,
+                density=True
+            )
+            xedges = edges[0]  # Assuming only one dimension for each bin
+            yedges = edges[1] 
+        elif hist_type == "unique":
+            unique, unique_counts = np.unique(
+                np.vstack([x[:, gene_index] for x in layers]).T, axis=0, return_counts=True
+            )
+            frequencies = unique_counts / n_cells
+            unique = unique.astype(int)
+            H = (unique, frequencies)
+        elif hist_type == "none":
+            H = [x[:, gene_index] for x in layers]
+
+        hist.append(H)
+
+    return hist
+
+def get_moment_dicts(layers, layer_names, cov_matrix_key='layer_covariances'):
+    """
+    Compute and add mean and variance for each gene within each layer, and add covariances
+    between layers for each gene, returning a list of dictionaries where each dictionary 
+    corresponds to a gene with calculated moments and covariances.
+
+    Parameters
+    ----------
+    adata: anndata.AnnData
+        AnnData object with layers containing gene expression data.
+    layer_names: list of strings.
+    cov_matrix_key: str, optional
+        Key under which the covariance matrix will be stored in `adata.uns`.
+
+    Returns
+    -------
+    gene_moments: list of dict
+        A list where each entry is a dictionary representing a gene, with keys as the column names 
+        (e.g., mean, variance, covariance) and values as the corresponding values for that gene.
+    """
+    n_layers = len(layer_names)
+    n_genes = np.shape(layers[0])[1]
+    # print('n_genes', n_genes)
+
+    gene_moments = []
+
+    # Compute mean, variance, and covariances for each gene
+    for gene_index in range(n_genes):
+        gene_dict = {}
+
+        for i in range(n_layers):
+            # These have already been ordered.
+            modality_name = layer_names[i]
+            layer = layers[i]
+            
+            mean_col = f"MOM_{modality_name}_mean"
+            var_col = f"MOM_{modality_name}_var"
+            
+            # Calculate mean and variance for each layer
+            gene_dict[mean_col] = layer[:, gene_index].mean()
+            gene_dict[var_col] = layer[:, gene_index].var()
+
+        # Compute covariances between each pair of layers
+        for i in range(n_layers):
+            for j in range(i + 1, n_layers):
+                layer_i = layers[i]
+                layer_j = layers[j]
+                mod_i, mod_j = layer_names[i], layer_names[j]
+                layer_layer_string = f"MOM_cov_{mod_i}_{mod_j}"
+
+                covar = np.cov(
+                    [layer_i[:, gene_index].flatten(), 
+                     layer_j[:, gene_index].flatten()]
+                )[0, 1]
+                
+                gene_dict[layer_layer_string] = covar
+        
+        gene_moments.append(gene_dict)
+
+    return gene_moments
+
 
 
 def get_hist_type(search_data):
@@ -1347,48 +1459,33 @@ class SearchResults:
         SearchData object
             SearchData object for cells in assigned k (self.assigns)
         """
-        layers = search_data.layers[:,:,self.filt]
+        layers = search_data.layers[:,self.filt,:]
         n_cells = self.n_cells
 
+        layer_names = search_data.layer_names
         gene_names = search_data.gene_names
         n_genes = len(gene_names)
 
-        S = layers[1,:,:]
-        U = layers[0,:,:]
-        l = [U,S]
-        if padding is None:
-            padding = np.asarray([10] * len(l))
-
-        M = np.amax(l, axis=2) + padding[:, None]
-
-        hist = []
-        moments = []
-        for gene_index in range(n_genes):
-            if search_data.hist_type == "grid":
-                H, xedges, yedges = np.histogramdd(
-                    *[x[gene_index] for x in l],
-                    bins=[np.arange(x[gene_index] + 1) - 0.5 for x in M],
-                    density=True
-                )
-            elif search_data.hist_type == "unique":
-                unique, unique_counts = np.unique(
-                    np.vstack([x[gene_index] for x in l]).T, axis=0, return_counts=True
-                )
-                frequencies = unique_counts / n_cells
-                unique = unique.astype(int)
-                H = (unique, frequencies)
-
-            hist.append(H)
-
-            moments.append(
-                {
-                    "S_mean": S[gene_index].mean(),
-                    "U_mean": U[gene_index].mean(),
-                    "S_var": S[gene_index].var(),
-                    "U_var": U[gene_index].var(),
-                }
-            )
+        new_layers = np.transpose(layers, axes=(0, 2, 1))
+        # new_layers = layers
         
+        # Compute maximum expression value across cells for each gene and each layer
+        max_values = np.amax(new_layers, axis=2)  # Shape: (n_genes, n_layers)
+    
+        # Define default padding if None
+        if padding is None:
+            padding = [10] * max_values.shape[1]  # One padding value per layer
+        
+        # Ensure padding is a column vector
+        padding = np.asarray(padding)[:, None]
+    
+        # Add padding to the maximum values
+        M = (max_values + padding.T).astype(int)
+
+        hist_type = search_data.hist_type
+
+        hist = make_histogram(layers, layer_names, hist_type, M)
+        moments = get_moment_dicts(layers, layer_names)
 
         #Remake SearchData object
         attr_names = [
@@ -1401,6 +1498,7 @@ class SearchResults:
             "n_cells",
             "layers",
             "hist_type",
+            "layer_names"
         ]
 
         
@@ -1414,8 +1512,76 @@ class SearchResults:
             gene_names,
             n_cells,
             layers,
-            search_data.hist_type,
+            hist_type,
+            layer_names
         )
+
+
+        # S = layers[1,:,:]
+        # U = layers[0,:,:]
+        # l = [U,S]
+        # if padding is None:
+        #     padding = np.asarray([10] * len(l))
+
+        # M = np.amax(l, axis=2) + padding[:, None]
+
+        # hist = []
+        # moments = []
+        # for gene_index in range(n_genes):
+        #     if search_data.hist_type == "grid":
+        #         H, xedges, yedges = np.histogramdd(
+        #             *[x[gene_index] for x in l],
+        #             bins=[np.arange(x[gene_index] + 1) - 0.5 for x in M],
+        #             density=True
+        #         )
+        #     elif search_data.hist_type == "unique":
+        #         unique, unique_counts = np.unique(
+        #             np.vstack([x[gene_index] for x in l]).T, axis=0, return_counts=True
+        #         )
+        #         frequencies = unique_counts / n_cells
+        #         unique = unique.astype(int)
+        #         H = (unique, frequencies)
+
+        #     hist.append(H)
+
+        #     moments.append(
+        #         {
+        #             "S_mean": S[gene_index].mean(),
+        #             "U_mean": U[gene_index].mean(),
+        #             "S_var": S[gene_index].var(),
+        #             "U_var": U[gene_index].var(),
+        #         }
+        #     )
+        
+
+        # #Remake SearchData object
+        # attr_names = [
+        #     "M",
+        #     "hist",
+        #     "moments",
+        #     "gene_log_lengths",
+        #     "n_genes",
+        #     "gene_names",
+        #     "n_cells",
+        #     "layers",
+        #     "hist_type",
+        # ]
+
+        
+        # sub_data = SearchData(
+        #     attr_names,
+        #     M,
+        #     hist,
+        #     moments,
+        #     search_data.gene_log_lengths,
+        #     n_genes,
+        #     gene_names,
+        #     n_cells,
+        #     layers,
+        #     search_data.hist_type,
+        # )
+
+        
         return sub_data
 
     def find_sampling_optimum(self, gene_filter=None, discard_rejected=False):
@@ -1683,7 +1849,7 @@ class SearchResults:
         This method performs two rounds of goodness-of-fit testing.
         First, it applies a chi-squared test to the distributions induced by biological parameter values
         at the sampling parameter optimum.
-        Optionally, it also rejectes genes that are too close to the search parameter bounds,
+        Optionally, it also rejects genes that are too close to the search parameter bounds,
         as they typically exhibit poor gradient descent performance or do not have enough counts to
         reliably estimate parameters.
         This is typically sufficient to reject genes with proposed distributions that are grossly
@@ -2437,7 +2603,6 @@ class SearchResults:
         logL: a vector of size n_genes containing model log-likelihoods.
         """
         search_data = self._subset_search_data(search_data)
-
         hist_type = get_hist_type(search_data)
         logL = np.zeros(self.n_genes)
         for gene_index in range(self.n_genes):
@@ -2446,6 +2611,7 @@ class SearchResults:
                 limits=search_data.M[:, gene_index] + offs,
                 samp=self.regressor_optimum[gene_index],
                 data=search_data.hist[gene_index],
+                n_cells = search_data.n_cells,
                 hist_type=hist_type,
                 EPS=EPS,
             )
