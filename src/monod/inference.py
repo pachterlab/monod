@@ -321,35 +321,90 @@ def reject_genes(adata, viz=False,
         bound_thr=0.01,
         grouping_thr=5,
         use_hellinger=True,
-        hellinger_thr=0.05):
+        hellinger_thr=0.05,
+        mek_means=False,
+        save_csq=True,
+                save_pval=False,
+                save_hellinger=False):
     '''
     Perform chi-squared testing and add list of rejected genes to anndata object.
+
+    Parameters
+    ------------------
+    save_csq: boolean
+        whether to save chi-squared values per cluster if performing mek-means 
+    save_pval: boolean
+        whether to save p-values per cluster if performing mek-means analysis
     '''
 
-    search_data = adata.uns['search_data']
-    search_result = adata.uns['search_result']
-
-    csq, pval, hellinger = search_result.chisquare_testing(search_data,
-        viz=viz,
-        EPS=EPS,
-        threshold=threshold,
-        bonferroni=bonferroni,
-        reject_at_bounds=reject_at_bounds,
-        bound_thr=bound_thr,
-        grouping_thr=grouping_thr,
-        use_hellinger=use_hellinger,
-        hellinger_thr=hellinger_thr)
-
-    # Save chi-squared values, p-values, and rejected genes to adata.
-    adata.var['csq'] = csq
-    adata.var['pval'] = pval
-    adata.var['hellinger'] = hellinger
-    adata.var['rejected_genes'] = search_result.rejected_genes
+    if not mek_means:
+        search_data = adata.uns['search_data']
+        try:
+            search_result = adata.uns['search_result']
+        except AttributeError:
+            log.error('Did you mean to run with meK-Means? If so, make sure to set mek_means=True')
     
-    # Reset search_data and search_result.
-    adata.uns['search_data'] = search_data
-    adata.uns['search_result'] = search_result
-    adata.uns['rejection_index'] = search_result.rejection_index
+        csq, pval, hellinger = search_result.chisquare_testing(search_data,
+            viz=viz,
+            EPS=EPS,
+            threshold=threshold,
+            bonferroni=bonferroni,
+            reject_at_bounds=reject_at_bounds,
+            bound_thr=bound_thr,
+            grouping_thr=grouping_thr,
+            use_hellinger=use_hellinger,
+            hellinger_thr=hellinger_thr)
+    
+        # Save chi-squared values, p-values, and rejected genes to adata.
+        adata.var['csq'] = csq
+        adata.var['pval'] = pval
+        adata.var['hellinger'] = hellinger
+        adata.var['rejected_genes'] = search_result.rejected_genes
+        
+        # Reset search_data and search_result.
+        adata.uns['search_data'] = search_data
+        adata.uns['search_result'] = search_result
+        adata.uns['rejection_index'] = search_result.rejection_index
+
+    else:
+        search_data = adata.uns['search_data']
+        search_result_list = adata.uns['search_result_list']
+
+        new_sr_list = []
+        
+        for i in range(len(search_result_list)):
+            
+            sr = search_result_list[i]
+            sd =  sr._subset_search_data(search_data)
+            cluster_filter = sr.filt
+            
+            csq, pval, hellinger = sr.chisquare_testing(sd,
+            viz=viz,
+            EPS=EPS,
+            threshold=threshold,
+            bonferroni=bonferroni,
+            reject_at_bounds=reject_at_bounds,
+            bound_thr=bound_thr,
+            grouping_thr=grouping_thr,
+            use_hellinger=use_hellinger,
+            hellinger_thr=hellinger_thr)
+
+            # Save chi-squared values, p-values, and rejected genes to adata.
+            if save_csq:
+                adata.var['{}_csq'.format(i)] = csq
+            if save_pval:
+                adata.var['{}_pval'.format(i)] = pval
+            if save_hellinger:
+                adata.var['{}_hellinger'.format(i)] = pval
+                
+            adata.var['{}_rejected_genes'.format(i)] = sr.rejected_genes
+
+            new_sr_list += [sr]
+            
+        # Reset search_data and search_result.
+        adata.uns['search_result_list'] = new_sr_list
+        # This is the same for all clusters (all sr objects), so can be set once (correct?)
+        adata.uns['rejection_index'] = sr.rejection_index
 
     # Return list of rejected genes.
     return adata
