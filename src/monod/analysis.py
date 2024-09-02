@@ -457,7 +457,7 @@ def compare_AIC_weights(
     plt.savefig(fig_string, dpi=450)
     log.info("Figure stored to {}.".format(fig_string))
 
-def DE_parameters(adata1, adata2, modeltype="id",
+def DE_parameters(adata1, adata2=None, modeltype="id",
     gene_filter_=None,
     discard_rejected=True,
     use_sigma=True,
@@ -465,39 +465,86 @@ def DE_parameters(adata1, adata2, modeltype="id",
     meta="12",
     viz=True,
     pval_thr=0.001,
-    nit=10 ):
+    nit=10, save_cluster_FCs=False):
 
-    if not (adata1.var_names == adata2.var_names).all():
-        raise KeyError('Genes are not the same between datasets')
-        # log.error('Genes are not the same between datasets')
+    if modeltype != 'id':
+        raise Exception('Model type not implemented for DE_parameters.')
 
-    sr1, sr2 = adata1.uns['search_result'], adata2.uns['search_result']
+    # If 2 dataframes are given, compare two datasets.
+    if adata2:
+        mek_means = False
+
+        if not (adata1.var_names == adata2.var_names).all():
+            raise KeyError('Genes are not the same between datasets')
+            # log.error('Genes are not the same between datasets')
     
-    gn, gf, offs, resid = diffexp_pars(sr1, sr2, modeltype=modeltype,
-    gene_filter_=gene_filter_,
-    discard_rejected=discard_rejected,
-    use_sigma=use_sigma,
-    figsize=figsize,
-    meta=meta,
-    viz=viz,
-    pval_thr=pval_thr,
-    nit=nit)
+        sr1, sr2 = adata1.uns['search_result'], adata2.uns['search_result']
+            
+        gn, gf, offs, resid = diffexp_pars(sr1, sr2, modeltype=modeltype,
+        gene_filter_=gene_filter_,
+        discard_rejected=discard_rejected,
+        use_sigma=use_sigma,
+        figsize=figsize,
+        meta=meta,
+        viz=viz,
+        pval_thr=pval_thr,
+        nit=nit)
+        
+        param_strings = adata1.uns['model'].get_log_name_str()
+        fold_changes = offs + resid
     
-    param_strings = adata1.uns['model'].get_log_name_str()
-    fold_changes = offs + resid
-
-    for i, param in enumerate(param_strings):
-        if modeltype=='id':
+        # Save fold changes and adjusted fold changes (with offset removed).
+        for i, param in enumerate(param_strings):
             adata2.var["FC_{}".format(param)] = fold_changes[i]
             adata1.var["FC_{}".format(param)] = -fold_changes[i]
 
             # Save adjusted parameters, subtracting the offset from adata2
             adata2.var["adj_{}".format(param)] = adata2.var["param_{}".format(param)] - offs[i]
+        
+            adj_fold_changes = resid[i]
     
-        adj_fold_changes = resid[i]
+            adata2.var["adj_FC_{}".format(param)] = adj_fold_changes
+            adata1.var["adj_FC_{}".format(param)] = -adj_fold_changes
+                
+    else:
+        
+        mek_means = True
+        sr_list = adata1.uns['search_result_list']
+    
+        gn, gf, offs, resid = {}, {}, {}, {}
+    
+        for i in range(len(sr_list)):
+            for j in range(i+1, len(sr_list)):
+                
+                sr1, sr2 = sr_list[i], sr_list[j]
+                cluster1, cluster2 = sr1.assigns, sr2.assigns
+                dict_key = (cluster1, cluster2)
+                print('Clusters:', dict_key)
+                
+                gn_clusts, gf_clusts, offs_clusts, resid_clusts = \
+                    diffexp_pars(sr1, sr2, modeltype=modeltype,
+                                gene_filter_=gene_filter_,
+                                discard_rejected=discard_rejected,
+                                use_sigma=use_sigma,
+                                figsize=figsize,
+                                meta=meta,
+                                viz=viz,
+                                pval_thr=pval_thr,
+                                nit=nit)
+                plt.show()
 
-        adata2.var["adj_FC_{}".format(param)] = adj_fold_changes
-        adata1.var["adj_FC_{}".format(param)] = -adj_fold_changes
+                gn[dict_key], gf[dict_key], offs[dict_key], resid[dict_key] = gn_clusts, gf_clusts, offs_clusts, resid_clusts
+                
+                if save_cluster_FCs:
+                    param_strings = adata1.uns['model'].get_log_name_str()
+                    fold_changes = offs_clusts + resid_clusts
+                
+                    # Save fold changes.
+                    for i, param in enumerate(param_strings):
+                        adata1.var["FC_{}_{}".format(param, dict_key)] = fold_changes[i]
+                
+
+    
 
     return gn, gf, offs, resid
     

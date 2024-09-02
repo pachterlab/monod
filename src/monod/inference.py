@@ -178,7 +178,6 @@ def perform_inference(h5ad_filepath,
     else:
         # AIC values from meK-Means are the same for all SRs.
         AICs = get_AIC_mek_means(search_result_list, search_data, AIC_EPS=AIC_EPS, AIC_offs=AIC_offs)
-        print('AICs', AICs)
         monod_adata.var['AIC'] = AICs
     
     log.info('AIC values calculated.')
@@ -377,6 +376,7 @@ def reject_genes(adata, viz=False,
             sr = search_result_list[i]
             sd =  sr._subset_search_data(search_data)
             cluster_filter = sr.filt
+            cluster = sr.assigns
             
             csq, pval, hellinger = sr.chisquare_testing(sd,
             viz=viz,
@@ -391,13 +391,13 @@ def reject_genes(adata, viz=False,
 
             # Save chi-squared values, p-values, and rejected genes to adata.
             if save_csq:
-                adata.var['{}_csq'.format(i)] = csq
+                adata.var['{}_csq'.format(cluster)] = csq
             if save_pval:
-                adata.var['{}_pval'.format(i)] = pval
+                adata.var['{}_pval'.format(cluster)] = pval
             if save_hellinger:
-                adata.var['{}_hellinger'.format(i)] = pval
+                adata.var['{}_hellinger'.format(cluster)] = pval
                 
-            adata.var['{}_rejected_genes'.format(i)] = sr.rejected_genes
+            adata.var['{}_rejected_genes'.format(cluster)] = sr.rejected_genes
 
             new_sr_list += [sr]
             
@@ -2577,3 +2577,103 @@ def plot_hist_and_fit(
     )
     ax1.plot(np.arange(sd.M[lind, i_]), Pa, color=fitcolor, linestyle=linestyle)
     ax1.set_xlim([-0.5, sd.layers[lind, i_].max() + 2.5])
+
+
+# Differential expression analysis between mek-means clusters.
+def make_fcs(sr,sd,clus1=0,clus2=1,gf_rej=False,thrpars=2,thrmean=1,outlier_de=False,nuc=False,correct_off=False):
+    '''
+    Utilize different metrics to find fold-changes (FCs) between cluster parameters
+
+    sr: list of SearchResults objects from meK-Means runs
+    sd: SearchData object that corresponds to full, input data
+    clus1: cluster 1 (to compare FCS of cluster 1/cluster 2 )
+    clus2: cluster 2 (to compare FCS of cluster 1/cluster 2 )
+    gf_rej: whether to use boolean list of rejected genes from both clusters
+    thrpars: FC threshold value (to call DE-theta genes)
+    thrmean: Mean S expression threshold value, for genes to consider
+    outlier_de: Use iterative outlier calling procedure to assign DE-theta genes (see Monod https://github.com/pachterlab/monod_examples/blob/main/Monod_demo.ipynb)
+    nuc: is this nuclear RNA data
+    correct_off: correct offset between cluster parameters (through ODR)
+    '''
+
+    all_filt_fcs = pd.DataFrame()
+    fcs,types,which_pair,highFC,spliceFC,g_names,out_de = ([] for i in range(7))
+
+    ind1 = [i for i in range(len(sr)) if clus1 == sr[i].assigns][0]
+    ind2 = [i for i in range(len(sr)) if clus2 == sr[i].assigns][0]
+
+    sr1 = sr[ind1]
+    sr2 = sr[ind2]
+    if correct_off:
+        param_names = sr1.model.get_log_name_str()
+        offsets = []
+        par_vals = np.copy(sr2.param_estimates)
+        for k in range(3):
+            m1 = sr1.param_estimates[0,:,k]
+            m2 = sr2.param_estimates[0,:,k]
+            offset = diffexp_fpi(m1,m2,param_names[k],viz=False)[1]
+            par_vals[0,:,k] -= offset
+
+        fc_par = (sr1.param_estimates-par_vals)/np.log10(2)
+    else:
+        fc_par = (sr1.param_estimates-sr2.param_estimates)/np.log10(2)  #Get FCs between cluster params
+
+    print('fc_par.shape: ',fc_par.shape)
+    if nuc:
+        fc_s_par = np.log2(sd.layers[0][:,sr1.filt].mean(1)/sd.layers[0][:,sr2.filt].mean(1))
+    else:
+        fc_s_par = np.log2(sd.layers[1][:,sr1.filt].mean(1)/sd.layers[1][:,sr2.filt].mean(1)) #Get spliced FCs
+
+    print('fc_s_par.shape: ',fc_s_par.shape)
+
+    if outlier_de:
+        dr_analysis = monod.analysis.diffexp_pars(sr1,sr2,viz=True,modeltype='id',use_sigma=True)
+        par_bool_de = dr_analysis[1].T
+
+    parnames = ('b','beta','gamma')
+
+
+  #-----is parameter FC significant -----
+    if gf_rej is False:
+        gf_rej = [True]*sd.n_genes
+    else:
+        gf_rej = (~sr1.rejected_genes) & (~sr2.rejected_genes)
+
+    for n in range(len(parnames)):
+        #Boolean for if large param FC and not rejected gene (with minimum expression)
+        if nuc:
+            gf_highnoise = (np.abs(fc_par[0,:,n])>thrpars)  \
+                & ((sd.layers[0][:,sr1.filt].mean(1)>thrmean) | (sd.layers[0][:,sr2.filt].mean(1)>thrmean)) \
+                & gf_rej
+        else:
+            gf_highnoise = (np.abs(fc_par[0,:,n])>thrpars)  \
+                & ((sd.layers[1][:,sr1.filt].mean(1)>thrmean) | (sd.layers[1][:,sr2.filt].mean(1)>thrmean)) \
+                & gf_rej
+
+        #Boolean for FC (above) but no FC detected at S-level
+        gf_highnoise_meanS = gf_highnoise & (np.abs(fc_s_par)<1) & gf_rej
+
+        #Boolean for FC (above)
+        gf_onlyhigh = gf_highnoise & gf_rej
+
+        #For dataframe
+        fcs += list(fc_par[0,gf_rej,n])
+        g_names += list(sr1.gene_names[gf_rej])
+        which_pair += [[sr1.assigns,sr2.assigns]]*np.sum(gf_rej)
+        highFC += list(gf_onlyhigh[gf_rej])
+        spliceFC += list(gf_highnoise_meanS[gf_rej])
+        types += [parnames[n]]*np.sum(gf_rej)
+        if outlier_de:
+            out_de += list(par_bool_de[gf_rej,n])
+
+    if outlier_de:
+        all_filt_fcs['deTheta_outlier'] = out_de
+
+    all_filt_fcs['log2FC'] = fcs
+    all_filt_fcs['gene'] = g_names
+    all_filt_fcs['cluster_pair'] = which_pair
+    all_filt_fcs['deTheta_FC'] = highFC
+    all_filt_fcs['deTheta_noDeMuS'] = spliceFC
+    all_filt_fcs['param'] = types
+
+    return all_filt_fcs
