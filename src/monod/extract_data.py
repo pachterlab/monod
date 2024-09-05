@@ -926,10 +926,6 @@ def process_adata(adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes
     adata = threshold_by_expression(adata, filt_param)
     gene_names = adata.var_names
 
-    # Add gene lengths.
-    if transcriptome_dict:
-        adata.var['length'] = [transcriptome_dict.get(gene, np.nan) for gene in gene_names]
-
     gene_name_reference = np.copy(gene_names)
     # Apply expression threshold filter
     gene_exp_filter = adata.var['gene_exp_filter']
