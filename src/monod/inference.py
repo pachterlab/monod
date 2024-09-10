@@ -208,6 +208,14 @@ def perform_inference(h5ad_filepath,
 
         log.info('Uncertainties per gene calculated.')
 
+    # If meK-Means, save clusters.
+    if mek_means_params:
+        monod_adata.obs['cluster'] = None
+        log.info('Saving clusters')
+        for sr in search_result_list:
+            cluster_label = sr.assigns
+            monod_adata.obs.loc[sr.filt, 'cluster'] = cluster_label
+
     # Also save entire objects to adata.
     monod_adata.uns['search_data'] = search_data
     if not mek_means_params:
