@@ -2566,7 +2566,7 @@ class SearchResults:
                 jitter_magn = 0.1
                 jitter = np.random.randn(2, self.n_cells) * jitter_magn
                 ax1[axloc].scatter(
-                    *search_data.layers[:2, i_] + jitter, c="k", s=1, alpha=0.1
+                    *search_data.layers[:2, :,i_] + jitter, c="k", s=1, alpha=0.1
                 )
 
                 ax1[axloc].set_xlim([-0.5, search_data.M[0, i_] - 1.5])

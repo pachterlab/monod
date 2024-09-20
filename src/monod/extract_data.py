@@ -23,8 +23,6 @@ code_ver_global = "029"  # bumping up version April 2024
 import logging, sys
 from scipy.sparse import csr_matrix
 from scipy.sparse import issparse
-print('new')
-
 
 logging.basicConfig(stream=sys.stdout)
 log = logging.getLogger()
@@ -151,6 +149,12 @@ def extract_data(
     else:
         monod_adata = h5ad_filepath.copy()
 
+    # Load the AnnData object into memory if it is in backed mode
+    if monod_adata.isbacked:
+        monod_adata = monod_adata.to_memory()
+    # Store the raw data.
+    raw_adata = monod_adata.copy()
+
     # Check whether the given data is in sparse or numpy format.
     layer_data = monod_adata.layers[[i for i in ordered_layer_names][0]]
 
@@ -171,6 +175,8 @@ def extract_data(
         monod_adata = CSRDataset_to_arrays(monod_adata)
         print('CSRDataset')
 
+    # # Save entire raw data object to monod_adata
+    # mono
 
     # Subset to the layers required in the model.
     adata = monod_adata.to_memory()
@@ -266,6 +272,9 @@ def extract_data(
     if mek_means_params:
         monod_adata.uns['k'] = k
         monod_adata.uns['epochs'] = epochs
+
+    # Save the raw data as an attribute.
+    monod_adata.raw = raw_adata
     
     return monod_adata
 
@@ -452,13 +461,12 @@ def make_histogram(monod_adata, hist_type, M):
 
     # NB the order of the layers here will be enforced to be the same as the order of the model 
     # modalities defined in cme_toolbox.
-    print([i for i in monod_adata.layers.keys()], 'previous ordering')
+
     modality_name_dict = monod_adata.uns['modality_name_dict']
     model = monod_adata.uns['model']
-    # print(adata.layers)
+
     ordered_modalities = model.model_modalities
     ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
-    print(ordered_layer_names, 'ordered for histogram')
 
     hist = []
     layers = [monod_adata.layers[layer_name] for layer_name in ordered_layer_names] # toarray

@@ -89,7 +89,7 @@ def perform_inference(h5ad_filepath,
     
     # Filter adata for selected genes.
     monod_adata = monod_adata[:, monod_adata.var['selected_genes'].astype(bool)]
-
+    
     search_data = searchdata_from_adata(monod_adata)
     log.info('Search data created.')
 
@@ -128,7 +128,6 @@ def perform_inference(h5ad_filepath,
     
     log.info('Global inference parameters set.')
 
-    
     if not mek_means_params:
         # Fit the model at all values of technical parameters, and save the location of the results.
         search_result = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores)
@@ -174,7 +173,7 @@ def perform_inference(h5ad_filepath,
                 param_values = cluster_params[j][:,i]
                 # cluster_param_column = 
                 monod_adata.var["c{}_".format(j) + without_log] = param_values
-           
+    
     if mek_means_params:
         # log.info('Optimal parameters for each cluster saved to anndata. For cluster i, the .var attribute is of the form: ci_' + param_name)
         log.info('Optimal parameters for each cluster saved to anndata. For cluster i, the .var attribute is of the form: \"ci_'+without_log+ '\". Note that the parameters are given in log-base 10.')
@@ -191,7 +190,6 @@ def perform_inference(h5ad_filepath,
         monod_adata.var['AIC'] = AICs
     
     log.info('AIC values calculated and saved under .var attribute: AIC.')
-
 
     if not exclude_sigma:
         if not mek_means_params:
@@ -227,6 +225,7 @@ def perform_inference(h5ad_filepath,
         else:
             # NB log.
             log.info('Uncertainties per gene calculated for each cluster. E.g. for cluser, i, uncertainty saved to anndata in .var attribute of the form: \"ci_error_'+ without_log + '\". Note that the errors are given in log-base 10.')
+
             
     # If meK-Means, save clusters.
     if mek_means_params:
@@ -235,6 +234,7 @@ def perform_inference(h5ad_filepath,
         for sr in search_result_list:
             cluster_label = sr.assigns
             monod_adata.obs.loc[sr.filt, 'cluster'] = cluster_label
+        log.info('Cluster labels added to anndata .obs')
 
     # Also save entire objects to adata.
     monod_adata.uns['search_data'] = search_data
@@ -253,10 +253,9 @@ def searchdata_from_adata(adata):
     # modalities defined in cme_toolbox.
     modality_name_dict = adata.uns['modality_name_dict']
     model = adata.uns['model']
-    print(adata.layers)
+
     ordered_modalities = model.model_modalities
     ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
-    print(ordered_layer_names)
     
     layers = np.array([adata.layers[layer_name] for layer_name in ordered_layer_names])
 
@@ -384,9 +383,17 @@ def reject_genes(adata, viz=False,
     
         # Save chi-squared values, p-values, and rejected genes to adata.
         adata.var['csq'] = csq
+        log.info('Chi-squared values for each gene have been added as \"csq\" in .var')
+
         adata.var['pval'] = pval
+        log.info('P-values for each gene have been added as \"pval\" in .var')
+
         adata.var['hellinger'] = hellinger
+        log.info('Hellinger distances for each gene have been added as \"hellinger\" in .var')
+
         adata.var['rejected_genes'] = search_result.rejected_genes
+        log.info('Rejected genes are recorded in \"rejected_genes\" in .var')
+
         
         # Reset search_data and search_result.
         adata.uns['search_data'] = search_data
@@ -420,14 +427,24 @@ def reject_genes(adata, viz=False,
             # Save chi-squared values, p-values, and rejected genes to adata.
             if save_csq:
                 adata.var['{}_csq'.format(cluster)] = csq
+
             if save_pval:
                 adata.var['{}_pval'.format(cluster)] = pval
+
             if save_hellinger:
-                adata.var['{}_hellinger'.format(cluster)] = pval
-                
+                adata.var['{}_hellinger'.format(cluster)] = hellinger
+
             adata.var['{}_rejected_genes'.format(cluster)] = sr.rejected_genes
 
             new_sr_list += [sr]
+
+        log.info('Rejected genes in cluster i have been recorded under \"ci_rejected_genes\" in .var')
+        if save_csq:
+            log.info('Chi-squared values for each gene in cluster i have been added as \"ci_csq\" in .var')
+        if save_pval:
+            log.info('P-values for each gene in cluster i have been added as \"ci_pval\" in .var')
+        if save_hellinger:
+            log.info('Hellinger distances for each gene in cluster i have been added as \"ci_hellinger\" in .var')
             
         # Reset search_data and search_result.
         adata.uns['search_result_list'] = new_sr_list
@@ -2352,7 +2369,7 @@ class SearchResults:
             genes_to_plot = genes_to_plot[:nax]
 
         j_ = 0
-        print(genes_to_plot)
+
         for i_ in genes_to_plot:
             lm = np.copy(search_data.M[:, i_])
             
@@ -2646,13 +2663,13 @@ def make_fcs(sr,sd,clus1=0,clus2=1,gf_rej=False,thrpars=2,thrmean=1,outlier_de=F
     else:
         fc_par = (sr1.param_estimates-sr2.param_estimates)/np.log10(2)  #Get FCs between cluster params
 
-    print('fc_par.shape: ',fc_par.shape)
+    # print('fc_par.shape: ',fc_par.shape)
     if nuc:
         fc_s_par = np.log2(sd.layers[0][:,sr1.filt].mean(1)/sd.layers[0][:,sr2.filt].mean(1))
     else:
         fc_s_par = np.log2(sd.layers[1][:,sr1.filt].mean(1)/sd.layers[1][:,sr2.filt].mean(1)) #Get spliced FCs
 
-    print('fc_s_par.shape: ',fc_s_par.shape)
+    # print('fc_s_par.shape: ',fc_s_par.shape)
 
     if outlier_de:
         dr_analysis = monod.analysis.diffexp_pars(sr1,sr2,viz=True,modeltype='id',use_sigma=True)

@@ -10,15 +10,26 @@ from scipy import odr
 import numpy as np
 import matplotlib.pyplot as plt
 from extract_data import log
+import sys
+
+import logging
+logging.basicConfig(stream=sys.stdout)
+log = logging.getLogger()
+log.setLevel(logging.INFO)
 
 
 ########################
 ## Helper functions
 ########################
 
-def run_qc(monod_adata):
-    sr = monod_adata.uns['search_result']
+def run_qc(monod_adata, mek_means_params=None,cluster=0):
     sd = monod_adata.uns['search_data']
+
+    if not mek_means_params:
+        sr = monod_adata.uns['search_result']
+    else:
+        sr = monod_adata.uns['search_result_list'][cluster]
+        
     fig1,ax1 = plt.subplots(1,1)
     sr.find_sampling_optimum()
     sr.plot_landscape(ax1)
@@ -29,8 +40,9 @@ def run_qc(monod_adata):
     sr.plot_gene_distributions(sd,marg='joint')
 
     _=sr.chisquare_testing(sd)
-    sr.resample_opt_viz()
-    sr.resample_opt_mc_viz()
+    if monod_adata.n_vars >=60:
+        sr.resample_opt_viz()
+        sr.resample_opt_mc_viz()
     sr.chisq_best_param_correction(sd,viz=True) 
 
     sr.compute_sigma(sd,num_cores=1) #colab has a hard time with multiprocessing
@@ -465,7 +477,7 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
     meta="12",
     viz=True,
     pval_thr=0.001,
-    nit=10, save_cluster_FCs=False):
+    nit=10, save_cluster_FCs=True):
 
     if modeltype != 'id':
         raise Exception('Model type not implemented for DE_parameters.')
@@ -495,17 +507,26 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
     
         # Save fold changes and adjusted fold changes (with offset removed).
         for i, param in enumerate(param_strings):
-            adata2.var["FC_{}".format(param)] = fold_changes[i]
-            adata1.var["FC_{}".format(param)] = -fold_changes[i]
+            without_log = param.replace(r"\log_{10} ", "")
+
+            FC_label = "FC_{}".format(without_log)
+            adata2.var[FC_label] = fold_changes[i]
+            adata1.var[FC_label] = -fold_changes[i]
 
             # Save adjusted parameters, subtracting the offset from adata2
-            adata2.var["adj_{}".format(param)] = adata2.var["param_{}".format(param)] - offs[i]
+            adjusted_param_label = "adj_{}".format(without_log)
+            adata2.var[adjusted_param_label] = adata2.var[without_log] - offs[i]
         
             adj_fold_changes = resid[i]
-    
-            adata2.var["adj_FC_{}".format(param)] = adj_fold_changes
-            adata1.var["adj_FC_{}".format(param)] = -adj_fold_changes
-                
+
+            adj_FC_label = "adj_FC_{}".format(without_log)
+            adata2.var[adj_FC_label] = adj_fold_changes
+            adata1.var[adj_FC_label] = -adj_fold_changes
+
+        print('Fold changes saved to each dataframe under .var, e.g. ' + FC_label)
+        print('Adjusted parameter values (subtracting the average fold change) saved to the second dataframe under .var, e.g. ' + adjusted_param_label)
+        print('Adjusted fold changes (subtracting the average fold change) saved to each dataframe under .var, e.g. ' + adj_FC_label)
+               
     else:
         
         mek_means = True
@@ -541,9 +562,11 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
                 
                     # Save fold changes.
                     for i, param in enumerate(param_strings):
-                        adata1.var["FC_{}_{}".format(param, dict_key)] = fold_changes[i]
-                
+                        without_log = param.replace(r"\log_{10} ", "")
+                        FC_label = "FC_{}_{}".format(without_log, dict_key)
+                        adata1.var[FC_label] = fold_changes[i]
 
+                    print('Fold changes between two clusters recorded in .var in form: ' + FC_label + ', where the tuple (i,j) represents the fold change between cluster i and j.')
     
 
     return gn, gf, offs, resid
