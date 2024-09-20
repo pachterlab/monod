@@ -177,9 +177,9 @@ def perform_inference(h5ad_filepath,
            
     if mek_means_params:
         # log.info('Optimal parameters for each cluster saved to anndata. For cluster i, the .var attribute is of the form: ci_' + param_name)
-        log.info('Optimal parameters for each cluster saved to anndata. For cluster i, the .var attribute is of the form: ci_log10_γ')
+        log.info('Optimal parameters for each cluster saved to anndata. For cluster i, the .var attribute is of the form: \"ci_'+without_log+ '\". Note that the parameters are given in log-base 10.')
     else:
-        log.info('Optimal parameters saved to anndata, under .var attributes in the form: log10_γ')
+        log.info('Optimal parameters saved to anndata, under .var attributes in the form: \"'+without_log + '\". Note that the parameters are given in log-base 10.')
 
     
     # Save AIC values to adata.
@@ -223,10 +223,10 @@ def perform_inference(h5ad_filepath,
 
         if not mek_means_params:
             # NB log.
-            log.info('Uncertainties per gene calculated, saved to anndata in .var attribute of the form: σ_log10_γ')
+            log.info('Uncertainties per gene calculated, saved to anndata in .var attribute of the form: \"error_' + without_log + '\". Note that the errors are given in log-base 10.')
         else:
             # NB log.
-            log.info('Uncertainties per gene calculated for each cluster. E.g. for cluser, i, uncertainty saved to anndata in .var attribute of the form: ci_σ_log10_γ')
+            log.info('Uncertainties per gene calculated for each cluster. E.g. for cluser, i, uncertainty saved to anndata in .var attribute of the form: \"ci_error_'+ without_log + '\". Note that the errors are given in log-base 10.')
             
     # If meK-Means, save clusters.
     if mek_means_params:
