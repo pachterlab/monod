@@ -23,7 +23,7 @@ code_ver_global = "029"  # bumping up version April 2024
 import logging, sys
 from scipy.sparse import csr_matrix
 from scipy.sparse import issparse
-
+print('new')
 
 
 logging.basicConfig(stream=sys.stdout)
@@ -387,7 +387,7 @@ def add_moments(adata, modality_name_dict=None, cov_matrix_key='layer_covariance
                 # covariances[gene_index, index] = covar
                 gene_covars += [covar]
 
-            adata.var[layer_layer_string] = gene_covars
+            adata.var[layer_layer_string] = np.array(gene_covars)
             
             index += 1
 

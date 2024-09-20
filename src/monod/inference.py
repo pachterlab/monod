@@ -162,15 +162,25 @@ def perform_inference(h5ad_filepath,
         
         if not mek_means_params:
             param_name = search_result.model.param_str[i]
+            without_log = param_name.replace(r"\log_{10} ", "")
+
             param_values = parameters_per_gene[:,i]
-            monod_adata.var['param_' + param_name] = param_values
+            monod_adata.var[without_log] = param_values
         else:
             param_name = search_result_list[0].model.param_str[i]
+            without_log = param_name.replace(r"\log_{10} ", "")
+
             for j in cluster_params.keys():
                 param_values = cluster_params[j][:,i]
-                monod_adata.var["cluster_{}_param_".format(j) + param_name] = param_values
-                
-    log.info('Optimal parameters saved.')
+                # cluster_param_column = 
+                monod_adata.var["c{}_".format(j) + without_log] = param_values
+           
+    if mek_means_params:
+        # log.info('Optimal parameters for each cluster saved to anndata. For cluster i, the .var attribute is of the form: ci_' + param_name)
+        log.info('Optimal parameters for each cluster saved to anndata. For cluster i, the .var attribute is of the form: ci_log10_γ')
+    else:
+        log.info('Optimal parameters saved to anndata, under .var attributes in the form: log10_γ')
+
     
     # Save AIC values to adata.
     if not mek_means_params:
@@ -180,7 +190,7 @@ def perform_inference(h5ad_filepath,
         AICs = get_AIC_mek_means(search_result_list, search_data, AIC_EPS=AIC_EPS, AIC_offs=AIC_offs)
         monod_adata.var['AIC'] = AICs
     
-    log.info('AIC values calculated.')
+    log.info('AIC values calculated and saved under .var attribute: AIC.')
 
 
     if not exclude_sigma:
@@ -192,7 +202,10 @@ def perform_inference(h5ad_filepath,
             for i in range(num_params):
                 param_name = search_result.model.param_str[i]
                 sigmas = all_sigmas[:,i]
-                monod_adata.var['sigma_' + param_name] = sigmas#[:,i]
+                without_log = param_name.replace(r"\log_{10} ", "")
+                # monod_adata.var[r'$\sigma$_' + param_name] = sigmas#[:,i]
+                monod_adata.var['error_' + without_log] = sigmas#[:,i]
+
         else:
             # Save uncertainties from Hessian.
             for j, sr in enumerate(search_result_list):
@@ -203,11 +216,18 @@ def perform_inference(h5ad_filepath,
                 
                 for i in range(num_params):
                     param_name = sr.model.param_str[i]
+                    without_log = param_name.replace(r"\log_{10} ", "")
+
                     sigmas = all_sigmas[:,i]
-                    monod_adata.var["cluster_{}_sigma_".format(j) + param_name] = sigmas#[:,i]
+                    monod_adata.var[r"c{}_error_".format(j) + without_log] = sigmas#[:,i]
 
-        log.info('Uncertainties per gene calculated.')
-
+        if not mek_means_params:
+            # NB log.
+            log.info('Uncertainties per gene calculated, saved to anndata in .var attribute of the form: σ_log10_γ')
+        else:
+            # NB log.
+            log.info('Uncertainties per gene calculated for each cluster. E.g. for cluser, i, uncertainty saved to anndata in .var attribute of the form: ci_σ_log10_γ')
+            
     # If meK-Means, save clusters.
     if mek_means_params:
         monod_adata.obs['cluster'] = None
