@@ -727,7 +727,7 @@ class CMEModel:
             x0 = np.asarray([b, beta, gamma])
 
         elif self.bio_model == "ProteinBursty":
-            U_var, U_mean, S_mean, P_mean, UP_covar = moments["MOM_unspliced_var"], moments["MOM_unspliced_mean"], moments["MOM_spliced_mean"], moments["MOM_protein_mean"], moments["MOM_unspliced_protein_covar"]
+            U_var, U_mean, S_mean, P_mean, UP_covar = moments["MOM_unspliced_var"], moments["MOM_unspliced_mean"], moments["MOM_spliced_mean"], moments["MOM_protein_mean"], moments["MOM_cov_unspliced_protein"]
             try:
                 b = U_var / U_mean - 1
             except:
