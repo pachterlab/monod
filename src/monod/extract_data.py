@@ -118,7 +118,7 @@ def extract_data(
 
     Returns
     -------
-    search_data: SearchData object.
+    anndata: adata object.
     """
     log.info("Beginning data extraction.")
     log.info("Dataset: " + dataset_name)
@@ -128,6 +128,7 @@ def extract_data(
 
     if not filt_param:
         filt_param = model.filter_bounds
+        log.info('Using default gene filtering parameters')
 
     # If no mapping given, assume that the layers are named according to the conventional modalities for the model
     # e.g. 'spliced', 'unspliced'
@@ -234,6 +235,9 @@ def extract_data(
         else:
             visualize_gene_filtering(monod_adata)
 
+    # # Save the filter for selected genes, which should be applied to the raw adata.
+    monod_adata.uns['selected_genes'] = monod_adata.var['selected_genes'].astype(bool)
+
     # Filter for selected genes.
     monod_adata = monod_adata[:, monod_adata.var['selected_genes'].astype(bool)].to_memory()
     
@@ -263,6 +267,8 @@ def extract_data(
     monod_adata.uns['hist_type'] = hist_type
 
     monod_adata = add_moments(monod_adata)
+    log.debug('Moments were added')
+    
     monod_adata.uns['model'] = model
 
     hist = make_histogram(monod_adata, hist_type, M)
@@ -756,18 +762,41 @@ def threshold_by_expression(adata, filt_param={'min_means': [0.01, 0.01],
     
     layers = [adata.layers[layer] for layer in ordered_layer_names] # toarray
 
+    # print('before', np.sum(gene_exp_filter))
     # # Iterate over each layer to apply filters
+    # print(filt_param)
     for i in range(len(layers)):
         layer = layers[i]
+        # print(ordered_layer_names[i])
     
         means = layer.mean(axis=0)
         maxes = layer.max(axis=0)
+        total_gene_num = len(means)
         
         # Apply filtering criteria
-        layer_filter = (means > filt_param['min_means'][i]) & (maxes < filt_param['max_maxes'][i]) & (maxes > filt_param['min_maxes'][i])
+        layer_filter = (means >= filt_param['min_means'][i]) 
+        # Debug.
+        num_filtered_out = total_gene_num - sum(layer_filter)
+        log.debug('{} genes failed to meet minimum {} means'.format( num_filtered_out, ordered_layer_names[i]))
+
+        # Add max-max filter.
+        new_filter = (maxes <= filt_param['max_maxes'][i]) 
+        layer_filter = layer_filter & new_filter
+        # Debug.
+        num_filtered_out = total_gene_num - sum(new_filter)
+        log.debug('{} genes exceeded maximum {} means'.format( num_filtered_out, ordered_layer_names[i]))
+
+        # Add min-max filter.
+        new_filter = (maxes >= filt_param['min_maxes'][i])
+        layer_filter = layer_filter & new_filter
+        # Debug.
+        num_filtered_out =  total_gene_num - sum(new_filter)
+        log.debug('{} genes failed to meet minimum {} maximum'.format(num_filtered_out, ordered_layer_names[i]))
         
         # Combine filters across layers
         gene_exp_filter &= layer_filter
+
+        # print('left', np.sum(gene_exp_filter))
 
     ## Do not remove filtered genes.
     # # Update AnnData object with filtered genes
