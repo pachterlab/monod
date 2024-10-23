@@ -726,6 +726,8 @@ def add_gene_lengths(adata, length_dict, attribute_name='length_given', lengths_
     """
     # Initialize the attributes
     adata.var[attribute_name] = adata.var_names.isin(length_dict).astype(int)
+
+    
     adata.var[lengths_name] = adata.var_names.map(length_dict).fillna(0).astype(float)
     adata.var['log_lengths'] = np.log10(adata.var['lengths'])
 
@@ -762,41 +764,28 @@ def threshold_by_expression(adata, filt_param={'min_means': [0.01, 0.01],
     
     layers = [adata.layers[layer] for layer in ordered_layer_names] # toarray
 
-    # print('before', np.sum(gene_exp_filter))
     # # Iterate over each layer to apply filters
-    # print(filt_param)
     for i in range(len(layers)):
         layer = layers[i]
-        # print(ordered_layer_names[i])
     
         means = layer.mean(axis=0)
         maxes = layer.max(axis=0)
         total_gene_num = len(means)
+
+        min_means_filt = (means > filt_param['min_means'][i])
+        max_maxes_filt = (maxes < filt_param['max_maxes'][i])
+        min_maxes_filt = (maxes > filt_param['min_maxes'][i])
         
-        # Apply filtering criteria
-        layer_filter = (means >= filt_param['min_means'][i]) 
-        # Debug.
-        num_filtered_out = total_gene_num - sum(layer_filter)
-        log.debug('{} genes failed to meet minimum {} means'.format( num_filtered_out, ordered_layer_names[i]))
+        layer_filter = min_means_filt  &  max_maxes_filt & min_maxes_filt
 
-        # Add max-max filter.
-        new_filter = (maxes <= filt_param['max_maxes'][i]) 
-        layer_filter = layer_filter & new_filter
-        # Debug.
-        num_filtered_out = total_gene_num - sum(new_filter)
-        log.debug('{} genes exceeded maximum {} means'.format( num_filtered_out, ordered_layer_names[i]))
+        log.debug('{} genes failed to meet minimum {} means'.format( total_gene_num - sum(min_means_filt), ordered_layer_names[i]))
 
-        # Add min-max filter.
-        new_filter = (maxes >= filt_param['min_maxes'][i])
-        layer_filter = layer_filter & new_filter
-        # Debug.
-        num_filtered_out =  total_gene_num - sum(new_filter)
-        log.debug('{} genes failed to meet minimum {} maximum'.format(num_filtered_out, ordered_layer_names[i]))
+        log.debug('{} genes exceeded maximum {} means'.format( total_gene_num - sum(max_maxes_filt), ordered_layer_names[i]))
+
+        log.debug('{} genes failed to meet minimum {} maximum'.format(total_gene_num - sum(min_maxes_filt), ordered_layer_names[i]))
         
         # Combine filters across layers
         gene_exp_filter &= layer_filter
-
-        # print('left', np.sum(gene_exp_filter))
 
     ## Do not remove filtered genes.
     # # Update AnnData object with filtered genes
@@ -958,7 +947,7 @@ def process_adata(adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes
     n_cells = adata.n_obs
     log.info(f"{n_cells} cells detected.")
     n_genes_original = adata.n_vars
-    
+
     # Filter genes by expression
     adata = threshold_by_expression(adata, filt_param)
     gene_names = adata.var_names
@@ -975,7 +964,7 @@ def process_adata(adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes
     for gene in genes_to_fit:
         gene_loc = np.where(adata.var_names == gene)[0]
         if len(gene_loc) == 0:
-            log.warning(f"Gene {gene} not found or has multiple entries in annotations.")
+            log.warning(f"Gene {gene} not found.")
         elif len(gene_loc) > 1:
             log.error(f"Multiple entries found for gene {gene}: this should never happen.")
         else:
@@ -987,7 +976,7 @@ def process_adata(adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes
     np.random.seed(seed)
     sampling_gene_set = np.where(gene_exp_filter)[0]
     if n_genes < len(sampling_gene_set):
-        gene_select_ind = np.random.choice(sampling_gene_set, n_genes, replace=False)
+        gene_select_ind = np.random.choice(sampling_gene_set, max(n_genes,0), replace=False)
         log.info(f"{n_genes} random genes selected.")
     else:
         gene_select_ind = sampling_gene_set
@@ -1124,7 +1113,7 @@ def select_genes_across_datasets(adata_list, filt_param, exp_filter_threshold, g
 
     for dataset_index, adata in enumerate(adata_list):
         log.info("Processing dataset: " + str(dataset_index))
-        
+
         # Apply expression filter
         adata = threshold_by_expression(adata, filt_param)
         gene_exp_filter = adata.var['expression_filter'].values

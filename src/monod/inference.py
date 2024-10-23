@@ -87,9 +87,6 @@ def perform_inference(h5ad_filepath,
     genes_to_fit=genes_to_fit, hist_type='unique', mek_means_params=mek_means_params)
     log.info('Data extracted')
     
-    # Filter adata for selected genes.
-    monod_adata = monod_adata[:, monod_adata.var['selected_genes'].astype(bool)]
-    
     search_data = searchdata_from_adata(monod_adata)
     log.info('Search data created.')
 
@@ -905,9 +902,11 @@ class GradientInference:
             method of moments estimates for all genes under the current technical variation parameters.
 
         """
+        
         regressor = np.array(
             [global_parameters.sampl_vals[point_index]] * search_data.n_genes
         )
+
         if global_parameters.use_lengths:
             if model.seq_model == "Bernoulli":
                 raise ValueError(
@@ -2197,7 +2196,8 @@ class SearchResults:
         try: 
             gene_log_lengths = self.gene_log_lengths
         except AttributeError:
-            log.error('No gene lengths given, length-dependence cannot be plotted.')
+            log.info('No gene lengths given, length-dependence cannot be plotted. Function exiting')
+            return 
             
         num_params = self.sp.n_phys_pars
         figsize = figsize or (4 * num_params, 4)
