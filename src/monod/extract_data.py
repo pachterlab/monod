@@ -959,8 +959,11 @@ def process_adata(adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes
     # Randomly select genes to meet the required n_genes.
     n_vars = adata.n_vars
     selected_genes_filter = np.zeros(n_vars, dtype=bool)
-    
+
     enforced_genes = np.zeros(n_vars, dtype=bool)
+    gene_exp_filter = gene_exp_filter.copy()  # Make a copy to avoid modifying the original
+    
+    # First mark the enforced genes
     for gene in genes_to_fit:
         gene_loc = np.where(adata.var_names == gene)[0]
         if len(gene_loc) == 0:
@@ -968,23 +971,32 @@ def process_adata(adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes
         elif len(gene_loc) > 1:
             log.error(f"Multiple entries found for gene {gene}: this should never happen.")
         else:
-            gene_exp_filter.loc[gene_loc[0]] = False
-            # gene_exp_filter[gene_loc[0]] = False
+            gene_exp_filter[gene_loc[0]] = False  # Exclude from sampling pool
             n_genes -= 1
             enforced_genes[gene_loc[0]] = True
 
+    log.debug(f"Number of additional genes to select: {n_genes}")
     np.random.seed(seed)
-    sampling_gene_set = np.where(gene_exp_filter)[0]
+    # Get indices where gene_exp_filter is True (available for sampling) AND enforced_genes is False
+    sampling_gene_set = np.where(gene_exp_filter & ~enforced_genes)[0]
+    log.info(f"Number of enforced genes: {sum(enforced_genes)}")
+    log.debug(f"Size of sampling pool: {len(sampling_gene_set)}")
+    log.debug(f"Sampling gene indices: {sampling_gene_set}")
+    
+    # Initialize the final selection filter
+    selected_genes_filter = np.zeros(n_vars, dtype=bool)
+    
+    # Select random genes from the sampling pool
     if n_genes < len(sampling_gene_set):
-        gene_select_ind = np.random.choice(sampling_gene_set, max(n_genes,0), replace=False)
-        log.info(f"{n_genes} random genes selected.")
+        gene_select_ind = np.random.choice(sampling_gene_set, max(n_genes, 0), replace=False)
+        log.info(f"{len(gene_select_ind)} random genes selected.")
     else:
         gene_select_ind = sampling_gene_set
         log.warning(f"{len(sampling_gene_set)} random genes selected: cannot satisfy query of {n_genes} genes.")
     
+    # Set both randomly selected and enforced genes to True
     selected_genes_filter[gene_select_ind] = True
     selected_genes_filter[enforced_genes] = True
-
     adata.var['selected_genes'] = selected_genes_filter
     log.info(f"Total of {selected_genes_filter.sum()} genes selected.")
     
