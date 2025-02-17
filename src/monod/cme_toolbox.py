@@ -394,6 +394,13 @@ class CMEModel:
 
         u = []
         mx = np.copy(limits)
+
+        # if protein model, then decrease resolution
+        if len(mx) == 3:
+            for i,xx in enumerate(mx):
+                scale = xx//resol + 1
+                mx[i] = xx//scale + 1
+    
         mx[-1] = mx[-1] // 2 + 1
         for i in range(len(mx)):
             l = np.arange(mx[i])
@@ -437,7 +444,7 @@ class CMEModel:
                 )
             )
             
-        gf = self.eval_model_pgf(p, g)
+        gf = self.eval_model_pgf(p, g) # this gf is actually phi
         gf = np.exp(gf)
         gf = gf.reshape(tuple(mx))
         Pss = irfftn(gf, s=tuple(limits))
@@ -561,7 +568,7 @@ class CMEModel:
         b, beta, gamma, k_p, gamma_p = p
         
         min_fudge, max_fudge = 1, 1    # Determine integration time scale
-        dt = np.min(1/p)*min_fudge
+        dt = np.min(1/p[1:])*min_fudge
         #t_max = np.max(1/p)*max_fudge
         #num_tsteps = int(np.ceil(t_max/dt))
     
@@ -577,8 +584,7 @@ class CMEModel:
             
         u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, p)
         phi += b*u_tilde[0]/(1-b*u_tilde[0])*dt/2
-        
-        #gf = np.exp(phi)    # get generating function
+
         return phi
 
     def cir_intfun(self, x, g, b, beta, gamma):
