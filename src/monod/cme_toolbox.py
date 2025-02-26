@@ -25,7 +25,7 @@ class CMEModel:
 
     The sampling parameters use the following conventions:
         Null model uses samp=None.
-        Bernoulli model uses probabilities.
+        Bernoulli model uses log-sampling rates.
         Poisson model uses log-sampling rates.
 
     Attributes
@@ -50,6 +50,8 @@ class CMEModel:
         quadrature method to use.
         if 'fixed_quad', use Gaussian quadrature via scipy.integrate.fixed_quad.
         if 'quad_vec', use adaptive integration via scipy.integrate.quad_vec.
+    protein_limit: int
+        Upper limit for protein grids. Default np.inf.
 
     """
     def __init__(
@@ -61,6 +63,7 @@ class CMEModel:
         fixed_quad_T=10,
         quad_order=60,
         quad_vec_T=np.inf,
+        protein_grids=np.inf
     ):
         """Initialize the CMEModel instance.
 
@@ -89,6 +92,8 @@ class CMEModel:
             Gaussian quadrature order.
         quad_vec_T: float or np.inf, optional
             time horizon used for adaptive integration.
+        protein_limit: int
+            coarse grid for pgf only relevant for protein model.
         """
         self.bio_model = bio_model
         self.available_biomodels = (
@@ -165,6 +170,8 @@ class CMEModel:
         self.set_integration_parameters(
             fixed_quad_T, quad_order, quad_vec_T, quad_method
         )
+        if self.bio_model == "ProteinBursty":
+            self.protein_limit = protein_limit
 
         # Define the parameter bounds used for each technical noise model.
         # TODO: check reasonableness of these bounds.
@@ -381,9 +388,9 @@ class CMEModel:
 
         elif hist_type == "none":
             d = -np.log([proposal[tuple(idx)] for idx in np.array(data,dtype=int).T])
+            
+        log.debug('The KL divergence with parameter %s is %.10f', np.array2string(10**p), np.sum(d))
         
-        #log.debug('The KL divergence with parameter %s is %f', np.array2string(10**p),np.sum(d))
-
         return np.sum(d)
 
     def eval_model_pss(self, p, limits, samp=None):
@@ -420,6 +427,12 @@ class CMEModel:
 
         u = []
         mx = np.copy(limits)
+
+        # if protein model, then decrease the grids of pgf
+        if len(mx) == 3:
+            scale = mx[-1]//self.protein_limit + 1
+            mx[-1] = (mx[-1]+scale-1)//scale
+    
         mx[-1] = mx[-1] // 2 + 1
         for i in range(len(mx)):
             l = np.arange(mx[i])
@@ -463,7 +476,7 @@ class CMEModel:
                 )
             )
             
-        gf = self.eval_model_pgf(p, g)
+        gf = self.eval_model_pgf(p, g) # this gf is actually phi
         gf = np.exp(gf)
         gf = gf.reshape(tuple(mx))
         Pss = irfftn(gf, s=tuple(limits))
@@ -573,7 +586,7 @@ class CMEModel:
             du[1] = - gamma * u[1] + k_p * u[2] * (u[1]+1) # Spliced
             du[2] = - gamma_p * u[2] # Proteins
             return du
-        
+                    
         # Vectorized RK4 implementation
         def RK4(x, f, t, step_size, param):
             j1 = f(x, t, param)
@@ -586,25 +599,25 @@ class CMEModel:
             
         b, beta, gamma, k_p, gamma_p = p
         
-        min_fudge, max_fudge = 1, 1    # Determine integration time scale
-        dt = np.min(1/p)*min_fudge
-        #t_max = np.max(1/p)*max_fudge
-        #num_tsteps = int(np.ceil(t_max/dt))
+        min_fudge, max_fudge = 1, 10    # Determine integration time scale
+        dt = np.min(1/p[1:])*min_fudge
+        t_max = np.max(1/p[1:])*max_fudge
+        num_tsteps = int(np.ceil(t_max/dt))
     
         t = 0
         u_tilde = np.array(g, dtype=np.complex64)
         phi = b*u_tilde[0]/(1-b*u_tilde[0])*dt/2
         
         # Solve ODE using RK4 method 
-        while np.max(np.abs(u_tilde))>1e-3:
+        while np.max(np.abs(u_tilde[0]))>1e-3:
+        #for step in range(num_tsteps):
             t += dt
             u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, p)
             phi += b*u_tilde[0]/(1-b*u_tilde[0])*dt
             
         u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, p)
         phi += b*u_tilde[0]/(1-b*u_tilde[0])*dt/2
-        
-        #gf = np.exp(phi)    # get generating function
+
         return phi
 
     def cir_intfun(self, x, g, b, beta, gamma):
