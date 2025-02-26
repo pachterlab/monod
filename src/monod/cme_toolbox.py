@@ -63,7 +63,7 @@ class CMEModel:
         fixed_quad_T=10,
         quad_order=60,
         quad_vec_T=np.inf,
-        protein_grids=np.inf
+        protein_limit=np.inf
     ):
         """Initialize the CMEModel instance.
 
@@ -389,7 +389,7 @@ class CMEModel:
         elif hist_type == "none":
             d = -np.log([proposal[tuple(idx)] for idx in np.array(data,dtype=int).T])
             
-        log.debug('The KL divergence with parameter %s is %.10f', np.array2string(10**p), np.sum(d))
+        #log.debug('The KL divergence with parameter %s is %.10f', np.array2string(10**p), np.sum(d))
         
         return np.sum(d)
 
