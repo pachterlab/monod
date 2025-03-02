@@ -26,7 +26,7 @@ from scipy.sparse import issparse
 
 logging.basicConfig(stream=sys.stdout)
 log = logging.getLogger()
-log.setLevel(logging.INFO)
+log.setLevel(logging.DEBUG)
 
 import logging.config
 
@@ -158,6 +158,7 @@ def extract_data(
 
     # Check whether the given data is in sparse or numpy format.
     layer_data = monod_adata.layers[[i for i in ordered_layer_names][0]]
+    log.debug('layers')
 
     layer_type = None
     if issparse(layer_data):
@@ -166,6 +167,9 @@ def extract_data(
         layer_type = 'numpy_array'
     else:
         pass
+
+    log.debug('1'+ str(monod_adata.n_vars))
+
 
     if layer_type == 'sparse':
         monod_adata = CSRDataset_to_arrays(monod_adata)
@@ -181,6 +185,7 @@ def extract_data(
 
     # Subset to the layers required in the model.
     adata = monod_adata.to_memory()
+
     
     adata_subset = ad.AnnData(
     X=adata.X.copy(),
@@ -196,6 +201,7 @@ def extract_data(
     adata_subset.obs_names = adata.obs_names
     adata_subset.var_names = adata.var_names
 
+
     # Copy over only the desired layers
     for layer in ordered_layer_names:
         if layer in adata.layers:
@@ -203,8 +209,12 @@ def extract_data(
 
     monod_adata = adata_subset.to_memory()
 
+
+
     monod_adata.uns['modality_name_dict'] = modality_name_dict
     monod_adata.uns['model'] = model
+
+
     
     if padding is None:
         padding = np.asarray([10] * len(ordered_layer_names))
@@ -947,7 +957,8 @@ def process_adata(adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes
     n_cells = adata.n_obs
     log.info(f"{n_cells} cells detected.")
     n_genes_original = adata.n_vars
-
+    log.info(f"{n_genes_original} genes detected.")
+    
     # Filter genes by expression
     adata = threshold_by_expression(adata, filt_param)
     gene_names = adata.var_names

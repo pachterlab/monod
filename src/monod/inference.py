@@ -218,7 +218,7 @@ def perform_inference(h5ad_filepath,
 
         if not mek_means_params:
             # NB log.
-            log.info('Uncertainties per gene calculated, saved to anndata in .var attribute of the form: \"error_' + without_log + '\". Note that the errors are given in log-base 10.')
+            log.info('Uncertainties per gene calculated, saved to anndata in .var attribute of the form: \"error_' + without_log + '\". Note that the errors are given for log-base 10 parameters.')
         else:
             # NB log.
             log.info('Uncertainties per gene calculated for each cluster. E.g. for cluser, i, uncertainty saved to anndata in .var attribute of the form: \"ci_error_'+ without_log + '\". Note that the errors are given in log-base 10.')
@@ -723,6 +723,7 @@ class InferenceParameters:
         self.grid_values_sampl = grid_values_sampl
         
         self.sampl_vals = list(zip(*grid_values_sampl))
+        
         self.n_grid_points = len(grid_values_sampl[0])
 
     def store_inference_parameters(self, inference_parameter_string):
@@ -902,7 +903,7 @@ class GradientInference:
             method of moments estimates for all genes under the current technical variation parameters.
 
         """
-        
+ 
         regressor = np.array(
             [global_parameters.sampl_vals[point_index]] * search_data.n_genes
         )
@@ -1796,6 +1797,23 @@ class SearchResults:
             assert np.isclose(proposed.sum(), search_data.n_cells)
             assert np.isclose(search_data.n_cells, counts.sum())
             assert np.isclose(search_data.n_cells, expect_freq.sum())
+
+
+            # Ensure the sums of f_obs and f_exp match
+            f_obs_sum = observed.sum()
+            f_exp_sum = proposed.sum()
+            
+            # Check if normalization is needed
+            if not np.isclose(f_obs_sum, f_exp_sum, rtol=1e-9):
+                # Print a warning/info message
+                warnings.warn(
+                    f"The sums of observed and expected frequencies differ by {f_obs_sum - f_exp_sum:.2e}. "
+                    "Normalizing expected frequencies to match observed frequencies.",
+                    UserWarning,
+                )
+                # Normalize f_exp
+                proposed = proposed * (f_obs_sum / f_exp_sum)
+
 
             # chi-squared takes only the number of biological parameters?
             csqarr += [
