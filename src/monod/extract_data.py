@@ -782,12 +782,13 @@ def threshold_by_expression(adata, filt_param={'min_means': [0.01, 0.01],
         maxes = layer.max(axis=0)
         total_gene_num = len(means)
 
-        min_means_filt = (means > filt_param['min_means'][i])
-        max_maxes_filt = (maxes < filt_param['max_maxes'][i])
-        min_maxes_filt = (maxes > filt_param['min_maxes'][i])
+        min_means_filt = (means >= filt_param['min_means'][i])
+        max_maxes_filt = (maxes <= filt_param['max_maxes'][i])
+        min_maxes_filt = (maxes >= filt_param['min_maxes'][i])
         
         layer_filter = min_means_filt  &  max_maxes_filt & min_maxes_filt
 
+        log.debug('{} filt_param'.format(filt_param))
         log.debug('{} genes failed to meet minimum {} means'.format( total_gene_num - sum(min_means_filt), ordered_layer_names[i]))
 
         log.debug('{} genes exceeded maximum {} means'.format( total_gene_num - sum(max_maxes_filt), ordered_layer_names[i]))

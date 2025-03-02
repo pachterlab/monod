@@ -63,7 +63,7 @@ class CMEModel:
         fixed_quad_T=10,
         quad_order=60,
         quad_vec_T=np.inf,
-        protein_grids=np.inf
+        protein_limit=np.inf
     ):
         """Initialize the CMEModel instance.
 
