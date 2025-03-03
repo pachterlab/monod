@@ -23,7 +23,6 @@ code_ver_global = "029"  # bumping up version April 2024
 
 def perform_inference(h5ad_filepath,
     model,
-    output_directory=None,
     transcriptome_filepath=None,
     n_genes=100,
     seed=2813308004,
@@ -67,13 +66,11 @@ def perform_inference(h5ad_filepath,
             dataset_string = model.bio_model + '_' + model.seq_model
             log.info("No dataset name given (dataset_string=None). Saving as {}".format(dataset_string))
         
-    if not output_directory:
-        output_directory = dataset_string
-    make_dir(output_directory)
+    make_dir(dataset_string)
     
     monod_adata = extract_data(h5ad_filepath,
     model,
-    dataset_name=output_directory,
+    dataset_name=dataset_string,
     transcriptome_filepath=transcriptome_filepath,
     n_genes=n_genes,
     seed=seed,
