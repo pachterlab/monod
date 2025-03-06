@@ -78,7 +78,6 @@ def extract_data(
     padding=None,
     mek_means_params=None
 ):
-    log.debug('working')
     """Extract data for selected genes from a single dataset.
 
     Parameters

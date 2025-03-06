@@ -45,7 +45,8 @@ def perform_inference(h5ad_filepath,
     samp_lb=None,
     samp_ub=None,
     gridsize=None,
-    exclude_sigma=False,
+    hist_type='unique',
+    exclude_sigma=True,
     poisson_average_log_length=5,
     dataset_string=None,
     mek_means_params=None,
@@ -81,8 +82,9 @@ def perform_inference(h5ad_filepath,
     cf=cf,
     code_ver=code_ver,
     exp_filter_threshold=exp_filter_threshold,
-    genes_to_fit=genes_to_fit, hist_type='unique', mek_means_params=mek_means_params)
+    genes_to_fit=genes_to_fit, hist_type=hist_type, mek_means_params=mek_means_params)
     log.info('Data extracted')
+    log.debug('hist type is %s',hist_type)
     
     search_data = searchdata_from_adata(monod_adata)
     log.info('Search data created.')
@@ -263,9 +265,7 @@ def searchdata_from_adata(adata):
 
     n_cells = adata.n_obs
 
-    # Hard code for now.
-    # hist_type = get_hist_type_adata(adata)
-    hist_type = 'unique'
+    hist_type = get_hist_type_adata(adata)
 
     attr_names = [
         "M",
