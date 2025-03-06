@@ -27,11 +27,11 @@ def perform_inference(h5ad_filepath,
     n_genes=100,
     seed=2813308004,
     viz=True,
-    filt_param=None,
     modality_name_dict=None,
-    batch_location="./fits",
+    dataset_string=None,
     cf=None,
     code_ver=code_ver_global,
+    filt_param=None,
     exp_filter_threshold=1,
     genes_to_fit=[],
     gradient_params={
@@ -48,9 +48,8 @@ def perform_inference(h5ad_filepath,
     hist_type='unique',
     exclude_sigma=True,
     poisson_average_log_length=5,
-    dataset_string=None,
     mek_means_params=None,
-                     num_cores=1, AIC_EPS=1e-20, AIC_offs=0):
+    num_cores=1, AIC_EPS=1e-20, AIC_offs=0):
     '''
     Load and filter data from h5ad file.
     Run inference procedure for the desired model, save parameters, uncertainty from Hessian and AIC values automatically.
@@ -78,7 +77,6 @@ def perform_inference(h5ad_filepath,
     viz=viz,
     filt_param=filt_param,
     modality_name_dict=modality_name_dict,
-    batch_location=batch_location,
     cf=cf,
     code_ver=code_ver,
     exp_filter_threshold=exp_filter_threshold,
@@ -236,6 +234,8 @@ def perform_inference(h5ad_filepath,
     monod_adata.uns['search_data'] = search_data
     if not mek_means_params:
         monod_adata.uns['search_result'] = search_result
+        sr = search_result.store_on_disk()
+        log.info('Search Result stored to %s', sr)
     else:
         monod_adata.uns['search_result_list'] = search_result_list
 

@@ -69,7 +69,6 @@ def extract_data(
     viz=True,
     filt_param=None,
     modality_name_dict=None,
-    batch_location="./fits",
     cf=None,
     code_ver=code_ver_global,
     exp_filter_threshold=1,
