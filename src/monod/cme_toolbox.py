@@ -50,9 +50,7 @@ class CMEModel:
         quadrature method to use.
         if 'fixed_quad', use Gaussian quadrature via scipy.integrate.fixed_quad.
         if 'quad_vec', use adaptive integration via scipy.integrate.quad_vec.
-    protein_limit: int
-        Upper limit for protein grids. Default np.inf.
-
+    prot
     """
     def __init__(
         self,
@@ -63,7 +61,7 @@ class CMEModel:
         fixed_quad_T=10,
         quad_order=60,
         quad_vec_T=np.inf,
-        protein_limit=np.inf
+        protein_limit = np.inf
     ):
         """Initialize the CMEModel instance.
 
@@ -170,9 +168,11 @@ class CMEModel:
         self.set_integration_parameters(
             fixed_quad_T, quad_order, quad_vec_T, quad_method
         )
-        if self.bio_model == "ProteinBursty":
+        
+        if self.bio_model is "ProteinBursty":
             self.protein_limit = protein_limit
-
+            log.info("Protein grid limit: {}".format(self.protein_limit))
+            
         # Define the parameter bounds used for each technical noise model.
         # TODO: check reasonableness of these bounds.
         CMEModel.available_seq_bounds = {"None":{'samp_lb':[1, 1],'samp_ub':[1, 1],'gridsize':[1, 1]}, 
@@ -428,8 +428,8 @@ class CMEModel:
         u = []
         mx = np.copy(limits)
 
-        # if protein model, then decrease the grids of pgf
-        if len(mx) == 3:
+        ### if protein model, then decrease the grids of pgf
+        if len(mx) == 3 and self.protein_limit<np.inf:
             scale = mx[-1]//self.protein_limit + 1
             mx[-1] = (mx[-1]+scale-1)//scale
     
@@ -574,6 +574,7 @@ class CMEModel:
         phi: np.ndarray
             log gf.
         """
+        epsilon = 1e-10 
         
         def u_tilda_ode(u, t, param):
             """
@@ -606,17 +607,17 @@ class CMEModel:
     
         t = 0
         u_tilde = np.array(g, dtype=np.complex64)
-        phi = b*u_tilde[0]/(1-b*u_tilde[0])*dt/2
+        phi = b*u_tilde[0]/(1-b*u_tilde[0]+epsilon)*dt/2
         
         # Solve ODE using RK4 method 
         while np.max(np.abs(u_tilde[0]))>1e-3:
         #for step in range(num_tsteps):
             t += dt
             u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, p)
-            phi += b*u_tilde[0]/(1-b*u_tilde[0])*dt
+            phi += b*u_tilde[0]/(1-b*u_tilde[0]+epsilon)*dt
             
         u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, p)
-        phi += b*u_tilde[0]/(1-b*u_tilde[0])*dt/2
+        phi += b*u_tilde[0]/(1-b*u_tilde[0]+epsilon)*dt/2
 
         return phi
 
@@ -814,7 +815,7 @@ class CMEModel:
             if self.bio_model == "Constitutive":
                 x0 *= samp
             elif self.bio_model == "ProteinBursty":
-                x0[1:3] = x0[1:3]*samp
+                x0[[1,2,-1]] = x0[[1,2,-1]]*samp
             else:
                 x0[1:] = x0[1:] * samp
 

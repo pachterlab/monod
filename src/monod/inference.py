@@ -671,8 +671,8 @@ class InferenceParameters:
             log.info(
                 "Sequencing model set to None. All sampling parameters set to null."
             )
-            samp_lb = [1, 1]
-            samp_ub = [1, 1]
+            samp_lb = [0, 0]
+            samp_ub = [0, 0]
             gridsize = [1, 1]
 
         self.samp_lb = np.array(samp_lb)
