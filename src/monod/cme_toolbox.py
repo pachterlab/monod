@@ -3,7 +3,7 @@ This script provides convenience functions for evaluating RNA distributions.
 """
 
 import numpy as np
-
+from numba import jit
 import scipy
 from scipy import integrate
 
@@ -61,7 +61,9 @@ class CMEModel:
         fixed_quad_T=10,
         quad_order=60,
         quad_vec_T=np.inf,
-        protein_limit = np.inf
+        protein_limit = np.inf,
+        min_fudge = 0.1, 
+        max_fudge = 10
     ):
         """Initialize the CMEModel instance.
 
@@ -135,7 +137,7 @@ class CMEModel:
             "Constitutive":{'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]},
             "CIR":{'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]},
             "DelayedSplicing":{'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]},
-            "ProteinBursty":{'min_means':[0.01, 0.01, 1], 'max_maxes':[350, 350, 1000], 'min_maxes':[4,4, 10]}}
+            "ProteinBursty":{'min_means':[0.01, 0.01, 1], 'max_maxes':[350, 350, 1000], 'min_maxes':[4,4,10]}}
         
         try:
             self.filter_bounds = CMEModel.available_filter_bounds[self.bio_model]
@@ -169,8 +171,10 @@ class CMEModel:
             fixed_quad_T, quad_order, quad_vec_T, quad_method
         )
         
-        if self.bio_model is "ProteinBursty":
+        if self.bio_model == "ProteinBursty":
             self.protein_limit = protein_limit
+            self.min_fudge = min_fudge
+            self.max_fudge = max_fudge
             log.info("Protein grid limit: {}".format(self.protein_limit))
             
         # Define the parameter bounds used for each technical noise model.
@@ -389,7 +393,7 @@ class CMEModel:
         elif hist_type == "none":
             d = -np.log([proposal[tuple(idx)] for idx in np.array(data,dtype=int).T])
             
-        #log.debug('The KL divergence with parameter %s is %.10f', np.array2string(10**p), np.sum(d))
+        log.debug('The KL divergence with parameter %s is %.10f', np.array2string(10**p), np.sum(d))
         
         return np.sum(d)
 
@@ -429,7 +433,7 @@ class CMEModel:
         mx = np.copy(limits)
 
         ### if protein model, then decrease the grids of pgf
-        if len(mx) == 3 and self.protein_limit<np.inf:
+        if self.bio_model == "ProteinBursty":
             scale = mx[-1]//self.protein_limit + 1
             mx[-1] = (mx[-1]+scale-1)//scale
     
@@ -438,10 +442,10 @@ class CMEModel:
             l = np.arange(mx[i])
             u_ = np.exp(-2j * np.pi * l / limits[i]) - 1
             u.append(u_)
+        
         g = np.meshgrid(*[u_ for u_ in u], indexing="ij")
-        for i in range(len(mx)):
-            g[i] = g[i].flatten()
-        g = np.asarray(g)
+        g = np.array([arr.flatten() for arr in g])
+
         
         if self.amb_model == "Unequal":
             g_ = np.zeros((2, g.shape[1], g.shape[2]), dtype=np.complex128)
@@ -576,49 +580,81 @@ class CMEModel:
         """
         epsilon = 1e-10 
         
-        def u_tilda_ode(u, t, param):
+        def u_tilda_ode(u, du, beta, gamma, k_p, gamma_p):
             """
             Solve the characteristics ODE
             """
             # u (n_species, n_grids)
-            b, beta, gamma, k_p, gamma_p = param
             du = np.zeros_like(u)
             du[0] = beta * (u[1]-u[0]) # Unspliced
             du[1] = - gamma * u[1] + k_p * u[2] * (u[1]+1) # Spliced
             du[2] = - gamma_p * u[2] # Proteins
             return du
-                    
-        # Vectorized RK4 implementation
-        def RK4(x, f, t, step_size, param):
-            j1 = f(x, t, param)
-            j2 = f(x + (step_size/2)*j1, t + (step_size/2), param)   
-            j3 = f(x + (step_size/2)*j2, t + (step_size/2), param)   
-            j4 = f(x + (step_size)*j3, t + (step_size), param)  
+        
+        def RK2(x, dx, f, dt, beta, gamma, k_p, gamma_p):
+            """
+            2nd Order Runge-Kutta integration for updating x.
+        
+            Parameters:
+            - x: Current state of the system
+            - dx: Current derivative
+            - f: Function defining the differential equation
+            - dt: Time step
+            - beta, gamma, k_p, gamma_p: Parameters for the ODE
+        
+            Returns:
+            - x_new: Updated state after one step
+            """
+            # Calculate k1: the slope at the current position
+            k1 = f(x, dx, beta, gamma, k_p, gamma_p)
+        
+            # Calculate k2: the slope at the midpoint
+            k2 = f(x + (dt / 2) * k1, dx, beta, gamma, k_p, gamma_p)
+        
+            # Update x using the second-order approximation
+            x_new = x + dt * k2
+        
+            return x_new
+    
+        def RK4(x, dx, f, dt, beta, gamma, k_p, gamma_p):
             
-            x_new = x + (step_size/6)*(j1 + 2*j2 + 2*j3 + j4)
+            j1 = f(x, dx, beta, gamma, k_p, gamma_p)
+            j2 = f(x + (dt / 2) * j1, dx, beta, gamma, k_p, gamma_p)
+            j3 = f(x + (dt / 2) * j2, dx, beta, gamma, k_p, gamma_p)
+            j4 = f(x + dt * j3, dx, beta, gamma, k_p, gamma_p)
+            
+            x_new = x + (dt / 6) * (j1 + 2 * j2 + 2 * j3 + j4)
             return x_new
             
         b, beta, gamma, k_p, gamma_p = p
         
-        min_fudge, max_fudge = 1, 10    # Determine integration time scale
-        dt = np.min(1/p[1:])*min_fudge
-        t_max = np.max(1/p[1:])*max_fudge
-        num_tsteps = int(np.ceil(t_max/dt))
-    
+        dt = np.min(1 / np.array(p)) * self.min_fudge
+        t_max = np.max(1 / np.array(p)) * self.max_fudge
+        num_tsteps = int(np.ceil(t_max / dt))
+        #log.debug('dt: %s, t_max: %s', np.array2string(dt), np.array2string(t_max))
+        
         t = 0
         u_tilde = np.array(g, dtype=np.complex64)
-        phi = b*u_tilde[0]/(1-b*u_tilde[0]+epsilon)*dt/2
+        du_tilde = np.array(g, dtype=np.complex64)
         
+        # Use numexpr for fast computation
+        phi = b * u_tilde[0] / (1 - b * u_tilde[0]) * dt / 2
+    
         # Solve ODE using RK4 method 
-        while np.max(np.abs(u_tilde[0]))>1e-3:
-        #for step in range(num_tsteps):
+        for step in range(num_tsteps):
             t += dt
-            u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, p)
-            phi += b*u_tilde[0]/(1-b*u_tilde[0]+epsilon)*dt
+            u_tilde = RK4(u_tilde, du_tilde, u_tilda_ode, dt, beta, gamma, k_p, gamma_p)
+            phi += b * u_tilde[0] / (1 - b * u_tilde[0]) * dt
+        
+        while np.max(np.abs(u_tilde[0]))>1e-3:
+            t += dt
+            u_tilde = RK4(u_tilde, du_tilde, u_tilda_ode, dt, beta, gamma, k_p, gamma_p)
+            phi += b * u_tilde[0] / (1 - b * u_tilde[0]) * dt
             
-        u_tilde = RK4(u_tilde, u_tilda_ode, t, dt, p)
-        phi += b*u_tilde[0]/(1-b*u_tilde[0]+epsilon)*dt/2
-
+        #log.debug('t: %s', np.array2string(t))
+        u_tilde = RK4(u_tilde, du_tilde, u_tilda_ode,dt, beta, gamma, k_p, gamma_p)
+        phi += b * u_tilde[0] / (1 - b * u_tilde[0]) * dt / 2
+        
         return phi
 
     def cir_intfun(self, x, g, b, beta, gamma):
@@ -718,7 +754,7 @@ class CMEModel:
         """
         lb = 10**lb_log
         ub = 10**ub_log
-        if self.seq_model == "Poisson":
+        if self.seq_model == "Poisson" or "Bernoulli":
             samp = 10**samp
 
         # These can be defined per model (just happen to be shared by multiple models here).
@@ -730,6 +766,7 @@ class CMEModel:
                 b = U_var / U_mean - 1
             except:
                 b = 1  # safe for U_mean = U_var = 0
+            
             if self.seq_model == "Bernoulli":
                 b /= samp[0]
             elif self.seq_model == "Poisson":
@@ -739,7 +776,7 @@ class CMEModel:
             beta = b / U_mean
             gamma = b / S_mean
             x0 = np.asarray([b, beta, gamma])
-
+            
         elif self.bio_model == "ProteinBursty":
             U_var, U_mean, S_mean, P_mean, UP_covar = moments["MOM_unspliced_var"], moments["MOM_unspliced_mean"], moments["MOM_spliced_mean"], moments["MOM_protein_mean"], moments["MOM_cov_unspliced_protein"]
             try:
