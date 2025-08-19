@@ -988,7 +988,7 @@ class GradientInference:
         #x = x0[0]
         err = np.inf
         ERR_THRESH = 0.99
-        log.debug('Optimizing gene %d with initial value %s', gene_index, np.array2string(10**x0))
+        log.info('Optimizing gene %d with initial value %s', gene_index, np.array2string(10**x0))
         
         hist_type = get_hist_type(search_data)
         for restart in range(self.gradient_params["num_restarts"]):
@@ -1001,6 +1001,7 @@ class GradientInference:
                     hist_type=hist_type,
                 ),
                 x0=x0[restart],
+                method='Nelder-Mead',
                 bounds=self.grad_bnd,
                 options={
                     "maxiter": self.gradient_params["max_iterations"],
@@ -1015,7 +1016,7 @@ class GradientInference:
         if not (np.isfinite(x).all()):
             log.warning("Gene index: " + str(gene_index))
             raise ValueError("Search failed. Please check input data.")
-        log.debug('Optimized parameters for gene %d is %s', gene_index, np.array2string(10**x))
+        log.info('Optimized parameters for gene %d is %s', gene_index, np.array2string(10**x))
         return x, err
 
     def iterate_over_genes(self, model, search_data):

@@ -62,6 +62,7 @@ class CMEModel:
         quad_order=60,
         quad_vec_T=np.inf,
         protein_limit = np.inf,
+        fit_unspliced = True,
         min_fudge = 0.1, 
         max_fudge = 10
     ):
@@ -173,6 +174,7 @@ class CMEModel:
         
         if self.bio_model == "ProteinBursty":
             self.protein_limit = protein_limit
+            self.fit_unspliced = fit_unspliced
             self.min_fudge = min_fudge
             self.max_fudge = max_fudge
             log.info("Protein grid limit: {}".format(self.protein_limit))
@@ -436,6 +438,10 @@ class CMEModel:
         if self.bio_model == "ProteinBursty":
             scale = mx[-1]//self.protein_limit + 1
             mx[-1] = (mx[-1]+scale-1)//scale
+            
+            if not self.fit_unspliced:
+                mx[0]=1
+                
     
         mx[-1] = mx[-1] // 2 + 1
         for i in range(len(mx)):
@@ -852,7 +858,8 @@ class CMEModel:
             if self.bio_model == "Constitutive":
                 x0 *= samp
             elif self.bio_model == "ProteinBursty":
-                x0[[1,2,-1]] = x0[[1,2,-1]]*samp
+                x0[[1,2]] *= samp[:2]
+                x0[-1] *= samp[2]/samp[1]
             else:
                 x0[1:] = x0[1:] * samp
 
