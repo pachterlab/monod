@@ -231,13 +231,22 @@ def perform_inference(h5ad_filepath,
         log.info('Cluster labels added to anndata .obs')
 
     # Also save entire objects to adata.
-    monod_adata.uns['search_data'] = search_data
+
     if not mek_means_params:
         monod_adata.uns['search_result'] = search_result
         sr = search_result.store_on_disk()
         log.info('Search Result stored to %s', sr)
     else:
         monod_adata.uns['search_result_list'] = search_result_list
+
+    monod_adata.uns['search_data'] = search_data
+    inference_string = search_result.inference_string
+    sd = search_data.store_on_disk(inference_string)
+
+    adata_file_path = inference_string + '/monod_adata.pkl'
+    with open(adata_file_path, 'wb') as adfs:
+        pickle.dump(monod_adata, adfs)
+    log.info('Anndata object stored to %s', adata_file_path)
 
     return monod_adata
 
@@ -493,6 +502,29 @@ class SearchData:
         """
         for j in range(len(input_data)):
             setattr(self, attr_names[j], input_data[j])
+
+    def store_on_disk(self, inference_string):
+        """This helper method attempts to store the SearchData object to disk.
+
+        Returns
+        -------
+        full_result_string: str
+            file location.
+        """
+        try:
+            full_result_string = inference_string + "/search_data.res"
+            with open(full_result_string, "wb") as sdfs:
+                pickle.dump(self, sdfs)
+            log.info("Search data stored to {}.".format(full_result_string))
+        except:
+            log.error(
+                "Search data could not be stored to {}.".format(
+                    full_result_string
+                )
+            )
+        self.full_result_string = full_result_string
+        return full_result_string
+
             
 
 def AIC_per_gene(search_result, monod_adata):
@@ -548,6 +580,8 @@ def get_hist_type(search_data):
     else:
         hist_type = "grid"
     return hist_type
+
+
 
 class InferenceParameters:
     """Stores parameters and distributes the multi-grid point inference procedure.
@@ -923,7 +957,7 @@ class GradientInference:
 
         else:
             # If no specific lengths given, multiply the unspliced sampling rate by an average length value for all genes.
-            if model.seq_model == "Poisson":
+            if model.seq_model == "Poisson" and model.fit_unspliced:
                 regressor[:, 0] += global_parameters.poisson_average_log_length
             
         self.grid_point = global_parameters.sampl_vals[point_index]

@@ -867,8 +867,10 @@ class CMEModel:
             x0 = np.concatenate((x0, [0.1]))  # just make a guess
         elif self.amb_model == "Unequal":
             x0 = np.concatenate((x0, [0.1, 0.1]))  # just make a guess
+
         for j in range(self.get_num_params()):
             x0[j] = np.clip(x0[j], lb[j], ub[j])
+
         x0 = np.log10(x0)
         if (~np.isfinite(x0)).any():
             x0 = (
