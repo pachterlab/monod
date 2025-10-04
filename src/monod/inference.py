@@ -1010,11 +1010,19 @@ class GradientInference:
         err: float
             Kullback-Leibler divergence of the model at x, relative to data.
         """
+        # Further cap the random initializations within a smaller box.
+        restricted_bounds_lb = np.array([0, -2,-2,-2,-2])
+        restricted_bounds_ub = np.array([2,2,2,2,2])
         x0 = (
             np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
-            * (self.phys_ub - self.phys_lb)
-            + self.phys_lb
+            * (restricted_bounds_ub - restricted_bounds_lb)
+            + restricted_bounds_lb
         )
+        # x0 = (
+        #     np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
+        #     * (self.phys_ub - self.phys_lb)
+        #     + self.phys_lb
+        # )
         if (
             self.gradient_params["init_pattern"] == "moments"
         ):  # this can be extended to other initialization patterns, like latin squares
@@ -2444,8 +2452,9 @@ class SearchResults:
 
                 if num_modalities==2:
                     ax1[axloc].imshow(Pa.T, aspect="auto", cmap="summer")
+                # Set so that, for protein model, the joint distribution of protein and spliced is shown.
                 elif num_modalities==3:
-                    ax1[axloc].imshow(Pa.sum(axis=2).T, aspect="auto", cmap="summer")
+                    ax1[axloc].imshow(Pa.sum(axis=0).T, aspect="auto", cmap="summer")
                 else:
                     log.error('Joint distribution plot only implemented for 2 or 3 modalities')
                     
@@ -2453,12 +2462,20 @@ class SearchResults:
 
                 jitter_magn = 0.1
                 jitter = np.random.randn(2, self.n_cells) * jitter_magn
-                ax1[axloc].scatter(
-                    *search_data.layers[:2, :, i_] + jitter, c="k", s=1, alpha=0.1
+                if num_modalities==2:
+                    ax1[axloc].scatter(
+                        *search_data.layers[:2, :, i_] + jitter, c="k", s=1, alpha=0.1)
+                # for protein model, scatter protein and spliced counts.
+                elif num_modalities==3:
+                    ax1[axloc].scatter(
+                        *search_data.layers[1:, :, i_] + jitter, c="k", s=1, alpha=0.1
                 )
-
-                ax1[axloc].set_xlim([-0.5, search_data.M[0, i_] - 1.5])
-                ax1[axloc].set_ylim([-0.5, search_data.M[1, i_] - 1.5])
+                if num_modalities==2:
+                    ax1[axloc].set_xlim([-0.5, search_data.M[0, i_] - 1.5])
+                    ax1[axloc].set_ylim([-0.5, search_data.M[1, i_] - 1.5])
+                elif num_modalities==3:
+                    ax1[axloc].set_xlim([-0.5, search_data.M[1, i_] - 1.5])
+                    ax1[axloc].set_ylim([-0.5, search_data.M[2, i_] - 1.5])
             else:
                 plot_hist_and_fit(ax1[axloc], search_data, i_, Pa, marg)
                 if logscale:

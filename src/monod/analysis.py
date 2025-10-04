@@ -22,7 +22,7 @@ log.setLevel(logging.INFO)
 ## Helper functions
 ########################
 
-def run_qc(monod_adata, mek_means_params=None,cluster=0, discard_rejected=True):
+def run_qc(monod_adata, mek_means_params=None,cluster=0, discard_rejected=True, marg='joint'):
     sd = monod_adata.uns['search_data']
 
     if not mek_means_params:
@@ -32,26 +32,26 @@ def run_qc(monod_adata, mek_means_params=None,cluster=0, discard_rejected=True):
         
     fig1,ax1 = plt.subplots(1,1)
     sr.find_sampling_optimum()
-    sr.plot_landscape(ax1)
+    # sr.plot_landscape(ax1)d
 
     fig1,ax1 = plt.subplots(1,1)
     sr.plot_KL(ax1, discard_rejected=discard_rejected)
 
-    sr.plot_gene_distributions(sd,marg='joint')
+    sr.plot_gene_distributions(sd,marg=marg)
 
-    _=sr.chisquare_testing(sd)
-    if monod_adata.n_vars >=60:
-        sr.resample_opt_viz()
-        sr.resample_opt_mc_viz()
-    sr.chisq_best_param_correction(sd,viz=True) 
+    # _=sr.chisquare_testing(sd)
+    # if monod_adata.n_vars >=60:
+    #     sr.resample_opt_viz()
+    #     sr.resample_opt_mc_viz()
+    # sr.chisq_best_param_correction(sd,viz=True) 
 
-    sr.compute_sigma(sd,num_cores=1) #colab has a hard time with multiprocessing
-    sr.plot_param_L_dep(plot_errorbars=True,plot_fit=True)
-    sr.plot_param_marg(discard_rejected=discard_rejected)
-    sr.update_on_disk()
+    # sr.compute_sigma(sd,num_cores=1) #colab has a hard time with multiprocessing
+    # sr.plot_param_L_dep(plot_errorbars=True,plot_fit=True)
+    # sr.plot_param_marg(discard_rejected=discard_rejected)
+    # sr.update_on_disk()
     
-    # Update the anndata object with the new search result.
-    monod_adata['search_result'] = sr
+    # # Update the anndata object with the new search result.
+    # monod_adata['search_result'] = sr
 
 
 def load_search_results(full_result_string):
