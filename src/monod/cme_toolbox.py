@@ -339,10 +339,9 @@ class CMEModel:
             l = np.arange(mx[i])
             u_ = np.exp(-2j * np.pi * l / limits[i]) - 1
             u.append(u_)
+
         g = np.meshgrid(*[u_ for u_ in u], indexing="ij")
-        for i in range(len(mx)):
-            g[i] = g[i].flatten()
-        g = np.asarray(g)[:, :, None]
+        g = np.array([arr.flatten() for arr in g])
 
         if self.amb_model == "Unequal":
             g_ = np.zeros((2, g.shape[1], g.shape[2]), dtype=np.complex128)
@@ -360,9 +359,9 @@ class CMEModel:
             p = np.copy(p[:-1])
 
         if self.seq_model == "Poisson":
-            g = np.exp((np.power(10, samp))[:, None, None] * g) - 1
+            g = np.exp((np.power(10, samp))[:, None] * g) - 1
         elif self.seq_model == "Bernoulli":
-            g *= np.asarray(samp)[:, None, None]
+            g *= np.asarray(samp)[:, None]
         elif self.seq_model == "None":
             pass
         else:
@@ -507,7 +506,7 @@ class CMEModel:
         _: np.ndarray
             integrand value.
         """
-
+        g = np.asarray(g)[:,:,None]
         if np.isclose(beta, gamma):  # compute prefactors for the ODE characteristics.
             c_1 = g[0]  # nascent
             c_2 = x * beta * g[1]
