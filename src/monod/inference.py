@@ -1011,8 +1011,9 @@ class GradientInference:
             Kullback-Leibler divergence of the model at x, relative to data.
         """
         # Further cap the random initializations within a smaller box.
-        restricted_bounds_lb = np.array([0, -2,-2,-2,-2])
-        restricted_bounds_ub = np.array([2,2,2,2,2])
+        restricted_bounds_lb = -2* np.ones(self.n_phys_pars)
+        restricted_bounds_lb[0] = 0
+        restricted_bounds_ub = 2* np.ones(self.n_phys_pars)
         x0 = (
             np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
             * (restricted_bounds_ub - restricted_bounds_lb)
