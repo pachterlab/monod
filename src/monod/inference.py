@@ -4,21 +4,583 @@ import numpy as np
 import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
-from .preprocess import make_dir, log
-from .cme_toolbox import CMEModel  # may be unnecessary
+import mminference
+
+from extract_data import make_dir, log, extract_data
+from cme_toolbox import CMEModel  # may be unnecessary
 import multiprocessing
 import os
 
 # lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
 import warnings
-from .plot_aesthetics import aesthetics
+from plot_aesthetics import aesthetics
 
 from tqdm import tqdm
+code_ver_global = "029"  # bumping up version April 2024
 
 # from tqdm.contrib.concurrent import process_map  # or thread_map
-
-
 # warnings.filterwarnings("ignore", category=DeprecationWarning) #let's do more gargeted stuff...
+
+def perform_inference(h5ad_filepath,
+    model,
+    transcriptome_filepath=None,
+    n_genes=100,
+    seed=2813308004,
+    viz=True,
+    modality_name_dict=None,
+    dataset_string=None,
+    cf=None,
+    code_ver=code_ver_global,
+    filt_param=None,
+    exp_filter_threshold=1,
+    genes_to_fit=[],
+    gradient_params={
+        "max_iterations": 10,
+        "init_pattern": "moments",
+        "num_restarts": 1},
+    use_lengths=True,
+    run_meta="",
+    phys_lb=None,
+    phys_ub=None,
+    samp_lb=None,
+    samp_ub=None,
+    gridsize=None,
+    hist_type='unique',
+    exclude_sigma=True,
+    poisson_average_log_length=5,
+    mek_means_params=None,
+    num_cores=1, AIC_EPS=1e-20, AIC_offs=0):
+    '''
+    Load and filter data from h5ad file.
+    Run inference procedure for the desired model, save parameters, uncertainty from Hessian and AIC values automatically.
+    '''
+    
+    if mek_means_params:
+        k, epochs = mek_means_params
+    
+    if not dataset_string:
+        try:
+            dataset_string = ''.join(h5ad_filepath.split('/')[-1].split('.')[:-1])
+        except AttributeError:
+            # For anndata, use the name of the anndata object.
+            dataset_string = model.bio_model + '_' + model.seq_model
+            log.info("No dataset name given (dataset_string=None). Saving as {}".format(dataset_string))
+        
+    make_dir(dataset_string)
+    
+    monod_adata = extract_data(h5ad_filepath,
+    model,
+    dataset_name=dataset_string,
+    transcriptome_filepath=transcriptome_filepath,
+    n_genes=n_genes,
+    seed=seed,
+    viz=viz,
+    filt_param=filt_param,
+    modality_name_dict=modality_name_dict,
+    cf=cf,
+    code_ver=code_ver,
+    exp_filter_threshold=exp_filter_threshold,
+    genes_to_fit=genes_to_fit, hist_type=hist_type, mek_means_params=mek_means_params)
+    log.info('Data extracted')
+    log.debug('hist type is %s',hist_type)
+    
+    search_data = searchdata_from_adata(monod_adata)
+    log.info('Search data created.')
+
+    if not transcriptome_filepath:
+        use_lengths = False
+        log.info('Lengths have not been given so are not being used')
+
+    if not mek_means_params:
+        inference_parameters = InferenceParameters(
+            dataset_string,
+            model,
+            use_lengths=use_lengths,
+            gradient_params=gradient_params,
+            run_meta=run_meta,
+            phys_lb=phys_lb,
+            phys_ub=phys_ub,
+            samp_lb=samp_lb,
+            samp_ub=samp_ub,
+            gridsize=gridsize,
+        poisson_average_log_length=poisson_average_log_length)
+
+    else:
+        inference_parameters = mminference.InferenceParameters(
+            dataset_string,
+            model,
+            use_lengths=use_lengths,
+            gradient_params=gradient_params,
+            run_meta=run_meta,
+            phys_lb=phys_lb,
+            phys_ub=phys_ub,
+            samp_lb=samp_lb,
+            samp_ub=samp_ub,
+            gridsize=gridsize,
+        poisson_average_log_length=poisson_average_log_length,
+        k=k, epochs=epochs)
+    
+    log.info('Global inference parameters set.')
+
+    if not mek_means_params:
+        # Fit the model at all values of technical parameters, and save the location of the results.
+        search_result = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores)
+        log.info('Grid points fit.')
+        search_result.find_sampling_optimum(discard_rejected=False)
+        parameters_per_gene = search_result.phys_optimum
+        log.info('Optimal parameters found.')
+        num_params = search_result.model.get_num_params()
+
+    else:
+        # Fit the model at all values of technical parameters, and save the location of the results.
+        search_result_list = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores)
+        log.info('Grid points fit.')
+
+        cluster_params = {}
+        # Assume results are ordered according to desired cluster labels.
+        for i, sr in enumerate(search_result_list):
+            sr.find_sampling_optimum(discard_rejected=False)
+            parameters_per_gene = sr.phys_optimum
+            log.info('Optimal parameters found.')
+            cluster_params[i] = parameters_per_gene
+            
+        num_params = search_result_list[0].model.get_num_params()
+
+    # Load the AnnData object into memory if it is in backed mode
+    if monod_adata.isbacked:
+        monod_adata = monod_adata.to_memory()
+
+    # Save parameter results to adata.
+    for i in range(num_params):
+        
+        if not mek_means_params:
+            param_name = search_result.model.param_str[i]
+            without_log = param_name.replace(r"\log_{10} ", "")
+
+            param_values = parameters_per_gene[:,i]
+            monod_adata.var[without_log] = param_values
+        else:
+            param_name = search_result_list[0].model.param_str[i]
+            without_log = param_name.replace(r"\log_{10} ", "")
+
+            for j in cluster_params.keys():
+                param_values = cluster_params[j][:,i]
+                # cluster_param_column = 
+                monod_adata.var["c{}_".format(j) + without_log] = param_values
+    
+    if mek_means_params:
+        # log.info('Optimal parameters for each cluster saved to anndata. For cluster i, the .var attribute is of the form: ci_' + param_name)
+        log.info('Optimal parameters for each cluster saved to anndata. For cluster i, the .var attribute is of the form: \"ci_'+without_log+ '\". Note that the parameters are given in log-base 10.')
+    else:
+        log.info('Optimal parameters saved to anndata, under .var attributes in the form: \"'+without_log + '\". Note that the parameters are given in log-base 10.')
+
+    
+    # Save AIC values to adata.
+    if not mek_means_params:
+        AIC_per_gene(search_result, monod_adata)
+    else:
+        # AIC values from meK-Means are the same for all SRs.
+        AICs = get_AIC_mek_means(search_result_list, search_data, AIC_EPS=AIC_EPS, AIC_offs=AIC_offs)
+        monod_adata.var['AIC'] = AICs
+    
+    log.info('AIC values calculated and saved under .var attribute: AIC.')
+
+    if not exclude_sigma:
+        if not mek_means_params:
+            # Save uncertainties from Hessian.
+            search_result.compute_sigma(search_data,num_cores=1)
+            all_sigmas = search_result.sigma
+            
+            for i in range(num_params):
+                param_name = search_result.model.param_str[i]
+                sigmas = all_sigmas[:,i]
+                without_log = param_name.replace(r"\log_{10} ", "")
+                # monod_adata.var[r'$\sigma$_' + param_name] = sigmas#[:,i]
+                monod_adata.var['error_' + without_log] = sigmas#[:,i]
+
+        else:
+            # Save uncertainties from Hessian.
+            for j, sr in enumerate(search_result_list):
+                
+                sd =  sr._subset_search_data(search_data)
+                sr.compute_sigma(search_data, num_cores=1)
+                all_sigmas = sr.sigma
+                
+                for i in range(num_params):
+                    param_name = sr.model.param_str[i]
+                    without_log = param_name.replace(r"\log_{10} ", "")
+
+                    sigmas = all_sigmas[:,i]
+                    monod_adata.var[r"c{}_error_".format(j) + without_log] = sigmas#[:,i]
+
+        if not mek_means_params:
+            # NB log.
+            log.info('Uncertainties per gene calculated, saved to anndata in .var attribute of the form: \"error_' + without_log + '\". Note that the errors are given for log-base 10 parameters.')
+        else:
+            # NB log.
+            log.info('Uncertainties per gene calculated for each cluster. E.g. for cluser, i, uncertainty saved to anndata in .var attribute of the form: \"ci_error_'+ without_log + '\". Note that the errors are given in log-base 10.')
+
+            
+    # If meK-Means, save clusters.
+    if mek_means_params:
+        monod_adata.obs['cluster'] = None
+        log.info('Saving clusters')
+        for sr in search_result_list:
+            cluster_label = sr.assigns
+            monod_adata.obs.loc[sr.filt, 'cluster'] = cluster_label
+        log.info('Cluster labels added to anndata .obs')
+
+    # Also save entire objects to adata.
+
+    if not mek_means_params:
+        monod_adata.uns['search_result'] = search_result
+        sr = search_result.store_on_disk()
+        log.info('Search Result stored to %s', sr)
+    else:
+        monod_adata.uns['search_result_list'] = search_result_list
+
+    monod_adata.uns['search_data'] = search_data
+    inference_string = search_result.inference_string
+    sd = search_data.store_on_disk(inference_string)
+
+    adata_file_path = inference_string + '/monod_adata.pkl'
+    with open(adata_file_path, 'wb') as adfs:
+        pickle.dump(monod_adata, adfs)
+    log.info('Anndata object stored to %s', adata_file_path)
+
+    return monod_adata
+
+def searchdata_from_adata(adata):
+
+    n_genes = adata.n_vars
+
+    # NB the order of the layers here will be enforced to be the same as the order of the model 
+    # modalities defined in cme_toolbox.
+    modality_name_dict = adata.uns['modality_name_dict']
+    model = adata.uns['model']
+
+    ordered_modalities = model.model_modalities
+    ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
+    
+    layers = np.array([adata.layers[layer_name] for layer_name in ordered_layer_names])
+
+    M = adata.uns['M']
+
+    hist = adata.uns['hist']
+
+    moments = get_gene_moments(adata)
+
+    gene_names = adata.var.index
+
+    n_cells = adata.n_obs
+
+    hist_type = get_hist_type_adata(adata)
+
+    attr_names = [
+        "M",
+        "hist",
+        "moments",
+        "n_genes",
+        "gene_names",
+        "n_cells",
+        "layers",
+        "hist_type",
+        "layer_names"
+    ]
+
+    attr_values = [M, hist, moments, n_genes, gene_names, n_cells, layers, hist_type, ordered_layer_names]
+
+    try:
+        gene_log_lengths = adata.var['log_lengths']
+        attr_names += ['gene_log_lengths']
+        attr_values += [gene_log_lengths]
+        
+    except KeyError:
+        pass
+
+    try:
+        k, epochs = adata.uns['k'], adata.uns['epochs']
+        attr_names += ['k', 'epochs']
+        attr_values += [k, epochs]
+    except KeyError:
+        pass        
+    
+    search_data = SearchData(attr_names, *attr_values)
+    
+    return search_data
+
+
+def get_gene_moments(adata):
+    
+    # Specify the columns you want to extract
+    columns_of_interest = [i for i in adata.var.columns if 'MOM' in i]
+    
+    # Ensure the columns exist in adata.var
+    for col in columns_of_interest:
+        if col not in adata.var.columns:
+            raise ValueError(f"Column '{col}' does not exist in adata.var")
+    
+    # Extract the selected columns
+    selected_data = adata.var[columns_of_interest]
+    
+    # Convert the DataFrame to a list of dictionaries
+    list_of_dicts = selected_data.to_dict(orient='records')
+    
+    return list_of_dicts
+
+
+def get_gene_moments_single(adata, gene_index):
+
+    # Create an empty dictionary to store the gene attributes
+    gene_moment_dict = {}
+    
+    # Iterate through each column in adata.var and add it to the dictionary
+    for column in adata.var.columns:
+        if 'MOM_' in column:
+            gene_moment_dict[column[4:]] = adata.var[column].tolist()[gene_index]
+
+    return gene_moment_dict
+
+
+def reject_genes(adata, viz=False,
+        EPS=1e-15,
+        threshold=0.05,
+        bonferroni=True,
+        reject_at_bounds=True,
+        bound_thr=0.01,
+        grouping_thr=5,
+        use_hellinger=True,
+        hellinger_thr=0.05,
+        mek_means=False,
+        save_csq=True,
+                save_pval=False,
+                save_hellinger=False):
+    '''
+    Perform chi-squared testing and add list of rejected genes to anndata object.
+
+    Parameters
+    ------------------
+    save_csq: boolean
+        whether to save chi-squared values per cluster if performing mek-means 
+    save_pval: boolean
+        whether to save p-values per cluster if performing mek-means analysis
+    '''
+
+    if not mek_means:
+        search_data = adata.uns['search_data']
+        try:
+            search_result = adata.uns['search_result']
+        except AttributeError:
+            log.error('Did you mean to run with meK-Means? If so, make sure to set mek_means=True')
+    
+        csq, pval, hellinger = search_result.chisquare_testing(search_data,
+            viz=viz,
+            EPS=EPS,
+            threshold=threshold,
+            bonferroni=bonferroni,
+            reject_at_bounds=reject_at_bounds,
+            bound_thr=bound_thr,
+            grouping_thr=grouping_thr,
+            use_hellinger=use_hellinger,
+            hellinger_thr=hellinger_thr)
+    
+        # Save chi-squared values, p-values, and rejected genes to adata.
+        adata.var['csq'] = csq
+        log.info('Chi-squared values for each gene have been added as \"csq\" in .var')
+
+        adata.var['pval'] = pval
+        log.info('P-values for each gene have been added as \"pval\" in .var')
+
+        adata.var['hellinger'] = hellinger
+        log.info('Hellinger distances for each gene have been added as \"hellinger\" in .var')
+
+        adata.var['rejected_genes'] = search_result.rejected_genes
+        log.info('Rejected genes are recorded in \"rejected_genes\" in .var')
+
+        
+        # Reset search_data and search_result.
+        adata.uns['search_data'] = search_data
+        adata.uns['search_result'] = search_result
+        adata.uns['rejection_index'] = search_result.rejection_index
+
+    else:
+        search_data = adata.uns['search_data']
+        search_result_list = adata.uns['search_result_list']
+
+        new_sr_list = []
+        
+        for i in range(len(search_result_list)):
+            
+            sr = search_result_list[i]
+            sd =  sr._subset_search_data(search_data)
+            cluster_filter = sr.filt
+            cluster = sr.assigns
+            
+            csq, pval, hellinger = sr.chisquare_testing(sd,
+            viz=viz,
+            EPS=EPS,
+            threshold=threshold,
+            bonferroni=bonferroni,
+            reject_at_bounds=reject_at_bounds,
+            bound_thr=bound_thr,
+            grouping_thr=grouping_thr,
+            use_hellinger=use_hellinger,
+            hellinger_thr=hellinger_thr)
+
+            # Save chi-squared values, p-values, and rejected genes to adata.
+            if save_csq:
+                adata.var['{}_csq'.format(cluster)] = csq
+
+            if save_pval:
+                adata.var['{}_pval'.format(cluster)] = pval
+
+            if save_hellinger:
+                adata.var['{}_hellinger'.format(cluster)] = hellinger
+
+            adata.var['{}_rejected_genes'.format(cluster)] = sr.rejected_genes
+
+            new_sr_list += [sr]
+
+        log.info('Rejected genes in cluster i have been recorded under \"ci_rejected_genes\" in .var')
+        if save_csq:
+            log.info('Chi-squared values for each gene in cluster i have been added as \"ci_csq\" in .var')
+        if save_pval:
+            log.info('P-values for each gene in cluster i have been added as \"ci_pval\" in .var')
+        if save_hellinger:
+            log.info('Hellinger distances for each gene in cluster i have been added as \"ci_hellinger\" in .var')
+            
+        # Reset search_data and search_result.
+        adata.uns['search_result_list'] = new_sr_list
+        # This is the same for all clusters (all sr objects), so can be set once (correct?)
+        adata.uns['rejection_index'] = sr.rejection_index
+
+    # Return list of rejected genes.
+    return adata
+
+
+# Use class to make inference faster.
+class SearchData:
+    """Container for data for for inference, visualization, and testing.
+
+    Attributes
+    ----------
+    attr_names: tuple of str
+
+    layers: int np.ndarray
+        raw data from the layers of interest, size n_species x n_genes x n_cells.
+    M: int np.ndarray
+        grid size for PMF evaluation, size n_species x n_genes.
+    hist: tuple or np.ndarray
+        histogram of raw data, used to evaluate divergences.
+        if tuple, generated by np.unique.
+        if np.ndarray, generated by np.histogramdd.
+    moments: list of dict
+        length-n_genes list containing moments for each gene.
+        moments include 'mod2_mean', 'mod1_mean', 'mod2_var', 'mod1_var', and are used to define MoM estimates.
+        Also covariances in form 'mod1_mod2_covar'
+    gene_log_lengths: float np.ndarray
+        log lengths of analyzed genes.
+    n_genes: int
+        number of genes to analyze.
+    gene_names: str np.ndarray
+        list of genes to analyze.
+    n_cells: int
+        number of cells in the dataset.
+    hist_type: str
+        metadata defining the type of histogram.
+    """
+
+    def __init__(self, attr_names, *input_data):
+        """Creates a SearchData object from raw data.
+
+        Parameters
+        ----------
+        attr_names: tuple
+            list of attributes to store, provided in extract_data.
+        *input_data
+            attributes to store, as enumerated in the class definition.
+        """
+        for j in range(len(input_data)):
+            setattr(self, attr_names[j], input_data[j])
+
+    def store_on_disk(self, inference_string):
+        """This helper method attempts to store the SearchData object to disk.
+
+        Returns
+        -------
+        full_result_string: str
+            file location.
+        """
+        try:
+            full_result_string = inference_string + "/search_data.res"
+            with open(full_result_string, "wb") as sdfs:
+                pickle.dump(self, sdfs)
+            log.info("Search data stored to {}.".format(full_result_string))
+        except:
+            log.error(
+                "Search data could not be stored to {}.".format(
+                    full_result_string
+                )
+            )
+        self.full_result_string = full_result_string
+        return full_result_string
+
+            
+
+def AIC_per_gene(search_result, monod_adata):
+    """
+    Computes the AIC value for each gene for a single model.
+
+    Parameters
+    ----------
+    search_result : SearchResult
+        The search result object containing model fitting information.
+    adata : anndata.AnnData
+        The AnnData object containing the gene expression data.
+
+    Returns
+    -------
+    np.ndarray
+        The AIC values for each gene.
+    """
+    search_data = searchdata_from_adata(monod_adata)
+    n_cells = monod_adata.n_obs
+    # Calculate the log-likelihood for each gene
+    logL = search_result.get_logL(search_data, n_cells)
+    
+    # Calculate the number of parameters
+    n_params = search_result.sp.n_phys_pars
+    
+    # Calculate AIC for each gene
+    AIC = 2 * n_params - 2 * logL
+
+    monod_adata.var['AIC'] = AIC
+    
+    return AIC
+
+def get_hist_type(search_data):
+    """A helper function for backwards compatibility.
+
+    If the histogram type is not specified in the SearchData object, assume it is the legacy
+    type "grid".
+
+    Parameters
+    ----------
+    search_data: monod.extract_data.SearchData
+        SearchData object with the data to fit.
+
+    Returns
+    -------
+    hist_type: str
+        flavor of histogram used to generate search_data, either "unique" or "grid" or "none".
+    """
+
+    if hasattr(search_data, "hist_type") and search_data.hist_type == "unique" or "none":
+        hist_type = search_data.hist_type
+    else:
+        hist_type = "grid"
+    return hist_type
+
 
 
 class InferenceParameters:
@@ -59,6 +621,7 @@ class InferenceParameters:
         run-specific directory location within dataset_string.
     sampl_vals: list of lists of floats
         list of grid points.
+    
     X: np.ndarray
         grid point values representing unspliced RNA sampling parameters.
     Y: np.ndarray
@@ -70,11 +633,6 @@ class InferenceParameters:
 
     def __init__(
         self,
-        phys_lb,
-        phys_ub,
-        samp_lb,
-        samp_ub,
-        gridsize,
         dataset_string,
         model,
         use_lengths=True,
@@ -84,6 +642,12 @@ class InferenceParameters:
             "num_restarts": 1,
         },
         run_meta="",
+        phys_lb=None,
+        phys_ub=None,
+        samp_lb=None,
+        samp_ub=None,
+        gridsize=None,
+        poisson_average_log_length=5
     ):
         """Initialize the InferenceParameters instance.
 
@@ -115,19 +679,34 @@ class InferenceParameters:
         run_meta: str, optional
             any additional metadata to append to the run directory name.
         """
+        # Set biophysical parameter values to defaults.
+        if phys_lb is None:
+            phys_lb = model.bio_bounds['phys_lb']
+        if phys_ub is None:
+            phys_ub = model.bio_bounds['phys_ub']
+
+        # Set technical sequencing parameter values to defaults.
+        if samp_lb is None:
+            samp_lb = model.seq_bounds['samp_lb']
+        if samp_ub is None:
+            samp_ub = model.seq_bounds['samp_ub']
+        if gridsize is None:
+            gridsize = model.seq_bounds['gridsize']
+        
         self.gradient_params = gradient_params
         self.phys_lb = np.array(phys_lb)
         self.phys_ub = np.array(phys_ub)
         self.grad_bnd = scipy.optimize.Bounds(phys_lb, phys_ub)
 
         self.use_lengths = use_lengths
+        self.poisson_average_log_length = poisson_average_log_length
 
         if model.seq_model == "None":
             log.info(
                 "Sequencing model set to None. All sampling parameters set to null."
             )
-            samp_lb = [1, 1]
-            samp_ub = [1, 1]
+            samp_lb = [0, 0]
+            samp_ub = [0, 0]
             gridsize = [1, 1]
 
         self.samp_lb = np.array(samp_lb)
@@ -144,7 +723,13 @@ class InferenceParameters:
             run_meta = "_" + run_meta
 
         self.dataset_string = dataset_string
-        inference_string = f"{dataset_string}/{model.bio_model}_{model.seq_model}_{gridsize[0]:.0f}x{gridsize[1]:.0f}{run_meta}"
+        
+        inference_string = f"{dataset_string}/{model.bio_model}_{model.seq_model}_"
+        for i in range(len(gridsize)):
+            inference_string += f"{gridsize[i]:.0f}x"
+        inference_string = inference_string[:-1]
+        inference_string += f"{run_meta}"
+        
         make_dir(inference_string)
         self.inference_string = inference_string
         inference_parameter_string = inference_string + "/parameters.pr"
@@ -157,24 +742,20 @@ class InferenceParameters:
         ----
         sampl_vals: list of lists of floats
             list of grid points.
-        X: np.ndarray
-            grid point values representing unspliced RNA sampling parameters.
-        Y: np.ndarray
-            grid point values representing spliced RNA sampling parameters.
+        grid_values_sampl: list of np.ndarrays
+            grid point values representing sampling parameters for each modality.
         n_grid_pts: int
             total number of grid points to evaluate.
         """
-        X, Y = np.meshgrid(
-            np.linspace(self.samp_lb[0], self.samp_ub[0], self.gridsize[0]),
-            np.linspace(self.samp_lb[1], self.samp_ub[1], self.gridsize[1]),
-            indexing="ij",
-        )
-        X = X.flatten()
-        Y = Y.flatten()
-        self.X = X
-        self.Y = Y
-        self.sampl_vals = list(zip(X, Y))
-        self.n_grid_points = len(X)
+        linspaces = [np.linspace(self.samp_lb[i], self.samp_ub[i], self.gridsize[i]) for i in range(len(self.gridsize))]
+        grid_values_sampl = np.meshgrid(*linspaces, indexing="ij")
+        
+        grid_values_sampl = [i.flatten() for i in grid_values_sampl]
+        self.grid_values_sampl = grid_values_sampl
+        
+        self.sampl_vals = list(zip(*grid_values_sampl))
+        
+        self.n_grid_points = len(grid_values_sampl[0])
 
     def store_inference_parameters(self, inference_parameter_string):
         """This helper method attempts to save the InferenceParameters object.
@@ -199,7 +780,7 @@ class InferenceParameters:
                 )
             )
 
-    def fit_all_grid_points(self, num_cores, search_data):
+    def fit_all_grid_points(self, search_data, num_cores=1):
         """Fits the search data for all genes over all grid points.
 
         Parameters
@@ -211,8 +792,8 @@ class InferenceParameters:
 
         Returns
         -------
-        full_result_string: str
-            disk location of the SearchResults object.
+        results: SearchResults object
+            Saves search_result to disk and returns it.
 
         """
 
@@ -243,14 +824,17 @@ class InferenceParameters:
             ]
             log.info("Non-parallelized grid scan complete.")
 
-        warnings.resetwarnings()
+        # warnings.resetwarnings()
         results = SearchResults(self, search_data)
         results.aggregate_grid_points()
+
         full_result_string = results.store_on_disk()
+
 
         t2 = time.time()
         log.info("Runtime: {:.1f} seconds.".format(t2 - t1))
-        return full_result_string
+        
+        return results
 
     def par_fun(self, inputs):
         """Helper method for the grid point parallelization procedure.
@@ -350,9 +934,11 @@ class GradientInference:
             method of moments estimates for all genes under the current technical variation parameters.
 
         """
+ 
         regressor = np.array(
             [global_parameters.sampl_vals[point_index]] * search_data.n_genes
         )
+
         if global_parameters.use_lengths:
             if model.seq_model == "Bernoulli":
                 raise ValueError(
@@ -368,6 +954,12 @@ class GradientInference:
                 raise ValueError(
                     "Please select a technical noise model from {Poisson}, {Bernoulli}, {None}."
                 )
+
+        else:
+            # If no specific lengths given, multiply the unspliced sampling rate by an average length value for all genes.
+            if model.seq_model == "Poisson" and model.fit_unspliced:
+                regressor[:, 0] += global_parameters.poisson_average_log_length
+            
         self.grid_point = global_parameters.sampl_vals[point_index]
         self.point_index = point_index
         self.regressor = regressor
@@ -418,22 +1010,29 @@ class GradientInference:
         err: float
             Kullback-Leibler divergence of the model at x, relative to data.
         """
+        # Further cap the random initializations within a smaller box.
+        restricted_bounds_lb = np.array([0, -2,-2,-2,-2])
+        restricted_bounds_ub = np.array([2,2,2,2,2])
         x0 = (
             np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
-            * (self.phys_ub - self.phys_lb)
-            + self.phys_lb
+            * (restricted_bounds_ub - restricted_bounds_lb)
+            + restricted_bounds_lb
         )
+        # x0 = (
+        #     np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
+        #     * (self.phys_ub - self.phys_lb)
+        #     + self.phys_lb
+        # )
         if (
             self.gradient_params["init_pattern"] == "moments"
         ):  # this can be extended to other initialization patterns, like latin squares
             x0[0] = self.param_MoM[gene_index]
-        x = x0[0]
+        #x = x0[0]
         err = np.inf
         ERR_THRESH = 0.99
-
-        # print(hist_type)
+        log.info('Optimizing gene %d with initial value %s', gene_index, np.array2string(10**x0))
+        
         hist_type = get_hist_type(search_data)
-
         for restart in range(self.gradient_params["num_restarts"]):
             res_arr = scipy.optimize.minimize(
                 lambda x: model.eval_model_kld(
@@ -444,6 +1043,7 @@ class GradientInference:
                     hist_type=hist_type,
                 ),
                 x0=x0[restart],
+                method='Nelder-Mead',
                 bounds=self.grad_bnd,
                 options={
                     "maxiter": self.gradient_params["max_iterations"],
@@ -458,6 +1058,7 @@ class GradientInference:
         if not (np.isfinite(x).all()):
             log.warning("Gene index: " + str(gene_index))
             raise ValueError("Search failed. Please check input data.")
+        log.info('Optimized parameters for gene %d is %s', gene_index, np.array2string(10**x))
         return x, err
 
     def iterate_over_genes(self, model, search_data):
@@ -482,10 +1083,10 @@ class GradientInference:
             runtime in seconds.
         """
         t1 = time.time()
-
+        
         param_estimates, klds = zip(
             *[
-                self.optimize_gene(gene_index, model, search_data)
+                self.optimize_gene(gene_index=gene_index, model=model, search_data=search_data)
                 for gene_index in range(search_data.n_genes)
             ]
         )
@@ -510,7 +1111,8 @@ class GradientInference:
             SearchData object with the data to fit.
 
         """
-        search_out = self.iterate_over_genes(model, search_data)
+        
+        search_out = self.iterate_over_genes(model=model, search_data=search_data)
         results = GridPointResults(
             *search_out,
             self.regressor,
@@ -520,33 +1122,34 @@ class GradientInference:
         )
         results.store_grid_point_results()
 
-
 ########################
 ## Helper functions
 ########################
 
 
-def get_hist_type(search_data):
+def get_hist_type_adata(monod_adata):
     """A helper function for backwards compatibility.
 
-    If the histogram type is not specified in the SearchData object, assume it is the legacy
+    If the histogram type is not specified in the anndata object, assume it is the legacy
     type "grid".
 
     Parameters
     ----------
-    search_data: monod.extract_data.SearchData
-        SearchData object with the data to fit.
+    monod_adata: Anndata
+        anndata object with the data to fit.
 
     Returns
     -------
     hist_type: str
-        flavor of histogram used to generate search_data, either "unique" or "grid".
+        flavor of histogram used to generate monod_adata, either "unique" or "grid" or "none".
     """
-
-    if hasattr(search_data, "hist_type") and search_data.hist_type == "unique":
-        hist_type = "unique"
+    
+    if "hist_type" in monod_adata.uns and monod_adata.uns["hist_type"] in {"unique", "none"}:
+        hist_type = monod_adata.uns["hist_type"]
+        
     else:
         hist_type = "grid"
+        
     return hist_type
 
 
@@ -710,7 +1313,12 @@ class SearchResults:
         # pull in small amount of non-cell-specific info from search data
         self.n_genes = search_data.n_genes
         self.n_cells = search_data.n_cells
-        self.gene_log_lengths = search_data.gene_log_lengths
+        try:
+            self.gene_log_lengths = search_data.gene_log_lengths
+        # Do not define an attribute for gene_lengths if non is given.
+        except AttributeError:
+            pass
+            
         self.gene_names = search_data.gene_names
 
         self.param_estimates = []
@@ -778,7 +1386,7 @@ class SearchResults:
             full_result_string = self.inference_string + "/grid_scan_results.res"
             with open(full_result_string, "wb") as srfs:
                 pickle.dump(self, srfs)
-            log.debug("Grid scan results stored to {}.".format(full_result_string))
+            log.info("Grid scan results stored to {}.".format(full_result_string))
         except:
             log.error(
                 "Grid scan results could not be stored to {}.".format(
@@ -1079,7 +1687,7 @@ class SearchResults:
         This method performs two rounds of goodness-of-fit testing.
         First, it applies a chi-squared test to the distributions induced by biological parameter values
         at the sampling parameter optimum.
-        Optionally, it also rejectes genes that are too close to the search parameter bounds,
+        Optionally, it also rejects genes that are too close to the search parameter bounds,
         as they typically exhibit poor gradient descent performance or do not have enough counts to
         reliably estimate parameters.
         This is typically sufficient to reject genes with proposed distributions that are grossly
@@ -1138,12 +1746,12 @@ class SearchResults:
 
         """
         t1 = time.time()
-
         hist_type = get_hist_type(search_data)
 
         csqarr = []
         hellinger = []
         for gene_index in range(self.n_genes):
+            # lm = search_data.M[:, gene_index]
             lm = search_data.M[:, gene_index]
             expect_freq = (
                 self.model.eval_model_pss(
@@ -1163,10 +1771,24 @@ class SearchResults:
                 counts = np.concatenate(
                     (search_data.n_cells * search_data.hist[gene_index][1], [0])
                 )
-                expect_freq = expect_freq[
-                    search_data.hist[gene_index][0][:, 0],
-                    search_data.hist[gene_index][0][:, 1],
-                ]
+                # print(search_data.hist)
+                number_of_modalities = len(search_data.hist[gene_index][0][0])
+                if number_of_modalities == 2:
+                    expect_freq = expect_freq[
+                        search_data.hist[gene_index][0][:, 0],
+                        search_data.hist[gene_index][0][:, 1],
+                    ]
+                elif number_of_modalities == 3:
+                    expect_freq = expect_freq[
+                        search_data.hist[gene_index][0][:, 0],
+                        search_data.hist[gene_index][0][:, 1],
+                        search_data.hist[gene_index][0][:, 2]
+                    ]
+
+                # expect_freq = expect_freq[ [
+                #     search_data.hist[gene_index][0][:, i] for i in range(len(search_data.hist[gene_index][0][0]))
+                # ]]
+
                 expect_freq = np.concatenate(
                     (expect_freq, [search_data.n_cells - expect_freq.sum()])
                 )
@@ -1216,6 +1838,24 @@ class SearchResults:
             assert np.isclose(search_data.n_cells, counts.sum())
             assert np.isclose(search_data.n_cells, expect_freq.sum())
 
+
+            # Ensure the sums of f_obs and f_exp match
+            f_obs_sum = observed.sum()
+            f_exp_sum = proposed.sum()
+            
+            # Check if normalization is needed
+            if not np.isclose(f_obs_sum, f_exp_sum, rtol=1e-9):
+                # Print a warning/info message
+                warnings.warn(
+                    f"The sums of observed and expected frequencies differ by {f_obs_sum - f_exp_sum:.2e}. "
+                    "Normalizing expected frequencies to match observed frequencies.",
+                    UserWarning,
+                )
+                # Normalize f_exp
+                proposed = proposed * (f_obs_sum / f_exp_sum)
+
+
+            # chi-squared takes only the number of biological parameters?
             csqarr += [
                 scipy.stats.mstats.chisquare(
                     observed,
@@ -1231,6 +1871,8 @@ class SearchResults:
         pval = np.asarray(pval)
         hellinger = np.asarray(hellinger)
 
+        log.info('P-value threshold: ' + str(threshold) + ', Adjusted P-value threshold:' + str(threshold)+ ', Hellinger Threshold:' + str(hellinger_thr))
+        
         if bonferroni:
             threshold /= self.n_genes
         self.rejected_genes = pval < threshold
@@ -1303,6 +1945,7 @@ class SearchResults:
             )
         )
         hess = Hfun(self.phys_optimum[gene_index])
+        
         return hess
 
     def compute_sigma(self, search_data, num_cores=1):
@@ -1417,9 +2060,14 @@ class SearchResults:
         for samp_num in range(Nsamp):
             for i_ in range(Ntries):
                 axloc = (samp_num, i_)
-                gene_filter = np.random.choice(
-                    self.n_genes, resamp_vec[samp_num], replace=False
-                )
+                if resamp_vec[samp_num] <= self.n_genes:
+                    gene_filter = np.random.choice(
+                        self.n_genes, resamp_vec[samp_num], replace=False
+                    )
+                else:
+                    gene_filter = np.random.choice(
+                        self.n_genes, self.n_genes, replace=False
+                    )
                 subsampled_samp_optimum = self.find_sampling_optimum(gene_filter)
                 self.plot_landscape(ax1[axloc], gene_filter=gene_filter, hideticks=True)
 
@@ -1455,9 +2103,14 @@ class SearchResults:
             axloc = samp_num
             subsampled_samp_optimum_array = []
             for i__ in range(Ntries):
-                gene_filter = np.random.choice(
-                    self.n_genes, resamp_vec[samp_num], replace=False
-                )
+                if resamp_vec[samp_num] <= self.n_genes:
+                    gene_filter = np.random.choice(
+                        self.n_genes, resamp_vec[samp_num], replace=False
+                    )
+                else:
+                    gene_filter = np.random.choice(
+                        self.n_genes, self.n_genes, replace=False
+                    )
                 subsampled_samp_optimum = self.find_sampling_optimum(gene_filter)
                 subsampled_samp_optimum_array.append(subsampled_samp_optimum)
             subsampled_samp_optimum_array = np.asarray(subsampled_samp_optimum_array)
@@ -1598,6 +2251,12 @@ class SearchResults:
         distinguish_rej: bool, optional
              whether to distinguish the genes in the rejected_genes attribute by color.
         """
+        try: 
+            gene_log_lengths = self.gene_log_lengths
+        except AttributeError:
+            log.info('No gene lengths given, length-dependence cannot be plotted. Function exiting')
+            return 
+            
         num_params = self.sp.n_phys_pars
         figsize = figsize or (4 * num_params, 4)
 
@@ -1635,6 +2294,7 @@ class SearchResults:
 
                 lfun = lambda x, a, b: a * x + b
                 if plot_fit:
+                    
                     popt, pcov = scipy.optimize.curve_fit(
                         lfun,
                         self.gene_log_lengths[gene_filter],
@@ -1697,6 +2357,7 @@ class SearchResults:
             ax1[i].set_ylabel(self.model.get_log_name_str()[i])
             if axis_search_bounds:
                 ax1[i].set_ylim([self.sp.phys_lb[i], self.sp.phys_ub[i]])
+        
         fig1.tight_layout()
         fig_string = self.analysis_figure_string + "/length_dependence.png"
         plt.savefig(fig_string, dpi=450)
@@ -1724,9 +2385,9 @@ class SearchResults:
         figsize: tuple of floats, optional
             figure dimensions.
         marg: str, optional
-            if 'nascent': plot unspliced RNA marginal.
-            if 'mature': plot spliced RNA marginal.
-            if 'joint': plot the bivariate distribution.
+            if 'unspliced', 'spliced', 'protein' etc., plot marginal for this modality.
+            if 'joint': plot the bivariate distribution for spliced or unspliced
+            if tuple of modality strings, plot the bivariate distribution for these modalities.
         logscale: None or bool, optional
             whether to plot probabilities or log-probabilities.
             by default, True for 'joint', False for marginals.
@@ -1740,7 +2401,7 @@ class SearchResults:
         """
 
         if logscale is None:
-            if marg == "joint":
+            if marg == "joint" or type(marg)==tuple:
                 logscale = True
             else:
                 logscale = False
@@ -1766,12 +2427,19 @@ class SearchResults:
             genes_to_plot = genes_to_plot[:nax]
 
         j_ = 0
+
         for i_ in genes_to_plot:
             lm = np.copy(search_data.M[:, i_])
-            if marg == "mature":
-                lm[0] = 1
-            if marg == "nascent":
-                lm[1] = 1
+            
+            # TODO: generalize by adding attribute names as attribute of e.g. CMEModel
+            # attributes = ['unspliced', 'spliced', 'protein']
+            self.modalities = self.model.model_modalities
+            num_modalities = len(self.modalities)
+            for i in range(num_modalities):
+                if marg == self.modalities[i]:
+                    lm[:i] = 1
+                    lm[i+1:]=1
+                    
             axloc = np.unravel_index(j_, sz) if (sz[0] > 1 and sz[1] > 1) else j_
 
             samp = self.regressor_optimum[i_]
@@ -1782,17 +2450,32 @@ class SearchResults:
                     Pa[Pa < 1e-10] = 1e-10
                     Pa = np.log10(Pa)
 
-                ax1[axloc].imshow(Pa.T, aspect="auto", cmap="summer")
+                if num_modalities==2:
+                    ax1[axloc].imshow(Pa.T, aspect="auto", cmap="summer")
+                # Set so that, for protein model, the joint distribution of protein and spliced is shown.
+                elif num_modalities==3:
+                    ax1[axloc].imshow(Pa.sum(axis=0).T, aspect="auto", cmap="summer")
+                else:
+                    log.error('Joint distribution plot only implemented for 2 or 3 modalities')
+                    
                 ax1[axloc].invert_yaxis()
 
                 jitter_magn = 0.1
                 jitter = np.random.randn(2, self.n_cells) * jitter_magn
-                ax1[axloc].scatter(
-                    *search_data.layers[:2, i_] + jitter, c="k", s=1, alpha=0.1
+                if num_modalities==2:
+                    ax1[axloc].scatter(
+                        *search_data.layers[:2, :, i_] + jitter, c="k", s=1, alpha=0.1)
+                # for protein model, scatter protein and spliced counts.
+                elif num_modalities==3:
+                    ax1[axloc].scatter(
+                        *search_data.layers[1:, :, i_] + jitter, c="k", s=1, alpha=0.1
                 )
-
-                ax1[axloc].set_xlim([-0.5, search_data.M[0, i_] - 1.5])
-                ax1[axloc].set_ylim([-0.5, search_data.M[1, i_] - 1.5])
+                if num_modalities==2:
+                    ax1[axloc].set_xlim([-0.5, search_data.M[0, i_] - 1.5])
+                    ax1[axloc].set_ylim([-0.5, search_data.M[1, i_] - 1.5])
+                elif num_modalities==3:
+                    ax1[axloc].set_xlim([-0.5, search_data.M[1, i_] - 1.5])
+                    ax1[axloc].set_ylim([-0.5, search_data.M[2, i_] - 1.5])
             else:
                 plot_hist_and_fit(ax1[axloc], search_data, i_, Pa, marg)
                 if logscale:
@@ -1815,7 +2498,7 @@ class SearchResults:
             log.info("Figure stored to {}.".format(fig_string))
 
     # the next two functions are useful for model selection, but are not currently in use.
-    def get_logL(self, search_data, EPS=1e-20, offs=0):
+    def get_logL(self, search_data, n_cells, EPS=1e-20, offs=0):
         """
         This method calculates the log-likelihood for all genes at the sampling parameter optimum.
 
@@ -1829,12 +2512,14 @@ class SearchResults:
         """
         hist_type = get_hist_type(search_data)
         logL = np.zeros(self.n_genes)
+
         for gene_index in range(self.n_genes):
             logL[gene_index] = self.model.eval_model_logL(
                 p=self.phys_optimum[gene_index],
                 limits=search_data.M[:, gene_index] + offs,
                 samp=self.regressor_optimum[gene_index],
                 data=search_data.hist[gene_index],
+                n_cells=n_cells,
                 hist_type=hist_type,
                 EPS=EPS,
             )
@@ -1871,6 +2556,23 @@ class SearchResults:
                 ]
             )
         return np.asarray(f).squeeze()
+
+def get_AIC_mek_means(search_result_list, search_data, AIC_EPS=1e-20, AIC_offs=0):
+
+    LL = np.zeros(search_result_list[0].n_genes)
+    
+    for sr in search_result_list:
+
+        n_cells = sr.n_cells
+        LL += sr.get_logL(search_data, EPS=AIC_EPS, offs=AIC_offs)
+
+    # Calculate the number of parameters
+    n_params = sr.sp.n_phys_pars
+    
+    # Calculate AIC for each gene
+    AIC = 2 * n_params - 2 * LL
+
+    return AIC
 
 
 def parallelize(
@@ -1935,7 +2637,7 @@ def parallelize(
 
 def plot_hist_and_fit(
     ax1,
-    sd,
+    monod_adata,
     i_,
     Pa,
     marg="nascent",
@@ -1950,8 +2652,8 @@ def plot_hist_and_fit(
     ----------
     ax: matplotlib.axes.Axes
         axes to plot into.
-    sd: monod.extract_data.SearchData
-        SearchData object with the fit data.
+    monod_adata: anndata
+        anndata object with the fit data.
     i_: int
         gene index to plot.
     Pa: float np.ndarray
@@ -1968,18 +2670,122 @@ def plot_hist_and_fit(
         model fit line style in a matplotlib-compatible format.
     """
 
-    if marg == "nascent":
+    # Identify layer index of the layer we want to gain the marginal of.
+    layer_names = [i for i in monod_adata.layers.keys()]
+    for i in range(len(layer_names)):
+        if marg==layer_names[i]:
+            lind = i
+    # Otherwise use first modality.
+    else:
         lind = 0
-    elif marg == "mature":
-        lind = 1
-    elif marg == "ambiguous":
-        lind = 2
+    marg_name = layer_names[lind]
+        
     ax1.hist(
-        sd.layers[lind, i_],
-        bins=np.arange(sd.M[lind, i_]) - 0.5,
+        monod_adata.layers[marg_name][:, i_],
+        bins=np.arange(monod_adata.uns['M'][lind, i_]) - 0.5,
         density=True,
         color=facecolor,
         alpha=facealpha,
     )
     ax1.plot(np.arange(sd.M[lind, i_]), Pa, color=fitcolor, linestyle=linestyle)
     ax1.set_xlim([-0.5, sd.layers[lind, i_].max() + 2.5])
+
+
+# Differential expression analysis between mek-means clusters.
+def make_fcs(sr,sd,clus1=0,clus2=1,gf_rej=False,thrpars=2,thrmean=1,outlier_de=False,nuc=False,correct_off=False):
+    '''
+    Utilize different metrics to find fold-changes (FCs) between cluster parameters
+
+    sr: list of SearchResults objects from meK-Means runs
+    sd: SearchData object that corresponds to full, input data
+    clus1: cluster 1 (to compare FCS of cluster 1/cluster 2 )
+    clus2: cluster 2 (to compare FCS of cluster 1/cluster 2 )
+    gf_rej: whether to use boolean list of rejected genes from both clusters
+    thrpars: FC threshold value (to call DE-theta genes)
+    thrmean: Mean S expression threshold value, for genes to consider
+    outlier_de: Use iterative outlier calling procedure to assign DE-theta genes (see Monod https://github.com/pachterlab/monod_examples/blob/main/Monod_demo.ipynb)
+    nuc: is this nuclear RNA data
+    correct_off: correct offset between cluster parameters (through ODR)
+    '''
+
+    all_filt_fcs = pd.DataFrame()
+    fcs,types,which_pair,highFC,spliceFC,g_names,out_de = ([] for i in range(7))
+
+    ind1 = [i for i in range(len(sr)) if clus1 == sr[i].assigns][0]
+    ind2 = [i for i in range(len(sr)) if clus2 == sr[i].assigns][0]
+
+    sr1 = sr[ind1]
+    sr2 = sr[ind2]
+    if correct_off:
+        param_names = sr1.model.get_log_name_str()
+        offsets = []
+        par_vals = np.copy(sr2.param_estimates)
+        for k in range(3):
+            m1 = sr1.param_estimates[0,:,k]
+            m2 = sr2.param_estimates[0,:,k]
+            offset = diffexp_fpi(m1,m2,param_names[k],viz=False)[1]
+            par_vals[0,:,k] -= offset
+
+        fc_par = (sr1.param_estimates-par_vals)/np.log10(2)
+    else:
+        fc_par = (sr1.param_estimates-sr2.param_estimates)/np.log10(2)  #Get FCs between cluster params
+
+    # print('fc_par.shape: ',fc_par.shape)
+    if nuc:
+        fc_s_par = np.log2(sd.layers[0][:,sr1.filt].mean(1)/sd.layers[0][:,sr2.filt].mean(1))
+    else:
+        fc_s_par = np.log2(sd.layers[1][:,sr1.filt].mean(1)/sd.layers[1][:,sr2.filt].mean(1)) #Get spliced FCs
+
+    # print('fc_s_par.shape: ',fc_s_par.shape)
+
+    if outlier_de:
+        dr_analysis = monod.analysis.diffexp_pars(sr1,sr2,viz=True,modeltype='id',use_sigma=True)
+        par_bool_de = dr_analysis[1].T
+
+    parnames = ('b','beta','gamma')
+
+
+  #-----is parameter FC significant -----
+    if gf_rej is False:
+        gf_rej = [True]*sd.n_genes
+    else:
+        gf_rej = (~sr1.rejected_genes) & (~sr2.rejected_genes)
+
+    for n in range(len(parnames)):
+        #Boolean for if large param FC and not rejected gene (with minimum expression)
+        if nuc:
+            gf_highnoise = (np.abs(fc_par[0,:,n])>thrpars)  \
+                & ((sd.layers[0][:,sr1.filt].mean(1)>thrmean) | (sd.layers[0][:,sr2.filt].mean(1)>thrmean)) \
+                & gf_rej
+        else:
+            gf_highnoise = (np.abs(fc_par[0,:,n])>thrpars)  \
+                & ((sd.layers[1][:,sr1.filt].mean(1)>thrmean) | (sd.layers[1][:,sr2.filt].mean(1)>thrmean)) \
+                & gf_rej
+
+        #Boolean for FC (above) but no FC detected at S-level
+        gf_highnoise_meanS = gf_highnoise & (np.abs(fc_s_par)<1) & gf_rej
+
+        #Boolean for FC (above)
+        gf_onlyhigh = gf_highnoise & gf_rej
+
+        #For dataframe
+        fcs += list(fc_par[0,gf_rej,n])
+        g_names += list(sr1.gene_names[gf_rej])
+        which_pair += [[sr1.assigns,sr2.assigns]]*np.sum(gf_rej)
+        highFC += list(gf_onlyhigh[gf_rej])
+        spliceFC += list(gf_highnoise_meanS[gf_rej])
+        types += [parnames[n]]*np.sum(gf_rej)
+        if outlier_de:
+            out_de += list(par_bool_de[gf_rej,n])
+
+    if outlier_de:
+        all_filt_fcs['deTheta_outlier'] = out_de
+
+    all_filt_fcs['log2FC'] = fcs
+    all_filt_fcs['gene'] = g_names
+    all_filt_fcs['cluster_pair'] = which_pair
+    all_filt_fcs['deTheta_FC'] = highFC
+    all_filt_fcs['deTheta_noDeMuS'] = spliceFC
+    all_filt_fcs['param'] = types
+
+    return all_filt_fcs

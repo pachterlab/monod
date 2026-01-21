@@ -1,19 +1,57 @@
-from .cme_toolbox import CMEModel
-from .inference import SearchResults, plot_hist_and_fit
-from .extract_data import SearchData, normalize_count_matrix
-from .preprocess import make_dir, log
-from .plot_aesthetics import aesthetics
+from cme_toolbox import CMEModel
+from inference import SearchResults, plot_hist_and_fit
+# from extract_data import SearchData, normalize_count_matrix
+# from preprocess import make_dir, log
+from plot_aesthetics import aesthetics
 import pickle
 import scipy
 from scipy import stats
 from scipy import odr
 import numpy as np
 import matplotlib.pyplot as plt
+from extract_data import log
+import sys
+
+import logging
+logging.basicConfig(stream=sys.stdout)
+log = logging.getLogger()
+log.setLevel(logging.INFO)
 
 
 ########################
 ## Helper functions
 ########################
+
+def run_qc(monod_adata, mek_means_params=None,cluster=0, discard_rejected=True, marg='joint'):
+    sd = monod_adata.uns['search_data']
+
+    if not mek_means_params:
+        sr = monod_adata.uns['search_result']
+    else:
+        sr = monod_adata.uns['search_result_list'][cluster]
+        
+    fig1,ax1 = plt.subplots(1,1)
+    sr.find_sampling_optimum()
+    # sr.plot_landscape(ax1)d
+
+    fig1,ax1 = plt.subplots(1,1)
+    sr.plot_KL(ax1, discard_rejected=discard_rejected)
+
+    sr.plot_gene_distributions(sd,marg=marg)
+
+    # _=sr.chisquare_testing(sd)
+    # if monod_adata.n_vars >=60:
+    #     sr.resample_opt_viz()
+    #     sr.resample_opt_mc_viz()
+    # sr.chisq_best_param_correction(sd,viz=True) 
+
+    # sr.compute_sigma(sd,num_cores=1) #colab has a hard time with multiprocessing
+    # sr.plot_param_L_dep(plot_errorbars=True,plot_fit=True)
+    # sr.plot_param_marg(discard_rejected=discard_rejected)
+    # sr.update_on_disk()
+    
+    # # Update the anndata object with the new search result.
+    # monod_adata['search_result'] = sr
 
 
 def load_search_results(full_result_string):
@@ -434,6 +472,108 @@ def compare_AIC_weights(
     plt.savefig(fig_string, dpi=450)
     log.info("Figure stored to {}.".format(fig_string))
 
+def DE_parameters(adata1, adata2=None, modeltype="id",
+    gene_filter_=None,
+    discard_rejected=True,
+    use_sigma=True,
+    figsize=None,
+    meta="12",
+    viz=True,
+    pval_thr=0.001,
+    nit=10, save_cluster_FCs=True):
+
+    if modeltype != 'id':
+        raise Exception('Model type not implemented for DE_parameters.')
+
+    # If 2 dataframes are given, compare two datasets.
+    if adata2:
+        mek_means = False
+
+        if not (adata1.var_names == adata2.var_names).all():
+            raise KeyError('Genes are not the same between datasets')
+            # log.error('Genes are not the same between datasets')
+    
+        sr1, sr2 = adata1.uns['search_result'], adata2.uns['search_result']
+            
+        gn, gf, offs, resid = diffexp_pars(sr1, sr2, modeltype=modeltype,
+        gene_filter_=gene_filter_,
+        discard_rejected=discard_rejected,
+        use_sigma=use_sigma,
+        figsize=figsize,
+        meta=meta,
+        viz=viz,
+        pval_thr=pval_thr,
+        nit=nit)
+        
+        param_strings = adata1.uns['model'].get_log_name_str()
+        fold_changes = offs + resid
+    
+        # Save fold changes and adjusted fold changes (with offset removed).
+        for i, param in enumerate(param_strings):
+            without_log = param.replace(r"\log_{10} ", "")
+
+            FC_label = "FC_{}".format(without_log)
+            adata2.var[FC_label] = fold_changes[i]
+            adata1.var[FC_label] = -fold_changes[i]
+
+            # Save adjusted parameters, subtracting the offset from adata2
+            adjusted_param_label = "adj_{}".format(without_log)
+            adata2.var[adjusted_param_label] = adata2.var[without_log] - offs[i]
+        
+            adj_fold_changes = resid[i]
+
+            adj_FC_label = "adj_FC_{}".format(without_log)
+            adata2.var[adj_FC_label] = adj_fold_changes
+            adata1.var[adj_FC_label] = -adj_fold_changes
+
+        print('Fold changes saved to each dataframe under .var, e.g. ' + FC_label)
+        print('Adjusted parameter values (subtracting the average fold change) saved to the second dataframe under .var, e.g. ' + adjusted_param_label)
+        print('Adjusted fold changes (subtracting the average fold change) saved to each dataframe under .var, e.g. ' + adj_FC_label)
+               
+    else:
+        
+        mek_means = True
+        sr_list = adata1.uns['search_result_list']
+    
+        gn, gf, offs, resid = {}, {}, {}, {}
+    
+        for i in range(len(sr_list)):
+            for j in range(i+1, len(sr_list)):
+                
+                sr1, sr2 = sr_list[i], sr_list[j]
+                cluster1, cluster2 = sr1.assigns, sr2.assigns
+                dict_key = (cluster1, cluster2)
+                print('Clusters:', dict_key)
+                
+                gn_clusts, gf_clusts, offs_clusts, resid_clusts = \
+                    diffexp_pars(sr1, sr2, modeltype=modeltype,
+                                gene_filter_=gene_filter_,
+                                discard_rejected=discard_rejected,
+                                use_sigma=use_sigma,
+                                figsize=figsize,
+                                meta=meta,
+                                viz=viz,
+                                pval_thr=pval_thr,
+                                nit=nit)
+                plt.show()
+
+                gn[dict_key], gf[dict_key], offs[dict_key], resid[dict_key] = gn_clusts, gf_clusts, offs_clusts, resid_clusts
+                
+                if save_cluster_FCs:
+                    param_strings = adata1.uns['model'].get_log_name_str()
+                    fold_changes = offs_clusts + resid_clusts
+                
+                    # Save fold changes.
+                    for i, param in enumerate(param_strings):
+                        without_log = param.replace(r"\log_{10} ", "")
+                        FC_label = "FC_{}_{}".format(without_log, dict_key)
+                        adata1.var[FC_label] = fold_changes[i]
+
+                    print('Fold changes between two clusters recorded in .var in form: ' + FC_label + ', where the tuple (i,j) represents the fold change between cluster i and j.')
+    
+
+    return gn, gf, offs, resid
+    
 
 def diffexp_pars(
     sr1,
@@ -582,11 +722,13 @@ def diffexp_pars(
             ax.legend()
     if viz:
         fig1.tight_layout()
-        fig_string = f"{sr1.batch_analysis_string}/parameter_residuals_{meta}.png"
-        plt.savefig(fig_string, dpi=450)
-        log.info("Figure stored to {}.".format(fig_string))
+        # fig_string = f"{sr1.batch_analysis_string}/parameter_residuals_{meta}.png"
+        # plt.savefig(fig_string, dpi=450)
+        # log.info("Figure stored to {}.".format(fig_string))
 
     return gn, np.asarray(gf), np.asarray(offs), np.asarray(resid)
+
+# def diffexp_pars_plot(gn, gf, offs, resid)
 
 
 def linoffset(B, x, modeltype="id"):
@@ -634,6 +776,7 @@ def diffexp_fpi(
 
     This function uses the optimal physical and sampling parameters obtained for a pair of datasets
     to attempt to identify differentially expressed genes under a model of transcription, for a single stest statistic.
+    
     Specifically, it uses a fixed-point iteration (FPI) procedure to distinguish a set of genes with
     Gaussian aleatory variation from a set with systematic, high-magnitude deviations between the datasets.
 
@@ -709,6 +852,7 @@ def diffexp_fpi(
             resid = m2 - m1 * out.beta[1] - out.beta[0]
 
         fitparams = fitlaw.fit(resid[gf])
+
         x = np.linspace(resid.min(), resid.max(), 100)
         p = fitlaw.pdf(x, *fitparams)
         if j == 0 and viz:
