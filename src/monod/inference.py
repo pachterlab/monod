@@ -1048,7 +1048,6 @@ class GradientInference:
                 bounds=self.grad_bnd,
                 options={
                     "maxiter": self.gradient_params["max_iterations"],
-                    "disp": False,
                 },
             )
             if (

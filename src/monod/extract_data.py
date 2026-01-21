@@ -26,7 +26,7 @@ from scipy.sparse import issparse
 
 logging.basicConfig(stream=sys.stdout)
 log = logging.getLogger()
-log.setLevel(logging.DEBUG)
+log.setLevel(logging.WARNING)
 
 import logging.config
 
