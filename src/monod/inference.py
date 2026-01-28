@@ -2371,6 +2371,7 @@ class SearchResults:
         marg="joint",
         logscale=None,
         title=True,
+        show_axes=False,
         genes_to_plot=None,
         savefig=True,
     ):
@@ -2485,10 +2486,19 @@ class SearchResults:
                 if hasattr(self, "rejected_genes") and self.rejected_genes[i_]:
                     titlestr += " (rej.)"
                 ax1[axloc].set_title(titlestr, fontdict={"fontsize": 9})
-            ax1[axloc].set_xticks([])
-            ax1[axloc].set_yticks([])
+            if show_axes:
+                if axloc % sz[1] != 0:
+                    ax1[axloc].set_yticks([])
+                if axloc < (sz[0] - 1) * sz[1]:
+                    ax1[axloc].set_xticks([])
+            else:
+                ax1[axloc].set_xticks([])
+                ax1[axloc].set_yticks([])
             j_ += 1
-        fig1.tight_layout(pad=0.02)
+        if show_axes:
+            fig1.supxlabel(self.modalities[0 if num_modalities == 2 else 1])
+            fig1.supylabel(self.modalities[1 if num_modalities == 2 else 2])
+        fig1.tight_layout(pad=0.02, rect=[0.05, 0.05, 0.98, 0.98])
 
         if savefig:
             fig_string = (

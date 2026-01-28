@@ -22,7 +22,8 @@ log.setLevel(logging.INFO)
 ## Helper functions
 ########################
 
-def run_qc(monod_adata, mek_means_params=None,cluster=0, discard_rejected=True, marg='joint'):
+def run_qc(monod_adata, mek_means_params=None,cluster=0, discard_rejected=True, marg='joint',
+           gene_dist_size=(5, 5), show_axes=False):
     sd = monod_adata.uns['search_data']
 
     if not mek_means_params:
@@ -37,7 +38,7 @@ def run_qc(monod_adata, mek_means_params=None,cluster=0, discard_rejected=True, 
     fig1,ax1 = plt.subplots(1,1)
     sr.plot_KL(ax1, discard_rejected=discard_rejected)
 
-    sr.plot_gene_distributions(sd,marg=marg)
+    sr.plot_gene_distributions(sd,marg=marg, sz=gene_dist_size, show_axes = show_axes)
 
     # _=sr.chisquare_testing(sd)
     # if monod_adata.n_vars >=60:
