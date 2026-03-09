@@ -1,5 +1,5 @@
 """
-This script provides convenience functions for evaluating RNA distributions. 
+This script provides convenience functions for evaluating RNA distributions.
 """
 
 import numpy as np
@@ -11,6 +11,17 @@ from scipy.fft import irfftn
 
 # from .nn_toolbox import basic_ml_bivariate, ml_microstate_logP
 from extract_data import log
+
+# ---------------------------------------------------------------------------
+# Optional Rust backend (monod_core).  When available, eval_model_pss for
+# 2-modality models with seq_model="None" and amb_model="None" is delegated
+# to the Rust implementation (same results, faster computation).
+# ---------------------------------------------------------------------------
+try:
+    import monod_core as _mc
+    _HAS_RUST = True
+except ImportError:
+    _HAS_RUST = False
 
 class CMEModel:
     """Stores and evaluates biological and technical variation models.
@@ -427,6 +438,30 @@ class CMEModel:
         # ):
         #     return basic_ml_bivariate(p, limits)
         # else:
+
+        # Fast path: delegate to Rust for 2-modality models with no sequencing
+        # or ambiguity model and fixed-quadrature method.
+        _RUST_MODELS_2D = {
+            "Constitutive", "Bursty", "CIR",
+            "Extrinsic", "Delay", "DelayedSplicing",
+        }
+        if (
+            _HAS_RUST
+            and self.bio_model in _RUST_MODELS_2D
+            and self.seq_model == "None"
+            and self.amb_model == "None"
+            and self.quad_method == "fixed_quad"
+            and samp is None
+        ):
+            pss_flat = _mc.eval_model_pss_2d(
+                self.bio_model,
+                p.tolist(),
+                [int(x) for x in limits],
+                float(self.fixed_quad_T),
+                int(self.quad_order),
+            )
+            pss = np.array(pss_flat).reshape(int(limits[0]), int(limits[1]))
+            return pss.squeeze()
 
         if (self.amb_model != "None") and (len(limits) == 2):
             raise ValueError("Please specify a limit for the ambiguous species.")
