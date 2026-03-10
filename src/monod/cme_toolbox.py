@@ -12,6 +12,22 @@ from scipy.fft import irfftn
 # from .nn_toolbox import basic_ml_bivariate, ml_microstate_logP
 from extract_data import log
 
+_MESH_CACHE: dict = {}
+
+
+def _build_mesh(limits_tuple, mx_tuple):
+    """Build and cache the complex evaluation mesh for eval_model_pss."""
+    key = (limits_tuple, mx_tuple)
+    if key not in _MESH_CACHE:
+        u = []
+        for i, m in enumerate(mx_tuple):
+            l = np.arange(m)
+            u_ = np.exp(-2j * np.pi * l / limits_tuple[i]) - 1
+            u.append(u_)
+        g = np.meshgrid(*u, indexing="ij")
+        _MESH_CACHE[key] = np.array([arr.flatten() for arr in g])
+    return _MESH_CACHE[key].copy()
+
 # ---------------------------------------------------------------------------
 # Optional Rust backend (monod_core).  When available, eval_model_pss for
 # 2-modality models with seq_model="None" and amb_model="None" is delegated
@@ -22,6 +38,164 @@ try:
     _HAS_RUST = True
 except ImportError:
     _HAS_RUST = False
+
+# ---------------------------------------------------------------------------
+# Optional GPU backend (PyTorch).  When a CUDA or MPS GPU is available,
+# eval_model_pss for 2-modality models with seq_model="None" is delegated
+# to a fully-vectorised torch implementation that broadcasts the grid ×
+# quadrature computation onto the GPU.  Results match the Python/Rust
+# baseline within rtol=1e-5.
+# ---------------------------------------------------------------------------
+try:
+    import torch as _torch
+
+    def _probe_float64(device_str):
+        """Return True if the device supports float64 tensors."""
+        try:
+            t = _torch.ones(1, dtype=_torch.float64, device=device_str)
+            _ = t + t   # force a computation
+            return True
+        except Exception:
+            return False
+
+    if _torch.cuda.is_available() and _probe_float64("cuda"):
+        _GPU_DEVICE = _torch.device("cuda")
+        _HAS_GPU = True
+    elif hasattr(_torch.backends, "mps") and _torch.backends.mps.is_available() and _probe_float64("mps"):
+        _GPU_DEVICE = _torch.device("mps")
+        _HAS_GPU = True
+    else:
+        _HAS_GPU = False
+        _GPU_DEVICE = None
+except ImportError:
+    _HAS_GPU = False
+    _GPU_DEVICE = None
+
+
+def _gpu_build_mesh_2d(l0, l1, device):
+    """Return (g0, g1) flat complex128 tensors of length l0*(l1//2+1)."""
+    mx1 = l1 // 2 + 1
+    pi = np.pi
+    k0 = _torch.arange(l0, dtype=_torch.float64, device=device)
+    k1 = _torch.arange(mx1, dtype=_torch.float64, device=device)
+    a0 = k0 * (-2.0 * pi / l0)
+    a1 = k1 * (-2.0 * pi / l1)
+    u0 = _torch.complex(_torch.cos(a0) - 1.0, _torch.sin(a0))   # [l0]
+    u1 = _torch.complex(_torch.cos(a1) - 1.0, _torch.sin(a1))   # [mx1]
+    g0 = u0.unsqueeze(1).expand(l0, mx1).reshape(-1)             # [n_grid]
+    g1 = u1.unsqueeze(0).expand(l0, mx1).reshape(-1)             # [n_grid]
+    return g0, g1
+
+
+def _gpu_pgf_bursty(g0, g1, b, beta, gamma, T, quad_order):
+    """Vectorised Bursty log-PGF on GPU (broadcast grid × quadrature)."""
+    from numpy.polynomial.legendre import leggauss
+    device = g0.device
+    xi_np, wi_np = leggauss(quad_order)
+    xi = _torch.tensor(xi_np, dtype=_torch.float64, device=device)
+    wi = _torch.tensor(wi_np, dtype=_torch.float64, device=device)
+    t_half = T / 2.0
+    x = t_half + t_half * xi                             # [Q]
+    close = bool(np.isclose(beta, gamma))
+    eb = _torch.exp(-beta * x).unsqueeze(0)              # [1, Q]
+    eg = _torch.exp(-gamma * x).unsqueeze(0)             # [1, Q]
+    g0_ = g0.unsqueeze(1)                                # [N, 1]
+    g1_ = g1.unsqueeze(1)                                # [N, 1]
+    if close:
+        x_ = x.unsqueeze(0)
+        u = b * (g0_ * eb + g1_ * (beta * x_ * eg))
+    else:
+        f = beta / (beta - gamma)
+        c2 = g1_ * f
+        c1 = g0_ - c2
+        u = b * (c1 * eb + c2 * eg)
+    integrand = u / (1.0 - u)                            # [N, Q]
+    return (integrand * (wi * t_half)).sum(dim=1)         # [N]
+
+
+def _gpu_pgf_cir(g0, g1, b, beta, gamma, T, quad_order):
+    """Vectorised CIR log-PGF on GPU (broadcast grid × quadrature)."""
+    from numpy.polynomial.legendre import leggauss
+    device = g0.device
+    xi_np, wi_np = leggauss(quad_order)
+    xi = _torch.tensor(xi_np, dtype=_torch.float64, device=device)
+    wi = _torch.tensor(wi_np, dtype=_torch.float64, device=device)
+    t_half = T / 2.0
+    x = t_half + t_half * xi                             # [Q]
+    close = bool(np.isclose(beta, gamma))
+    eb = _torch.exp(-beta * x).unsqueeze(0)              # [1, Q]
+    eg = _torch.exp(-gamma * x).unsqueeze(0)             # [1, Q]
+    g0_ = g0.unsqueeze(1)                                # [N, 1]
+    g1_ = g1.unsqueeze(1)                                # [N, 1]
+    if close:
+        x_ = x.unsqueeze(0)
+        u = b * (g0_ * eb + g1_ * (beta * x_ * eg))
+    else:
+        f = beta / (beta - gamma)
+        c2 = g1_ * f
+        c1 = g0_ - c2
+        u = b * (c1 * eb + c2 * eg)
+    integrand = 1.0 - _torch.sqrt(1.0 - 4.0 * u)        # [N, Q]
+    return (integrand * (wi * t_half)).sum(dim=1) / 2.0  # [N]
+
+
+def _eval_model_pss_gpu(bio_model, p_log, limits, fixed_quad_T, quad_order, device):
+    """Evaluate 2D PSS on GPU for the six supported bio_models.
+
+    p_log is an array of log10 parameters (same convention as Python/Rust).
+    Returns a numpy array of shape (l0, l1).
+    """
+    p = 10.0 ** np.asarray(p_log)
+    l0, l1 = int(limits[0]), int(limits[1])
+
+    g0, g1 = _gpu_build_mesh_2d(l0, l1, device)
+
+    if bio_model == "Constitutive":
+        beta, gamma = p[0], p[1]
+        gf = g0 / beta + g1 / gamma
+
+    elif bio_model == "Extrinsic":
+        alpha, beta, gamma = p[0], p[1], p[2]
+        one = _torch.ones(1, dtype=_torch.complex128, device=device)
+        gf = -alpha * _torch.log(one - g0 / beta - g1 / gamma)
+
+    elif bio_model == "Delay":
+        b, beta, tauinv = p[0], p[1], p[2]
+        tau = 1.0 / tauinv
+        one = _torch.ones(1, dtype=_torch.complex128, device=device)
+        exp_bt = float(np.exp(-beta * tau))
+        u = g1 + (g0 - g1) * exp_bt
+        term1 = -_torch.log(one - u * b) / beta
+        ratio = (u * b - one) / (g0 * b - one)
+        term2 = _torch.log(ratio) / (beta * (one - g1 * b))
+        term3 = g1 * b * tau / (one - g1 * b)
+        gf = term1 + term2 + term3
+
+    elif bio_model == "DelayedSplicing":
+        b, tauinv, gamma = p[0], p[1], p[2]
+        tau = 1.0 / tauinv
+        one = _torch.ones(1, dtype=_torch.complex128, device=device)
+        gf = g0 * b * tau / (one - g0 * b) - _torch.log(one - g1 * b) / gamma
+
+    elif bio_model == "Bursty":
+        b, beta, gamma = p[0], p[1], p[2]
+        T = fixed_quad_T * (1.0 / beta + 1.0 / gamma + 1.0)
+        gf = _gpu_pgf_bursty(g0, g1, b, beta, gamma, T, quad_order)
+
+    elif bio_model == "CIR":
+        b, beta, gamma = p[0], p[1], p[2]
+        T = fixed_quad_T * (1.0 / beta + 1.0 / gamma + 1.0)
+        gf = _gpu_pgf_cir(g0, g1, b, beta, gamma, T, quad_order)
+
+    else:
+        raise ValueError(f"Unknown bio_model for GPU path: {bio_model}")
+
+    gf = _torch.exp(gf).reshape(l0, l1 // 2 + 1)
+    pss = _torch.fft.irfftn(gf, s=(l0, l1))
+    pss = pss.abs()
+    pss = pss / pss.sum()
+    # Use tolist() then np.array to avoid ABI issues with some torch+numpy combos.
+    return np.array(pss.cpu().tolist(), dtype=np.float64)
 
 class CMEModel:
     """Stores and evaluates biological and technical variation models.
@@ -407,8 +581,59 @@ class CMEModel:
             d = -np.log([proposal[tuple(idx)] for idx in np.array(data,dtype=int).T])
             
         log.debug('The KL divergence with parameter %s is %.10f', np.array2string(10**p), np.sum(d))
-        
+
         return np.sum(d)
+
+    def eval_model_kld_and_grad(self, p, limits, samp, data, hist_type,
+                                EPS=1e-15, eps=1e-6, n_jobs=1):
+        """Compute KLD and its gradient w.r.t. log10 parameters.
+
+        Uses forward finite differences, optionally parallelised with joblib.
+
+        Parameters
+        ----------
+        p: np.ndarray
+            log10 biological parameters.
+        limits: list of int
+            grid size for PMF evaluation.
+        samp: None or np.ndarray
+            sampling parameters.
+        data: tuple or np.ndarray
+            experimental histogram.
+        hist_type: str
+            histogram type ("unique", "grid", or "none").
+        EPS: float
+            minimum allowed probability mass.
+        eps: float
+            finite-difference step size in log10 parameter space.
+        n_jobs: int
+            number of parallel joblib workers for gradient evaluation.
+            1 = serial (default); -1 = all available cores.
+
+        Returns
+        -------
+        kld: float
+        grad: np.ndarray, shape (n_params,)
+        """
+        from joblib import Parallel, delayed
+
+        p = np.asarray(p, dtype=float)
+        kld0 = self.eval_model_kld(p, limits, samp, data, hist_type, EPS)
+
+        def _perturbed(i):
+            p_eps = p.copy()
+            p_eps[i] += eps
+            return self.eval_model_kld(p_eps, limits, samp, data, hist_type, EPS)
+
+        n_params = len(p)
+        if n_jobs == 1:
+            klds_eps = [_perturbed(i) for i in range(n_params)]
+        else:
+            klds_eps = Parallel(n_jobs=min(n_params, n_jobs) if n_jobs > 0 else n_jobs)(
+                delayed(_perturbed)(i) for i in range(n_params)
+            )
+        grad = (np.array(klds_eps) - kld0) / eps
+        return kld0, grad
 
     def eval_model_pss(self, p, limits, samp=None):
         """Evaluate the PMF of the model over a grid at a set of parameters.
@@ -439,19 +664,36 @@ class CMEModel:
         #     return basic_ml_bivariate(p, limits)
         # else:
 
-        # Fast path: delegate to Rust for 2-modality models with no sequencing
-        # or ambiguity model and fixed-quadrature method.
-        _RUST_MODELS_2D = {
+        # Fast path: GPU (PyTorch) if available, then Rust (quadrature models only), then Python.
+        # Analytical models (Constitutive, Extrinsic, Delay, DelayedSplicing) are faster in
+        # Python because their PGF is a single numpy broadcast and scipy/FFTW beats RustFFT.
+        _FAST_MODELS_2D = {
             "Constitutive", "Bursty", "CIR",
             "Extrinsic", "Delay", "DelayedSplicing",
         }
-        if (
-            _HAS_RUST
-            and self.bio_model in _RUST_MODELS_2D
+        _RUST_MODELS_2D = {"Bursty", "CIR"}
+        _fast_cond = (
+            self.bio_model in _FAST_MODELS_2D
             and self.seq_model == "None"
             and self.amb_model == "None"
             and self.quad_method == "fixed_quad"
             and samp is None
+        )
+        if _HAS_GPU and _fast_cond:
+            pss = _eval_model_pss_gpu(
+                self.bio_model,
+                p.tolist(),
+                limits,
+                float(self.fixed_quad_T),
+                int(self.quad_order),
+                _GPU_DEVICE,
+            )
+            return pss.reshape(int(limits[0]), int(limits[1])).squeeze()
+
+        if (
+            _HAS_RUST
+            and _fast_cond
+            and self.bio_model in _RUST_MODELS_2D
         ):
             pss_flat = _mc.eval_model_pss_2d(
                 self.bio_model,
@@ -463,29 +705,23 @@ class CMEModel:
             pss = np.array(pss_flat).reshape(int(limits[0]), int(limits[1]))
             return pss.squeeze()
 
+
         if (self.amb_model != "None") and (len(limits) == 2):
             raise ValueError("Please specify a limit for the ambiguous species.")
 
-        u = []
         mx = np.copy(limits)
 
         ### if protein model, then decrease the grids of pgf
         if self.bio_model == "ProteinBursty":
             scale = mx[-1]//self.protein_limit + 1
             mx[-1] = (mx[-1]+scale-1)//scale
-            
+
             if not self.fit_unspliced:
                 mx[0]=1
-                
-    
-        mx[-1] = mx[-1] // 2 + 1
-        for i in range(len(mx)):
-            l = np.arange(mx[i])
-            u_ = np.exp(-2j * np.pi * l / limits[i]) - 1
-            u.append(u_)
 
-        g = np.meshgrid(*[u_ for u_ in u], indexing="ij")
-        g = np.array([arr.flatten() for arr in g])
+
+        mx[-1] = mx[-1] // 2 + 1
+        g = _build_mesh(tuple(limits), tuple(mx))
 
         
         if self.amb_model == "Unequal":

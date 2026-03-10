@@ -780,7 +780,7 @@ class InferenceParameters:
                 )
             )
 
-    def fit_all_grid_points(self, search_data, num_cores=1):
+    def fit_all_grid_points(self, search_data, num_cores=1, coarse_to_fine=False):
         """Fits the search data for all genes over all grid points.
 
         Parameters
@@ -789,51 +789,74 @@ class InferenceParameters:
             number of cores to use for parallelization over grid points.
         search_data: monod.extract_data.SearchData
             SearchData object with the data to fit.
+        coarse_to_fine: bool, optional
+            If True and more than 1 grid point exists, runs a fast coarse scan
+            first (reduced iterations/restarts), then refines the top-3 grid
+            points with the full gradient_params. Default False.
 
         Returns
         -------
         results: SearchResults object
             Saves search_result to disk and returns it.
-
         """
-
         t1 = time.time()
         warnings.filterwarnings("ignore", category=DeprecationWarning)
-        if num_cores > 1:
-            log.info("Starting parallelized grid scan.")
-            parallelize(
-                function=self.par_fun,
-                iterable=zip(
-                    range(self.n_grid_points),
-                    [[search_data, self.model]] * self.n_grid_points,
-                ),
-                num_cores=num_cores,
-                num_entries=self.n_grid_points,
-                completion_message="Parallelized grid scan complete.",
-                termination_message="The scan has been manually terminated.",
-                error_message="The scan has been terminated due to computation issues. Please check MoM estimates.",
-            )
-        else:
-            log.info("Starting non-parallelized grid scan.")
-            [
-                self.par_fun(x)
-                for x in zip(
-                    range(self.n_grid_points),
-                    [[search_data, self.model]] * self.n_grid_points,
-                )
-            ]
-            log.info("Non-parallelized grid scan complete.")
 
-        # warnings.resetwarnings()
+        def _run_points(point_indices):
+            iterable = zip(point_indices, [[search_data, self.model]] * len(point_indices))
+            if num_cores > 1:
+                log.info("Starting parallelized grid scan (%d points).", len(point_indices))
+                parallelize(
+                    function=self.par_fun,
+                    iterable=iterable,
+                    num_cores=num_cores,
+                    num_entries=len(point_indices),
+                    completion_message="Parallelized grid scan complete.",
+                    termination_message="The scan has been manually terminated.",
+                    error_message="The scan has been terminated due to computation issues. Please check MoM estimates.",
+                )
+            else:
+                log.info("Starting non-parallelized grid scan (%d points).", len(point_indices))
+                [self.par_fun(x) for x in iterable]
+                log.info("Non-parallelized grid scan complete.")
+
+        all_indices = list(range(self.n_grid_points))
+
+        if coarse_to_fine and self.n_grid_points > 1:
+            # ── Phase 1: fast coarse scan over all grid points ────────────────
+            orig_params = self.gradient_params.copy()
+            coarse_params = dict(orig_params)
+            coarse_params["max_iterations"] = max(3, orig_params.get("max_iterations", 10) // 4)
+            coarse_params["num_restarts"] = 1
+            self.gradient_params = coarse_params
+
+            _run_points(all_indices)
+
+            # Read coarse obj_func values from saved files
+            coarse_klds = []
+            for i in all_indices:
+                gp_path = self.inference_string + "/grid_point_" + str(i) + ".gp"
+                with open(gp_path, "rb") as fh:
+                    gp = pickle.load(fh)
+                coarse_klds.append(gp.obj_func)
+
+            # ── Phase 2: refine top-k grid points with full settings ──────────
+            n_refine = min(3, self.n_grid_points)
+            top_k = list(np.argsort(coarse_klds)[:n_refine])
+            log.info("Coarse-to-fine: refining top-%d grid points %s.", n_refine, top_k)
+
+            self.gradient_params = orig_params
+            _run_points(top_k)
+        else:
+            _run_points(all_indices)
+
         results = SearchResults(self, search_data)
         results.aggregate_grid_points()
-
         full_result_string = results.store_on_disk()
-
 
         t2 = time.time()
         log.info("Runtime: {:.1f} seconds.".format(t2 - t1))
-        
+
         return results
 
     def par_fun(self, inputs):
@@ -1035,19 +1058,28 @@ class GradientInference:
         
         hist_type = get_hist_type(search_data)
         for restart in range(self.gradient_params["num_restarts"]):
-            res_arr = scipy.optimize.minimize(
-                lambda x: model.eval_model_kld(
-                    p=x,  # limits=[search_data.M[gene_index],search_data.N[gene_index]],\
+            n_jac_jobs = self.gradient_params.get("n_jac_jobs", 1)
+
+            def _obj_and_grad(x):
+                return model.eval_model_kld_and_grad(
+                    p=x,
                     limits=search_data.M[:, gene_index],
                     samp=self.regressor[gene_index],
                     data=search_data.hist[gene_index],
                     hist_type=hist_type,
-                ),
+                    n_jobs=n_jac_jobs,
+                )
+
+            res_arr = scipy.optimize.minimize(
+                _obj_and_grad,
                 x0=x0[restart],
-                method='Nelder-Mead',
+                method='L-BFGS-B',
+                jac=True,
                 bounds=self.grad_bnd,
                 options={
                     "maxiter": self.gradient_params["max_iterations"],
+                    "ftol": 1e-10,
+                    "gtol": 1e-6,
                 },
             )
             if (
@@ -1084,12 +1116,21 @@ class GradientInference:
         """
         t1 = time.time()
         
-        param_estimates, klds = zip(
-            *[
-                self.optimize_gene(gene_index=gene_index, model=model, search_data=search_data)
-                for gene_index in range(search_data.n_genes)
-            ]
-        )
+        from joblib import Parallel, delayed
+        n_gene_cores = self.gradient_params.get("num_gene_cores", 1)
+        if n_gene_cores != 1:
+            results = Parallel(n_jobs=n_gene_cores)(
+                delayed(self.optimize_gene)(gene_index=i, model=model, search_data=search_data)
+                for i in range(search_data.n_genes)
+            )
+            param_estimates, klds = zip(*results)
+        else:
+            param_estimates, klds = zip(
+                *[
+                    self.optimize_gene(gene_index=gene_index, model=model, search_data=search_data)
+                    for gene_index in range(search_data.n_genes)
+                ]
+            )
 
         klds = np.asarray(klds)
         param_estimates = np.asarray(param_estimates)
