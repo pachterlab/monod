@@ -49,7 +49,8 @@ def perform_inference(h5ad_filepath,
     exclude_sigma=True,
     poisson_average_log_length=5,
     mek_means_params=None,
-    num_cores=1, AIC_EPS=1e-20, AIC_offs=0):
+    num_cores=1, AIC_EPS=1e-20, AIC_offs=0,
+    save=False, checkpoint=False):
     '''
     Load and filter data from h5ad file.
     Run inference procedure for the desired model, save parameters, uncertainty from Hessian and AIC values automatically.
@@ -65,8 +66,9 @@ def perform_inference(h5ad_filepath,
             # For anndata, use the name of the anndata object.
             dataset_string = model.bio_model + '_' + model.seq_model
             log.info("No dataset name given (dataset_string=None). Saving as {}".format(dataset_string))
-        
-    make_dir(dataset_string)
+
+    if save:
+        make_dir(dataset_string)
     
     monod_adata = extract_data(h5ad_filepath,
     model,
@@ -124,7 +126,7 @@ def perform_inference(h5ad_filepath,
 
     if not mek_means_params:
         # Fit the model at all values of technical parameters, and save the location of the results.
-        search_result = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores)
+        search_result = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, checkpoint=checkpoint, save=save)
         log.info('Grid points fit.')
         search_result.find_sampling_optimum(discard_rejected=False)
         parameters_per_gene = search_result.phys_optimum
@@ -133,7 +135,7 @@ def perform_inference(h5ad_filepath,
 
     else:
         # Fit the model at all values of technical parameters, and save the location of the results.
-        search_result_list = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores)
+        search_result_list = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, checkpoint=checkpoint, save=save)
         log.info('Grid points fit.')
 
         cluster_params = {}
@@ -234,19 +236,22 @@ def perform_inference(h5ad_filepath,
 
     if not mek_means_params:
         monod_adata.uns['search_result'] = search_result
-        sr = search_result.store_on_disk()
-        log.info('Search Result stored to %s', sr)
+        if save:
+            sr = search_result.store_on_disk()
+            log.info('Search Result stored to %s', sr)
     else:
         monod_adata.uns['search_result_list'] = search_result_list
 
     monod_adata.uns['search_data'] = search_data
-    inference_string = search_result.inference_string
-    sd = search_data.store_on_disk(inference_string)
 
-    adata_file_path = inference_string + '/monod_adata.pkl'
-    with open(adata_file_path, 'wb') as adfs:
-        pickle.dump(monod_adata, adfs)
-    log.info('Anndata object stored to %s', adata_file_path)
+    if save:
+        inference_string = search_result.inference_string
+        sd = search_data.store_on_disk(inference_string)
+
+        adata_file_path = inference_string + '/monod_adata.pkl'
+        with open(adata_file_path, 'wb') as adfs:
+            pickle.dump(monod_adata, adfs)
+        log.info('Anndata object stored to %s', adata_file_path)
 
     return monod_adata
 
@@ -647,7 +652,8 @@ class InferenceParameters:
         samp_lb=None,
         samp_ub=None,
         gridsize=None,
-        poisson_average_log_length=5
+        poisson_average_log_length=5,
+        save=False,
     ):
         """Initialize the InferenceParameters instance.
 
@@ -723,17 +729,18 @@ class InferenceParameters:
             run_meta = "_" + run_meta
 
         self.dataset_string = dataset_string
-        
+
         inference_string = f"{dataset_string}/{model.bio_model}_{model.seq_model}_"
         for i in range(len(gridsize)):
             inference_string += f"{gridsize[i]:.0f}x"
         inference_string = inference_string[:-1]
         inference_string += f"{run_meta}"
-        
-        make_dir(inference_string)
+
+        if save:
+            make_dir(inference_string)
+            inference_parameter_string = inference_string + "/parameters.pr"
+            self.store_inference_parameters(inference_parameter_string)
         self.inference_string = inference_string
-        inference_parameter_string = inference_string + "/parameters.pr"
-        self.store_inference_parameters(inference_parameter_string)
 
     def construct_grid(self):
         """Creates a grid of points over the two-dimensional technical variation parameter domain.
@@ -780,7 +787,7 @@ class InferenceParameters:
                 )
             )
 
-    def fit_all_grid_points(self, search_data, num_cores=1, coarse_to_fine=False):
+    def fit_all_grid_points(self, search_data, num_cores=1, coarse_to_fine=False, checkpoint=False, save=False):
         """Fits the search data for all genes over all grid points.
 
         Parameters
@@ -793,6 +800,11 @@ class InferenceParameters:
             If True and more than 1 grid point exists, runs a fast coarse scan
             first (reduced iterations/restarts), then refines the top-3 grid
             points with the full gradient_params. Default False.
+        checkpoint: bool, optional
+            If True, write each grid point result to disk as a crash-recovery
+            checkpoint (.gp file). Default False.
+        save: bool, optional
+            If True, write the final SearchResults object to disk. Default False.
 
         Returns
         -------
@@ -801,12 +813,18 @@ class InferenceParameters:
         """
         t1 = time.time()
         warnings.filterwarnings("ignore", category=DeprecationWarning)
+        self._checkpoint = checkpoint
+        if checkpoint:
+            make_dir(self.inference_string)
+
+        # in-memory store: point_index -> GridPointResults
+        gp_results: dict = {}
 
         def _run_points(point_indices):
             iterable = zip(point_indices, [[search_data, self.model]] * len(point_indices))
             if num_cores > 1:
                 log.info("Starting parallelized grid scan (%d points).", len(point_indices))
-                parallelize(
+                returned = parallelize(
                     function=self.par_fun,
                     iterable=iterable,
                     num_cores=num_cores,
@@ -815,9 +833,15 @@ class InferenceParameters:
                     termination_message="The scan has been manually terminated.",
                     error_message="The scan has been terminated due to computation issues. Please check MoM estimates.",
                 )
+                if returned:
+                    for r in returned:
+                        if r is not None:
+                            gp_results[r.point_index] = r
             else:
                 log.info("Starting non-parallelized grid scan (%d points).", len(point_indices))
-                [self.par_fun(x) for x in iterable]
+                for r in [self.par_fun(x) for x in iterable]:
+                    if r is not None:
+                        gp_results[r.point_index] = r
                 log.info("Non-parallelized grid scan complete.")
 
         all_indices = list(range(self.n_grid_points))
@@ -832,13 +856,16 @@ class InferenceParameters:
 
             _run_points(all_indices)
 
-            # Read coarse obj_func values from saved files
+            # Read coarse obj_func values from in-memory dict (fall back to disk if checkpoint)
             coarse_klds = []
             for i in all_indices:
-                gp_path = self.inference_string + "/grid_point_" + str(i) + ".gp"
-                with open(gp_path, "rb") as fh:
-                    gp = pickle.load(fh)
-                coarse_klds.append(gp.obj_func)
+                if i in gp_results:
+                    coarse_klds.append(gp_results[i].obj_func)
+                else:
+                    gp_path = self.inference_string + "/grid_point_" + str(i) + ".gp"
+                    with open(gp_path, "rb") as fh:
+                        gp = pickle.load(fh)
+                    coarse_klds.append(gp.obj_func)
 
             # ── Phase 2: refine top-k grid points with full settings ──────────
             n_refine = min(3, self.n_grid_points)
@@ -851,8 +878,10 @@ class InferenceParameters:
             _run_points(all_indices)
 
         results = SearchResults(self, search_data)
-        results.aggregate_grid_points()
-        full_result_string = results.store_on_disk()
+        results.aggregate_grid_points(gp_results if gp_results else None)
+        if save:
+            make_dir(self.inference_string)
+            results.store_on_disk()
 
         t2 = time.time()
         log.info("Runtime: {:.1f} seconds.".format(t2 - t1))
@@ -872,10 +901,14 @@ class InferenceParameters:
                     SearchData object with the data to fit.
                 entry 1: monod.cme_toolbox.CMEModel
                     CME model used for inference.
+
+        Returns
+        -------
+        GridPointResults or None
         """
         point_index, (search_data, model) = inputs
         grad_inference = GradientInference(self, model, search_data, point_index)
-        grad_inference.fit_all_genes(model, search_data)
+        return grad_inference.fit_all_genes(model, search_data, checkpoint=getattr(self, '_checkpoint', False))
 
 
 class GradientInference:
@@ -1141,8 +1174,8 @@ class GradientInference:
 
         return param_estimates, klds, obj_func, d_time
 
-    def fit_all_genes(self, model, search_data):
-        """Wraps iterate_over_genes and stores the results on disk.
+    def fit_all_genes(self, model, search_data, checkpoint=False):
+        """Wraps iterate_over_genes and optionally stores the results on disk.
 
         Parameters
         ----------
@@ -1150,9 +1183,14 @@ class GradientInference:
             CME model used for inference.
         search_data: monod.extract_data.SearchData
             SearchData object with the data to fit.
+        checkpoint: bool, optional
+            If True, write result to disk as a crash-recovery checkpoint. Default False.
 
+        Returns
+        -------
+        results: GridPointResults
         """
-        
+
         search_out = self.iterate_over_genes(model=model, search_data=search_data)
         results = GridPointResults(
             *search_out,
@@ -1161,7 +1199,9 @@ class GradientInference:
             self.point_index,
             self.inference_string,
         )
-        results.store_grid_point_results()
+        if checkpoint:
+            results.store_grid_point_results()
+        return results
 
 ########################
 ## Helper functions
@@ -1368,14 +1408,35 @@ class SearchResults:
         self.d_time = []
         self.regressor = []
 
-    def aggregate_grid_points(self):
+    def aggregate_grid_points(self, grid_point_results=None):
         """This helper method concatenates all of the grid point results.
 
-        The method runs append_grid_point for all grid points, then removes the original grid point files.
+        Parameters
+        ----------
+        grid_point_results: dict or None, optional
+            If provided, a dict mapping point_index -> GridPointResults for in-memory
+            aggregation. If None or incomplete, falls back to reading .gp files from disk.
         """
         for point_index in range(self.sp.n_grid_points):
-            self.append_grid_point(point_index)
-        self.clean_up()
+            if grid_point_results is not None and point_index in grid_point_results:
+                self._append_from_object(grid_point_results[point_index])
+            else:
+                self.append_grid_point(point_index)
+        self.clean_up(remove_files=(grid_point_results is None))
+
+    def _append_from_object(self, gp):
+        """This helper method updates the result attributes from an in-memory GridPointResults object.
+
+        Parameters
+        ----------
+        gp: GridPointResults
+            in-memory grid point results.
+        """
+        self.param_estimates += [gp.param_estimates]
+        self.klds += [gp.klds]
+        self.obj_func += [gp.obj_func]
+        self.d_time += [gp.d_time]
+        self.regressor += [gp.regressor]
 
     def append_grid_point(self, point_index):
         """This helper method updates the result attributes from a GridPointResult object stored on disk.
@@ -1396,15 +1457,23 @@ class SearchResults:
             self.d_time += [grid_point_results.d_time]
             self.regressor += [grid_point_results.regressor]
 
-    def clean_up(self):
+    def clean_up(self, remove_files=False):
         """This helper method removes temporary files and finalizes the SearchResults object.
 
-        The GridPointResult objects are erased from disk, the attributes are converted to
-        np.ndarrays, and a directory for analysis figures is created.
+        The GridPointResult objects are optionally erased from disk, the attributes are converted to
+        np.ndarrays, and a directory for analysis figures is created (only if inference_string exists).
+
+        Parameters
+        ----------
+        remove_files: bool, optional
+            If True, delete .gp checkpoint files from disk. Default False.
         """
-        for point_index in range(self.sp.n_grid_points):
-            os.remove(self.inference_string + "/grid_point_" + str(point_index) + ".gp")
-        log.info("All grid point data cleaned from disk.")
+        if remove_files:
+            for point_index in range(self.sp.n_grid_points):
+                gp_path = self.inference_string + "/grid_point_" + str(point_index) + ".gp"
+                if os.path.exists(gp_path):
+                    os.remove(gp_path)
+            log.info("All grid point data cleaned from disk.")
         self.param_estimates = np.asarray(self.param_estimates)
         self.klds = np.asarray(self.klds)
         self.obj_func = np.asarray(self.obj_func)
@@ -1413,7 +1482,8 @@ class SearchResults:
 
         analysis_figure_string = self.inference_string + "/analysis_figures"
         self.analysis_figure_string = analysis_figure_string
-        make_dir(analysis_figure_string)
+        if os.path.isdir(self.inference_string):
+            make_dir(analysis_figure_string)
 
     def store_on_disk(self):
         """This helper method attempts to store the SearchResults object to disk.
