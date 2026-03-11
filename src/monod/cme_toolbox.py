@@ -705,6 +705,26 @@ class CMEModel:
             pss = np.array(pss_flat).reshape(int(limits[0]), int(limits[1]))
             return pss.squeeze()
 
+        # Rust fast-path for Poisson technical noise (Bursty/CIR only).
+        # Poisson transform g → exp(λ·g) − 1 is applied inside Rust per gene.
+        if (
+            _HAS_RUST
+            and self.bio_model in _RUST_MODELS_2D
+            and self.seq_model == "Poisson"
+            and self.amb_model == "None"
+            and self.quad_method == "fixed_quad"
+            and samp is not None
+        ):
+            pss_flat = _mc.eval_model_pss_2d(
+                self.bio_model,
+                p.tolist(),
+                [int(x) for x in limits],
+                float(self.fixed_quad_T),
+                int(self.quad_order),
+                samp.tolist(),
+            )
+            pss = np.array(pss_flat).reshape(int(limits[0]), int(limits[1]))
+            return pss.squeeze()
 
         if (self.amb_model != "None") and (len(limits) == 2):
             raise ValueError("Please specify a limit for the ambiguous species.")

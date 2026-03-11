@@ -18,6 +18,25 @@ from plot_aesthetics import aesthetics
 from tqdm import tqdm
 code_ver_global = "029"  # bumping up version April 2024
 
+# ---------------------------------------------------------------------------
+# uns serialization helpers (mirrors extract_data._uns_pack / _uns_unpack)
+# ---------------------------------------------------------------------------
+
+def _uns_pack(obj):
+    """Pickle *obj* to a uint8 array for storage in adata.uns."""
+    return np.frombuffer(pickle.dumps(obj), dtype=np.uint8)
+
+def _uns_unpack(v):
+    """Restore an object previously packed with _uns_pack (no-op otherwise)."""
+    if isinstance(v, (bytes, np.ndarray)) and (
+        isinstance(v, bytes) or (isinstance(v, np.ndarray) and v.dtype == np.uint8)
+    ):
+        try:
+            return pickle.loads(bytes(v))
+        except Exception:
+            pass
+    return v
+
 # from tqdm.contrib.concurrent import process_map  # or thread_map
 # warnings.filterwarnings("ignore", category=DeprecationWarning) #let's do more gargeted stuff...
 
@@ -235,14 +254,14 @@ def perform_inference(h5ad_filepath,
     # Also save entire objects to adata.
 
     if not mek_means_params:
-        monod_adata.uns['search_result'] = search_result
+        monod_adata.uns['search_result'] = _uns_pack(search_result)
         if save:
             sr = search_result.store_on_disk()
             log.info('Search Result stored to %s', sr)
     else:
-        monod_adata.uns['search_result_list'] = search_result_list
+        monod_adata.uns['search_result_list'] = _uns_pack(search_result_list)
 
-    monod_adata.uns['search_data'] = search_data
+    monod_adata.uns['search_data'] = _uns_pack(search_data)
 
     if save:
         inference_string = search_result.inference_string
@@ -262,7 +281,7 @@ def searchdata_from_adata(adata):
     # NB the order of the layers here will be enforced to be the same as the order of the model 
     # modalities defined in cme_toolbox.
     modality_name_dict = adata.uns['modality_name_dict']
-    model = adata.uns['model']
+    model = _uns_unpack(adata.uns['model'])
 
     ordered_modalities = model.model_modalities
     ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
@@ -271,7 +290,7 @@ def searchdata_from_adata(adata):
 
     M = adata.uns['M']
 
-    hist = adata.uns['hist']
+    hist = _uns_unpack(adata.uns['hist'])
 
     moments = get_gene_moments(adata)
 
@@ -372,9 +391,9 @@ def reject_genes(adata, viz=False,
     '''
 
     if not mek_means:
-        search_data = adata.uns['search_data']
+        search_data = _uns_unpack(adata.uns['search_data'])
         try:
-            search_result = adata.uns['search_result']
+            search_result = _uns_unpack(adata.uns['search_result'])
         except AttributeError:
             log.error('Did you mean to run with meK-Means? If so, make sure to set mek_means=True')
     
@@ -404,13 +423,13 @@ def reject_genes(adata, viz=False,
 
         
         # Reset search_data and search_result.
-        adata.uns['search_data'] = search_data
-        adata.uns['search_result'] = search_result
+        adata.uns['search_data'] = _uns_pack(search_data)
+        adata.uns['search_result'] = _uns_pack(search_result)
         adata.uns['rejection_index'] = search_result.rejection_index
 
     else:
-        search_data = adata.uns['search_data']
-        search_result_list = adata.uns['search_result_list']
+        search_data = _uns_unpack(adata.uns['search_data'])
+        search_result_list = _uns_unpack(adata.uns['search_result_list'])
 
         new_sr_list = []
         
@@ -455,7 +474,7 @@ def reject_genes(adata, viz=False,
             log.info('Hellinger distances for each gene in cluster i have been added as \"ci_hellinger\" in .var')
             
         # Reset search_data and search_result.
-        adata.uns['search_result_list'] = new_sr_list
+        adata.uns['search_result_list'] = _uns_pack(new_sr_list)
         # This is the same for all clusters (all sr objects), so can be set once (correct?)
         adata.uns['rejection_index'] = sr.rejection_index
 
@@ -817,31 +836,47 @@ class InferenceParameters:
         if checkpoint:
             make_dir(self.inference_string)
 
+        from joblib import Parallel, delayed as jdelayed
+
         # in-memory store: point_index -> GridPointResults
         gp_results: dict = {}
 
-        def _run_points(point_indices):
-            iterable = zip(point_indices, [[search_data, self.model]] * len(point_indices))
+        def _run_points(point_indices, init_warm_start=None):
+            """Run optimization for the given grid point indices.
+
+            In serial mode, each grid point warm-starts from the previous point's
+            optimal parameters. In parallel mode, warm-starting is disabled (no
+            shared state across workers).
+
+            Parameters
+            ----------
+            init_warm_start: dict or None
+                Optional mapping point_index -> param array to seed the first
+                warm-start for each point (used in coarse-to-fine Phase 2).
+            """
             if num_cores > 1:
                 log.info("Starting parallelized grid scan (%d points).", len(point_indices))
-                returned = parallelize(
-                    function=self.par_fun,
-                    iterable=iterable,
-                    num_cores=num_cores,
-                    num_entries=len(point_indices),
-                    completion_message="Parallelized grid scan complete.",
-                    termination_message="The scan has been manually terminated.",
-                    error_message="The scan has been terminated due to computation issues. Please check MoM estimates.",
+                returned = Parallel(n_jobs=num_cores)(
+                    jdelayed(self.par_fun)(idx, search_data, self.model)
+                    for idx in tqdm(point_indices, desc="Grid scan")
                 )
-                if returned:
-                    for r in returned:
-                        if r is not None:
-                            gp_results[r.point_index] = r
-            else:
-                log.info("Starting non-parallelized grid scan (%d points).", len(point_indices))
-                for r in [self.par_fun(x) for x in iterable]:
+                for r in returned:
                     if r is not None:
                         gp_results[r.point_index] = r
+                log.info("Parallelized grid scan complete.")
+            else:
+                log.info("Starting non-parallelized grid scan (%d points).", len(point_indices))
+                prev_params = None
+                for idx in tqdm(point_indices, desc="Grid scan"):
+                    # Pick warm-start: point-specific seed first, then previous point
+                    if init_warm_start is not None and idx in init_warm_start:
+                        ws = init_warm_start[idx].param_estimates
+                    else:
+                        ws = prev_params
+                    r = self.par_fun(idx, search_data, self.model, warm_start=ws)
+                    if r is not None:
+                        gp_results[r.point_index] = r
+                        prev_params = r.param_estimates
                 log.info("Non-parallelized grid scan complete.")
 
         all_indices = list(range(self.n_grid_points))
@@ -867,13 +902,13 @@ class InferenceParameters:
                         gp = pickle.load(fh)
                     coarse_klds.append(gp.obj_func)
 
-            # ── Phase 2: refine top-k grid points with full settings ──────────
+            # ── Phase 2: refine top-k grid points using coarse results as warm-start
             n_refine = min(3, self.n_grid_points)
             top_k = list(np.argsort(coarse_klds)[:n_refine])
             log.info("Coarse-to-fine: refining top-%d grid points %s.", n_refine, top_k)
 
             self.gradient_params = orig_params
-            _run_points(top_k)
+            _run_points(top_k, init_warm_start=gp_results)
         else:
             _run_points(all_indices)
 
@@ -888,26 +923,24 @@ class InferenceParameters:
 
         return results
 
-    def par_fun(self, inputs):
+    def par_fun(self, point_index, search_data, model, warm_start=None):
         """Helper method for the grid point parallelization procedure.
 
         Parameters
         ----------
-        inputs: tuple
-            entry 0: int
-                point index within [0, n_grid_points) to evaluate at.
-            entry 1: tuple
-                entry 0: monod.extract_data.SearchData
-                    SearchData object with the data to fit.
-                entry 1: monod.cme_toolbox.CMEModel
-                    CME model used for inference.
+        point_index: int
+            index within [0, n_grid_points) to evaluate at.
+        search_data: SearchData
+        model: CMEModel
+        warm_start: np.ndarray or None, optional
+            Shape (n_genes, n_phys_pars). If provided, seeds the first L-BFGS-B
+            restart for each gene instead of the method-of-moments estimate.
 
         Returns
         -------
         GridPointResults or None
         """
-        point_index, (search_data, model) = inputs
-        grad_inference = GradientInference(self, model, search_data, point_index)
+        grad_inference = GradientInference(self, model, search_data, point_index, warm_start=warm_start)
         return grad_inference.fit_all_genes(model, search_data, checkpoint=getattr(self, '_checkpoint', False))
 
 
@@ -945,7 +978,7 @@ class GradientInference:
         method of moments estimates for all genes under the current technical variation parameters.
     """
 
-    def __init__(self, global_parameters, model, search_data, point_index):
+    def __init__(self, global_parameters, model, search_data, point_index, warm_start=None):
         """Initialize a GradientInference object.
 
         Parameters
@@ -1027,6 +1060,7 @@ class GradientInference:
         self.n_samp_pars = global_parameters.n_samp_pars
 
         self.inference_string = global_parameters.inference_string
+        self.warm_start = warm_start  # shape (n_genes, n_phys_pars) or None
         if self.gradient_params["init_pattern"] == "moments":
             warnings.filterwarnings("ignore", category=RuntimeWarning)
             self.param_MoM = np.asarray(
@@ -1084,7 +1118,9 @@ class GradientInference:
             self.gradient_params["init_pattern"] == "moments"
         ):  # this can be extended to other initialization patterns, like latin squares
             x0[0] = self.param_MoM[gene_index]
-        #x = x0[0]
+        # Warm-start: override first restart with previous grid point's solution
+        if self.warm_start is not None:
+            x0[0] = np.clip(self.warm_start[gene_index], self.phys_lb, self.phys_ub)
         err = np.inf
         ERR_THRESH = 0.99
         log.info('Optimizing gene %d with initial value %s', gene_index, np.array2string(10**x0))
@@ -2706,9 +2742,9 @@ def parallelize(
     error_message="Parallelization terminated due to error.",
     use_tqdm=True,
 ):
-    """Helper function to safely parallelize computations.
+    """Helper function to safely parallelize computations using joblib.
 
-    Inputs a single-parameter function and an iterable, requests a number of cores, \
+    Inputs a single-parameter function and an iterable, requests a number of cores,
     and gracefully shuts down if needed.
 
     Parameters
@@ -2716,7 +2752,7 @@ def parallelize(
     function: function
         a one-parameter function that can be mapped using entries of the iterable.
     iterable: iterable
-        an iterable to be passed into the function.        
+        an iterable to be passed into the function.
     num_cores: int
         number of cores to use for parallelization.
     num_entries: int
@@ -2732,27 +2768,19 @@ def parallelize(
 
     Returns
     -------
-    x: iterable
-        result of applying function to iterable.
-
+    x: list
+        result of applying function to each item in iterable.
     """
+    from joblib import Parallel, delayed
+    x = []
     try:
-        pool = multiprocessing.Pool(processes=num_cores)
-        if use_tqdm:
-            x = list(tqdm(pool.imap(function, iterable), total=num_entries))  # hacky
-        else:
-            x = pool.map(function, iterable)
-        pool.close()
-        pool.join()
+        items = list(tqdm(iterable, total=num_entries) if use_tqdm else iterable)
+        x = Parallel(n_jobs=num_cores)(delayed(function)(item) for item in items)
         log.info(completion_message)
     except KeyboardInterrupt:
         log.warning(termination_message)
-        pool.terminate()
-        pool.join()
     except ValueError:
         log.warning(error_message)
-        pool.terminate()
-        pool.join()
     return x
 
 

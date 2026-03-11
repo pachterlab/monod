@@ -20,6 +20,27 @@ from scipy import sparse
 import pandas as pd
 code_ver_global = "029"  # bumping up version April 2024
 
+# ---------------------------------------------------------------------------
+# uns serialization helpers
+# ---------------------------------------------------------------------------
+# anndata's h5ad backend cannot write arbitrary Python objects.  Wrapping them
+# as pickle bytes keeps them round-trip-safe while allowing adata.write_h5ad().
+
+def _uns_pack(obj):
+    """Pickle *obj* to bytes for storage in adata.uns."""
+    return np.frombuffer(pickle.dumps(obj), dtype=np.uint8)
+
+def _uns_unpack(v):
+    """Restore an object previously packed with _uns_pack (no-op otherwise)."""
+    if isinstance(v, (bytes, np.ndarray)) and (
+        isinstance(v, bytes) or v.dtype == np.uint8
+    ):
+        try:
+            return pickle.loads(bytes(v))
+        except Exception:
+            pass
+    return v
+
 import logging, sys
 from scipy.sparse import csr_matrix
 from scipy.sparse import issparse
@@ -210,7 +231,7 @@ def extract_data(
 
 
     monod_adata.uns['modality_name_dict'] = modality_name_dict
-    monod_adata.uns['model'] = model
+    monod_adata.uns['model'] = _uns_pack(model)
 
 
     
@@ -244,7 +265,7 @@ def extract_data(
             visualize_gene_filtering(monod_adata)
 
     # # Save the filter for selected genes, which should be applied to the raw adata.
-    monod_adata.uns['selected_genes'] = monod_adata.var['selected_genes'].astype(bool)
+    monod_adata.uns['selected_genes'] = monod_adata.var['selected_genes'].to_numpy().astype(bool)
 
     # Filter for selected genes.
     monod_adata = monod_adata[:, monod_adata.var['selected_genes'].astype(bool)].to_memory()
@@ -277,11 +298,11 @@ def extract_data(
     monod_adata = add_moments(monod_adata)
     log.debug('Moments were added')
     
-    monod_adata.uns['model'] = model
+    monod_adata.uns['model'] = _uns_pack(model)
 
     hist = make_histogram(monod_adata, hist_type, M)
-    
-    monod_adata.uns['hist'] = hist
+
+    monod_adata.uns['hist'] = _uns_pack(hist)
     # Save adata?
     if mek_means_params:
         monod_adata.uns['k'] = k
@@ -477,7 +498,7 @@ def make_histogram(monod_adata, hist_type, M):
     # modalities defined in cme_toolbox.
 
     modality_name_dict = monod_adata.uns['modality_name_dict']
-    model = monod_adata.uns['model']
+    model = _uns_unpack(monod_adata.uns['model'])
 
     ordered_modalities = model.model_modalities
     ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
@@ -762,7 +783,7 @@ def threshold_by_expression(adata, filt_param={'min_means': [0.01, 0.01],
     adata: anndata.AnnData
         Filtered AnnData object with genes that meet the expression thresholds.
     """
-    model = adata.uns['model']
+    model = _uns_unpack(adata.uns['model'])
     ordered_modalities = model.model_modalities
     modality_name_dict = adata.uns['modality_name_dict']
     ordered_layer_names = [modality_name_dict[mod] for mod in ordered_modalities]
@@ -863,7 +884,7 @@ def visualize_gene_filtering_lengths(monod_adata):
         len_arr = monod_adata.var['log_lengths']
     except AttributeError:
         log.error('No gene lengths given')
-    modality_names = monod_adata.uns['model'].model_modalities
+    modality_names = _uns_unpack(monod_adata.uns['model']).model_modalities
     
     # len_arr = np.array([transcriptome_dict[k] for k in gene_names])
     var_name = tuple([name[0].upper() for name in modality_names[::-1]])
@@ -899,7 +920,7 @@ def visualize_gene_filtering(monod_adata):
     """
     gene_names = monod_adata.var_names
 
-    modality_names = monod_adata.uns['model'].model_modalities
+    modality_names = _uns_unpack(monod_adata.uns['model']).model_modalities
     
     # len_arr = np.array([transcriptome_dict[k] for k in gene_names])
     var_name = tuple([name[0].upper() for name in modality_names[::-1]])

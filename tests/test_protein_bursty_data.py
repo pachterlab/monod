@@ -33,7 +33,7 @@ from conftest import check_snapshot
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "monod"))
 
 from cme_toolbox import CMEModel
-from extract_data import extract_data
+from extract_data import extract_data, _uns_unpack
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -458,7 +458,7 @@ class TestExtractDataPipeline:
 
     def test_usp_histogram_type(self, processed_usp):
         """Histogram should be a list of (coords, freqs) tuples for unique hist_type."""
-        hist = processed_usp.uns["hist"]
+        hist = _uns_unpack(processed_usp.uns["hist"])
         assert isinstance(hist, list)
         assert len(hist) == processed_usp.n_vars
         coords, freqs = hist[0]
@@ -467,11 +467,11 @@ class TestExtractDataPipeline:
         assert freqs.ndim == 1
 
     def test_usp_histogram_freqs_sum_to_one(self, processed_usp):
-        _, freqs = processed_usp.uns["hist"][0]
+        _, freqs = _uns_unpack(processed_usp.uns["hist"])[0]
         np.testing.assert_allclose(freqs.sum(), 1.0, rtol=1e-5)
 
     def test_sp_histogram_freqs_sum_to_one(self, processed_sp):
-        _, freqs = processed_sp.uns["hist"][0]
+        _, freqs = _uns_unpack(processed_sp.uns["hist"])[0]
         np.testing.assert_allclose(freqs.sum(), 1.0, rtol=1e-5)
 
     def test_usp_moments_match_usp_test_stored(self, processed_usp, usp_adata):

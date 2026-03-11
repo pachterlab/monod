@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "monod")
 
 from conftest import check_snapshot
 from cme_toolbox import CMEModel
-from extract_data import extract_data
+from extract_data import extract_data, _uns_unpack
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -115,7 +115,7 @@ def _limits(adata):
 
 def _histogram(adata):
     """Return the (coords, freqs) unique histogram for gene 0."""
-    return adata.uns["hist"][0]
+    return _uns_unpack(adata.uns["hist"])[0]
 
 
 def _snap(bio_model, tag):
@@ -199,7 +199,7 @@ class TestExtractDataAllModels:
         check_snapshot(_snap(processed["bio_model"], "extract_data_moments"), moments)
 
     def test_histogram_is_list(self, processed):
-        hist = processed["adata"].uns["hist"]
+        hist = _uns_unpack(processed["adata"].uns["hist"])
         assert isinstance(hist, list)
         assert len(hist) == 1
 

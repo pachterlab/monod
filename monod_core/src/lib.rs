@@ -595,16 +595,30 @@ fn irfftn_3d_inner(input: &[Complex64], mx0: usize, mx2_in: usize, n0: usize, n1
 // ============================================================================
 
 #[pyfunction]
+#[pyo3(signature = (bio_model, p_log, limits, fixed_quad_t, quad_order, samp_log=None))]
 fn eval_model_pss_2d(
     bio_model: &str,
     p_log: Vec<f64>,
     limits: Vec<usize>,
     fixed_quad_t: f64,
     quad_order: usize,
+    samp_log: Option<Vec<f64>>,
 ) -> PyResult<Vec<f64>> {
     let p: Vec<f64> = p_log.iter().map(|&x| 10.0_f64.powf(x)).collect();
     let (l0, l1) = (limits[0], limits[1]);
-    let (g0, g1) = build_mesh_2d_cached(l0, l1);
+    let (base_g0, base_g1) = build_mesh_2d_cached(l0, l1);
+
+    // Apply Poisson technical noise: g → exp(λ·g) − 1 per modality.
+    let (g0, g1): (Vec<Complex64>, Vec<Complex64>) = if let Some(ref samp) = samp_log {
+        let lam0 = 10.0_f64.powf(samp[0]);
+        let lam1 = 10.0_f64.powf(samp[1]);
+        let one = Complex64::new(1.0, 0.0);
+        let g0t = base_g0.iter().map(|&z| (lam0 * z).exp() - one).collect();
+        let g1t = base_g1.iter().map(|&z| (lam1 * z).exp() - one).collect();
+        (g0t, g1t)
+    } else {
+        (base_g0, base_g1)
+    };
 
     let gf_log: Vec<Complex64> = match bio_model {
         "Constitutive" => pgf_constitutive(&g0, &g1, &p),

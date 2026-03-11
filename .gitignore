@@ -1,4 +1,31 @@
 .gitignore
 src/.DS_Store
 .DS_Store
+**/.DS_Store
+
+# Python cache
 src/monod/__pycache__
+tests/__pycache__
+**/__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Build artifacts
+dist/
+*.whl
+monod_core/target/
+
+# Inference artifacts
+*.gp
+*.res
+*.pr
+
+# Large example data
+example_h5ad/gaba_example.h5ad
+example_h5ad/gaba_results.h5ad
+
+# Snapshot tied to large data
+tests/snapshots/gaba_bursty_poisson_params.npy
