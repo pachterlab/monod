@@ -2,6 +2,7 @@
 This script provides convenience functions for evaluating RNA distributions.
 """
 
+import logging
 import numpy as np
 from numba import jit
 import scipy
@@ -26,7 +27,7 @@ def _build_mesh(limits_tuple, mx_tuple):
             u.append(u_)
         g = np.meshgrid(*u, indexing="ij")
         _MESH_CACHE[key] = np.array([arr.flatten() for arr in g])
-    return _MESH_CACHE[key].copy()
+    return _MESH_CACHE[key]
 
 # ---------------------------------------------------------------------------
 # Optional Rust backend (monod_core).  When available, eval_model_pss for
@@ -580,7 +581,8 @@ class CMEModel:
         elif hist_type == "none":
             d = -np.log([proposal[tuple(idx)] for idx in np.array(data,dtype=int).T])
             
-        log.debug('The KL divergence with parameter %s is %.10f', np.array2string(10**p), np.sum(d))
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug('The KL divergence with parameter %s is %.10f', np.array2string(10**p), np.sum(d))
 
         return np.sum(d)
 
@@ -588,7 +590,12 @@ class CMEModel:
                                 EPS=1e-15, eps=1e-6, n_jobs=1):
         """Compute KLD and its gradient w.r.t. log10 parameters.
 
-        Uses forward finite differences, optionally parallelised with joblib.
+        For Constitutive and Extrinsic models (Python path only), uses an
+        analytical gradient derived through the IFFT via the chain rule —
+        one shared PGF evaluation plus n_params IFFTs, no extra quadrature.
+
+        For all other models, uses forward finite differences, optionally
+        parallelised with joblib.
 
         Parameters
         ----------
@@ -605,9 +612,9 @@ class CMEModel:
         EPS: float
             minimum allowed probability mass.
         eps: float
-            finite-difference step size in log10 parameter space.
+            finite-difference step size (used only for FD fallback).
         n_jobs: int
-            number of parallel joblib workers for gradient evaluation.
+            number of parallel joblib workers for FD gradient evaluation.
             1 = serial (default); -1 = all available cores.
 
         Returns
@@ -618,6 +625,20 @@ class CMEModel:
         from joblib import Parallel, delayed
 
         p = np.asarray(p, dtype=float)
+
+        # Analytical gradient path: Constitutive and Extrinsic with Python
+        # fallback (seq_model="None" or "Poisson"/"Bernoulli", no ambiguity).
+        _ANALYTIC_GRAD_MODELS = {"Constitutive", "Extrinsic",
+                                 "Delay", "DelayedSplicing"}
+        if (self.bio_model in _ANALYTIC_GRAD_MODELS
+                and self.amb_model == "None"
+                and hist_type in ("unique", "grid")):
+            result = self._eval_kld_analytic_grad(p, limits, samp, data,
+                                                   hist_type, EPS)
+            if result is not None:
+                return result
+
+        # Fallback: forward finite differences.
         kld0 = self.eval_model_kld(p, limits, samp, data, hist_type, EPS)
 
         def _perturbed(i):
@@ -634,6 +655,148 @@ class CMEModel:
             )
         grad = (np.array(klds_eps) - kld0) / eps
         return kld0, grad
+
+    def _eval_kld_analytic_grad(self, p, limits, samp, data, hist_type, EPS):
+        """Analytical KLD gradient via chain rule through log-PGF → IFFT.
+
+        Computes d KLD / d log10(θ_i) = -(1/N) * dot(f/pss, dR_i) + dN_i/N
+        where dR_i = irfftn(exp(phi) * d phi / d log10(θ_i)).
+
+        Returns (kld, grad) or None to signal fallback to finite differences.
+        """
+        LN10 = np.log(10.0)
+        p_lin = 10.0 ** p
+
+        # Build mesh (reads from cache; no copy needed since g is read-only here).
+        mx = np.array(limits, dtype=int)
+        mx[-1] = mx[-1] // 2 + 1
+        g = _build_mesh(tuple(limits), tuple(mx))
+
+        # Apply technical noise transform to the mesh.
+        if samp is not None and self.seq_model == "Poisson":
+            g = np.exp(np.power(10.0, samp)[:, None] * g) - 1
+        elif samp is not None and self.seq_model == "Bernoulli":
+            g = g * np.asarray(samp)[:, None]
+        elif self.seq_model not in ("None", "Poisson", "Bernoulli"):
+            return None  # unsupported seq_model
+
+        g0, g1 = g[0], g[1]
+
+        # Compute log-PGF (phi) and its gradient w.r.t. each log10 parameter.
+        if self.bio_model == "Constitutive":
+            beta, gamma = p_lin
+            phi = g0 / beta + g1 / gamma
+            dphi = [
+                -g0 / beta * LN10,   # d phi / d log10(beta)
+                -g1 / gamma * LN10,  # d phi / d log10(gamma)
+            ]
+        elif self.bio_model == "Extrinsic":
+            alpha, beta, gamma = p_lin
+            D = 1.0 - g0 / beta - g1 / gamma
+            phi = -alpha * np.log(D)
+            dphi = [
+                phi * LN10,                          # d phi / d log10(alpha)
+                -alpha * g0 / (beta * D) * LN10,    # d phi / d log10(beta)
+                -alpha * g1 / (gamma * D) * LN10,   # d phi / d log10(gamma)
+            ]
+        elif self.bio_model == "DelayedSplicing":
+            b, tauinv, gamma = p_lin
+            tau = 1.0 / tauinv
+            D0 = 1.0 - b * g0
+            D1 = 1.0 - b * g1
+            phi = b * g0 * tau / D0 - np.log(D1) / gamma
+            dphi = [
+                (g0 * tau / D0 ** 2 + g1 / (gamma * D1)) * b * LN10,
+                -b * g0 * tau / D0 * LN10,
+                np.log(D1) / gamma * LN10,
+            ]
+        elif self.bio_model == "Delay":
+            b, beta, tauinv = p_lin
+            tau = 1.0 / tauinv
+            E = np.exp(-beta * tau)
+            U = g1 + (g0 - g1) * E
+            A = 1.0 - b * U
+            B = 1.0 - b * g0
+            C = 1.0 - b * g1
+            phi = (-np.log(A) / beta
+                   + np.log(A / B) / (beta * C)
+                   + tau * b * g1 / C)
+            dU_db = 0.0  # U doesn't depend on b
+            dU_dbeta = (g0 - g1) * (-tau) * E
+            dU_dtauinv = (g0 - g1) * beta * E * tau ** 2
+            dA_db = -U;   dA_dbeta = -b * dU_dbeta;   dA_dtauinv = -b * dU_dtauinv
+            dphi_db = (
+                U / (A * beta)
+                - U / (A * beta * C)
+                + np.log(A / B) * g1 / (beta * C ** 2)
+                + tau * g1 / C + tau * b * g1 ** 2 / C ** 2
+            ) * b * LN10
+            dphi_dbeta = (
+                np.log(A) / beta ** 2
+                + dA_dbeta / (A * beta)
+                - np.log(A / B) / (beta ** 2 * C)
+                + dA_dbeta / (A * beta * C)
+                + dU_dbeta * b / (A * beta * C) * (-1)
+                - tau * b * g1 / C
+            ) * beta * LN10
+            # tauinv gradient via tau = 1/tauinv, d/dtauinv = -tau^2 * d/dtau
+            dphi_dtauinv = (
+                b * g1 * tau ** 2 / C
+                + dA_dtauinv / (A * beta) * (-1)
+                + dA_dtauinv / (A * beta * C)
+            ) * (-tauinv ** 2) * tauinv * LN10 * (-1)
+            # Simpler: use LN10 * tauinv * d phi / d tauinv
+            # d phi / d tauinv = d phi / d tau * (-tau^2)
+            # d phi / d tau = b*g1/C - (g0-g1)*E*(b / (A*beta) - b/(A*beta*C))
+            dphidtau = (b * g1 / C
+                        + (g0 - g1) * (-beta) * E * (-b / (A * beta) + b / (A * beta * C))
+                        + b * g1 / C)
+            # avoid double-counting; recompute cleanly
+            dphidtau = ((g0 - g1) * beta * E * b / (A * beta * (1.0 - 1.0 / C))
+                        + b * g1 / C)
+            # The Delay gradient is complex; fall back to FD to avoid bugs.
+            return None
+        else:
+            return None  # unsupported model
+
+        # Shared forward pass: G = exp(phi), PSS via irfftn.
+        G = np.exp(phi)
+        shape_mx = tuple(mx)
+        pss_unnorm = irfftn(G.reshape(shape_mx), s=tuple(limits))
+        pss_unnorm_flat = pss_unnorm.flatten()
+        norm = float(np.sum(np.abs(pss_unnorm_flat)))
+        pss_flat = np.abs(pss_unnorm_flat) / norm
+
+        # KLD value.
+        if hist_type == "unique":
+            coords, freqs = data
+            proposal = pss_unnorm.reshape(limits)[tuple(coords.T)] / norm
+            proposal_clipped = np.clip(proposal.real, EPS, None)
+            kld = float(np.sum(freqs * np.log(freqs / proposal_clipped)))
+        else:  # "grid"
+            H = data
+            pss_grid = pss_unnorm.real / norm
+            pss_clipped = np.clip(pss_grid, EPS, None)
+            kld = float(np.sum(H * np.log(H / pss_clipped)))
+
+        # Analytical gradient: d KLD / d θ_i = -(1/N)*dot(f/pss, dR_i) + dN_i/N
+        grad = np.empty(len(dphi))
+        for i, dphi_i in enumerate(dphi):
+            dG_i = G * dphi_i
+            dR_i = irfftn(dG_i.reshape(shape_mx), s=tuple(limits)).flatten().real
+            dN_i = float(np.sum(dR_i))
+            if hist_type == "unique":
+                dR_at_data = dR_i.reshape(limits)[tuple(coords.T)]
+                grad[i] = float(
+                    -(1.0 / norm) * np.sum(freqs / proposal_clipped * dR_at_data)
+                    + dN_i / norm
+                )
+            else:
+                grad[i] = float(
+                    -(1.0 / norm) * np.sum(H / pss_clipped * dR_i.reshape(limits))
+                    + dN_i / norm
+                )
+        return kld, grad
 
     def eval_model_pss(self, p, limits, samp=None):
         """Evaluate the PMF of the model over a grid at a set of parameters.
@@ -726,6 +889,27 @@ class CMEModel:
             pss = np.array(pss_flat).reshape(int(limits[0]), int(limits[1]))
             return pss.squeeze()
 
+        # Rust fast-path for ProteinBursty (seq_model="None", amb_model="None").
+        if (
+            _HAS_RUST
+            and self.bio_model == "ProteinBursty"
+            and self.seq_model == "None"
+            and self.amb_model == "None"
+            and samp is None
+        ):
+            pss_flat = _mc.eval_model_pss_protein_bursty(
+                p.tolist(),
+                [int(x) for x in limits],
+                bool(self.fit_unspliced),
+                float(self.protein_limit),
+                float(self.min_fudge),
+                float(self.max_fudge),
+            )
+            pss = np.array(pss_flat).reshape(
+                int(limits[0]), int(limits[1]), int(limits[2])
+            )
+            return pss.squeeze()
+
         if (self.amb_model != "None") and (len(limits) == 2):
             raise ValueError("Please specify a limit for the ambiguous species.")
 
@@ -762,12 +946,12 @@ class CMEModel:
         # For now add zero for protein sampling parameter.
         if samp is not None:
             num_excess = np.shape(g)[0] - len(samp)
-            samp_use = np.array([i for i in samp]+[0]*num_excess)
+            samp_use = np.pad(samp, (0, num_excess))
         
         if self.seq_model == "Poisson":
             g = np.exp((np.power(10, samp))[:, None] * g) - 1
         elif self.seq_model == "Bernoulli":
-            g *= np.asarray(samp)[:, None]
+            g = g * np.asarray(samp)[:, None]
         elif self.seq_model == "None":
             pass
         else:
@@ -1059,10 +1243,9 @@ class CMEModel:
         S_var, S_mean = moments['MOM_spliced_var'], moments['MOM_spliced_mean']
 
         if self.bio_model == "Bursty" or self.bio_model == "CIR":
-            try:
-                b = U_var / U_mean - 1
-            except:
-                b = 1  # safe for U_mean = U_var = 0
+            b = (U_var / U_mean - 1) if U_mean > 0 else 1.0
+            if not np.isfinite(b):
+                b = 1.0
             
             if self.seq_model == "Bernoulli":
                 b /= samp[0]
@@ -1076,10 +1259,9 @@ class CMEModel:
             
         elif self.bio_model == "ProteinBursty":
             U_var, U_mean, S_mean, P_mean, UP_covar = moments["MOM_unspliced_var"], moments["MOM_unspliced_mean"], moments["MOM_spliced_mean"], moments["MOM_protein_mean"], moments["MOM_cov_unspliced_protein"]
-            try:
-                b = U_var / U_mean - 1
-            except:
-                b = 1  # safe for U_mean = U_var = 0
+            b = (U_var / U_mean - 1) if U_mean > 0 else 1.0
+            if not np.isfinite(b):
+                b = 1.0
             if self.seq_model == "Bernoulli":
                 b /= samp[0]
             elif self.seq_model == "Poisson":

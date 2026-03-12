@@ -8,9 +8,12 @@ All numerical tests use a two-phase approach:
 Delete tests/snapshots/ and re-run pytest to regenerate all snapshots.
 """
 
+import unittest.mock
+
 import numpy as np
 import pytest
 
+import cme_toolbox as _cme_toolbox_module
 from conftest import check_snapshot
 from cme_toolbox import CMEModel
 
@@ -608,3 +611,86 @@ class TestGetMoM:
         samp = np.array([-6.0, -6.0])
         x0 = m.get_MoM(_bursty_moments(), lb, ub, samp=samp)
         check_snapshot("get_mom_bursty_poisson", x0)
+
+
+# ---------------------------------------------------------------------------
+# Rust / Python parity — Rust and Python paths must agree to rtol=1e-5
+# ---------------------------------------------------------------------------
+
+
+def _eval_pss_python(model, p, limits, samp=None):
+    """Call eval_model_pss with Rust disabled, returning the pure-Python result."""
+    with unittest.mock.patch.object(_cme_toolbox_module, "_HAS_RUST", False):
+        return model.eval_model_pss(p, limits, samp=samp)
+
+
+class TestRustPythonParity:
+    """Verify that the Rust fast-path produces the same PSS as the Python path.
+
+    seq_model="None" Rust paths: Bursty, CIR (quadrature models only;
+    analytical models use Python/scipy which is faster at small grid sizes).
+    seq_model="Poisson" Rust paths: Bursty, CIR.
+    seq_model="Bernoulli": no Rust path (Python only).
+    """
+
+    LIMITS = [20, 20]
+    _SAMP_POISSON = np.array([-6.0, -6.0])
+
+    def test_constitutive_none_parity(self, constitutive_none):
+        p = np.array([0.0, 0.0])
+        rust = constitutive_none.eval_model_pss(p, self.LIMITS)
+        py = _eval_pss_python(constitutive_none, p, self.LIMITS)
+        np.testing.assert_allclose(rust, py, rtol=1e-5, atol=1e-10,
+                                   err_msg="Constitutive/None Rust vs Python mismatch")
+
+    def test_bursty_none_parity(self, bursty_none):
+        p = np.array([0.3, 0.0, -0.1])
+        rust = bursty_none.eval_model_pss(p, self.LIMITS)
+        py = _eval_pss_python(bursty_none, p, self.LIMITS)
+        np.testing.assert_allclose(rust, py, rtol=1e-5, atol=1e-10,
+                                   err_msg="Bursty/None Rust vs Python mismatch")
+
+    def test_extrinsic_none_parity(self, extrinsic_none):
+        p = np.array([0.5, 0.0, 0.0])
+        rust = extrinsic_none.eval_model_pss(p, self.LIMITS)
+        py = _eval_pss_python(extrinsic_none, p, self.LIMITS)
+        np.testing.assert_allclose(rust, py, rtol=1e-5, atol=1e-10,
+                                   err_msg="Extrinsic/None Rust vs Python mismatch")
+
+    def test_delay_none_parity(self, delay_none):
+        p = np.array([0.3, 0.0, 0.0])
+        rust = delay_none.eval_model_pss(p, self.LIMITS)
+        py = _eval_pss_python(delay_none, p, self.LIMITS)
+        np.testing.assert_allclose(rust, py, rtol=1e-5, atol=1e-10,
+                                   err_msg="Delay/None Rust vs Python mismatch")
+
+    def test_cir_none_parity(self, cir_none):
+        p = np.array([0.3, 0.0, 0.0])
+        rust = cir_none.eval_model_pss(p, self.LIMITS)
+        py = _eval_pss_python(cir_none, p, self.LIMITS)
+        np.testing.assert_allclose(rust, py, rtol=1e-5, atol=1e-10,
+                                   err_msg="CIR/None Rust vs Python mismatch")
+
+    def test_delayed_splicing_none_parity(self, delayed_splicing_none):
+        p = np.array([0.3, 0.0, 0.0])
+        rust = delayed_splicing_none.eval_model_pss(p, self.LIMITS)
+        py = _eval_pss_python(delayed_splicing_none, p, self.LIMITS)
+        np.testing.assert_allclose(rust, py, rtol=1e-5, atol=1e-10,
+                                   err_msg="DelayedSplicing/None Rust vs Python mismatch")
+
+    # --- Poisson seq_model (Rust path: Bursty and CIR only) ---
+
+    def test_bursty_poisson_parity(self, bursty_poisson):
+        p = np.array([0.3, 0.0, -0.1])
+        rust = bursty_poisson.eval_model_pss(p, self.LIMITS, samp=self._SAMP_POISSON)
+        py = _eval_pss_python(bursty_poisson, p, self.LIMITS, samp=self._SAMP_POISSON)
+        np.testing.assert_allclose(rust, py, rtol=1e-5, atol=1e-10,
+                                   err_msg="Bursty/Poisson Rust vs Python mismatch")
+
+    def test_cir_poisson_parity(self):
+        model = CMEModel("CIR", "Poisson")
+        p = np.array([0.3, 0.0, 0.0])
+        rust = model.eval_model_pss(p, self.LIMITS, samp=self._SAMP_POISSON)
+        py = _eval_pss_python(model, p, self.LIMITS, samp=self._SAMP_POISSON)
+        np.testing.assert_allclose(rust, py, rtol=1e-5, atol=1e-10,
+                                   err_msg="CIR/Poisson Rust vs Python mismatch")

@@ -206,25 +206,20 @@ def extract_data(
     adata = monod_adata.to_memory()
 
     
+    # Build a new AnnData containing only the required layers.
+    # Avoid copying large data arrays — share references with adata (which
+    # is itself a copy of the input, so mutations are safe).
     adata_subset = ad.AnnData(
-    X=adata.X.copy(),
-    obs=adata.obs.copy(),
-    var=adata.var.copy(),
-    obsm=adata.obsm.copy(),
-    varm=adata.varm.copy(),
-    obsp=adata.obsp.copy(),
-    varp=adata.varp.copy(),
-    uns=adata.uns.copy()
-)
-    # Ensure var and obs names are preserved
+        X=adata.X,
+        obs=adata.obs,
+        var=adata.var,
+        uns={},   # fresh dict; uns will be populated below
+    )
     adata_subset.obs_names = adata.obs_names
     adata_subset.var_names = adata.var_names
-
-
-    # Copy over only the desired layers
     for layer in ordered_layer_names:
         if layer in adata.layers:
-            adata_subset.layers[layer] = adata.layers[layer].copy()
+            adata_subset.layers[layer] = adata.layers[layer]
 
     monod_adata = adata_subset.to_memory()
 
@@ -272,8 +267,11 @@ def extract_data(
     
     gene_names, n_cells = monod_adata.var.index, len(monod_adata.obs.index)
 
-    # Extract layers
-    layers = np.array([monod_adata.layers[layer_name].T for layer_name in ordered_layer_names]) # toarray
+    # Extract layers — densify sparse matrices if necessary.
+    def _to_dense(arr):
+        return arr.toarray() if issparse(arr) else np.asarray(arr)
+    layers = np.array([_to_dense(monod_adata.layers[layer_name]).T
+                       for layer_name in ordered_layer_names])
 
     # Compute maximum expression value across cells for each gene and each layer
     max_values = np.amax(layers, axis=2)  # Shape: (n_genes, n_layers)
@@ -492,9 +490,42 @@ def plot_diagnostic(monod_adata):
             dataset_diagnostics_dir_string + "/{}.png".format(dataset_name), dpi=450
         )
 
-def make_histogram(monod_adata, hist_type, M):
+def _make_histogram_one_gene(gene_index, layers, hist_type, M, n_cells):
+    """Compute the histogram for a single gene (parallelisable worker)."""
+    from scipy.sparse import issparse as _issparse
+    gene_cols = [
+        (x[:, gene_index].toarray().ravel() if _issparse(x) else np.asarray(x[:, gene_index]).ravel())
+        for x in layers
+    ]
+    stacked = np.column_stack(gene_cols)  # (n_cells, n_modalities) — built once
 
-    # NB the order of the layers here will be enforced to be the same as the order of the model 
+    if hist_type == "grid":
+        bins = [np.arange(M[layer_i][gene_index] + 1) - 0.5 for layer_i in range(len(layers))]
+        H, _ = np.histogramdd(stacked, bins=bins, density=True)
+    elif hist_type == "unique":
+        unique, unique_counts = np.unique(stacked, axis=0, return_counts=True)
+        H = (unique.astype(int), unique_counts / n_cells)
+    else:  # "none"
+        H = [col for col in gene_cols]
+    return H
+
+
+def make_histogram(monod_adata, hist_type, M, n_jobs=1):
+    """Build per-gene expression histograms.
+
+    Parameters
+    ----------
+    monod_adata : AnnData
+    hist_type : str
+        "unique", "grid", or "none".
+    M : array-like
+        Grid limits per layer per gene.
+    n_jobs : int
+        Number of joblib workers (1 = serial; -1 = all cores).
+    """
+    from joblib import Parallel, delayed as jdelayed
+
+    # NB the order of the layers here will be enforced to be the same as the order of the model
     # modalities defined in cme_toolbox.
 
     modality_name_dict = monod_adata.uns['modality_name_dict']
@@ -503,36 +534,20 @@ def make_histogram(monod_adata, hist_type, M):
     ordered_modalities = model.model_modalities
     ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
 
-    hist = []
-    layers = [monod_adata.layers[layer_name] for layer_name in ordered_layer_names] # toarray
+    layers = [monod_adata.layers[layer_name] for layer_name in ordered_layer_names]
     n_cells = monod_adata.n_obs
     n_genes = monod_adata.n_vars
-    
-    for gene_index in range(n_genes):
-        
-        if hist_type == "grid":
-            bins = [np.arange(x[gene_index] + 1) - 0.5 for x in M]
-            stacked_data = np.vstack([x[:,gene_index] for x in layers]).T
-            H, edges = np.histogramdd(
-                stacked_data,
-                bins=bins,
-                density=True
-            )
-            xedges = edges[0]  # Assuming only one dimension for each bin
-            yedges = edges[1] 
-        elif hist_type == "unique":
-            
-            unique, unique_counts = np.unique(
-                np.vstack([x[:,gene_index] for x in layers]).T, axis=0, return_counts=True
-            )
-            frequencies = unique_counts / n_cells
-            unique = unique.astype(int)
-            H = (unique, frequencies)
-            
-        elif hist_type == "none":
-            H = [x[:, gene_index] for x in layers]
 
-        hist.append(H)
+    if n_jobs == 1:
+        hist = [
+            _make_histogram_one_gene(i, layers, hist_type, M, n_cells)
+            for i in range(n_genes)
+        ]
+    else:
+        hist = Parallel(n_jobs=n_jobs)(
+            jdelayed(_make_histogram_one_gene)(i, layers, hist_type, M, n_cells)
+            for i in range(n_genes)
+        )
 
     return hist
 

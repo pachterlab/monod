@@ -1,3 +1,5 @@
+import itertools
+import logging
 import pickle
 import time
 import numpy as np
@@ -1061,6 +1063,13 @@ class GradientInference:
 
         self.inference_string = global_parameters.inference_string
         self.warm_start = warm_start  # shape (n_genes, n_phys_pars) or None
+
+        # Pre-allocate restart initialisation bounds (constant across all genes/restarts).
+        self._restart_lb = -2.0 * np.ones(self.n_phys_pars)
+        self._restart_lb[0] = 0.0
+        self._restart_ub = 2.0 * np.ones(self.n_phys_pars)
+        self._restart_range = self._restart_ub - self._restart_lb
+
         if self.gradient_params["init_pattern"] == "moments":
             warnings.filterwarnings("ignore", category=RuntimeWarning)
             self.param_MoM = np.asarray(
@@ -1100,14 +1109,11 @@ class GradientInference:
         err: float
             Kullback-Leibler divergence of the model at x, relative to data.
         """
-        # Further cap the random initializations within a smaller box.
-        restricted_bounds_lb = -2* np.ones(self.n_phys_pars)
-        restricted_bounds_lb[0] = 0
-        restricted_bounds_ub = 2* np.ones(self.n_phys_pars)
+        # Draw random restart initialisations within the pre-allocated bounds.
         x0 = (
             np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
-            * (restricted_bounds_ub - restricted_bounds_lb)
-            + restricted_bounds_lb
+            * self._restart_range
+            + self._restart_lb
         )
         # x0 = (
         #     np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
@@ -1123,7 +1129,8 @@ class GradientInference:
             x0[0] = np.clip(self.warm_start[gene_index], self.phys_lb, self.phys_ub)
         err = np.inf
         ERR_THRESH = 0.99
-        log.info('Optimizing gene %d with initial value %s', gene_index, np.array2string(10**x0))
+        if log.isEnabledFor(logging.INFO):
+            log.info('Optimizing gene %d with initial value %s', gene_index, np.array2string(10**x0))
         
         hist_type = get_hist_type(search_data)
         for restart in range(self.gradient_params["num_restarts"]):
@@ -1159,7 +1166,8 @@ class GradientInference:
         if not (np.isfinite(x).all()):
             log.warning("Gene index: " + str(gene_index))
             raise ValueError("Search failed. Please check input data.")
-        log.info('Optimized parameters for gene %d is %s', gene_index, np.array2string(10**x))
+        if log.isEnabledFor(logging.INFO):
+            log.info('Optimized parameters for gene %d is %s', gene_index, np.array2string(10**x))
         return x, err
 
     def iterate_over_genes(self, model, search_data):
@@ -2132,7 +2140,7 @@ class SearchResults:
             log.info("Starting parallelized Hessian computation.")
             hess = parallelize(
                 function=self.par_fun_hess,
-                iterable=zip(range(self.n_genes), [search_data] * self.n_genes),
+                iterable=zip(range(self.n_genes), itertools.repeat(search_data, self.n_genes)),
                 num_cores=num_cores,
                 num_entries=self.n_genes,
                 completion_message="Parallelized Hessian computation complete.",
@@ -2144,7 +2152,7 @@ class SearchResults:
             log.info("Starting non-parallelized Hessian computation.")
             hess = [
                 self.par_fun_hess(x)
-                for x in zip(range(self.n_genes), [search_data] * self.n_genes)
+                for x in zip(range(self.n_genes), itertools.repeat(search_data, self.n_genes))
             ]
             log.info("Non-parallelized Hessian computation complete.")
         warnings.resetwarnings()

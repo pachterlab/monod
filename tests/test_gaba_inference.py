@@ -21,6 +21,7 @@ Checks
 
 import os
 import sys
+import unittest.mock
 import warnings
 
 import matplotlib
@@ -32,6 +33,7 @@ import anndata as ad
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "monod"))
 
+import cme_toolbox as _cme_toolbox_module
 from conftest import check_snapshot
 from cme_toolbox import CMEModel
 from extract_data import extract_data
@@ -257,4 +259,84 @@ class TestGabaParamSnapshot:
             params_at_ref,
             rtol=0.05,   # 5% relative — accounts for optimizer variation
             atol=0.1,    # 0.1 log10 units absolute
+        )
+
+
+# ---------------------------------------------------------------------------
+# 5. Rust / Python parity on gaba data
+# ---------------------------------------------------------------------------
+# The main gaba_fit fixture uses Bursty+Poisson (seq_model != "None"), which
+# bypasses the Rust fast-path.  These parity tests extract a single gaba gene
+# with each seq_model="None" model to exercise the Rust path at the larger
+# grid dimensions that arise from GABAergic neuron expression data.
+
+_PARITY_MODELS = [
+    ("Bursty", "None"),
+    ("Constitutive", "None"),
+    ("Extrinsic", "None"),
+    ("Delay", "None"),
+    ("CIR", "None"),
+    ("DelayedSplicing", "None"),
+    # Poisson: only Bursty and CIR have a Rust fast-path for seq_model="Poisson".
+    ("Bursty", "Poisson"),
+    ("CIR", "Poisson"),
+]
+_PARITY_MODEL_IDS = [f"{m}_{s}" for m, s in _PARITY_MODELS]
+_PARITY_GENE = GENES[0]  # "Eif5b"
+_DUMMY_SAMP = np.zeros(2)          # safe dummy for seq_model="None" get_MoM calls
+_POISSON_SAMP = np.array(list(REF_SAMP_OPTIMUM))  # realistic Poisson samp from reference
+
+
+@pytest.fixture(scope="module", params=_PARITY_MODELS, ids=_PARITY_MODEL_IDS)
+def gaba_parity_processed(request):
+    """Extract one gaba gene per model for lightweight Rust/Python parity checks."""
+    bio_model, seq_model = request.param
+    model = CMEModel(bio_model, seq_model)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        adata = extract_data(
+            GABA_EXAMPLE_PATH,
+            model,
+            dataset_name=f"gaba_parity_{bio_model}_{seq_model}",
+            modality_name_dict={"unspliced": "unspliced", "spliced": "spliced"},
+            n_genes=1,
+            genes_to_fit=[_PARITY_GENE],
+            hist_type="unique",
+            viz=False,
+        )
+    return {"bio_model": bio_model, "seq_model": seq_model, "model": model, "adata": adata}
+
+
+class TestRustPythonParityGaba:
+    """Verify Rust and Python eval_model_pss agree on gaba_example.h5ad grid sizes.
+
+    Covers seq_model="None" for all six 2D models and seq_model="Poisson" for
+    Bursty and CIR (the only two with a Rust Poisson fast-path).
+    """
+
+    def test_pss_parity_at_mom_params(self, gaba_parity_processed):
+        model = gaba_parity_processed["model"]
+        adata = gaba_parity_processed["adata"]
+        seq_model = gaba_parity_processed["seq_model"]
+
+        moments = {
+            col: float(adata.var[col].values[0])
+            for col in adata.var.columns if col.startswith("MOM_")
+        }
+        lb = np.array(model.bio_bounds["phys_lb"])
+        ub = np.array(model.bio_bounds["phys_ub"])
+        p = model.get_MoM(moments, lb, ub, samp=_DUMMY_SAMP)
+        limits = adata.uns["M"][:, 0].tolist()
+        samp = _POISSON_SAMP if seq_model == "Poisson" else None
+
+        rust = model.eval_model_pss(p, limits, samp=samp)
+        with unittest.mock.patch.object(_cme_toolbox_module, "_HAS_RUST", False):
+            py = model.eval_model_pss(p, limits, samp=samp)
+
+        np.testing.assert_allclose(
+            rust, py, rtol=1e-5, atol=1e-10,
+            err_msg=(
+                f"{gaba_parity_processed['bio_model']}/{seq_model} Rust vs Python mismatch "
+                f"on gaba data limits {limits}"
+            ),
         )

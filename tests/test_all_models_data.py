@@ -21,6 +21,7 @@ for seq_model="None" the converted value (ones) is never used in the output.
 
 import os
 import sys
+import unittest.mock
 
 import matplotlib
 matplotlib.use("Agg")
@@ -31,6 +32,7 @@ import anndata as ad
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "monod"))
 
+import cme_toolbox as _cme_toolbox_module
 from conftest import check_snapshot
 from cme_toolbox import CMEModel
 from extract_data import extract_data, _uns_unpack
@@ -53,7 +55,15 @@ MODELS_2D = [
 ]
 MODEL_IDS = [f"{m}_{s}" for m, s in MODELS_2D]
 
-_DUMMY_SAMP = np.zeros(2)  # safe dummy for seq_model="None" get_MoM calls
+# Only Bursty and CIR have a Rust fast-path for seq_model="Poisson".
+RUST_POISSON_MODELS = [
+    ("Bursty", "Poisson"),
+    ("CIR", "Poisson"),
+]
+RUST_POISSON_MODEL_IDS = [f"{m}_{s}" for m, s in RUST_POISSON_MODELS]
+
+_DUMMY_SAMP = np.zeros(2)       # safe dummy for seq_model="None" get_MoM calls
+_POISSON_SAMP = np.array([-6.0, -6.0])  # representative Poisson samp for parity tests
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -63,6 +73,27 @@ _DUMMY_SAMP = np.zeros(2)  # safe dummy for seq_model="None" get_MoM calls
 @pytest.fixture(scope="module")
 def raw_example_adata():
     return ad.read_h5ad(EXAMPLE_PATH)
+
+
+@pytest.fixture(scope="module", params=RUST_POISSON_MODELS, ids=RUST_POISSON_MODEL_IDS)
+def processed_poisson(request, raw_example_adata):
+    """Run extract_data for Bursty/CIR+Poisson — the two models with a Rust Poisson path."""
+    bio_model, seq_model = request.param
+    model = CMEModel(bio_model, seq_model)
+    adata = extract_data(
+        raw_example_adata,
+        model,
+        dataset_name=f"test_{bio_model}_{seq_model}",
+        n_genes=1,
+        viz=False,
+        hist_type="unique",
+    )
+    return {
+        "bio_model": bio_model,
+        "seq_model": seq_model,
+        "model": model,
+        "adata": adata,
+    }
 
 
 @pytest.fixture(scope="module", params=MODELS_2D, ids=MODEL_IDS)
@@ -319,3 +350,59 @@ class TestKLDAtMOMAllModels:
         coords, freqs = _histogram(adata)
         kld = model.eval_model_kld(p, limits, None, (coords, freqs), "unique")
         check_snapshot(_snap(processed["bio_model"], "kld_mom"), np.array([kld]))
+
+
+# ===========================================================================
+# 4. Rust / Python parity on real data limits
+# ===========================================================================
+
+
+class TestRustPythonParityData:
+    """Verify Rust and Python eval_model_pss agree on real data grid sizes (~[81, 44]).
+
+    These tests complement the unit-level parity tests in test_cme_toolbox.py
+    by running at the grid dimensions that arise from actual scRNA-seq data,
+    where the allocations and FFT plan caching paths differ from the [20, 20] case.
+    """
+
+    def test_pss_parity_at_mom_params(self, processed):
+        model = processed["model"]
+        adata = processed["adata"]
+        p = _mom_params(model, adata)
+        limits = _limits(adata)
+
+        rust = model.eval_model_pss(p, limits)
+        with unittest.mock.patch.object(_cme_toolbox_module, "_HAS_RUST", False):
+            py = model.eval_model_pss(p, limits)
+
+        np.testing.assert_allclose(
+            rust, py, rtol=1e-5, atol=1e-10,
+            err_msg=f"{processed['bio_model']}/None Rust vs Python mismatch on real data limits {limits}",
+        )
+
+
+class TestRustPythonParityDataPoisson:
+    """Verify Rust and Python agree for seq_model='Poisson' at real data grid sizes.
+
+    Only Bursty and CIR have a Rust fast-path for Poisson technical noise.
+    Uses a fixed representative samp rather than an optimised value so the
+    test doesn't depend on inference results.
+    """
+
+    def test_pss_parity_poisson(self, processed_poisson):
+        model = processed_poisson["model"]
+        adata = processed_poisson["adata"]
+        p = _mom_params(model, adata)
+        limits = _limits(adata)
+
+        rust = model.eval_model_pss(p, limits, samp=_POISSON_SAMP)
+        with unittest.mock.patch.object(_cme_toolbox_module, "_HAS_RUST", False):
+            py = model.eval_model_pss(p, limits, samp=_POISSON_SAMP)
+
+        np.testing.assert_allclose(
+            rust, py, rtol=1e-5, atol=1e-10,
+            err_msg=(
+                f"{processed_poisson['bio_model']}/Poisson Rust vs Python mismatch "
+                f"on real data limits {limits}"
+            ),
+        )
