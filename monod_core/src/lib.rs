@@ -24,6 +24,7 @@
 use num_complex::Complex64;
 use pyo3::prelude::*;
 use rayon::prelude::*;
+use numpy::{PyReadonlyArray2, PyUntypedArrayMethods};
 use rustfft::FftPlanner;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -785,6 +786,214 @@ fn protein_bursty_pgf(
 }
 
 // ============================================================================
+// Parallel unique-histogram extraction
+// ============================================================================
+
+// Dense counting table threshold: if (max_l0+1)*(max_l1+1)*… ≤ this, use
+// the counting approach instead of O(n log n) sort.
+// 16384 = 2^14 keeps the table (128 KB) inside L2 cache; for 2 layers this
+// covers max_count ≈ 128 per layer, which handles the vast majority of real
+// RNA-seq genes.
+const DENSE_THRESHOLD: usize = 1 << 14; // 16384
+
+// Per-thread scratch buffers reused across genes — avoids one allocation per
+// gene for the sort-based fallback path.
+thread_local! {
+    static FLAT_BUF: RefCell<Vec<i64>> = RefCell::new(Vec::new());
+    static ORDER_BUF: RefCell<Vec<usize>> = RefCell::new(Vec::new());
+    static DENSE_BUF: RefCell<Vec<usize>> = RefCell::new(Vec::new());
+}
+
+/// Compute unique-microstate histograms for every gene (column) in parallel.
+///
+/// Parameters
+/// ----------
+/// layers : list of 2-D int64 numpy arrays, each shaped (n_cells, n_genes).
+///          Elements are treated as non-negative integer counts.
+///
+/// Returns
+/// -------
+/// (coords, freqs) where
+///   coords[g] — list of unique microstates; each microstate is a list of i64
+///               with one entry per layer, length = n_layers
+///   freqs[g]  — corresponding normalised frequencies (count / n_cells)
+#[pyfunction]
+fn make_histograms_unique(
+    py: Python<'_>,
+    layers: Vec<PyReadonlyArray2<'_, i64>>,
+) -> PyResult<(Vec<Vec<Vec<i64>>>, Vec<Vec<f64>>)> {
+    if layers.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let n_cells = layers[0].shape()[0];
+    let n_genes = layers[0].shape()[1];
+    let n_layers = layers.len();
+
+    // Borrow flat row-major slices from numpy arrays under the GIL.
+    let raw: Vec<&[i64]> = layers
+        .iter()
+        .map(|arr| {
+            arr.as_slice().map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "layer array must be C-contiguous: {e}"
+                ))
+            })
+        })
+        .collect::<PyResult<_>>()?;
+
+    // Release the GIL during the parallel computation.
+    let results: Vec<(Vec<Vec<i64>>, Vec<f64>)> = py.allow_threads(|| {
+        (0..n_genes)
+            .into_par_iter()
+            .map(|gene| {
+                // --- Column copy (one stride-n_genes pass per layer) ---
+                // Merging this into the flat-buffer build below would require
+                // two stride reads per layer; keeping it separate allows each
+                // subsequent step to work purely sequentially.
+                let cols: Vec<Vec<i64>> = raw
+                    .iter()
+                    .map(|layer| {
+                        (0..n_cells)
+                            .map(|cell| layer[cell * n_genes + gene])
+                            .collect()
+                    })
+                    .collect();
+
+                // --- Max per layer for this gene ---
+                let max_per_layer: Vec<usize> = cols
+                    .iter()
+                    .map(|col| col.iter().copied().max().unwrap_or(0).max(0) as usize)
+                    .collect();
+
+                let total_states: usize =
+                    max_per_layer.iter().map(|&m| m + 1).product();
+
+                if total_states <= DENSE_THRESHOLD {
+                    // ---- O(n_cells + total_states) counting path ----
+                    //
+                    // Build strides for row-major multi-dim indexing so that
+                    // iterating flat_idx = 0..total_states yields microstates
+                    // in lexicographic order (matching np.unique's output).
+                    let mut strides = vec![1usize; n_layers];
+                    for l in (0..n_layers - 1).rev() {
+                        strides[l] = strides[l + 1] * (max_per_layer[l + 1] + 1);
+                    }
+
+                    // Reuse thread-local dense table; extend if needed, then zero.
+                    DENSE_BUF.with(|db| {
+                        let mut table = db.borrow_mut();
+                        if table.len() < total_states {
+                            table.resize(total_states, 0);
+                        }
+                        let table = &mut table[..total_states];
+                        table.fill(0);
+
+                        // Count each cell's microstate in O(n_cells).
+                        for cell in 0..n_cells {
+                            let idx: usize = cols
+                                .iter()
+                                .zip(strides.iter())
+                                .map(|(col, &s)| col[cell] as usize * s)
+                                .sum();
+                            table[idx] += 1;
+                        }
+
+                        // Collect non-zero entries — already in lexicographic order.
+                        let mut unique: Vec<Vec<i64>> = Vec::new();
+                        let mut freqs: Vec<f64> = Vec::new();
+                        for flat_idx in 0..total_states {
+                            if table[flat_idx] == 0 {
+                                continue;
+                            }
+                            let mut microstate = vec![0i64; n_layers];
+                            let mut rem = flat_idx;
+                            for l in 0..n_layers {
+                                microstate[l] = (rem / strides[l]) as i64;
+                                rem %= strides[l];
+                            }
+                            unique.push(microstate);
+                            freqs.push(table[flat_idx] as f64 / n_cells as f64);
+                        }
+                        (unique, freqs)
+                    })
+                } else {
+                    // ---- O(n_cells log n_cells) sort-based fallback ----
+                    //
+                    // Reuse thread-local flat (n_cells × n_layers) and order buffers.
+                    FLAT_BUF.with(|fb| {
+                        ORDER_BUF.with(|ob| {
+                            let mut flat = fb.borrow_mut();
+                            let mut order = ob.borrow_mut();
+
+                            // Resize buffers only if they need to grow.
+                            let flat_len = n_cells * n_layers;
+                            if flat.len() < flat_len {
+                                flat.resize(flat_len, 0);
+                            }
+                            if order.len() < n_cells {
+                                order.resize(n_cells, 0);
+                            }
+                            let flat = &mut flat[..flat_len];
+                            let order = &mut order[..n_cells];
+
+                            // Build interleaved microstate rows from contiguous cols.
+                            for cell in 0..n_cells {
+                                for (l, col) in cols.iter().enumerate() {
+                                    flat[cell * n_layers + l] = col[cell];
+                                }
+                            }
+
+                            // Sort row indices (one Vec<usize>, no per-cell allocs).
+                            for (i, v) in order.iter_mut().enumerate() {
+                                *v = i;
+                            }
+                            order.sort_unstable_by(|&a, &b| {
+                                flat[a * n_layers..(a + 1) * n_layers]
+                                    .cmp(&flat[b * n_layers..(b + 1) * n_layers])
+                            });
+
+                            // Run-length encode.
+                            let mut unique: Vec<Vec<i64>> = Vec::new();
+                            let mut counts: Vec<usize> = Vec::new();
+                            let mut prev_start = usize::MAX;
+                            for &idx in order.iter() {
+                                let row_start = idx * n_layers;
+                                if prev_start != usize::MAX
+                                    && flat[prev_start..prev_start + n_layers]
+                                        == flat[row_start..row_start + n_layers]
+                                {
+                                    *counts.last_mut().unwrap() += 1;
+                                } else {
+                                    unique.push(
+                                        flat[row_start..row_start + n_layers].to_vec(),
+                                    );
+                                    counts.push(1);
+                                    prev_start = row_start;
+                                }
+                            }
+
+                            let freqs: Vec<f64> = counts
+                                .iter()
+                                .map(|&c| c as f64 / n_cells as f64)
+                                .collect();
+                            (unique, freqs)
+                        })
+                    })
+                }
+            })
+            .collect()
+    });
+
+    let mut all_coords = Vec::with_capacity(n_genes);
+    let mut all_freqs = Vec::with_capacity(n_genes);
+    for (c, f) in results {
+        all_coords.push(c);
+        all_freqs.push(f);
+    }
+    Ok((all_coords, all_freqs))
+}
+
+// ============================================================================
 // PyO3 module
 // ============================================================================
 
@@ -793,5 +1002,6 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(eval_model_pss_2d, m)?)?;
     m.add_function(wrap_pyfunction!(eval_model_pss_protein_bursty, m)?)?;
     m.add_function(wrap_pyfunction!(protein_bursty_pgf, m)?)?;
+    m.add_function(wrap_pyfunction!(make_histograms_unique, m)?)?;
     Ok(())
 }

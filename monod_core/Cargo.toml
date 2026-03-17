@@ -12,3 +12,4 @@ pyo3 = { version = "0.22", features = ["extension-module"] }
 num-complex = "0.4"
 rustfft = "6"
 rayon = "1"
+numpy = "0.22"
