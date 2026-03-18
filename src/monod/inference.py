@@ -58,7 +58,10 @@ def perform_inference(h5ad_filepath,
     gradient_params={
         "max_iterations": 10,
         "init_pattern": "moments",
-        "num_restarts": 1},
+        "num_restarts": 1,
+        "num_gene_cores": 1,
+        "n_jac_jobs": 1,
+    },
     use_lengths=True,
     run_meta="",
     phys_lb=None,
@@ -666,6 +669,8 @@ class InferenceParameters:
             "max_iterations": 10,
             "init_pattern": "moments",
             "num_restarts": 1,
+            "num_gene_cores": 1,
+            "n_jac_jobs": 1,
         },
         run_meta="",
         phys_lb=None,
@@ -703,6 +708,9 @@ class InferenceParameters:
             "max_iterations" defines the maximum number of gradient descent iterations.
             "init_pattern" defines whether the first try starts at the method of moments estimate.
             "num_restarts" defines how many attempts should be made.
+            "num_gene_cores" controls joblib parallelism over genes per grid point (-1 = all cores).
+            "n_jac_jobs" controls joblib parallelism over FD perturbations (-1 = all cores); only
+            effective when num_gene_cores=1 to avoid nested parallelism.
         run_meta: str, optional
             any additional metadata to append to the run directory name.
         """

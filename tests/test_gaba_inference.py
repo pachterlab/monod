@@ -108,6 +108,7 @@ def gaba_fit(ref_adata):
         save=False,
     )
 
+    np.random.seed(0)  # fix seed so multi-restart optimizer is deterministic
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         sr = ip.fit_all_grid_points(sd, num_cores=1, save=False)

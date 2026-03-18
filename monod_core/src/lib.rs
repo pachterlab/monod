@@ -2,8 +2,10 @@
 ///
 /// Exported PyO3 functions
 /// -----------------------
-/// eval_model_pss_2d(bio_model, p_log, limits, fixed_quad_t, quad_order, samp_log=None) -> Vec<f64>
-///     6 two-modality bio_models, seq_model="None" or seq_model="Poisson".
+/// eval_model_pss_2d(bio_model, p_log, limits, fixed_quad_t, quad_order,
+///                  samp_log=None, amb_model="None", amb_log=None) -> Vec<f64>
+///     6 two-modality bio_models, seq_model="None"/"Poisson", amb_model="None"/"Equal"/"Unequal".
+///     p_log contains only bio params; amb_log = [log10_p] (Equal) or [log10_p0, log10_p1] (Unequal).
 ///
 /// eval_model_pss_protein_bursty(p_log, limits, fit_unspliced,
 ///                                protein_limit, min_fudge, max_fudge) -> Vec<f64>
@@ -132,6 +134,11 @@ fn gauss_legendre_cached(n: usize) -> Arc<(Vec<f64>, Vec<f64>)> {
 static MESH_CACHE_2D: OnceLock<Mutex<HashMap<(usize, usize), Arc<(Vec<Complex64>, Vec<Complex64>)>>>> =
     OnceLock::new();
 
+/// 3-D ambient mesh cache — Arc-wrapped, keyed by (l0, l1, l2).
+/// Stores (g0, g1, g_amb) each of length l0 * l1 * (l2/2+1).
+static MESH_CACHE_3D: OnceLock<Mutex<HashMap<(usize, usize, usize), Arc<(Vec<Complex64>, Vec<Complex64>, Vec<Complex64>)>>>> =
+    OnceLock::new();
+
 fn build_mesh_2d_cached(l0: usize, l1: usize) -> Arc<(Vec<Complex64>, Vec<Complex64>)> {
     let cache = MESH_CACHE_2D.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = cache.lock().unwrap();
@@ -140,6 +147,22 @@ fn build_mesh_2d_cached(l0: usize, l1: usize) -> Arc<(Vec<Complex64>, Vec<Comple
     }
     let mesh = Arc::new(build_mesh_2d(l0, l1));
     map.insert((l0, l1), Arc::clone(&mesh));
+    mesh
+}
+
+fn build_mesh_3d_cached(
+    l0: usize,
+    l1: usize,
+    l2: usize,
+) -> Arc<(Vec<Complex64>, Vec<Complex64>, Vec<Complex64>)> {
+    let cache = MESH_CACHE_3D.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap();
+    if let Some(mesh) = map.get(&(l0, l1, l2)) {
+        return Arc::clone(mesh);
+    }
+    let mx2 = l2 / 2 + 1;
+    let mesh = Arc::new(build_mesh_3d(&[l0, l1, mx2], &[l0, l1, l2]));
+    map.insert((l0, l1, l2), Arc::clone(&mesh));
     mesh
 }
 
@@ -693,8 +716,36 @@ fn protein_bursty_core(
 // eval_model_pss — 2-D models
 // ============================================================================
 
+/// Evaluate log-PGF for any supported 2-D bio_model given g0/g1 mesh slices.
+fn eval_pgf_2d(
+    bio_model: &str,
+    g0: &[Complex64],
+    g1: &[Complex64],
+    p: &[f64],
+    fixed_quad_t: f64,
+    quad_order: usize,
+) -> PyResult<Vec<Complex64>> {
+    Ok(match bio_model {
+        "Constitutive" => pgf_constitutive(g0, g1, p),
+        "Extrinsic"    => pgf_extrinsic(g0, g1, p),
+        "Delay"        => pgf_delay(g0, g1, p),
+        "DelayedSplicing" => pgf_delayed_splicing(g0, g1, p),
+        "Bursty" => {
+            let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
+            pgf_bursty(g0, g1, p, t, quad_order)
+        }
+        "CIR" => {
+            let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
+            pgf_cir(g0, g1, p, t, quad_order)
+        }
+        _ => return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown bio_model for eval_model_pss_2d: {bio_model}"
+        ))),
+    })
+}
+
 #[pyfunction]
-#[pyo3(signature = (bio_model, p_log, limits, fixed_quad_t, quad_order, samp_log=None))]
+#[pyo3(signature = (bio_model, p_log, limits, fixed_quad_t, quad_order, samp_log=None, amb_model="None", amb_log=None))]
 fn eval_model_pss_2d(
     bio_model: &str,
     p_log: Vec<f64>,
@@ -702,43 +753,75 @@ fn eval_model_pss_2d(
     fixed_quad_t: f64,
     quad_order: usize,
     samp_log: Option<Vec<f64>>,
+    amb_model: &str,
+    amb_log: Option<Vec<f64>>,
 ) -> PyResult<Vec<f64>> {
     let p: Vec<f64> = p_log.iter().map(|&x| 10.0_f64.powf(x)).collect();
-    let (l0, l1) = (limits[0], limits[1]);
 
-    // Apply Poisson technical noise: g → exp(λ·g) − 1 per modality.
-    let mesh = if let Some(ref samp) = samp_log {
+    if amb_model == "None" {
+        // --- existing 2-D path ---
+        let (l0, l1) = (limits[0], limits[1]);
+        let mesh = if let Some(ref samp) = samp_log {
+            let lam0 = 10.0_f64.powf(samp[0]);
+            let lam1 = 10.0_f64.powf(samp[1]);
+            build_mesh_2d_poisson_cached(l0, l1, lam0, lam1)
+        } else {
+            build_mesh_2d_cached(l0, l1)
+        };
+        let (g0, g1) = (&mesh.0, &mesh.1);
+        let gf_log = eval_pgf_2d(bio_model, g0, g1, &p, fixed_quad_t, quad_order)?;
+        let gf: Vec<Complex64> = gf_log.par_iter().map(|z| z.exp()).collect();
+        let pss_raw = irfftn_2d(&gf, l0, l1);
+        let abs_sum: f64 = pss_raw.par_iter().map(|x| x.abs()).sum();
+        return Ok(pss_raw.par_iter().map(|x| x.abs() / abs_sum).collect());
+    }
+
+    // --- 3-D ambient path ---
+    // limits = [l0, l1, l_amb].  p_log contains only bio params; amb_log has
+    // [log10_p_amb] (Equal) or [log10_p0, log10_p1] (Unequal).
+    let (l0, l1, l2) = (limits[0], limits[1], limits[2]);
+    let mx2 = l2 / 2 + 1;
+
+    let amb = amb_log.as_deref().unwrap_or(&[]);
+    let (p_amb0, p_amb1): (f64, f64) = match amb_model {
+        "Equal"   => { let v = 10.0_f64.powf(amb[0]); (v, v) }
+        "Unequal" => (10.0_f64.powf(amb[0]), 10.0_f64.powf(amb[1])),
+        _ => return Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Unknown amb_model: {amb_model}")
+        )),
+    };
+
+    // Build (or retrieve cached) 3-D base mesh.
+    let mesh3 = build_mesh_3d_cached(l0, l1, l2);
+    let (g0_base, g1_base, g_amb) = (&mesh3.0, &mesh3.1, &mesh3.2);
+
+    // Mix: g0_eff = (1-p0)*g0 + p0*g_amb,  g1_eff = (1-p1)*g1 + p1*g_amb.
+    let one  = Complex64::new(1.0, 0.0);
+    let q0   = Complex64::new(1.0 - p_amb0, 0.0);
+    let pa0  = Complex64::new(p_amb0, 0.0);
+    let q1   = Complex64::new(1.0 - p_amb1, 0.0);
+    let pa1  = Complex64::new(p_amb1, 0.0);
+
+    let mut g0_eff: Vec<Complex64> = g0_base.iter().zip(g_amb.iter())
+        .map(|(&g0, &ga)| g0 * q0 + ga * pa0)
+        .collect();
+    let mut g1_eff: Vec<Complex64> = g1_base.iter().zip(g_amb.iter())
+        .map(|(&g1, &ga)| g1 * q1 + ga * pa1)
+        .collect();
+
+    // Apply Poisson seq_model if requested (applied to mixed variables).
+    if let Some(ref samp) = samp_log {
         let lam0 = 10.0_f64.powf(samp[0]);
         let lam1 = 10.0_f64.powf(samp[1]);
-        build_mesh_2d_poisson_cached(l0, l1, lam0, lam1)
-    } else {
-        build_mesh_2d_cached(l0, l1)
-    };
-    let (g0, g1) = (&mesh.0, &mesh.1);
+        g0_eff.iter_mut().for_each(|z| *z = (*z * lam0).exp() - one);
+        g1_eff.iter_mut().for_each(|z| *z = (*z * lam1).exp() - one);
+    }
 
-    let gf_log: Vec<Complex64> = match bio_model {
-        "Constitutive" => pgf_constitutive(g0, g1, &p),
-        "Extrinsic" => pgf_extrinsic(g0, g1, &p),
-        "Delay" => pgf_delay(g0, g1, &p),
-        "DelayedSplicing" => pgf_delayed_splicing(g0, g1, &p),
-        "Bursty" => {
-            let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
-            pgf_bursty(g0, g1, &p, t, quad_order)
-        }
-        "CIR" => {
-            let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
-            pgf_cir(g0, g1, &p, t, quad_order)
-        }
-        _ => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown bio_model for eval_model_pss_2d: {bio_model}"
-            )))
-        }
-    };
-
-    // Parallel exp, then irfftn, then parallel normalize.
+    // Evaluate log-PGF, exp, 3-D irfftn, normalize.
+    let gf_log = eval_pgf_2d(bio_model, &g0_eff, &g1_eff, &p, fixed_quad_t, quad_order)?;
     let gf: Vec<Complex64> = gf_log.par_iter().map(|z| z.exp()).collect();
-    let pss_raw = irfftn_2d(&gf, l0, l1);
+    // irfftn_3d(input, mx0, mx2_in, n0, n1, n2): mx0=l0 (no axis-0 coarsening)
+    let pss_raw = irfftn_3d(&gf, l0, mx2, l0, l1, l2);
     let abs_sum: f64 = pss_raw.par_iter().map(|x| x.abs()).sum();
     Ok(pss_raw.par_iter().map(|x| x.abs() / abs_sum).collect())
 }

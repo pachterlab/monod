@@ -590,12 +590,12 @@ class CMEModel:
                                 EPS=1e-15, eps=1e-6, n_jobs=1):
         """Compute KLD and its gradient w.r.t. log10 parameters.
 
-        For Constitutive and Extrinsic models (Python path only), uses an
-        analytical gradient derived through the IFFT via the chain rule —
+        For Constitutive, Extrinsic, Delay, and DelayedSplicing (Python path only),
+        uses an analytical gradient derived through the IFFT via the chain rule —
         one shared PGF evaluation plus n_params IFFTs, no extra quadrature.
 
-        For all other models, uses forward finite differences, optionally
-        parallelised with joblib.
+        For Bursty, CIR, and ProteinBursty, uses forward finite differences,
+        optionally parallelised with joblib.
 
         Parameters
         ----------
@@ -626,8 +626,8 @@ class CMEModel:
 
         p = np.asarray(p, dtype=float)
 
-        # Analytical gradient path: Constitutive and Extrinsic with Python
-        # fallback (seq_model="None" or "Poisson"/"Bernoulli", no ambiguity).
+        # Analytical gradient path: Constitutive, Extrinsic, Delay, DelayedSplicing
+        # with Python fallback (seq_model="None"/"Poisson"/"Bernoulli", no ambiguity).
         _ANALYTIC_GRAD_MODELS = {"Constitutive", "Extrinsic",
                                  "Delay", "DelayedSplicing"}
         if (self.bio_model in _ANALYTIC_GRAD_MODELS
@@ -718,44 +718,37 @@ class CMEModel:
             A = 1.0 - b * U
             B = 1.0 - b * g0
             C = 1.0 - b * g1
-            phi = (-np.log(A) / beta
-                   + np.log(A / B) / (beta * C)
-                   + tau * b * g1 / C)
-            dU_db = 0.0  # U doesn't depend on b
-            dU_dbeta = (g0 - g1) * (-tau) * E
-            dU_dtauinv = (g0 - g1) * beta * E * tau ** 2
-            dA_db = -U;   dA_dbeta = -b * dU_dbeta;   dA_dtauinv = -b * dU_dtauinv
+            phi = -np.log(A) / beta + np.log(A / B) / (beta * C) + tau * b * g1 / C
+            logAB = np.log(A / B)
+            # dA/dbeta via dU/dbeta = (g0-g1)*(-tau)*E
+            dA_dbeta = b * tau * (g0 - g1) * E
+            # dA/dtau  via dU/dtau  = (g0-g1)*(-beta)*E
+            dA_dtau = b * beta * (g0 - g1) * E
+            # d phi / d b  (A, B, C all depend on b; U does not)
             dphi_db = (
                 U / (A * beta)
                 - U / (A * beta * C)
-                + np.log(A / B) * g1 / (beta * C ** 2)
-                + tau * g1 / C + tau * b * g1 ** 2 / C ** 2
+                + g0 / (B * beta * C)
+                + logAB * g1 / (beta * C ** 2)
+                + tau * g1 / C
+                + tau * b * g1 ** 2 / C ** 2
             ) * b * LN10
+            # d phi / d beta  (B, C do not depend on beta)
             dphi_dbeta = (
                 np.log(A) / beta ** 2
-                + dA_dbeta / (A * beta)
-                - np.log(A / B) / (beta ** 2 * C)
+                - dA_dbeta / (A * beta)
                 + dA_dbeta / (A * beta * C)
-                + dU_dbeta * b / (A * beta * C) * (-1)
-                - tau * b * g1 / C
+                - logAB / (beta ** 2 * C)
             ) * beta * LN10
-            # tauinv gradient via tau = 1/tauinv, d/dtauinv = -tau^2 * d/dtau
+            # d phi / d tauinv:
+            #   d phi / d tau  = b*g1/C * (dA_dtau/(A*beta) + 1)
+            #   d phi / d tauinv = d phi / d tau * (-tau^2)
+            #   dphi_dtauinv   = d phi / d tauinv * tauinv * LN10
+            #                  = -b*g1*tau/C * (dA_dtau/(A*beta) + 1) * LN10
             dphi_dtauinv = (
-                b * g1 * tau ** 2 / C
-                + dA_dtauinv / (A * beta) * (-1)
-                + dA_dtauinv / (A * beta * C)
-            ) * (-tauinv ** 2) * tauinv * LN10 * (-1)
-            # Simpler: use LN10 * tauinv * d phi / d tauinv
-            # d phi / d tauinv = d phi / d tau * (-tau^2)
-            # d phi / d tau = b*g1/C - (g0-g1)*E*(b / (A*beta) - b/(A*beta*C))
-            dphidtau = (b * g1 / C
-                        + (g0 - g1) * (-beta) * E * (-b / (A * beta) + b / (A * beta * C))
-                        + b * g1 / C)
-            # avoid double-counting; recompute cleanly
-            dphidtau = ((g0 - g1) * beta * E * b / (A * beta * (1.0 - 1.0 / C))
-                        + b * g1 / C)
-            # The Delay gradient is complex; fall back to FD to avoid bugs.
-            return None
+                -b * g1 * tau / C * (dA_dtau / (A * beta) + 1.0)
+            ) * LN10
+            dphi = [dphi_db, dphi_dbeta, dphi_dtauinv]
         else:
             return None  # unsupported model
 
@@ -889,6 +882,36 @@ class CMEModel:
             pss = np.array(pss_flat).reshape(int(limits[0]), int(limits[1]))
             return pss.squeeze()
 
+        # Rust fast-path for ambient models (Equal/Unequal) + seq_model="None".
+        # All 6 2-D bio_models are supported; p_log must have the amb params stripped.
+        _RUST_AMB_MODELS = {
+            "Constitutive", "Bursty", "CIR",
+            "Extrinsic", "Delay", "DelayedSplicing",
+        }
+        if (
+            _HAS_RUST
+            and self.bio_model in _RUST_AMB_MODELS
+            and self.seq_model == "None"
+            and self.amb_model in ("Equal", "Unequal")
+            and self.quad_method == "fixed_quad"
+            and samp is None
+        ):
+            n_amb = 1 if self.amb_model == "Equal" else 2
+            p_bio = p[:-n_amb]
+            amb_params = p[-n_amb:].tolist()
+            pss_flat = _mc.eval_model_pss_2d(
+                self.bio_model,
+                p_bio.tolist(),
+                [int(x) for x in limits],
+                float(self.fixed_quad_T),
+                int(self.quad_order),
+                None,
+                self.amb_model,
+                amb_params,
+            )
+            pss = np.array(pss_flat).reshape([int(l) for l in limits])
+            return pss.squeeze()
+
         # Rust fast-path for ProteinBursty (seq_model="None", amb_model="None").
         if (
             _HAS_RUST
@@ -929,14 +952,14 @@ class CMEModel:
 
         
         if self.amb_model == "Unequal":
-            g_ = np.zeros((2, g.shape[1], g.shape[2]), dtype=np.complex128)
+            g_ = np.zeros((2, g.shape[1]), dtype=np.complex128)
             p_amb = np.power(10, p[-2:])
             g_[0] = p_amb[0] * g[2] + (1 - p_amb[0]) * g[0]
             g_[1] = p_amb[1] * g[2] + (1 - p_amb[1]) * g[1]
             g = g_
             p = np.copy(p[:-2])  # better safe
         elif self.amb_model == "Equal":
-            g_ = np.zeros((2, g.shape[1], g.shape[2]), dtype=np.complex128)
+            g_ = np.zeros((2, g.shape[1]), dtype=np.complex128)
             p_amb = np.power(10, p[-1])
             g_[0] = p_amb * g[2] + (1 - p_amb) * g[0]
             g_[1] = p_amb * g[2] + (1 - p_amb) * g[1]
