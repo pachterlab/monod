@@ -1090,7 +1090,7 @@ class CMEModel:
         Pss = Pss.squeeze()
         return Pss
 
-    def eval_model_pss_batch(self, params_list, limits_list, samp_list=None):
+    def eval_model_pss_batch(self, params_list, limits_list, samp_list=None, num_threads=None):
         """Evaluate PSS for N genes in a single batched Rust call (rayon-parallel).
 
         All N evaluations run in parallel on the Rust thread pool (rayon), with
@@ -1109,6 +1109,9 @@ class CMEModel:
         samp_list : list of (np.ndarray or None), length N, optional
             Poisson sampling parameters per gene; pass None per entry (or
             omit the argument) when seq_model=="None".
+        num_threads : int or None, optional
+            Number of rayon threads to use. None (default) uses all available
+            cores. Ignored when falling back to the sequential Python path.
 
         Returns
         -------
@@ -1153,6 +1156,7 @@ class CMEModel:
             float(self.fixed_quad_T),
             int(self.quad_order),
             samp_py,
+            num_threads,
         )
         return [
             np.array(flat).reshape(int(lim[0]), int(lim[1])).squeeze()

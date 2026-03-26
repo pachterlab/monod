@@ -9,7 +9,7 @@ from scipy import optimize, stats
 import mminference
 
 from extract_data import make_dir, log, extract_data
-from cme_toolbox import CMEModel  # may be unnecessary
+from cme_toolbox import CMEModel, _HAS_RUST  # may be unnecessary
 import multiprocessing
 import os
 
@@ -73,7 +73,7 @@ def perform_inference(h5ad_filepath,
     exclude_sigma=True,
     poisson_average_log_length=5,
     mek_means_params=None,
-    num_cores=1, AIC_EPS=1e-20, AIC_offs=0,
+    num_cores=1, grid_cores=1, AIC_EPS=1e-20, AIC_offs=0,
     save=False, checkpoint=False):
     '''
     Load and filter data from h5ad file.
@@ -150,7 +150,7 @@ def perform_inference(h5ad_filepath,
 
     if not mek_means_params:
         # Fit the model at all values of technical parameters, and save the location of the results.
-        search_result = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, checkpoint=checkpoint, save=save)
+        search_result = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, grid_cores=grid_cores, checkpoint=checkpoint, save=save)
         log.info('Grid points fit.')
         search_result.find_sampling_optimum(discard_rejected=False)
         parameters_per_gene = search_result.phys_optimum
@@ -159,7 +159,7 @@ def perform_inference(h5ad_filepath,
 
     else:
         # Fit the model at all values of technical parameters, and save the location of the results.
-        search_result_list = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, checkpoint=checkpoint, save=save)
+        search_result_list = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, grid_cores=grid_cores, checkpoint=checkpoint, save=save)
         log.info('Grid points fit.')
 
         cluster_params = {}
@@ -708,7 +708,7 @@ class InferenceParameters:
             "max_iterations" defines the maximum number of gradient descent iterations.
             "init_pattern" defines whether the first try starts at the method of moments estimate.
             "num_restarts" defines how many attempts should be made.
-            "num_gene_cores" controls joblib parallelism over genes per grid point (-1 = all cores).
+            "num_gene_cores" controls gene-level parallelism per grid point (-1 = all cores; Rust batch Adam if available, else ThreadPoolExecutor).
             "n_jac_jobs" controls joblib parallelism over FD perturbations (-1 = all cores); only
             effective when num_gene_cores=1 to avoid nested parallelism.
         run_meta: str, optional
@@ -816,13 +816,21 @@ class InferenceParameters:
                 )
             )
 
-    def fit_all_grid_points(self, search_data, num_cores=1, coarse_to_fine=False, checkpoint=False, save=False):
+    def fit_all_grid_points(self, search_data, num_cores=1, grid_cores=1, coarse_to_fine=False, checkpoint=False, save=False):
         """Fits the search data for all genes over all grid points.
 
         Parameters
         ----------
         num_cores: int
-            number of cores to use for parallelization over grid points.
+            Number of cores for gene-level parallelization at each grid point.
+            If Rust is available, uses batched Adam optimizer with num_cores
+            rayon threads. Otherwise falls back to ThreadPoolExecutor with
+            scipy L-BFGS-B. Pass -1 for all available cores. Default 1
+            (sequential).
+        grid_cores: int
+            Number of cores to use for parallelization over grid points via
+            joblib. Default 1 (sequential). Note: combining grid_cores > 1 with
+            num_cores > 1 can oversubscribe CPU cores.
         search_data: monod.extract_data.SearchData
             SearchData object with the data to fit.
         coarse_to_fine: bool, optional
@@ -846,6 +854,11 @@ class InferenceParameters:
         if checkpoint:
             make_dir(self.inference_string)
 
+        # Apply gene-level parallelism override for this call.
+        _prev_gene_cores = self.gradient_params.get("num_gene_cores", 1)
+        if num_cores != 1:
+            self.gradient_params["num_gene_cores"] = num_cores
+
         from joblib import Parallel, delayed as jdelayed
 
         # in-memory store: point_index -> GridPointResults
@@ -864,9 +877,9 @@ class InferenceParameters:
                 Optional mapping point_index -> param array to seed the first
                 warm-start for each point (used in coarse-to-fine Phase 2).
             """
-            if num_cores > 1:
+            if grid_cores > 1:
                 log.info("Starting parallelized grid scan (%d points).", len(point_indices))
-                returned = Parallel(n_jobs=num_cores)(
+                returned = Parallel(n_jobs=grid_cores)(
                     jdelayed(self.par_fun)(idx, search_data, self.model)
                     for idx in tqdm(point_indices, desc="Grid scan")
                 )
@@ -921,6 +934,9 @@ class InferenceParameters:
             _run_points(top_k, init_warm_start=gp_results)
         else:
             _run_points(all_indices)
+
+        # Restore num_gene_cores to its value before this call.
+        self.gradient_params["num_gene_cores"] = _prev_gene_cores
 
         results = SearchResults(self, search_data)
         results.aggregate_grid_points(gp_results if gp_results else None)
@@ -1202,29 +1218,29 @@ class GradientInference:
         t1 = time.time()
 
         n_gene_cores = self.gradient_params.get("num_gene_cores", 1)
-        if n_gene_cores == "rust":
-            param_estimates, klds = self._iterate_over_genes_batch(model, search_data)
-        elif n_gene_cores != 1:
-            # ThreadPoolExecutor: GIL is released during every Rust PSS call, so
-            # threads execute eval_model_pss in true parallel with zero pickling
-            # overhead.  Pass n_gene_cores=-1 (or any negative int) for all CPUs.
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            import os
-            n_workers = (
-                os.cpu_count() if n_gene_cores < 0 else n_gene_cores
-            )
-            results_list = [None] * search_data.n_genes
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                futures = {
-                    pool.submit(
-                        self.optimize_gene,
-                        gene_index=i, model=model, search_data=search_data
-                    ): i
-                    for i in range(search_data.n_genes)
-                }
-                for f in as_completed(futures):
-                    results_list[futures[f]] = f.result()
-            param_estimates, klds = zip(*results_list)
+        if n_gene_cores != 1:
+            num_threads = None if n_gene_cores < 0 else n_gene_cores
+            if _HAS_RUST:
+                # Batch Adam optimizer: all genes in one rayon call, GIL released.
+                param_estimates, klds = self._iterate_over_genes_batch(
+                    model, search_data, num_threads=num_threads
+                )
+            else:
+                # Fallback: ThreadPoolExecutor with scipy L-BFGS-B per gene.
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                n_workers = os.cpu_count() if num_threads is None else num_threads
+                results_list = [None] * search_data.n_genes
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    futures = {
+                        pool.submit(
+                            self.optimize_gene,
+                            gene_index=i, model=model, search_data=search_data
+                        ): i
+                        for i in range(search_data.n_genes)
+                    }
+                    for f in as_completed(futures):
+                        results_list[futures[f]] = f.result()
+                param_estimates, klds = zip(*results_list)
         else:
             param_estimates, klds = zip(
                 *[
@@ -1242,16 +1258,19 @@ class GradientInference:
 
         return param_estimates, klds, obj_func, d_time
 
-    def _iterate_over_genes_batch(self, model, search_data):
+    def _iterate_over_genes_batch(self, model, search_data, num_threads=None):
         """Vectorized gradient descent over all genes using a single batched Rust PSS call
         per optimizer step.
 
-        Uses projected gradient descent with backtracking Armijo line search.
-        At each step, all genes' PSS evaluations (center + FD perturbations) are
-        computed in one `eval_model_pss_batch` call, releasing the GIL and letting
-        rayon parallelize over genes.
+        Uses Adam optimizer.  At each step, all genes' PSS evaluations
+        (center + FD perturbations) are computed in one `eval_model_pss_batch`
+        call, releasing the GIL and letting rayon parallelize over genes.
 
-        Activated via ``gradient_params["num_gene_cores"] = "rust"``.
+        Parameters
+        ----------
+        num_threads : int or None
+            Rayon thread count passed to `eval_model_pss_batch`. None uses all
+            available cores.
 
         Note: uses Adam optimizer (not scipy L-BFGS-B), so parameter estimates
         may differ slightly from the default optimizer.  Key tunables in
@@ -1315,6 +1334,7 @@ class GradientInference:
                 [params_mat[i] for i in range(n_genes)],
                 limits_list,
                 samp_list,
+                num_threads,
             )
             return np.array([
                 _kld_from_pss(pss_list[i], i, limits_list[i])
@@ -1334,7 +1354,7 @@ class GradientInference:
                 aug_limits.extend(limits_list)
                 aug_samp.extend(samp_list)
 
-            all_pss = model.eval_model_pss_batch(aug_params, aug_limits, aug_samp)
+            all_pss = model.eval_model_pss_batch(aug_params, aug_limits, aug_samp, num_threads)
 
             kld0 = np.array([
                 _kld_from_pss(all_pss[i], i, limits_list[i])

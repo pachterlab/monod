@@ -1005,7 +1005,7 @@ fn eval_model_pss_2d_seq(
 /// samp_list    : optional list of Poisson sampling params per call
 ///                (pass None for seq_model="None"; list entries may be None)
 #[pyfunction]
-#[pyo3(signature = (bio_model, params_list, limits_list, fixed_quad_t, quad_order, samp_list=None))]
+#[pyo3(signature = (bio_model, params_list, limits_list, fixed_quad_t, quad_order, samp_list=None, num_threads=None))]
 fn eval_model_pss_2d_batch(
     py: Python<'_>,
     bio_model: String,
@@ -1014,6 +1014,7 @@ fn eval_model_pss_2d_batch(
     fixed_quad_t: f64,
     quad_order: usize,
     samp_list: Option<Vec<Option<Vec<f64>>>>,
+    num_threads: Option<usize>,
 ) -> PyResult<Vec<Vec<f64>>> {
     // Validate bio_model once, before releasing the GIL.
     match bio_model.as_str() {
@@ -1024,22 +1025,32 @@ fn eval_model_pss_2d_batch(
     }
     let n = params_list.len();
     let results = py.allow_threads(|| {
-        (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let samp = samp_list
-                    .as_ref()
-                    .and_then(|sl| sl[i].as_deref());
-                eval_model_pss_2d_seq(
-                    &bio_model,
-                    &params_list[i],
-                    &limits_list[i],
-                    fixed_quad_t,
-                    quad_order,
-                    samp,
-                )
-            })
-            .collect::<Vec<Vec<f64>>>()
+        let run = || {
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let samp = samp_list
+                        .as_ref()
+                        .and_then(|sl| sl[i].as_deref());
+                    eval_model_pss_2d_seq(
+                        &bio_model,
+                        &params_list[i],
+                        &limits_list[i],
+                        fixed_quad_t,
+                        quad_order,
+                        samp,
+                    )
+                })
+                .collect::<Vec<Vec<f64>>>()
+        };
+        match num_threads {
+            Some(nt) => rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .map(|pool| pool.install(run))
+                .unwrap_or_else(|_| run()),
+            None => run(),
+        }
     });
     Ok(results)
 }
