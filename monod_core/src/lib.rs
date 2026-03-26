@@ -195,6 +195,12 @@ fn build_mesh_2d_poisson_cached(
 // Helpers
 // ============================================================================
 
+/// Grid-point count below which we skip rayon and use sequential iterators.
+/// Rayon thread-pool spinup + PyO3 call overhead dominate for small grids;
+/// switching to sequential avoids this for the common inference case where
+/// per-gene grids have median ~100–500 rfft points (3×3 or 5×5 gridsize).
+const PAR_THRESHOLD: usize = 2048;
+
 #[inline]
 fn np_isclose(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1e-8 + 1e-5 * b.abs()
@@ -341,26 +347,28 @@ fn pgf_bursty(
     let ws: Vec<f64> = gl.1.iter().map(|&wq| wq * t_half).collect();
     let nq = xs.len();
 
-    (0..g0.len())
-        .into_par_iter()
-        .map(|k| {
-            let mut acc = Complex64::new(0.0, 0.0);
-            if close {
-                for q in 0..nq {
-                    let u = (g0[k] * eb_vals[q] + g1[k] * (xs[q] * beta * eg_vals[q])) * b;
-                    acc += (u / (one - u)) * ws[q];
-                }
-            } else {
-                let c2k = g1[k] * f_factor;
-                let c1k = g0[k] - c2k;
-                for q in 0..nq {
-                    let u = (c1k * eb_vals[q] + c2k * eg_vals[q]) * b;
-                    acc += (u / (one - u)) * ws[q];
-                }
+    let compute = |k: usize| {
+        let mut acc = Complex64::new(0.0, 0.0);
+        if close {
+            for q in 0..nq {
+                let u = (g0[k] * eb_vals[q] + g1[k] * (xs[q] * beta * eg_vals[q])) * b;
+                acc += (u / (one - u)) * ws[q];
             }
-            acc
-        })
-        .collect()
+        } else {
+            let c2k = g1[k] * f_factor;
+            let c1k = g0[k] - c2k;
+            for q in 0..nq {
+                let u = (c1k * eb_vals[q] + c2k * eg_vals[q]) * b;
+                acc += (u / (one - u)) * ws[q];
+            }
+        }
+        acc
+    };
+    if g0.len() >= PAR_THRESHOLD {
+        (0..g0.len()).into_par_iter().map(compute).collect()
+    } else {
+        (0..g0.len()).map(compute).collect()
+    }
 }
 
 fn pgf_cir(
@@ -385,29 +393,35 @@ fn pgf_cir(
     let ws: Vec<f64> = gl.1.iter().map(|&wq| wq * t_half).collect();
     let nq = xs.len();
 
-    let mut gf: Vec<Complex64> = (0..g0.len())
-        .into_par_iter()
-        .map(|k| {
-            let mut acc = Complex64::new(0.0, 0.0);
-            if close {
-                for q in 0..nq {
-                    let u = (g0[k] * eb_vals[q] + g1[k] * (xs[q] * beta * eg_vals[q])) * b;
-                    let integrand = one - (one - four * u).sqrt();
-                    acc += integrand * ws[q];
-                }
-            } else {
-                let c2k = g1[k] * f_factor;
-                let c1k = g0[k] - c2k;
-                for q in 0..nq {
-                    let u = (c1k * eb_vals[q] + c2k * eg_vals[q]) * b;
-                    let integrand = one - (one - four * u).sqrt();
-                    acc += integrand * ws[q];
-                }
+    let compute = |k: usize| {
+        let mut acc = Complex64::new(0.0, 0.0);
+        if close {
+            for q in 0..nq {
+                let u = (g0[k] * eb_vals[q] + g1[k] * (xs[q] * beta * eg_vals[q])) * b;
+                let integrand = one - (one - four * u).sqrt();
+                acc += integrand * ws[q];
             }
-            acc
-        })
-        .collect();
-    gf.par_iter_mut().for_each(|v| *v /= 2.0);
+        } else {
+            let c2k = g1[k] * f_factor;
+            let c1k = g0[k] - c2k;
+            for q in 0..nq {
+                let u = (c1k * eb_vals[q] + c2k * eg_vals[q]) * b;
+                let integrand = one - (one - four * u).sqrt();
+                acc += integrand * ws[q];
+            }
+        }
+        acc
+    };
+    let mut gf: Vec<Complex64> = if g0.len() >= PAR_THRESHOLD {
+        (0..g0.len()).into_par_iter().map(compute).collect()
+    } else {
+        (0..g0.len()).map(compute).collect()
+    };
+    if g0.len() >= PAR_THRESHOLD {
+        gf.par_iter_mut().for_each(|v| *v /= 2.0);
+    } else {
+        gf.iter_mut().for_each(|v| *v /= 2.0);
+    }
     gf
 }
 
@@ -488,46 +502,66 @@ fn protein_pgf(
     let num_tsteps = (t_max / dt).ceil() as usize;
     let one = Complex64::new(1.0, 0.0);
 
-    // Phase 1: fixed trajectory per point, fully parallel (no sync per step).
-    let mut states: Vec<(Complex64, Complex64, Complex64, Complex64)> =
-        (0..n_grid)
-            .into_par_iter()
-            .map(|k| {
-                // Truncate to f32 and back to match Python's dtype=np.complex64 cast.
-                let mut u0 = Complex64::new(g0[k].re as f32 as f64, g0[k].im as f32 as f64);
-                let mut u1 = Complex64::new(g1[k].re as f32 as f64, g1[k].im as f32 as f64);
-                let mut u2 = Complex64::new(g2[k].re as f32 as f64, g2[k].im as f32 as f64);
-                let mut phi = u0 * b / (one - u0 * b) * (dt / 2.0);
-                for _ in 0..num_tsteps {
-                    let (nu0, nu1, nu2) = rk4_step(u0, u1, u2, dt, beta, gamma, k_p, gamma_p);
-                    u0 = nu0; u1 = nu1; u2 = nu2;
-                    phi += u0 * b / (one - u0 * b) * dt;
-                }
-                (u0, u1, u2, phi)
-            })
-            .collect();
+    let phase1_fn = |k: usize| {
+        // Truncate to f32 and back to match Python's dtype=np.complex64 cast.
+        let mut u0 = Complex64::new(g0[k].re as f32 as f64, g0[k].im as f32 as f64);
+        let mut u1 = Complex64::new(g1[k].re as f32 as f64, g1[k].im as f32 as f64);
+        let mut u2 = Complex64::new(g2[k].re as f32 as f64, g2[k].im as f32 as f64);
+        let mut phi = u0 * b / (one - u0 * b) * (dt / 2.0);
+        for _ in 0..num_tsteps {
+            let (nu0, nu1, nu2) = rk4_step(u0, u1, u2, dt, beta, gamma, k_p, gamma_p);
+            u0 = nu0; u1 = nu1; u2 = nu2;
+            phi += u0 * b / (one - u0 * b) * dt;
+        }
+        (u0, u1, u2, phi)
+    };
+
+    // Phase 1: fixed trajectory per point.
+    let mut states: Vec<(Complex64, Complex64, Complex64, Complex64)> = if n_grid >= PAR_THRESHOLD {
+        (0..n_grid).into_par_iter().map(phase1_fn).collect()
+    } else {
+        (0..n_grid).map(phase1_fn).collect()
+    };
 
     // Phase 2: global-max termination — matches Python's
     // `while np.max(np.abs(u_tilde[0])) >= 1e-3`.
+    let phase2_step = |s: &mut (Complex64, Complex64, Complex64, Complex64)| {
+        let (nu0, nu1, nu2) = rk4_step(s.0, s.1, s.2, dt, beta, gamma, k_p, gamma_p);
+        s.0 = nu0; s.1 = nu1; s.2 = nu2;
+        s.3 += nu0 * b / (one - nu0 * b) * dt;
+    };
     loop {
-        let max_norm = states.par_iter().map(|s| s.0.norm()).reduce(|| 0.0_f64, f64::max);
+        let max_norm = if n_grid >= PAR_THRESHOLD {
+            states.par_iter().map(|s| s.0.norm()).reduce(|| 0.0_f64, f64::max)
+        } else {
+            states.iter().map(|s| s.0.norm()).fold(0.0_f64, f64::max)
+        };
         if max_norm < 1e-3 {
             break;
         }
-        states.par_iter_mut().for_each(|s| {
-            let (nu0, nu1, nu2) = rk4_step(s.0, s.1, s.2, dt, beta, gamma, k_p, gamma_p);
-            s.0 = nu0; s.1 = nu1; s.2 = nu2;
-            s.3 += nu0 * b / (one - nu0 * b) * dt;
-        });
+        if n_grid >= PAR_THRESHOLD {
+            states.par_iter_mut().for_each(phase2_step);
+        } else {
+            states.iter_mut().for_each(phase2_step);
+        }
     }
 
-    // Phase 3: final half-step, parallel.
-    states.par_iter_mut().for_each(|s| {
+    // Phase 3: final half-step.
+    let phase3_step = |s: &mut (Complex64, Complex64, Complex64, Complex64)| {
         let (nu0, _, _) = rk4_step(s.0, s.1, s.2, dt, beta, gamma, k_p, gamma_p);
         s.3 += nu0 * b / (one - nu0 * b) * (dt / 2.0);
-    });
+    };
+    if n_grid >= PAR_THRESHOLD {
+        states.par_iter_mut().for_each(phase3_step);
+    } else {
+        states.iter_mut().for_each(phase3_step);
+    }
 
-    states.into_par_iter().map(|s| s.3).collect()
+    if n_grid >= PAR_THRESHOLD {
+        states.into_par_iter().map(|s| s.3).collect()
+    } else {
+        states.into_iter().map(|s| s.3).collect()
+    }
 }
 
 // ============================================================================
@@ -546,22 +580,29 @@ fn irfftn_2d(input: &[Complex64], n0: usize, n1: usize) -> Vec<f64> {
     let mx1 = n1 / 2 + 1;
     let zero = Complex64::new(0.0, 0.0);
 
-    // Step 1: Transpose to column-major, then parallel IFFT along axis 0.
+    // Step 1: Transpose to column-major, then IFFT along axis 0.
     let mut col_buf = vec![zero; mx1 * n0];
     for i in 0..n0 {
         for j in 0..mx1 {
             col_buf[j * n0 + i] = input[i * mx1 + j];
         }
     }
-    col_buf.par_chunks_mut(n0).for_each(|col| {
-        let fft = plan_ifft(n0);
-        ifft_inplace(col, &fft);
-    });
+    if input.len() >= PAR_THRESHOLD {
+        col_buf.par_chunks_mut(n0).for_each(|col| {
+            let fft = plan_ifft(n0);
+            ifft_inplace(col, &fft);
+        });
+    } else {
+        col_buf.chunks_mut(n0).for_each(|col| {
+            let fft = plan_ifft(n0);
+            ifft_inplace(col, &fft);
+        });
+    }
 
-    // Step 2: Parallel irfft along axis 1.
+    // Step 2: irfft along axis 1.
     // Gather each row i from col_buf with stride n0 — no mid allocation needed.
     let mut result = vec![0.0_f64; n0 * n1];
-    result.par_chunks_mut(n1).enumerate().for_each(|(i, row_out)| {
+    let irfft_row = |(i, row_out): (usize, &mut [f64])| {
         let fft = plan_ifft(n1);
         ROW_BUF.with(|rb| {
             let mut buf = rb.borrow_mut();
@@ -585,7 +626,12 @@ fn irfftn_2d(input: &[Complex64], n0: usize, n1: usize) -> Vec<f64> {
                 *out = c.re;
             }
         });
-    });
+    };
+    if n0 * n1 >= PAR_THRESHOLD {
+        result.par_chunks_mut(n1).enumerate().for_each(irfft_row);
+    } else {
+        result.chunks_mut(n1).enumerate().for_each(irfft_row);
+    }
     result
 }
 
@@ -620,13 +666,20 @@ fn irfftn_3d(input: &[Complex64], mx0: usize, mx2_in: usize, n0: usize, n1: usiz
             // Indices mx0..n0 are already zero (zero-padding).
         }
     }
-    col0_buf.par_chunks_mut(n0).for_each(|col| {
-        let fft = plan_ifft(n0);
-        ifft_inplace(col, &fft);
-    });
+    if col0_buf.len() >= PAR_THRESHOLD {
+        col0_buf.par_chunks_mut(n0).for_each(|col| {
+            let fft = plan_ifft(n0);
+            ifft_inplace(col, &fft);
+        });
+    } else {
+        col0_buf.chunks_mut(n0).for_each(|col| {
+            let fft = plan_ifft(n0);
+            ifft_inplace(col, &fft);
+        });
+    }
     // After: col0_buf[(j1*mx2_in+j2)*n0 + i] = IFFT result at axis-0 position i.
 
-    // Step 2: Gather columns (i, j2) of length n1 from col0_buf, parallel IFFT along axis 1.
+    // Step 2: Gather columns (i, j2) of length n1 from col0_buf, IFFT along axis 1.
     // col1_buf layout: [(i*mx2_in+j2)*n1 + j1] — eliminates buf0 intermediate allocation.
     let n_cols_1 = n0 * mx2_in;
     let mut col1_buf = vec![zero; n_cols_1 * n1];
@@ -638,17 +691,24 @@ fn irfftn_3d(input: &[Complex64], mx0: usize, mx2_in: usize, n0: usize, n1: usiz
             }
         }
     }
-    col1_buf.par_chunks_mut(n1).for_each(|col| {
-        let fft = plan_ifft(n1);
-        ifft_inplace(col, &fft);
-    });
+    if col1_buf.len() >= PAR_THRESHOLD {
+        col1_buf.par_chunks_mut(n1).for_each(|col| {
+            let fft = plan_ifft(n1);
+            ifft_inplace(col, &fft);
+        });
+    } else {
+        col1_buf.chunks_mut(n1).for_each(|col| {
+            let fft = plan_ifft(n1);
+            ifft_inplace(col, &fft);
+        });
+    }
     // After: col1_buf[(i*mx2_in+j2)*n1 + j1] = IFFT result at axis-1 position j1.
 
-    // Step 3: Parallel irfft along axis 2.
+    // Step 3: irfft along axis 2.
     // Gather row (i, j1) from col1_buf with stride n1 — eliminates buf1 intermediate allocation.
     let copy_len = mx2_in.min(mx2_out);
     let mut result = vec![0.0_f64; n0 * n1 * n2];
-    result.par_chunks_mut(n2).enumerate().for_each(|(row_idx, row_out)| {
+    let irfft_row3 = |(row_idx, row_out): (usize, &mut [f64])| {
         let i = row_idx / n1;
         let j1 = row_idx % n1;
         let fft = plan_ifft(n2);
@@ -674,7 +734,12 @@ fn irfftn_3d(input: &[Complex64], mx0: usize, mx2_in: usize, n0: usize, n1: usiz
                 *out = c.re;
             }
         });
-    });
+    };
+    if n0 * n1 * n2 >= PAR_THRESHOLD {
+        result.par_chunks_mut(n2).enumerate().for_each(irfft_row3);
+    } else {
+        result.chunks_mut(n2).enumerate().for_each(irfft_row3);
+    }
     result
 }
 
@@ -707,8 +772,12 @@ fn protein_bursty_core(
     let (g0, g1, g2) = build_mesh_3d(&mx, &lims);
 
     let gf_log = protein_pgf(&g0, &g1, &g2, &p, min_fudge, max_fudge);
-    // Parallel exp over the grid.
-    let gf: Vec<Complex64> = gf_log.par_iter().map(|z| z.exp()).collect();
+    let n = gf_log.len();
+    let gf: Vec<Complex64> = if n >= PAR_THRESHOLD {
+        gf_log.par_iter().map(|z| z.exp()).collect()
+    } else {
+        gf_log.iter().map(|z| z.exp()).collect()
+    };
     (gf, mx, lims)
 }
 
@@ -770,10 +839,24 @@ fn eval_model_pss_2d(
         };
         let (g0, g1) = (&mesh.0, &mesh.1);
         let gf_log = eval_pgf_2d(bio_model, g0, g1, &p, fixed_quad_t, quad_order)?;
-        let gf: Vec<Complex64> = gf_log.par_iter().map(|z| z.exp()).collect();
+        let n = gf_log.len();
+        let gf: Vec<Complex64> = if n >= PAR_THRESHOLD {
+            gf_log.par_iter().map(|z| z.exp()).collect()
+        } else {
+            gf_log.iter().map(|z| z.exp()).collect()
+        };
         let pss_raw = irfftn_2d(&gf, l0, l1);
-        let abs_sum: f64 = pss_raw.par_iter().map(|x| x.abs()).sum();
-        return Ok(pss_raw.par_iter().map(|x| x.abs() / abs_sum).collect());
+        let pn = pss_raw.len();
+        let abs_sum: f64 = if pn >= PAR_THRESHOLD {
+            pss_raw.par_iter().map(|x| x.abs()).sum()
+        } else {
+            pss_raw.iter().map(|x| x.abs()).sum()
+        };
+        return Ok(if pn >= PAR_THRESHOLD {
+            pss_raw.par_iter().map(|x| x.abs() / abs_sum).collect()
+        } else {
+            pss_raw.iter().map(|x| x.abs() / abs_sum).collect()
+        });
     }
 
     // --- 3-D ambient path ---
@@ -819,11 +902,146 @@ fn eval_model_pss_2d(
 
     // Evaluate log-PGF, exp, 3-D irfftn, normalize.
     let gf_log = eval_pgf_2d(bio_model, &g0_eff, &g1_eff, &p, fixed_quad_t, quad_order)?;
-    let gf: Vec<Complex64> = gf_log.par_iter().map(|z| z.exp()).collect();
+    let n = gf_log.len();
+    let gf: Vec<Complex64> = if n >= PAR_THRESHOLD {
+        gf_log.par_iter().map(|z| z.exp()).collect()
+    } else {
+        gf_log.iter().map(|z| z.exp()).collect()
+    };
     // irfftn_3d(input, mx0, mx2_in, n0, n1, n2): mx0=l0 (no axis-0 coarsening)
     let pss_raw = irfftn_3d(&gf, l0, mx2, l0, l1, l2);
-    let abs_sum: f64 = pss_raw.par_iter().map(|x| x.abs()).sum();
-    Ok(pss_raw.par_iter().map(|x| x.abs() / abs_sum).collect())
+    let pn = pss_raw.len();
+    let abs_sum: f64 = if pn >= PAR_THRESHOLD {
+        pss_raw.par_iter().map(|x| x.abs()).sum()
+    } else {
+        pss_raw.iter().map(|x| x.abs()).sum()
+    };
+    Ok(if pn >= PAR_THRESHOLD {
+        pss_raw.par_iter().map(|x| x.abs() / abs_sum).collect()
+    } else {
+        pss_raw.iter().map(|x| x.abs() / abs_sum).collect()
+    })
+}
+
+// ============================================================================
+// eval_model_pss_2d_batch — gene-parallel batch evaluation
+// ============================================================================
+
+/// Evaluate the 2-D PSS for a single (params, limits) pair without PyO3 types.
+///
+/// Caller must validate `bio_model` before calling (panics on unknown model).
+/// Used as the per-gene unit in `eval_model_pss_2d_batch`.
+fn eval_model_pss_2d_seq(
+    bio_model: &str,
+    p_log: &[f64],
+    limits: &[usize],
+    fixed_quad_t: f64,
+    quad_order: usize,
+    samp_log: Option<&[f64]>,
+) -> Vec<f64> {
+    let p: Vec<f64> = p_log.iter().map(|&x| 10.0_f64.powf(x)).collect();
+    let (l0, l1) = (limits[0], limits[1]);
+
+    let mesh = if let Some(samp) = samp_log {
+        let lam0 = 10.0_f64.powf(samp[0]);
+        let lam1 = 10.0_f64.powf(samp[1]);
+        build_mesh_2d_poisson_cached(l0, l1, lam0, lam1)
+    } else {
+        build_mesh_2d_cached(l0, l1)
+    };
+    let (g0, g1) = (&mesh.0, &mesh.1);
+
+    let gf_log = match bio_model {
+        "Constitutive" => pgf_constitutive(g0, g1, &p),
+        "Extrinsic"    => pgf_extrinsic(g0, g1, &p),
+        "Delay"        => pgf_delay(g0, g1, &p),
+        "DelayedSplicing" => pgf_delayed_splicing(g0, g1, &p),
+        "Bursty" => {
+            let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
+            pgf_bursty(g0, g1, &p, t, quad_order)
+        }
+        "CIR" => {
+            let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
+            pgf_cir(g0, g1, &p, t, quad_order)
+        }
+        other => panic!("Unknown bio_model in eval_model_pss_2d_seq: {other}"),
+    };
+
+    let n = gf_log.len();
+    let gf: Vec<Complex64> = if n >= PAR_THRESHOLD {
+        gf_log.par_iter().map(|z| z.exp()).collect()
+    } else {
+        gf_log.iter().map(|z| z.exp()).collect()
+    };
+    let pss_raw = irfftn_2d(&gf, l0, l1);
+    let pn = pss_raw.len();
+    let abs_sum: f64 = if pn >= PAR_THRESHOLD {
+        pss_raw.par_iter().map(|x| x.abs()).sum()
+    } else {
+        pss_raw.iter().map(|x| x.abs()).sum()
+    };
+    if pn >= PAR_THRESHOLD {
+        pss_raw.par_iter().map(|x| x.abs() / abs_sum).collect()
+    } else {
+        pss_raw.iter().map(|x| x.abs() / abs_sum).collect()
+    }
+}
+
+/// Evaluate the 2-D PSS for N (params, limits) pairs in parallel using rayon.
+///
+/// The GIL is released for the entire computation via `py.allow_threads()`,
+/// so rayon workers run freely on all available cores.  Each entry is
+/// processed by `eval_model_pss_2d_seq`, which is sequential for small grids
+/// (n_grid < PAR_THRESHOLD); gene-level parallelism across the batch fills
+/// all cores instead.
+///
+/// Parameters
+/// ----------
+/// bio_model    : one of the six supported 2-D bio_models
+/// params_list  : log10 biological parameters per call
+/// limits_list  : grid dimensions per call
+/// fixed_quad_t : quadrature time-scale multiplier
+/// quad_order   : number of Gauss-Legendre quadrature points
+/// samp_list    : optional list of Poisson sampling params per call
+///                (pass None for seq_model="None"; list entries may be None)
+#[pyfunction]
+#[pyo3(signature = (bio_model, params_list, limits_list, fixed_quad_t, quad_order, samp_list=None))]
+fn eval_model_pss_2d_batch(
+    py: Python<'_>,
+    bio_model: String,
+    params_list: Vec<Vec<f64>>,
+    limits_list: Vec<Vec<usize>>,
+    fixed_quad_t: f64,
+    quad_order: usize,
+    samp_list: Option<Vec<Option<Vec<f64>>>>,
+) -> PyResult<Vec<Vec<f64>>> {
+    // Validate bio_model once, before releasing the GIL.
+    match bio_model.as_str() {
+        "Constitutive" | "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => {}
+        other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown bio_model for eval_model_pss_2d_batch: {other}"
+        ))),
+    }
+    let n = params_list.len();
+    let results = py.allow_threads(|| {
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let samp = samp_list
+                    .as_ref()
+                    .and_then(|sl| sl[i].as_deref());
+                eval_model_pss_2d_seq(
+                    &bio_model,
+                    &params_list[i],
+                    &limits_list[i],
+                    fixed_quad_t,
+                    quad_order,
+                    samp,
+                )
+            })
+            .collect::<Vec<Vec<f64>>>()
+    });
+    Ok(results)
 }
 
 // ============================================================================
@@ -843,8 +1061,17 @@ fn eval_model_pss_protein_bursty(
     let (gf, mx, lims) =
         protein_bursty_core(&p_log, &limits, fit_unspliced, protein_limit, min_fudge, max_fudge);
     let pss_raw = irfftn_3d(&gf, mx[0], mx[2], lims[0], lims[1], lims[2]);
-    let abs_sum: f64 = pss_raw.par_iter().map(|x| x.abs()).sum();
-    Ok(pss_raw.par_iter().map(|x| x.abs() / abs_sum).collect())
+    let pn = pss_raw.len();
+    let abs_sum: f64 = if pn >= PAR_THRESHOLD {
+        pss_raw.par_iter().map(|x| x.abs()).sum()
+    } else {
+        pss_raw.iter().map(|x| x.abs()).sum()
+    };
+    Ok(if pn >= PAR_THRESHOLD {
+        pss_raw.par_iter().map(|x| x.abs() / abs_sum).collect()
+    } else {
+        pss_raw.iter().map(|x| x.abs() / abs_sum).collect()
+    })
 }
 
 // ============================================================================
@@ -1330,6 +1557,7 @@ fn eval_custom_network_pgf(
 #[pymodule]
 fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(eval_model_pss_2d, m)?)?;
+    m.add_function(wrap_pyfunction!(eval_model_pss_2d_batch, m)?)?;
     m.add_function(wrap_pyfunction!(eval_model_pss_protein_bursty, m)?)?;
     m.add_function(wrap_pyfunction!(protein_bursty_pgf, m)?)?;
     m.add_function(wrap_pyfunction!(make_histograms_unique, m)?)?;

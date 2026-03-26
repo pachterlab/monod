@@ -1090,6 +1090,75 @@ class CMEModel:
         Pss = Pss.squeeze()
         return Pss
 
+    def eval_model_pss_batch(self, params_list, limits_list, samp_list=None):
+        """Evaluate PSS for N genes in a single batched Rust call (rayon-parallel).
+
+        All N evaluations run in parallel on the Rust thread pool (rayon), with
+        the GIL released for the entire computation.  Falls back to sequential
+        `eval_model_pss` calls when the Rust batch path is not available.
+
+        Supported for all six 2-D bio_models with seq_model in {"None","Poisson"}
+        and amb_model="None", quad_method="fixed_quad".
+
+        Parameters
+        ----------
+        params_list : list of np.ndarray, length N
+            log10 biological parameters per gene.
+        limits_list : list of array-like, length N
+            grid dimensions per gene.
+        samp_list : list of (np.ndarray or None), length N, optional
+            Poisson sampling parameters per gene; pass None per entry (or
+            omit the argument) when seq_model=="None".
+
+        Returns
+        -------
+        list of np.ndarray, length N
+            PSS reshaped to limits_list[i] for each gene.
+        """
+        _RUST_BATCH_MODELS = {
+            "Constitutive", "Bursty", "CIR",
+            "Extrinsic", "Delay", "DelayedSplicing",
+        }
+        n = len(params_list)
+        if samp_list is None:
+            samp_list = [None] * n
+
+        _batch_ok = (
+            _HAS_RUST
+            and self.bio_model in _RUST_BATCH_MODELS
+            and self.amb_model == "None"
+            and self.quad_method == "fixed_quad"
+            and self.seq_model in ("None", "Poisson")
+        )
+        if not _batch_ok:
+            return [
+                self.eval_model_pss(p, lim, s)
+                for p, lim, s in zip(params_list, limits_list, samp_list)
+            ]
+
+        p_py   = [p.tolist() for p in params_list]
+        lim_py = [[int(x) for x in lim] for lim in limits_list]
+
+        if self.seq_model == "None":
+            samp_py = None
+        else:
+            samp_py = [
+                (s.tolist() if s is not None else None) for s in samp_list
+            ]
+
+        results_flat = _mc.eval_model_pss_2d_batch(
+            self.bio_model,
+            p_py,
+            lim_py,
+            float(self.fixed_quad_T),
+            int(self.quad_order),
+            samp_py,
+        )
+        return [
+            np.array(flat).reshape(int(lim[0]), int(lim[1])).squeeze()
+            for flat, lim in zip(results_flat, lim_py)
+        ]
+
     def eval_model_pgf(self, p_, g):
         """Evaluate the log-PGF of the model over the complex unit sphere at a set of parameters.
 
