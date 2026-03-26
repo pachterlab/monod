@@ -1056,7 +1056,7 @@ class GradientInference:
 
         else:
             # If no specific lengths given, multiply the unspliced sampling rate by an average length value for all genes.
-            if model.seq_model == "Poisson" and model.fit_unspliced:
+            if model.seq_model == "Poisson" and getattr(model, 'fit_unspliced', False):
                 regressor[:, 0] += global_parameters.poisson_average_log_length
             
         self.grid_point = global_parameters.sampl_vals[point_index]

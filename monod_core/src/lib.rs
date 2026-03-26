@@ -1077,6 +1077,253 @@ fn make_histograms_unique(
 }
 
 // ============================================================================
+// Custom reaction-network ODE integration — general n-species, parallel RK4
+// ============================================================================
+
+/// Compact encoding of one elementary reaction.
+/// `kind`: 0 = geometric-burst production, 1 = deterministic production, 2 = first-order.
+/// `rate_idx`: index of the rate constant in the `params` slice.
+/// `extra1`: kind 0 → burst-param idx; kind 2 → reactant species idx; else -1.
+/// `extra2`: kind 0 → burst species idx; else -1.
+/// `prod_start`/`prod_end`: range in flat `prod_sp`/`prod_st` arrays.
+#[derive(Clone, Copy)]
+struct RxnInfo {
+    kind:       u8,
+    rate_idx:   u32,
+    extra1:     i32,
+    extra2:     i32,
+    prod_start: u32,
+    prod_end:   u32,
+}
+
+/// Build an N-dimensional complex mesh for irfftn.
+/// Returns (g, mx_sizes, n_grid) where g[s] is the flat grid for species s.
+/// Last axis has rfft half-length (l/2+1); all others full.
+fn build_mesh_nd(limits: &[usize]) -> (Vec<Vec<Complex64>>, Vec<usize>, usize) {
+    let n = limits.len();
+    let two_pi = 2.0 * std::f64::consts::PI;
+
+    let mx: Vec<usize> = limits.iter().enumerate().map(|(i, &l)| {
+        if i == n - 1 { l / 2 + 1 } else { l }
+    }).collect();
+
+    let n_grid: usize = mx.iter().product();
+
+    let freq_vecs: Vec<Vec<Complex64>> = limits.iter().enumerate().map(|(ax, &l)| {
+        (0..mx[ax]).map(|k| {
+            let theta = -two_pi * k as f64 / l as f64;
+            Complex64::new(theta.cos() - 1.0, theta.sin())
+        }).collect()
+    }).collect();
+
+    let mut strides = vec![1usize; n];
+    for i in (0..n - 1).rev() {
+        strides[i] = strides[i + 1] * mx[i + 1];
+    }
+
+    let mut g = vec![vec![Complex64::new(0.0, 0.0); n_grid]; n];
+    for pt in 0..n_grid {
+        for s in 0..n {
+            let idx = (pt / strides[s]) % mx[s];
+            g[s][pt] = freq_vecs[s][idx];
+        }
+    }
+
+    (g, mx, n_grid)
+}
+
+/// Compute the custom-network ODE RHS for one grid point.
+#[inline(always)]
+fn custom_rhs_point(
+    u:       &[Complex64],
+    params:  &[f64],
+    rxns:    &[RxnInfo],
+    prod_sp: &[u32],
+    prod_st: &[u32],
+) -> (Vec<Complex64>, Complex64) {
+    let n   = u.len();
+    let one = Complex64::new(1.0, 0.0);
+    let mut du   = vec![Complex64::new(0.0, 0.0); n];
+    let mut dphi = Complex64::new(0.0, 0.0);
+
+    for rxn in rxns {
+        let k  = Complex64::new(params[rxn.rate_idx as usize], 0.0);
+        let ps = rxn.prod_start as usize;
+        let pe = rxn.prod_end   as usize;
+
+        match rxn.kind {
+            0 => {
+                // Geometric-burst production: dφ += k·b·u[sp]/(1−b·u[sp])
+                let b  = Complex64::new(params[rxn.extra1 as usize], 0.0);
+                let ui = u[rxn.extra2 as usize];
+                dphi += k * b * ui / (one - b * ui);
+            }
+            1 => {
+                // Deterministic production: dφ += k·(z_prod − 1)
+                let mut z = one;
+                for i in ps..pe {
+                    z *= (one + u[prod_sp[i] as usize]).powu(prod_st[i]);
+                }
+                dphi += k * (z - one);
+            }
+            _ => {
+                // First-order: du[ri] += k·(z_prod − (1 + u[ri]))
+                let ri    = rxn.extra1 as usize;
+                let mut z = one;
+                for i in ps..pe {
+                    z *= (one + u[prod_sp[i] as usize]).powu(prod_st[i]);
+                }
+                du[ri] += k * (z - (one + u[ri]));
+            }
+        }
+    }
+    (du, dphi)
+}
+
+/// One RK4 step for one grid point (in-place).
+/// φ is accumulated via RK4 weights, matching the Python `_rk4_step` convention.
+#[inline(always)]
+fn custom_rk4_point(
+    u:       &mut Vec<Complex64>,
+    phi:     &mut Complex64,
+    params:  &[f64],
+    rxns:    &[RxnInfo],
+    prod_sp: &[u32],
+    prod_st: &[u32],
+    dt:      f64,
+) {
+    let n = u.len();
+    let h = dt / 2.0;
+    let s = dt / 6.0;
+
+    let (k1u, k1p) = custom_rhs_point(u, params, rxns, prod_sp, prod_st);
+
+    let u2: Vec<_> = (0..n).map(|i| u[i] + k1u[i] * h).collect();
+    let (k2u, k2p) = custom_rhs_point(&u2, params, rxns, prod_sp, prod_st);
+
+    let u3: Vec<_> = (0..n).map(|i| u[i] + k2u[i] * h).collect();
+    let (k3u, k3p) = custom_rhs_point(&u3, params, rxns, prod_sp, prod_st);
+
+    let u4: Vec<_> = (0..n).map(|i| u[i] + k3u[i] * dt).collect();
+    let (k4u, k4p) = custom_rhs_point(&u4, params, rxns, prod_sp, prod_st);
+
+    for i in 0..n {
+        u[i] += (k1u[i] + k2u[i] * 2.0 + k3u[i] * 2.0 + k4u[i]) * s;
+    }
+    *phi += (k1p + k2p * 2.0 + k3p * 2.0 + k4p) * s;
+}
+
+/// Integrate the custom network over all grid points in parallel (rayon).
+/// Returns exp(φ) at each grid point.
+fn custom_pgf_parallel(
+    g:               &[Vec<Complex64>],
+    params:          &[f64],
+    rxns:            &[RxnInfo],
+    prod_sp:         &[u32],
+    prod_st:         &[u32],
+    n_species:       usize,
+    n_grid:          usize,
+    dt:              f64,
+    n_steps:         usize,
+    max_while_steps: usize,
+) -> Vec<Complex64> {
+    // Phase 1: fixed steps, fully parallel.
+    let mut states: Vec<(Vec<Complex64>, Complex64)> = (0..n_grid)
+        .into_par_iter()
+        .map(|k| {
+            // Truncate to f32 precision to match Python's complex64 cast.
+            let mut u: Vec<Complex64> = (0..n_species)
+                .map(|s| Complex64::new(
+                    g[s][k].re as f32 as f64,
+                    g[s][k].im as f32 as f64,
+                ))
+                .collect();
+            // Leading trapezoidal half-step.
+            let (_, dp0) = custom_rhs_point(&u, params, rxns, prod_sp, prod_st);
+            let mut phi = dp0 * (dt / 2.0);
+            for _ in 0..n_steps {
+                custom_rk4_point(&mut u, &mut phi, params, rxns, prod_sp, prod_st, dt);
+            }
+            (u, phi)
+        })
+        .collect();
+
+    // Phase 2: global-max termination — matches Python `while np.max(|u[0]|) > 1e-3`.
+    let mut while_steps = 0usize;
+    loop {
+        let max_norm = states.par_iter().map(|(u, _)| u[0].norm()).reduce(|| 0.0_f64, f64::max);
+        if max_norm < 1e-3 || while_steps >= max_while_steps {
+            break;
+        }
+        states.par_iter_mut().for_each(|(u, phi)| {
+            custom_rk4_point(u, phi, params, rxns, prod_sp, prod_st, dt);
+        });
+        while_steps += 1;
+    }
+
+    // Phase 3: trailing trapezoidal half-step, then exp(φ).
+    states.into_par_iter().map(|(u, mut phi)| {
+        let (_, dpf) = custom_rhs_point(&u, params, rxns, prod_sp, prod_st);
+        phi += dpf * (dt / 2.0);
+        phi.exp()
+    }).collect()
+}
+
+/// Evaluate the custom reaction-network log-PGF over all grid points in
+/// parallel (rayon), returning exp(φ) as split real/imaginary Vec<f64>.
+///
+/// Reaction topology is encoded as parallel arrays (one entry per reaction):
+/// * `rxn_kinds`     — 0=geometric burst, 1=deterministic prod, 2=first-order
+/// * `rxn_rate_idxs` — index into `params` for each rate constant
+/// * `rxn_extra1`    — kind 0: burst-param idx; kind 2: reactant species idx; else -1
+/// * `rxn_extra2`    — kind 0: burst species idx; else -1
+/// * `prod_sp`/`prod_st`/`prod_off` — CSR products (species idx, stoich, offsets)
+/// * `params`        — **linear-scale** values (including the normalised rate if any)
+/// * `limits`        — grid size per species (length = n_species)
+/// * `dt`, `n_steps`, `max_while_steps` — integration control
+///
+/// Returns `(re_exphi, im_exphi, shape)` in row-major flat order.
+#[pyfunction]
+fn eval_custom_network_pgf(
+    n_species:       usize,
+    limits:          Vec<usize>,
+    rxn_kinds:       Vec<u8>,
+    rxn_rate_idxs:   Vec<u32>,
+    rxn_extra1:      Vec<i32>,
+    rxn_extra2:      Vec<i32>,
+    prod_sp:         Vec<u32>,
+    prod_st:         Vec<u32>,
+    prod_off:        Vec<u32>,
+    params:          Vec<f64>,
+    dt:              f64,
+    n_steps:         usize,
+    max_while_steps: usize,
+) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>)> {
+    let n_rxns = rxn_kinds.len();
+    let rxns: Vec<RxnInfo> = (0..n_rxns)
+        .map(|i| RxnInfo {
+            kind:       rxn_kinds[i],
+            rate_idx:   rxn_rate_idxs[i],
+            extra1:     rxn_extra1[i],
+            extra2:     rxn_extra2[i],
+            prod_start: prod_off[i],
+            prod_end:   prod_off[i + 1],
+        })
+        .collect();
+
+    let (g, mx, n_grid) = build_mesh_nd(&limits);
+
+    let exp_phi = custom_pgf_parallel(
+        &g, &params, &rxns, &prod_sp, &prod_st,
+        n_species, n_grid, dt, n_steps, max_while_steps,
+    );
+
+    let re: Vec<f64> = exp_phi.iter().map(|z| z.re).collect();
+    let im: Vec<f64> = exp_phi.iter().map(|z| z.im).collect();
+    Ok((re, im, mx))
+}
+
+// ============================================================================
 // PyO3 module
 // ============================================================================
 
@@ -1086,5 +1333,6 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(eval_model_pss_protein_bursty, m)?)?;
     m.add_function(wrap_pyfunction!(protein_bursty_pgf, m)?)?;
     m.add_function(wrap_pyfunction!(make_histograms_unique, m)?)?;
+    m.add_function(wrap_pyfunction!(eval_custom_network_pgf, m)?)?;
     Ok(())
 }

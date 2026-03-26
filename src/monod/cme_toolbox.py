@@ -12,6 +12,7 @@ from scipy.fft import irfftn
 
 # from .nn_toolbox import basic_ml_bivariate, ml_microstate_logP
 from extract_data import log
+from reaction_network import ReactionNetwork
 
 _MESH_CACHE: dict = {}
 
@@ -249,8 +250,10 @@ class CMEModel:
         quad_vec_T=np.inf,
         protein_limit = np.inf,
         fit_unspliced = True,
-        min_fudge = 0.1, 
-        max_fudge = 10
+        min_fudge = 0.1,
+        max_fudge = 10,
+        network = None,
+        normalize_production_rate = False,
     ):
         """Initialize the CMEModel instance.
 
@@ -290,10 +293,23 @@ class CMEModel:
             "Constitutive",
             "CIR",
             "DelayedSplicing",
-            "ProteinBursty"
+            "ProteinBursty",
+            "Custom",
         )
         self.available_seqmodels = ("None", "Bernoulli", "Poisson")
         self.available_ambmodels = ("None", "Equal", "Unequal")
+
+        # Store the custom reaction network (required when bio_model == "Custom").
+        if bio_model == "Custom":
+            if network is None:
+                raise ValueError(
+                    "bio_model='Custom' requires a network string passed as network=..."
+                )
+            self.network = ReactionNetwork(
+                network, normalize_production_rate=normalize_production_rate
+            )
+        else:
+            self.network = None
 
         # Define the modalities used for each model, and their order.
         CMEModel.available_model_modalities = {"Delay":['unspliced', 'spliced'],
@@ -303,12 +319,15 @@ class CMEModel:
             "CIR":['unspliced', 'spliced'],
             "DelayedSplicing":['unspliced', 'spliced'],
             "ProteinBursty":['unspliced', 'spliced', 'protein']}
-        
+
         try:
             self.model_modalities = CMEModel.available_model_modalities[self.bio_model]
-        
+
         except KeyError:
-            log.error("Modalities unknown for model: {}".format(self.bio_model))
+            if self.bio_model == "Custom":
+                self.model_modalities = self.network.species
+            else:
+                log.error("Modalities unknown for model: {}".format(self.bio_model))
 
         print('The expected modalities for this model are:', self.model_modalities)
         print('If your anndata layers have different names, please give a modality dictionary of the form: modality_name_dict  = {\'spliced\':your_spliced_layer_name, \'unspliced\':your_unspliced_layer_name} ')
@@ -358,12 +377,13 @@ class CMEModel:
             fixed_quad_T, quad_order, quad_vec_T, quad_method
         )
         
-        if self.bio_model == "ProteinBursty":
+        if self.bio_model in ("ProteinBursty", "Custom"):
             self.protein_limit = protein_limit
             self.fit_unspliced = fit_unspliced
             self.min_fudge = min_fudge
             self.max_fudge = max_fudge
-            log.info("Protein grid limit: {}".format(self.protein_limit))
+            if self.bio_model == "ProteinBursty":
+                log.info("Protein grid limit: {}".format(self.protein_limit))
             
         # Define the parameter bounds used for each technical noise model.
         # TODO: check reasonableness of these bounds.
@@ -439,7 +459,10 @@ class CMEModel:
 
         elif self.bio_model == "ProteinBursty":
             param_str += [r"$\log_{10} b$", r"$\log_{10} \beta$", r"$\log_{10} \gamma$", r"$\log_{10} k_p$", r"$\log_{10} \gamma_p$"]
-            
+
+        elif self.bio_model == "Custom":
+            param_str += self.network.get_log_name_str()
+
         else:
             raise ValueError(
                 "Please select a biological noise model from {}.".format(
@@ -468,6 +491,8 @@ class CMEModel:
             numpars += 2
         elif self.bio_model == "ProteinBursty":
             numpars += 5
+        elif self.bio_model == "Custom":
+            numpars += len(self.network.all_params)
         else:
             numpars += 3
             
@@ -933,6 +958,79 @@ class CMEModel:
             )
             return pss.squeeze()
 
+        # Rust fast-path for Custom networks (non-delayed, seq_model="None",
+        # amb_model="None").  Parallelises RK4 over grid points via rayon.
+        if (
+            _HAS_RUST
+            and self.bio_model == "Custom"
+            and not self.network._has_delays
+            and self.seq_model == "None"
+            and self.amb_model == "None"
+            and samp is None
+        ):
+            p_lin = np.power(10.0, p)
+            dt      = float(np.min(1.0 / p_lin) * self.min_fudge)
+            t_max   = float(np.max(1.0 / p_lin) * self.max_fudge)
+            n_steps = int(np.ceil(t_max / dt))
+            max_while = 10 * n_steps + 10_000
+
+            # Serialise network topology to flat arrays for Rust.
+            net       = self.network
+            params_d  = net._param_map(p)          # name → linear float
+            if net._norm_rate is not None:
+                params_d[net._norm_rate] = 1.0
+            all_names = list(net.all_params) + ([net._norm_rate] if net._norm_rate else [])
+            params_linear = [float(params_d[name]) for name in all_names]
+            name_to_idx   = {name: i for i, name in enumerate(all_names)}
+            sp_idx_map    = {s: i for i, s in enumerate(net.species)}
+
+            rxn_kinds, rxn_rate_idxs = [], []
+            rxn_extra1, rxn_extra2   = [], []
+            prod_sp_flat, prod_st_flat, prod_off = [], [], [0]
+
+            for rxn in net.reactions:
+                rate_idx = name_to_idx[rxn.rate_name]
+                if not rxn.reactants and rxn.burst_param is not None:
+                    rxn_kinds.append(0)
+                    rxn_rate_idxs.append(rate_idx)
+                    rxn_extra1.append(name_to_idx[rxn.burst_param])
+                    rxn_extra2.append(sp_idx_map[rxn.burst_species])
+                elif not rxn.reactants:
+                    rxn_kinds.append(1)
+                    rxn_rate_idxs.append(rate_idx)
+                    rxn_extra1.append(-1)
+                    rxn_extra2.append(-1)
+                else:
+                    src = next(iter(rxn.reactants))
+                    rxn_kinds.append(2)
+                    rxn_rate_idxs.append(rate_idx)
+                    rxn_extra1.append(sp_idx_map[src])
+                    rxn_extra2.append(-1)
+                for sp, st in rxn.products.items():
+                    prod_sp_flat.append(sp_idx_map[sp])
+                    prod_st_flat.append(st)
+                prod_off.append(len(prod_sp_flat))
+
+            re_e, im_e, mx_shape = _mc.eval_custom_network_pgf(
+                len(net.species),
+                [int(x) for x in limits],
+                rxn_kinds,
+                rxn_rate_idxs,
+                rxn_extra1,
+                rxn_extra2,
+                prod_sp_flat,
+                prod_st_flat,
+                prod_off,
+                params_linear,
+                dt,
+                n_steps,
+                max_while,
+            )
+            exp_phi = (np.array(re_e) + 1j * np.array(im_e)).reshape(mx_shape)
+            pss = np.abs(irfftn(exp_phi, s=[int(x) for x in limits]))
+            pss = pss / pss.sum()
+            return pss.squeeze()
+
         if (self.amb_model != "None") and (len(limits) == 2):
             raise ValueError("Please specify a limit for the ambiguous species.")
 
@@ -1056,6 +1154,17 @@ class CMEModel:
 
         elif self.bio_model == "ProteinBursty":  # bursty production
             gf = self.protein_pgf(g, p)
+
+        elif self.bio_model == "Custom":
+            dt    = np.min(1.0 / p) * self.min_fudge
+            t_max = np.max(1.0 / p) * self.max_fudge
+            n_steps = int(np.ceil(t_max / dt))
+            gf = self.network.eval_pgf(
+                p_,
+                [g[i] for i in range(len(self.network.species))],
+                t_max,
+                n_steps,
+            )
 
         else:
             raise ValueError(
