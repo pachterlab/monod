@@ -26,6 +26,7 @@ monod_core/target/
 # Large example data
 example_h5ad/gaba_example.h5ad
 example_h5ad/gaba_results.h5ad
+example_h5ad/processed_pbmc_10k_raw.h5ad
 
 # Snapshot tied to large data
 tests/snapshots/gaba_bursty_poisson_params.npy

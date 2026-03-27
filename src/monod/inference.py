@@ -1154,8 +1154,8 @@ class GradientInference:
             x0[0] = np.clip(self.warm_start[gene_index], self.phys_lb, self.phys_ub)
         err = np.inf
         ERR_THRESH = 0.99
-        if log.isEnabledFor(logging.INFO):
-            log.info('Optimizing gene %d with initial value %s', gene_index, np.array2string(10**x0))
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug('Optimizing gene %d with initial value %s', gene_index, np.array2string(10**x0))
         
         hist_type = get_hist_type(search_data)
         for restart in range(self.gradient_params["num_restarts"]):
@@ -1191,8 +1191,8 @@ class GradientInference:
         if not (np.isfinite(x).all()):
             log.warning("Gene index: " + str(gene_index))
             raise ValueError("Search failed. Please check input data.")
-        if log.isEnabledFor(logging.INFO):
-            log.info('Optimized parameters for gene %d is %s', gene_index, np.array2string(10**x))
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug('Optimized parameters for gene %d is %s', gene_index, np.array2string(10**x))
         return x, err
 
     def iterate_over_genes(self, model, search_data):
