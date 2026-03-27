@@ -570,9 +570,35 @@ class CMEModel:
         kld: float
             Kullback-Leibler divergence.
         """
-        # print('p', p)
-        # print('limits', limits)
-        # print('samp', samp)
+        _KLD_RUST_MODELS = {
+            "Constitutive", "Bursty", "CIR",
+            "Extrinsic", "Delay", "DelayedSplicing",
+        }
+        # Rust fast-path: compute PSS and KLD in one call, avoiding the
+        # Python round-trip for histogram indexing and log/sum operations.
+        if (
+            _HAS_RUST
+            and hist_type == "unique"
+            and self.bio_model in _KLD_RUST_MODELS
+            and self.amb_model == "None"
+            and self.quad_method == "fixed_quad"
+            and (samp is None or self.seq_model == "Poisson")
+        ):
+            x, f = data
+            x_np = np.asarray(x, dtype=np.int64)
+            return _mc.eval_kld_2d(
+                self.bio_model,
+                np.asarray(p, dtype=float).tolist(),
+                [int(v) for v in limits],
+                x_np[:, 0].tolist(),
+                x_np[:, 1].tolist(),
+                np.asarray(f, dtype=float).tolist(),
+                float(self.fixed_quad_T),
+                int(self.quad_order),
+                samp.tolist() if samp is not None else None,
+                float(EPS),
+            )
+
         proposal = self.eval_model_pss(p, limits, samp)
         proposal[proposal < EPS] = EPS
 
@@ -581,31 +607,15 @@ class CMEModel:
             data = data[filt]
             proposal = proposal[filt]
             d = data * np.log(data / proposal)
-            
+
         elif hist_type == "unique":
             x, f = data
-            # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
-            # It will be implemented in a future version.
-            # if (
-            #     (self.quad_method == "nn")
-            #     and (self.bio_model == "Bursty")
-            #     and (self.seq_model == "None")
-            # ):
-            #     log_EPS = np.log(EPS)
-            #     log_proposal = ml_microstate_logP(p, x)
-            #     filt = (log_proposal < log_EPS) | (~np.isfinite(log_proposal))
-            #     log_proposal[filt] = log_EPS
-            #     d = f * (np.log(f) - log_proposal)
-            #     # print(np.sum(d))
-            #     # raise ValueError
-            #     return np.sum(d)
-            # else:
             proposal = proposal[tuple(x.T)]
             d = f * np.log(f / proposal)
 
         elif hist_type == "none":
             d = -np.log([proposal[tuple(idx)] for idx in np.array(data,dtype=int).T])
-            
+
         if log.isEnabledFor(logging.DEBUG):
             log.debug('The KL divergence with parameter %s is %.10f', np.array2string(10**p), np.sum(d))
 
@@ -663,7 +673,38 @@ class CMEModel:
             if result is not None:
                 return result
 
-        # Fallback: forward finite differences.
+        # Rust FD gradient path: evaluates base + all perturbed PSS in parallel
+        # (rayon, GIL released), eliminating the Python round-trip per perturbation.
+        _RUST_FD_MODELS = {
+            "Constitutive", "Bursty", "CIR",
+            "Extrinsic", "Delay", "DelayedSplicing",
+        }
+        if (
+            _HAS_RUST
+            and hist_type == "unique"
+            and self.bio_model in _RUST_FD_MODELS
+            and self.amb_model == "None"
+            and self.quad_method == "fixed_quad"
+            and (samp is None or self.seq_model == "Poisson")
+        ):
+            x, f_data = data
+            x_np = np.asarray(x, dtype=np.int64)
+            kld0, grad_list = _mc.eval_kld_grad_2d(
+                self.bio_model,
+                p.tolist(),
+                [int(v) for v in limits],
+                x_np[:, 0].tolist(),
+                x_np[:, 1].tolist(),
+                np.asarray(f_data, dtype=float).tolist(),
+                float(self.fixed_quad_T),
+                int(self.quad_order),
+                eps,
+                samp.tolist() if samp is not None else None,
+                float(EPS),
+            )
+            return kld0, np.array(grad_list)
+
+        # Python fallback: forward finite differences.
         kld0 = self.eval_model_kld(p, limits, samp, data, hist_type, EPS)
 
         def _perturbed(i):
@@ -886,11 +927,12 @@ class CMEModel:
             pss = np.array(pss_flat).reshape(int(limits[0]), int(limits[1]))
             return pss.squeeze()
 
-        # Rust fast-path for Poisson technical noise (Bursty/CIR only).
-        # Poisson transform g → exp(λ·g) − 1 is applied inside Rust per gene.
+        # Rust fast-path for Poisson technical noise (all six 2-D models).
+        # Poisson transform g → exp(λ·g) − 1 is applied inside Rust via the
+        # cached Poisson mesh, avoiding an extra Python exp() broadcast.
         if (
             _HAS_RUST
-            and self.bio_model in _RUST_MODELS_2D
+            and self.bio_model in _FAST_MODELS_2D
             and self.seq_model == "Poisson"
             and self.amb_model == "None"
             and self.quad_method == "fixed_quad"

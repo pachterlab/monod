@@ -10,6 +10,12 @@ import mminference
 
 from extract_data import make_dir, log, extract_data
 from cme_toolbox import CMEModel, _HAS_RUST  # may be unnecessary
+try:
+    import monod_core as _mc
+except ImportError:
+    _mc = None
+
+_LBFGSB_RUST_MODELS_2D = {"Constitutive", "Bursty", "CIR", "Extrinsic", "Delay", "DelayedSplicing"}
 import multiprocessing
 import os
 
@@ -1220,7 +1226,81 @@ class GradientInference:
 
         n_gene_cores = self.gradient_params.get("num_gene_cores", 1)
         use_batch = self.gradient_params.get("use_batch_optimizer", False)
-        if n_gene_cores != 1:
+        hist_type = get_hist_type(search_data)
+
+        # --- Rust L-BFGS-B fast path: runs the full optimization loop in Rust
+        # with rayon parallelism over genes. No Python callbacks, no GIL round-trips.
+        # Opt-in: set gradient_params["use_rust_lbfgsb"] = True to enable.
+        # Supported when: Rust available, 2D models, unique histograms, not Adam batch.
+        use_rust_lbfgsb = (
+            _mc is not None
+            and self.gradient_params.get("use_rust_lbfgsb", False)
+            and not use_batch
+            and model.bio_model in _LBFGSB_RUST_MODELS_2D
+            and model.seq_model in ("None", "Poisson")
+            and model.amb_model == "None"
+            and model.quad_method == "fixed_quad"
+            and hist_type == "unique"
+        )
+        if use_rust_lbfgsb:
+            num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
+            n_genes = search_data.n_genes
+            n_restarts = self.gradient_params["num_restarts"]
+
+            # Build per-gene initial points: n_genes × n_restarts × n_params
+            x0_all = []
+            for gi in range(n_genes):
+                x0 = (
+                    np.random.rand(n_restarts, self.n_phys_pars)
+                    * self._restart_range
+                    + self._restart_lb
+                )
+                if self.gradient_params["init_pattern"] == "moments":
+                    x0[0] = self.param_MoM[gi]
+                if self.warm_start is not None:
+                    x0[0] = np.clip(self.warm_start[gi], self.phys_lb, self.phys_ub)
+                x0_all.append(x0.tolist())
+
+            # Per-gene histogram data
+            u_idx_list, s_idx_list, f_list, limits_list = [], [], [], []
+            for gi in range(n_genes):
+                x_data, f_data = search_data.hist[gi]
+                x_np = np.asarray(x_data, dtype=np.int64)
+                u_idx_list.append(x_np[:, 0].tolist())
+                s_idx_list.append(x_np[:, 1].tolist())
+                f_list.append(np.asarray(f_data).tolist())
+                limits_list.append([int(v) for v in search_data.M[:, gi]])
+
+            samp_list = None
+            if model.seq_model == "Poisson":
+                samp_list = [
+                    (self.regressor[gi].tolist() if self.regressor[gi] is not None else None)
+                    for gi in range(n_genes)
+                ]
+
+            params_arr, klds_arr = _mc.optimize_genes_2d(
+                bio_model=model.bio_model,
+                x0_list=x0_all,
+                lb=self.phys_lb.tolist(),
+                ub=self.phys_ub.tolist(),
+                limits_list=limits_list,
+                u_idx_list=u_idx_list,
+                s_idx_list=s_idx_list,
+                f_list=f_list,
+                fixed_quad_t=float(model.fixed_quad_T),
+                quad_order=int(model.quad_order),
+                fd_eps=1e-6,
+                maxiter=self.gradient_params["max_iterations"],
+                ftol=1e-10,
+                gtol=1e-6,
+                samp_list=samp_list,
+                eps=1e-15,
+                m_lbfgs=10,
+                num_threads=num_threads,
+            )
+            param_estimates = np.asarray(params_arr)
+            klds = np.asarray(klds_arr)
+        elif n_gene_cores != 1:
             num_threads = None if n_gene_cores < 0 else n_gene_cores
             if use_batch and _HAS_RUST:
                 # Explicit opt-in: batch Adam with rayon, all genes in one call.

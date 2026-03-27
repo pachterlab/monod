@@ -27,6 +27,7 @@ use num_complex::Complex64;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use numpy::{PyReadonlyArray2, PyUntypedArrayMethods};
+use realfft::RealFftPlanner;
 use rustfft::FftPlanner;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -41,9 +42,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 // so Complex64 is the same type as rustfft's internal Complex<f64>.
 thread_local! {
     static FFT_PLANNER: RefCell<FftPlanner<f64>> = RefCell::new(FftPlanner::new());
+    /// Per-thread RealFftPlanner — used for the row irfft step in irfftn_2d.
+    /// Plans a ComplexToReal (inverse) FFT, which is ~2× faster than a full
+    /// complex IFFT of the same size because it exploits real-output symmetry.
+    static REAL_FFT_PLANNER: RefCell<RealFftPlanner<f64>> = RefCell::new(RealFftPlanner::new());
     /// Reused scratch buffer for FFT scratch space — grown as needed, never shrunk.
     static SCRATCH_BUF: RefCell<Vec<Complex64>> = RefCell::new(Vec::new());
-    /// Reused row buffer for irfft (Hermitian expansion + output) — grown as needed.
+    /// Reused half-spectrum buffer for irfftn_2d row step (length mx1 = n1/2+1).
+    static HALF_BUF: RefCell<Vec<Complex64>> = RefCell::new(Vec::new());
+    /// Reused full-length row buffer for irfftn_3d (Hermitian expansion + complex IFFT).
     static ROW_BUF: RefCell<Vec<Complex64>> = RefCell::new(Vec::new());
 }
 
@@ -572,10 +579,13 @@ fn protein_pgf(
 ///
 /// Algorithm (verified vs scipy):
 ///   1. Transpose input to column-major; parallel IFFT of length n0 per column j.
-///   2. For each row i: gather row i from col_buf with stride n0, expand Hermitian
-///      conjugate, irfft — no intermediate `mid` buffer allocation.
+///   2. For each row i: gather the half-spectrum (length mx1) from col_buf with
+///      stride n0, then run a real-output IFFT via the `realfft` crate.
+///      This avoids filling in the Hermitian conjugate and uses a size-n1/2
+///      complex FFT internally, making the row step ~2× faster than a full
+///      complex IFFT of length n1.
 ///
-/// Each parallel task uses its own thread-local FftPlanner, scratch buffer, and row buffer.
+/// Each parallel task uses its own thread-local planners and scratch buffers.
 fn irfftn_2d(input: &[Complex64], n0: usize, n1: usize) -> Vec<f64> {
     let mx1 = n1 / 2 + 1;
     let zero = Complex64::new(0.0, 0.0);
@@ -599,32 +609,42 @@ fn irfftn_2d(input: &[Complex64], n0: usize, n1: usize) -> Vec<f64> {
         });
     }
 
-    // Step 2: irfft along axis 1.
-    // Gather each row i from col_buf with stride n0 — no mid allocation needed.
+    // Step 2: irfft along axis 1 using realfft (ComplexToReal plan).
+    // Gather each row i (length mx1) from col_buf with stride n0, then run
+    // the real-output IFFT directly on the half-spectrum — no Hermitian fill.
     let mut result = vec![0.0_f64; n0 * n1];
     let irfft_row = |(i, row_out): (usize, &mut [f64])| {
-        let fft = plan_ifft(n1);
-        ROW_BUF.with(|rb| {
-            let mut buf = rb.borrow_mut();
-            if buf.len() < n1 {
-                buf.resize(n1, zero);
-            }
-            // Zero, then gather positive frequencies from col_buf (stride n0).
-            buf[..n1].fill(zero);
-            for k in 0..mx1 {
-                buf[k] = col_buf[k * n0 + i];
-            }
-            // Fill Hermitian conjugate for negative frequencies.
-            for k in 1..mx1 {
-                let nk = n1 - k;
-                if nk >= mx1 {
-                    buf[nk] = buf[k].conj();
+        let irfft = REAL_FFT_PLANNER.with(|cell| cell.borrow_mut().plan_fft_inverse(n1));
+        let scratch_len = irfft.get_scratch_len();
+        HALF_BUF.with(|hb| {
+            SCRATCH_BUF.with(|sc| {
+                let mut half = hb.borrow_mut();
+                let mut scratch = sc.borrow_mut();
+                if half.len() < mx1 {
+                    half.resize(mx1, zero);
                 }
-            }
-            ifft_inplace(&mut buf[..n1], &fft);
-            for (out, c) in row_out.iter_mut().zip(buf[..n1].iter()) {
-                *out = c.re;
-            }
+                if scratch.len() < scratch_len {
+                    scratch.resize(scratch_len, zero);
+                }
+                // Gather positive-frequency slice from col_buf (stride n0).
+                for k in 0..mx1 {
+                    half[k] = col_buf[k * n0 + i];
+                }
+                // realfft requires the DC (k=0) bin to be real-valued.
+                // For even n1 only, the Nyquist bin (k=mx1-1) must also be real.
+                // Column IFFTs leave small floating-point residuals; zero them.
+                half[0].im = 0.0;
+                if n1 % 2 == 0 {
+                    half[mx1 - 1].im = 0.0;
+                }
+                // Real-output IFFT: half[..mx1] → row_out[..n1].
+                // Input is modified in-place (scratch); output is f64.
+                irfft.process_with_scratch(
+                    &mut half[..mx1],
+                    row_out,
+                    &mut scratch[..scratch_len],
+                ).expect("irfft row failed");
+            });
         });
     };
     if n0 * n1 >= PAR_THRESHOLD {
@@ -1562,6 +1582,516 @@ fn eval_custom_network_pgf(
 }
 
 // ============================================================================
+// KLD evaluation helpers (sparse "unique" histogram)
+// ============================================================================
+
+/// Compute KLD(data ‖ model) from a sparse histogram.
+///
+/// pss     : flat PSS array of length l0*l1 (row-major: index = u*l1 + s)
+/// l1      : number of spliced bins (second dimension)
+/// u_idx   : unspliced indices of observed microstates
+/// s_idx   : spliced indices of observed microstates
+/// f       : fractional frequencies (counts / n_cells), same length as u_idx
+/// eps     : minimum probability floor
+///
+/// Returns sum_i f[i] * ln(f[i] / pss[u[i],s[i]]).
+#[inline]
+fn compute_kld_sparse(
+    pss: &[f64],
+    l1: usize,
+    u_idx: &[u64],
+    s_idx: &[u64],
+    f: &[f64],
+    eps: f64,
+) -> f64 {
+    u_idx
+        .iter()
+        .zip(s_idx.iter())
+        .zip(f.iter())
+        .map(|((&u, &s), &fi)| {
+            let pval = pss[u as usize * l1 + s as usize].max(eps);
+            fi * (fi / pval).ln()
+        })
+        .sum()
+}
+
+/// Evaluate the KLD between a sparse observed histogram and a 2-D CME model.
+///
+/// Parameters (Python-visible)
+/// ---------------------------
+/// bio_model    : model name (same as eval_model_pss_2d)
+/// p_log        : log10 biological parameters
+/// limits       : [l0, l1] grid dimensions
+/// u_idx        : unspliced bin indices for each unique observed microstate
+/// s_idx        : spliced bin indices for each unique observed microstate
+/// f            : fractional frequency per microstate (counts / n_cells)
+/// fixed_quad_t : quadrature time-scale multiplier
+/// quad_order   : number of Gauss-Legendre quadrature points
+/// samp_log     : optional log10 Poisson sampling parameters [lam0, lam1]
+/// eps          : minimum probability floor (default 1e-15)
+///
+/// Returns the scalar KLD value.
+#[pyfunction]
+#[pyo3(signature = (bio_model, p_log, limits, u_idx, s_idx, f, fixed_quad_t, quad_order, samp_log=None, eps=1e-15))]
+#[allow(clippy::too_many_arguments)]
+fn eval_kld_2d(
+    bio_model: &str,
+    p_log: Vec<f64>,
+    limits: Vec<usize>,
+    u_idx: Vec<u64>,
+    s_idx: Vec<u64>,
+    f: Vec<f64>,
+    fixed_quad_t: f64,
+    quad_order: usize,
+    samp_log: Option<Vec<f64>>,
+    eps: f64,
+) -> PyResult<f64> {
+    let pss = eval_model_pss_2d_seq(
+        bio_model,
+        &p_log,
+        &limits,
+        fixed_quad_t,
+        quad_order,
+        samp_log.as_deref(),
+    );
+    let l1 = limits[1];
+    Ok(compute_kld_sparse(&pss, l1, &u_idx, &s_idx, &f, eps))
+}
+
+/// Evaluate the KLD and its forward finite-difference gradient for a 2-D CME model.
+///
+/// All (n_params + 1) PSS evaluations (base point + one per parameter) are run
+/// in parallel via rayon with the GIL released, making gradient computation
+/// effectively free compared to calling eval_kld_2d n_params+1 times.
+///
+/// Parameters
+/// ----------
+/// Same as eval_kld_2d, plus:
+/// fd_eps : finite-difference step size in log10 space (default 1e-6)
+///
+/// Returns (kld: float, grad: list[float]) where grad[i] = d KLD / d log10(θ_i).
+#[pyfunction]
+#[pyo3(signature = (bio_model, p_log, limits, u_idx, s_idx, f, fixed_quad_t, quad_order, fd_eps=1e-6, samp_log=None, eps=1e-15))]
+#[allow(clippy::too_many_arguments)]
+fn eval_kld_grad_2d(
+    py: Python<'_>,
+    bio_model: String,
+    p_log: Vec<f64>,
+    limits: Vec<usize>,
+    u_idx: Vec<u64>,
+    s_idx: Vec<u64>,
+    f: Vec<f64>,
+    fixed_quad_t: f64,
+    quad_order: usize,
+    fd_eps: f64,
+    samp_log: Option<Vec<f64>>,
+    eps: f64,
+) -> PyResult<(f64, Vec<f64>)> {
+    // Validate model before releasing GIL.
+    match bio_model.as_str() {
+        "Constitutive" | "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => {}
+        other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown bio_model for eval_kld_grad_2d: {other}"
+        ))),
+    }
+    let n_params = p_log.len();
+    let l1 = limits[1];
+    let samp_ref: Option<Vec<f64>> = samp_log;
+
+    // Evaluate base point + n_params perturbations in parallel (all with GIL released).
+    let all_klds: Vec<f64> = py.allow_threads(|| {
+        (0..=n_params)
+            .into_par_iter()
+            .map(|i| {
+                let p_eval: Vec<f64> = if i == 0 {
+                    p_log.clone()
+                } else {
+                    let mut p_eps = p_log.clone();
+                    p_eps[i - 1] += fd_eps;
+                    p_eps
+                };
+                let pss = eval_model_pss_2d_seq(
+                    &bio_model,
+                    &p_eval,
+                    &limits,
+                    fixed_quad_t,
+                    quad_order,
+                    samp_ref.as_deref(),
+                );
+                compute_kld_sparse(&pss, l1, &u_idx, &s_idx, &f, eps)
+            })
+            .collect()
+    });
+
+    let kld0 = all_klds[0];
+    let grad: Vec<f64> = (1..=n_params).map(|i| (all_klds[i] - kld0) / fd_eps).collect();
+    Ok((kld0, grad))
+}
+
+// ============================================================================
+// L-BFGS-B optimizer (box-constrained, no Python callbacks)
+// ============================================================================
+
+#[inline]
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(&ai, &bi)| ai * bi).sum()
+}
+
+/// Evaluate KLD + finite-difference gradient at x, sequentially.
+/// Called from within a rayon task — pure Rust, no GIL, no nested rayon.
+fn eval_kld_and_grad_seq(
+    bio_model: &str,
+    x: &[f64],
+    limits: &[usize],
+    u_idx: &[u64],
+    s_idx: &[u64],
+    f_data: &[f64],
+    fixed_quad_t: f64,
+    quad_order: usize,
+    fd_eps: f64,
+    samp_log: Option<&[f64]>,
+    eps: f64,
+) -> (f64, Vec<f64>) {
+    let l1 = limits[1];
+    let n = x.len();
+    let pss0 = eval_model_pss_2d_seq(bio_model, x, limits, fixed_quad_t, quad_order, samp_log);
+    let kld0 = compute_kld_sparse(&pss0, l1, u_idx, s_idx, f_data, eps);
+    let grad: Vec<f64> = (0..n)
+        .map(|i| {
+            let mut x_eps = x.to_vec();
+            x_eps[i] += fd_eps;
+            let pss = eval_model_pss_2d_seq(bio_model, &x_eps, limits, fixed_quad_t, quad_order, samp_log);
+            let kld = compute_kld_sparse(&pss, l1, u_idx, s_idx, f_data, eps);
+            (kld - kld0) / fd_eps
+        })
+        .collect();
+    (kld0, grad)
+}
+
+/// Minimize KLD(x) s.t. lb ≤ x ≤ ub using L-BFGS-B.
+///
+/// Uses Armijo sufficient-decrease backtracking line search with box projection.
+/// L-BFGS memory vectors are stored in circular buffers of size `m_mem`.
+/// Convergence: projected-gradient inf-norm < gtol OR relative f-change < ftol.
+///
+/// Called from within rayon tasks — pure Rust, no GIL, no nested rayon.
+fn lbfgsb_minimize(
+    bio_model: &str,
+    x0: &[f64],
+    lb: &[f64],
+    ub: &[f64],
+    limits: &[usize],
+    u_idx: &[u64],
+    s_idx: &[u64],
+    f_data: &[f64],
+    fixed_quad_t: f64,
+    quad_order: usize,
+    fd_eps: f64,
+    maxiter: usize,
+    ftol: f64,
+    gtol: f64,
+    samp_log: Option<&[f64]>,
+    eps: f64,
+    m_mem: usize,
+) -> (Vec<f64>, f64) {
+    let n = x0.len();
+
+    // Project initial point onto box constraints.
+    let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
+    let (mut fx, mut gx) = eval_kld_and_grad_seq(
+        bio_model, &x, limits, u_idx, s_idx, f_data,
+        fixed_quad_t, quad_order, fd_eps, samp_log, eps,
+    );
+
+    // L-BFGS memory: s[k] = x_{k+1} - x_k,  y[k] = g_{k+1} - g_k
+    let mut s_buf: Vec<Vec<f64>> = Vec::with_capacity(m_mem);
+    let mut y_buf: Vec<Vec<f64>> = Vec::with_capacity(m_mem);
+    let mut rho_buf: Vec<f64> = Vec::with_capacity(m_mem);
+
+    for _iter in 0..maxiter {
+        // --- Projected-gradient convergence check ---------------------------
+        let pg_inf: f64 = (0..n)
+            .map(|i| {
+                if (x[i] - lb[i]).abs() < 1e-15 {
+                    gx[i].min(0.0).abs()
+                } else if (x[i] - ub[i]).abs() < 1e-15 {
+                    gx[i].max(0.0).abs()
+                } else {
+                    gx[i].abs()
+                }
+            })
+            .fold(0.0_f64, f64::max);
+        if pg_inf < gtol {
+            break;
+        }
+
+        // --- L-BFGS two-loop recursion: compute H_k * g_k -------------------
+        let mem = s_buf.len();
+        let mut q = gx.clone();
+        let mut alphas = vec![0.0_f64; mem];
+
+        // First loop (most recent pair first).
+        for i in (0..mem).rev() {
+            let a = rho_buf[i] * dot(&s_buf[i], &q);
+            alphas[i] = a;
+            for j in 0..n {
+                q[j] -= a * y_buf[i][j];
+            }
+        }
+
+        // Initial Hessian scaling: γ = s^T y / y^T y (most recent pair).
+        let gamma = if mem > 0 {
+            let sy = dot(&s_buf[mem - 1], &y_buf[mem - 1]);
+            let yy = dot(&y_buf[mem - 1], &y_buf[mem - 1]);
+            if yy > 1e-30 { sy / yy } else { 1.0 }
+        } else {
+            1.0
+        };
+        let mut r: Vec<f64> = q.iter().map(|&qi| gamma * qi).collect();
+
+        // Second loop (oldest pair first).
+        for i in 0..mem {
+            let beta = rho_buf[i] * dot(&y_buf[i], &r);
+            for j in 0..n {
+                r[j] += s_buf[i][j] * (alphas[i] - beta);
+            }
+        }
+
+        // --- Search direction: d = -H*g, zeroing components at active bounds -
+        let mut d: Vec<f64> = (0..n)
+            .map(|i| {
+                let di = -r[i];
+                if (x[i] - lb[i]).abs() < 1e-15 && di < 0.0 { 0.0 }
+                else if (x[i] - ub[i]).abs() < 1e-15 && di > 0.0 { 0.0 }
+                else { di }
+            })
+            .collect();
+
+        // Reset memory and fall back to projected steepest descent if d ≈ 0.
+        if dot(&d, &d) < 1e-30 {
+            s_buf.clear();
+            y_buf.clear();
+            rho_buf.clear();
+            d = (0..n)
+                .map(|i| {
+                    let di = -gx[i];
+                    if (x[i] - lb[i]).abs() < 1e-15 && di < 0.0 { 0.0 }
+                    else if (x[i] - ub[i]).abs() < 1e-15 && di > 0.0 { 0.0 }
+                    else { di }
+                })
+                .collect();
+            if dot(&d, &d) < 1e-30 {
+                break;
+            }
+        }
+
+        // --- Backtracking line search (standard Armijo sufficient decrease) ----
+        // Condition: f(clip(x + α·d)) ≤ f(x) + c1 · α · ∇f(x)ᵀd
+        //
+        // We use α · g^T · d (the UNCONSTRAINED directional derivative scaled by α),
+        // NOT g^T · (x_new - x) (the actual clipped step).  When α·d clips to a
+        // boundary, g^T · (x_new - x) ≪ α · g^T · d, making the latter much more
+        // stringent.  Using the unconstrained form prevents accepting large steps
+        // that jump to boundary local minima — matching scipy's Fortran L-BFGS-B.
+        const C1: f64 = 1e-4;
+        let phi_prime_0: f64 = dot(&gx, &d); // g^T · d  (must be < 0 for descent)
+        let mut alpha = 1.0_f64;
+        let mut x_new: Vec<f64>;
+        let mut fx_new: f64;
+        let mut gx_new: Vec<f64>;
+
+        loop {
+            x_new = (0..n).map(|i| (x[i] + alpha * d[i]).max(lb[i]).min(ub[i])).collect();
+            let r = eval_kld_and_grad_seq(
+                bio_model, &x_new, limits, u_idx, s_idx, f_data,
+                fixed_quad_t, quad_order, fd_eps, samp_log, eps,
+            );
+            fx_new = r.0;
+            gx_new = r.1;
+            // Standard Armijo: f_new ≤ f + c1 · α · phi'(0)
+            // phi_prime_0 < 0, so the threshold decreases proportionally with α.
+            if fx_new <= fx + C1 * alpha * phi_prime_0 || alpha < 1e-12 {
+                break;
+            }
+            alpha *= 0.5;
+        }
+
+        // --- Convergence by relative function improvement -------------------
+        let f_improve = (fx - fx_new).abs() / fx.abs().max(1.0);
+
+        // --- Update L-BFGS memory -------------------------------------------
+        let sk: Vec<f64> = (0..n).map(|i| x_new[i] - x[i]).collect();
+        let yk: Vec<f64> = (0..n).map(|i| gx_new[i] - gx[i]).collect();
+        let sy = dot(&sk, &yk);
+
+        x = x_new;
+        fx = fx_new;
+        gx = gx_new;
+
+        // Curvature condition: only add pair when s·y > ε·‖y‖² (skip near-flat).
+        let yy = dot(&yk, &yk);
+        if sy > 1e-10 * yy.max(1e-60) {
+            if s_buf.len() == m_mem {
+                s_buf.remove(0);
+                y_buf.remove(0);
+                rho_buf.remove(0);
+            }
+            s_buf.push(sk);
+            y_buf.push(yk);
+            rho_buf.push(1.0 / sy);
+        }
+
+        if f_improve < ftol {
+            break;
+        }
+    }
+
+    (x, fx)
+}
+
+/// Optimize a single gene with L-BFGS-B using multiple restarts.
+///
+/// x0_list : num_restarts × n_params initial points (log10 scale)
+/// lb / ub : parameter bounds (log10 scale)
+/// Returns (x_opt, kld_min).
+#[pyfunction]
+#[pyo3(signature = (bio_model, x0_list, lb, ub, limits, u_idx, s_idx, f,
+                    fixed_quad_t, quad_order, fd_eps=1e-6, maxiter=1000,
+                    ftol=1e-10, gtol=1e-6, samp_log=None, eps=1e-15, m_lbfgs=10))]
+#[allow(clippy::too_many_arguments)]
+fn optimize_gene_2d(
+    py: Python<'_>,
+    bio_model: String,
+    x0_list: Vec<Vec<f64>>,
+    lb: Vec<f64>,
+    ub: Vec<f64>,
+    limits: Vec<usize>,
+    u_idx: Vec<u64>,
+    s_idx: Vec<u64>,
+    f: Vec<f64>,
+    fixed_quad_t: f64,
+    quad_order: usize,
+    fd_eps: f64,
+    maxiter: usize,
+    ftol: f64,
+    gtol: f64,
+    samp_log: Option<Vec<f64>>,
+    eps: f64,
+    m_lbfgs: usize,
+) -> PyResult<(Vec<f64>, f64)> {
+    match bio_model.as_str() {
+        "Constitutive" | "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => {}
+        other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown bio_model for optimize_gene_2d: {other}"
+        ))),
+    }
+    const ERR_THRESH: f64 = 0.99;
+    let result = py.allow_threads(|| {
+        let mut best_x: Vec<f64> = (0..lb.len())
+            .map(|i| x0_list[0][i].max(lb[i]).min(ub[i]))
+            .collect();
+        let mut best_kld = f64::INFINITY;
+        for x0 in &x0_list {
+            let (x_opt, kld) = lbfgsb_minimize(
+                &bio_model, x0, &lb, &ub, &limits,
+                &u_idx, &s_idx, &f,
+                fixed_quad_t, quad_order, fd_eps,
+                maxiter, ftol, gtol,
+                samp_log.as_deref(), eps, m_lbfgs,
+            );
+            if kld < best_kld * ERR_THRESH {
+                best_x = x_opt;
+                best_kld = kld;
+            }
+        }
+        (best_x, best_kld)
+    });
+    Ok(result)
+}
+
+/// Optimize all genes in parallel using L-BFGS-B + rayon.
+///
+/// x0_list : n_genes × num_restarts × n_params initial points
+/// Returns (param_estimates, klds) each of length n_genes.
+#[pyfunction]
+#[pyo3(signature = (bio_model, x0_list, lb, ub, limits_list, u_idx_list, s_idx_list, f_list,
+                    fixed_quad_t, quad_order, fd_eps=1e-6, maxiter=1000,
+                    ftol=1e-10, gtol=1e-6, samp_list=None, eps=1e-15,
+                    m_lbfgs=10, num_threads=None))]
+#[allow(clippy::too_many_arguments)]
+fn optimize_genes_2d(
+    py: Python<'_>,
+    bio_model: String,
+    x0_list: Vec<Vec<Vec<f64>>>,   // n_genes × num_restarts × n_params
+    lb: Vec<f64>,
+    ub: Vec<f64>,
+    limits_list: Vec<Vec<usize>>,
+    u_idx_list: Vec<Vec<u64>>,
+    s_idx_list: Vec<Vec<u64>>,
+    f_list: Vec<Vec<f64>>,
+    fixed_quad_t: f64,
+    quad_order: usize,
+    fd_eps: f64,
+    maxiter: usize,
+    ftol: f64,
+    gtol: f64,
+    samp_list: Option<Vec<Option<Vec<f64>>>>,
+    eps: f64,
+    m_lbfgs: usize,
+    num_threads: Option<usize>,
+) -> PyResult<(Vec<Vec<f64>>, Vec<f64>)> {
+    match bio_model.as_str() {
+        "Constitutive" | "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => {}
+        other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown bio_model for optimize_genes_2d: {other}"
+        ))),
+    }
+    let n_genes = x0_list.len();
+    const ERR_THRESH: f64 = 0.99;
+
+    let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
+        let run = || {
+            (0..n_genes)
+                .into_par_iter()
+                .map(|gi| {
+                    let samp = samp_list.as_ref().and_then(|sl| sl[gi].as_deref());
+                    let mut best_x: Vec<f64> = (0..lb.len())
+                        .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
+                        .collect();
+                    let mut best_kld = f64::INFINITY;
+                    for x0 in &x0_list[gi] {
+                        let (x_opt, kld) = lbfgsb_minimize(
+                            &bio_model, x0, &lb, &ub, &limits_list[gi],
+                            &u_idx_list[gi], &s_idx_list[gi], &f_list[gi],
+                            fixed_quad_t, quad_order, fd_eps,
+                            maxiter, ftol, gtol,
+                            samp, eps, m_lbfgs,
+                        );
+                        if kld < best_kld * ERR_THRESH {
+                            best_x = x_opt;
+                            best_kld = kld;
+                        }
+                    }
+                    (best_x, best_kld)
+                })
+                .collect()
+        };
+        match num_threads {
+            Some(nt) => rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .map(|pool| pool.install(run))
+                .unwrap_or_else(|_| run()),
+            None => run(),
+        }
+    });
+
+    let params: Vec<Vec<f64>> = results.iter().map(|(x, _)| x.clone()).collect();
+    let klds: Vec<f64> = results.iter().map(|(_, k)| *k).collect();
+    Ok((params, klds))
+}
+
+// ============================================================================
 // PyO3 module
 // ============================================================================
 
@@ -1571,6 +2101,10 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(eval_model_pss_2d_batch, m)?)?;
     m.add_function(wrap_pyfunction!(eval_model_pss_protein_bursty, m)?)?;
     m.add_function(wrap_pyfunction!(protein_bursty_pgf, m)?)?;
+    m.add_function(wrap_pyfunction!(eval_kld_2d, m)?)?;
+    m.add_function(wrap_pyfunction!(eval_kld_grad_2d, m)?)?;
+    m.add_function(wrap_pyfunction!(optimize_gene_2d, m)?)?;
+    m.add_function(wrap_pyfunction!(optimize_genes_2d, m)?)?;
     m.add_function(wrap_pyfunction!(make_histograms_unique, m)?)?;
     m.add_function(wrap_pyfunction!(eval_custom_network_pgf, m)?)?;
     Ok(())
