@@ -708,7 +708,7 @@ class InferenceParameters:
             "max_iterations" defines the maximum number of gradient descent iterations.
             "init_pattern" defines whether the first try starts at the method of moments estimate.
             "num_restarts" defines how many attempts should be made.
-            "num_gene_cores" controls gene-level parallelism per grid point (-1 = all cores; Rust batch Adam if available, else ThreadPoolExecutor).
+            "num_gene_cores" controls gene-level parallelism per grid point (-1 = all cores). Uses ThreadPoolExecutor + scipy by default; set "use_batch_optimizer"=True to use batch Adam with rayon instead.
             "n_jac_jobs" controls joblib parallelism over FD perturbations (-1 = all cores); only
             effective when num_gene_cores=1 to avoid nested parallelism.
         run_meta: str, optional
@@ -823,10 +823,11 @@ class InferenceParameters:
         ----------
         num_cores: int
             Number of cores for gene-level parallelization at each grid point.
-            If Rust is available, uses batched Adam optimizer with num_cores
-            rayon threads. Otherwise falls back to ThreadPoolExecutor with
-            scipy L-BFGS-B. Pass -1 for all available cores. Default 1
-            (sequential).
+            Uses ThreadPoolExecutor with scipy L-BFGS-B per gene; the Rust PSS
+            fast-path fires automatically inside each thread. Pass -1 for all
+            available cores. Default 1 (sequential). Set
+            gradient_params["use_batch_optimizer"]=True to use batch Adam with
+            rayon instead (only beneficial for small-M datasets).
         grid_cores: int
             Number of cores to use for parallelization over grid points via
             joblib. Default 1 (sequential). Note: combining grid_cores > 1 with
@@ -1218,15 +1219,17 @@ class GradientInference:
         t1 = time.time()
 
         n_gene_cores = self.gradient_params.get("num_gene_cores", 1)
+        use_batch = self.gradient_params.get("use_batch_optimizer", False)
         if n_gene_cores != 1:
             num_threads = None if n_gene_cores < 0 else n_gene_cores
-            if _HAS_RUST:
-                # Batch Adam optimizer: all genes in one rayon call, GIL released.
+            if use_batch and _HAS_RUST:
+                # Explicit opt-in: batch Adam with rayon, all genes in one call.
                 param_estimates, klds = self._iterate_over_genes_batch(
                     model, search_data, num_threads=num_threads
                 )
             else:
-                # Fallback: ThreadPoolExecutor with scipy L-BFGS-B per gene.
+                # Default: ThreadPoolExecutor + scipy L-BFGS-B per gene.
+                # Rust PSS fast-path fires automatically inside each thread.
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 n_workers = os.cpu_count() if num_threads is None else num_threads
                 results_list = [None] * search_data.n_genes
