@@ -23,7 +23,9 @@
 ///   - Shared protein_bursty_core helper: eliminates duplicated logic between
 ///     eval_model_pss_protein_bursty and protein_bursty_pgf.
 
+use lbfgsb_rs_pure::{IterationControl, LBFGSB};
 use num_complex::Complex64;
+use ruanndata::{read_h5ad, ArrayValue, MatrixData};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use numpy::{PyReadonlyArray2, PyUntypedArrayMethods};
@@ -1335,6 +1337,267 @@ fn make_histograms_unique(
 }
 
 // ============================================================================
+// ruanndata h5ad I/O helpers
+// ============================================================================
+
+/// Convert any MatrixData variant to a flat row-major (n_cells × n_genes) Vec<i64>.
+/// Returns (n_cells, n_genes, flat).
+fn matrix_to_dense_i64(matrix: &MatrixData) -> Result<(usize, usize, Vec<i64>), String> {
+    /// Cast one element of an ArrayValue to i64.
+    fn av_get(av: &ArrayValue, idx: usize) -> i64 {
+        match av {
+            ArrayValue::Int64(v)  => v[idx],
+            ArrayValue::Int32(v)  => v[idx] as i64,
+            ArrayValue::UInt64(v) => v[idx] as i64,
+            ArrayValue::UInt32(v) => v[idx] as i64,
+            ArrayValue::Float64(v) => v[idx].round() as i64,
+            ArrayValue::Float32(v) => v[idx].round() as i64,
+            _ => 0,
+        }
+    }
+    match matrix {
+        MatrixData::Dense { array } => {
+            let shape = &array.shape;
+            if shape.len() != 2 {
+                return Err(format!("expected 2-D dense array, got shape {:?}", shape));
+            }
+            let (nr, nc) = (shape[0], shape[1]);
+            let flat: Vec<i64> = (0..nr * nc).map(|i| av_get(&array.values, i)).collect();
+            Ok((nr, nc, flat))
+        }
+        MatrixData::Csr { n_rows, n_cols, data, indices, indptr } => {
+            let mut flat = vec![0i64; n_rows * n_cols];
+            for row in 0..*n_rows {
+                for k in indptr[row]..indptr[row + 1] {
+                    let col = indices[k];
+                    flat[row * n_cols + col] = av_get(&data.values, k);
+                }
+            }
+            Ok((*n_rows, *n_cols, flat))
+        }
+        MatrixData::Csc { n_rows, n_cols, data, indices, indptr } => {
+            let mut flat = vec![0i64; n_rows * n_cols];
+            for col in 0..*n_cols {
+                for k in indptr[col]..indptr[col + 1] {
+                    let row = indices[k];
+                    flat[row * n_cols + col] = av_get(&data.values, k);
+                }
+            }
+            Ok((*n_rows, *n_cols, flat))
+        }
+    }
+}
+
+
+/// Read an h5ad file, apply optional expression filter, compute unique histograms.
+///
+/// Parameters
+/// ----------
+/// filepath      : path to the .h5ad file.
+/// layer_names   : ordered list of layer keys (e.g. ["unspliced","spliced"]).
+/// gene_names    : if Some, use exactly these genes (must be present in var.index).
+///                 if None, apply expression filter and return all passing genes.
+/// min_means     : per-layer minimum mean expression (default 0.01 each).
+/// max_maxes     : per-layer maximum allowed peak count (default 350 each).
+/// min_maxes     : per-layer minimum required peak count (default 4 each).
+/// padding       : added to per-gene per-layer maximum to form grid limit (default 10).
+///
+/// Returns
+/// -------
+/// (gene_names, coords, freqs, limits) where
+///   gene_names  : Vec<String> of selected gene names (in requested / filter order)
+///   coords[g]   : unique microstates (each a Vec<i64> of length n_layers)
+///   freqs[g]    : normalised frequencies corresponding to coords[g]
+///   limits[g]   : Vec<usize> per-layer grid bound (max_val + padding)
+#[pyfunction]
+#[pyo3(signature = (filepath, layer_names, gene_names=None,
+                    min_means=None, max_maxes=None, min_maxes=None, padding=10))]
+#[allow(clippy::too_many_arguments)]
+fn load_histograms_h5ad(
+    py: Python<'_>,
+    filepath: String,
+    layer_names: Vec<String>,
+    gene_names: Option<Vec<String>>,
+    min_means: Option<Vec<f64>>,
+    max_maxes: Option<Vec<f64>>,
+    min_maxes: Option<Vec<f64>>,
+    padding: usize,
+) -> PyResult<(Vec<String>, Vec<Vec<Vec<i64>>>, Vec<Vec<f64>>, Vec<Vec<usize>>)> {
+    let n_layers = layer_names.len();
+    if n_layers == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err("layer_names must not be empty"));
+    }
+    let min_means  = min_means .unwrap_or_else(|| vec![0.01;  n_layers]);
+    let max_maxes  = max_maxes .unwrap_or_else(|| vec![350.0; n_layers]);
+    let min_maxes  = min_maxes .unwrap_or_else(|| vec![4.0;   n_layers]);
+    if min_means.len() != n_layers || max_maxes.len() != n_layers || min_maxes.len() != n_layers {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "min_means, max_maxes, min_maxes must each have length == len(layer_names)",
+        ));
+    }
+
+    let result = py.allow_threads(|| -> Result<_, String> {
+        // ── Read h5ad ─────────────────────────────────────────────────────────
+        let adata = read_h5ad(&filepath)
+            .map_err(|e| format!("read_h5ad failed: {e}"))?;
+        let all_gene_names: &[String] = &adata.var.index;
+        let n_total_genes = all_gene_names.len();
+
+        // ── Densify requested layers (n_cells × n_total_genes, row-major) ─────
+        let mut layers_flat: Vec<Vec<i64>> = Vec::with_capacity(n_layers);
+        let mut n_cells = 0usize;
+        for lname in &layer_names {
+            let mat = adata.layers.get(lname)
+                .ok_or_else(|| format!("layer '{}' not found", lname))?;
+            let (nr, nc, flat) = matrix_to_dense_i64(mat)?;
+            if nc != n_total_genes {
+                return Err(format!(
+                    "layer '{}': {} columns but var has {} genes", lname, nc, n_total_genes
+                ));
+            }
+            if layers_flat.is_empty() { n_cells = nr; }
+            else if nr != n_cells {
+                return Err(format!("layers have inconsistent cell counts ({} vs {})", n_cells, nr));
+            }
+            layers_flat.push(flat);
+        }
+
+        // ── Build (gene_name, gene_idx) list in requested order ───────────────
+        let ordered: Vec<(String, usize)> = if let Some(ref requested) = gene_names {
+            let name_to_idx: HashMap<&str, usize> = all_gene_names
+                .iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+            requested.iter().map(|g| {
+                let idx = name_to_idx.get(g.as_str())
+                    .copied()
+                    .ok_or_else(|| format!("gene '{}' not found in var", g))?;
+                Ok((g.clone(), idx))
+            }).collect::<Result<Vec<_>, String>>()?
+        } else {
+            // Parallel per-gene means + maxes via ruanndata's col_sums_par + custom max.
+            let mut passing = Vec::new();
+            for gene in 0..n_total_genes {
+                let mut ok = true;
+                for (l, flat) in layers_flat.iter().enumerate() {
+                    let (sum, max) = (0..n_cells).fold((0i64, 0i64), |(s, m), c| {
+                        let v = flat[c * n_total_genes + gene];
+                        (s + v, m.max(v))
+                    });
+                    let mean = sum as f64 / n_cells as f64;
+                    let max  = max as f64;
+                    if mean < min_means[l] || max > max_maxes[l] || max < min_maxes[l] {
+                        ok = false; break;
+                    }
+                }
+                if ok { passing.push((all_gene_names[gene].clone(), gene)); }
+            }
+            passing
+        };
+
+        // ── Parallel histogram computation ────────────────────────────────────
+        let results: Vec<(String, Vec<Vec<i64>>, Vec<f64>, Vec<usize>)> = ordered
+            .into_par_iter()
+            .map(|(gname, gene_idx)| {
+                let cols: Vec<Vec<i64>> = layers_flat.iter()
+                    .map(|flat| (0..n_cells).map(|c| flat[c * n_total_genes + gene_idx]).collect())
+                    .collect();
+
+                let max_per_layer: Vec<usize> = cols.iter()
+                    .map(|col| col.iter().copied().max().unwrap_or(0).max(0) as usize)
+                    .collect();
+                let limits: Vec<usize> = max_per_layer.iter().map(|&m| m + padding).collect();
+                let total_states: usize = max_per_layer.iter().map(|&m| m + 1).product();
+
+                let (coords, freqs) = if total_states <= DENSE_THRESHOLD {
+                    let mut strides = vec![1usize; n_layers];
+                    for l in (0..n_layers - 1).rev() {
+                        strides[l] = strides[l + 1] * (max_per_layer[l + 1] + 1);
+                    }
+                    DENSE_BUF.with(|db| {
+                        let mut table = db.borrow_mut();
+                        if table.len() < total_states { table.resize(total_states, 0); }
+                        let table = &mut table[..total_states];
+                        table.fill(0);
+                        for cell in 0..n_cells {
+                            let idx: usize = cols.iter().zip(strides.iter())
+                                .map(|(col, &s)| col[cell] as usize * s).sum();
+                            table[idx] += 1;
+                        }
+                        let mut unique = Vec::new();
+                        let mut freqs  = Vec::new();
+                        for flat_idx in 0..total_states {
+                            if table[flat_idx] == 0 { continue; }
+                            let mut ms = vec![0i64; n_layers];
+                            let mut rem = flat_idx;
+                            for l in 0..n_layers {
+                                ms[l] = (rem / strides[l]) as i64;
+                                rem %= strides[l];
+                            }
+                            unique.push(ms);
+                            freqs.push(table[flat_idx] as f64 / n_cells as f64);
+                        }
+                        (unique, freqs)
+                    })
+                } else {
+                    FLAT_BUF.with(|fb| { ORDER_BUF.with(|ob| {
+                        let mut flat_b = fb.borrow_mut();
+                        let mut order  = ob.borrow_mut();
+                        let flat_len = n_cells * n_layers;
+                        if flat_b.len() < flat_len { flat_b.resize(flat_len, 0); }
+                        if order.len()  < n_cells  { order.resize(n_cells, 0); }
+                        let flat_b = &mut flat_b[..flat_len];
+                        let order  = &mut order[..n_cells];
+                        for cell in 0..n_cells {
+                            for (l, col) in cols.iter().enumerate() {
+                                flat_b[cell * n_layers + l] = col[cell];
+                            }
+                        }
+                        for (i, v) in order.iter_mut().enumerate() { *v = i; }
+                        order.sort_unstable_by(|&a, &b| {
+                            flat_b[a * n_layers..(a+1)*n_layers]
+                                .cmp(&flat_b[b * n_layers..(b+1)*n_layers])
+                        });
+                        let mut unique: Vec<Vec<i64>> = Vec::new();
+                        let mut counts: Vec<usize> = Vec::new();
+                        let mut prev_start = usize::MAX;
+                        for &idx in order.iter() {
+                            let rs = idx * n_layers;
+                            if prev_start != usize::MAX
+                                && flat_b[prev_start..prev_start+n_layers]
+                                    == flat_b[rs..rs+n_layers]
+                            {
+                                *counts.last_mut().unwrap() += 1;
+                            } else {
+                                unique.push(flat_b[rs..rs+n_layers].to_vec());
+                                counts.push(1);
+                                prev_start = rs;
+                            }
+                        }
+                        let freqs = counts.iter().map(|&c| c as f64 / n_cells as f64).collect();
+                        (unique, freqs)
+                    })})
+                };
+
+                (gname, coords, freqs, limits)
+            })
+            .collect();
+
+        let mut out_names  = Vec::with_capacity(results.len());
+        let mut out_coords = Vec::with_capacity(results.len());
+        let mut out_freqs  = Vec::with_capacity(results.len());
+        let mut out_limits = Vec::with_capacity(results.len());
+        for (name, coords, freqs, limits) in results {
+            out_names.push(name);
+            out_coords.push(coords);
+            out_freqs.push(freqs);
+            out_limits.push(limits);
+        }
+        Ok((out_names, out_coords, out_freqs, out_limits))
+    });
+
+    result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+}
+
+// ============================================================================
 // Custom reaction-network ODE integration — general n-species, parallel RK4
 // ============================================================================
 
@@ -1732,11 +1995,6 @@ fn eval_kld_grad_2d(
 // L-BFGS-B optimizer (box-constrained, no Python callbacks)
 // ============================================================================
 
-#[inline]
-fn dot(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b).map(|(&ai, &bi)| ai * bi).sum()
-}
-
 /// Evaluate KLD + finite-difference gradient at x, sequentially.
 /// Called from within a rayon task — pure Rust, no GIL, no nested rayon.
 fn eval_kld_and_grad_seq(
@@ -1770,9 +2028,9 @@ fn eval_kld_and_grad_seq(
 
 /// Minimize KLD(x) s.t. lb ≤ x ≤ ub using L-BFGS-B.
 ///
-/// Uses Armijo sufficient-decrease backtracking line search with box projection.
-/// L-BFGS memory vectors are stored in circular buffers of size `m_mem`.
-/// Convergence: projected-gradient inf-norm < gtol OR relative f-change < ftol.
+/// Delegates to `lbfgsb_rs_pure::LBFGSB` which uses a Moré-Thuente safeguarded
+/// line search (same as scipy's Fortran L-BFGS-B), Cauchy point + subspace
+/// minimization, and compact column-major memory storage.
 ///
 /// Called from within rayon tasks — pure Rust, no GIL, no nested rayon.
 fn lbfgsb_minimize(
@@ -1795,158 +2053,39 @@ fn lbfgsb_minimize(
     m_mem: usize,
 ) -> (Vec<f64>, f64) {
     let n = x0.len();
-
-    // Project initial point onto box constraints.
     let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
-    let (mut fx, mut gx) = eval_kld_and_grad_seq(
-        bio_model, &x, limits, u_idx, s_idx, f_data,
-        fixed_quad_t, quad_order, fd_eps, samp_log, eps,
-    );
 
-    // L-BFGS memory: s[k] = x_{k+1} - x_k,  y[k] = g_{k+1} - g_k
-    let mut s_buf: Vec<Vec<f64>> = Vec::with_capacity(m_mem);
-    let mut y_buf: Vec<Vec<f64>> = Vec::with_capacity(m_mem);
-    let mut rho_buf: Vec<f64> = Vec::with_capacity(m_mem);
+    let mut solver = LBFGSB::new(m_mem)
+        .with_max_iter(maxiter)
+        .with_pgtol(gtol);
 
-    for _iter in 0..maxiter {
-        // --- Projected-gradient convergence check ---------------------------
-        let pg_inf: f64 = (0..n)
-            .map(|i| {
-                if (x[i] - lb[i]).abs() < 1e-15 {
-                    gx[i].min(0.0).abs()
-                } else if (x[i] - ub[i]).abs() < 1e-15 {
-                    gx[i].max(0.0).abs()
-                } else {
-                    gx[i].abs()
-                }
-            })
-            .fold(0.0_f64, f64::max);
-        if pg_inf < gtol {
-            break;
-        }
+    let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
+        eval_kld_and_grad_seq(
+            bio_model, xx, limits, u_idx, s_idx, f_data,
+            fixed_quad_t, quad_order, fd_eps, samp_log, eps,
+        )
+    };
 
-        // --- L-BFGS two-loop recursion: compute H_k * g_k -------------------
-        let mem = s_buf.len();
-        let mut q = gx.clone();
-        let mut alphas = vec![0.0_f64; mem];
-
-        // First loop (most recent pair first).
-        for i in (0..mem).rev() {
-            let a = rho_buf[i] * dot(&s_buf[i], &q);
-            alphas[i] = a;
-            for j in 0..n {
-                q[j] -= a * y_buf[i][j];
-            }
-        }
-
-        // Initial Hessian scaling: γ = s^T y / y^T y (most recent pair).
-        let gamma = if mem > 0 {
-            let sy = dot(&s_buf[mem - 1], &y_buf[mem - 1]);
-            let yy = dot(&y_buf[mem - 1], &y_buf[mem - 1]);
-            if yy > 1e-30 { sy / yy } else { 1.0 }
+    // Track previous f for relative-improvement ftol check.
+    let mut prev_f = f64::INFINITY;
+    let mut callback = |info: &lbfgsb_rs_pure::IterationInfo, _x: &[f64]| {
+        let improve = (prev_f - info.f).abs() / prev_f.abs().max(1.0);
+        prev_f = info.f;
+        if improve < ftol {
+            IterationControl::StopConverged
         } else {
-            1.0
-        };
-        let mut r: Vec<f64> = q.iter().map(|&qi| gamma * qi).collect();
-
-        // Second loop (oldest pair first).
-        for i in 0..mem {
-            let beta = rho_buf[i] * dot(&y_buf[i], &r);
-            for j in 0..n {
-                r[j] += s_buf[i][j] * (alphas[i] - beta);
-            }
+            IterationControl::Continue
         }
+    };
 
-        // --- Search direction: d = -H*g, zeroing components at active bounds -
-        let mut d: Vec<f64> = (0..n)
-            .map(|i| {
-                let di = -r[i];
-                if (x[i] - lb[i]).abs() < 1e-15 && di < 0.0 { 0.0 }
-                else if (x[i] - ub[i]).abs() < 1e-15 && di > 0.0 { 0.0 }
-                else { di }
-            })
-            .collect();
-
-        // Reset memory and fall back to projected steepest descent if d ≈ 0.
-        if dot(&d, &d) < 1e-30 {
-            s_buf.clear();
-            y_buf.clear();
-            rho_buf.clear();
-            d = (0..n)
-                .map(|i| {
-                    let di = -gx[i];
-                    if (x[i] - lb[i]).abs() < 1e-15 && di < 0.0 { 0.0 }
-                    else if (x[i] - ub[i]).abs() < 1e-15 && di > 0.0 { 0.0 }
-                    else { di }
-                })
-                .collect();
-            if dot(&d, &d) < 1e-30 {
-                break;
-            }
-        }
-
-        // --- Backtracking line search (standard Armijo sufficient decrease) ----
-        // Condition: f(clip(x + α·d)) ≤ f(x) + c1 · α · ∇f(x)ᵀd
-        //
-        // We use α · g^T · d (the UNCONSTRAINED directional derivative scaled by α),
-        // NOT g^T · (x_new - x) (the actual clipped step).  When α·d clips to a
-        // boundary, g^T · (x_new - x) ≪ α · g^T · d, making the latter much more
-        // stringent.  Using the unconstrained form prevents accepting large steps
-        // that jump to boundary local minima — matching scipy's Fortran L-BFGS-B.
-        const C1: f64 = 1e-4;
-        let phi_prime_0: f64 = dot(&gx, &d); // g^T · d  (must be < 0 for descent)
-        let mut alpha = 1.0_f64;
-        let mut x_new: Vec<f64>;
-        let mut fx_new: f64;
-        let mut gx_new: Vec<f64>;
-
-        loop {
-            x_new = (0..n).map(|i| (x[i] + alpha * d[i]).max(lb[i]).min(ub[i])).collect();
-            let r = eval_kld_and_grad_seq(
-                bio_model, &x_new, limits, u_idx, s_idx, f_data,
-                fixed_quad_t, quad_order, fd_eps, samp_log, eps,
-            );
-            fx_new = r.0;
-            gx_new = r.1;
-            // Standard Armijo: f_new ≤ f + c1 · α · phi'(0)
-            // phi_prime_0 < 0, so the threshold decreases proportionally with α.
-            if fx_new <= fx + C1 * alpha * phi_prime_0 || alpha < 1e-12 {
-                break;
-            }
-            alpha *= 0.5;
-        }
-
-        // --- Convergence by relative function improvement -------------------
-        let f_improve = (fx - fx_new).abs() / fx.abs().max(1.0);
-
-        // --- Update L-BFGS memory -------------------------------------------
-        let sk: Vec<f64> = (0..n).map(|i| x_new[i] - x[i]).collect();
-        let yk: Vec<f64> = (0..n).map(|i| gx_new[i] - gx[i]).collect();
-        let sy = dot(&sk, &yk);
-
-        x = x_new;
-        fx = fx_new;
-        gx = gx_new;
-
-        // Curvature condition: only add pair when s·y > ε·‖y‖² (skip near-flat).
-        let yy = dot(&yk, &yk);
-        if sy > 1e-10 * yy.max(1e-60) {
-            if s_buf.len() == m_mem {
-                s_buf.remove(0);
-                y_buf.remove(0);
-                rho_buf.remove(0);
-            }
-            s_buf.push(sk);
-            y_buf.push(yk);
-            rho_buf.push(1.0 / sy);
-        }
-
-        if f_improve < ftol {
-            break;
+    match solver.minimize_with_callback(&mut x, lb, ub, &mut f_and_grad, &mut callback) {
+        Ok(sol) => (sol.x, sol.f),
+        Err(_) => {
+            // Line-search or numerical failure: return the projected x0 with its f value.
+            let (f0, _) = f_and_grad(&x);
+            (x, f0)
         }
     }
-
-    (x, fx)
 }
 
 /// Optimize a single gene with L-BFGS-B using multiple restarts.
@@ -2106,6 +2245,7 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(optimize_gene_2d, m)?)?;
     m.add_function(wrap_pyfunction!(optimize_genes_2d, m)?)?;
     m.add_function(wrap_pyfunction!(make_histograms_unique, m)?)?;
+    m.add_function(wrap_pyfunction!(load_histograms_h5ad, m)?)?;
     m.add_function(wrap_pyfunction!(eval_custom_network_pgf, m)?)?;
     Ok(())
 }
