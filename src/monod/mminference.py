@@ -17,6 +17,15 @@ from sklearn.metrics.pairwise import cosine_similarity
 import warnings
 from plot_aesthetics import aesthetics
 
+try:
+    import monod_core as _mc
+    _HAS_RUST = True
+except ImportError:
+    _mc = None
+    _HAS_RUST = False
+
+_RUST_MODELS_2D = {"Constitutive", "Bursty", "CIR", "Extrinsic", "Delay", "DelayedSplicing"}
+
 from tqdm import tqdm
 
 # from tqdm.contrib.concurrent import process_map  # or thread_map
@@ -699,7 +708,7 @@ class GradientInference:
         return key, self.iterate_over_genes(model, k_dict)
 
     
-    def _e_step(self,model,search_data,EPS=1e-15): 
+    def _e_step(self,model,search_data,EPS=1e-15):
         """Update posterior p(z=k|x).
 
         Parameters
@@ -710,43 +719,80 @@ class GradientInference:
             SearchData object with the data to fit.
 
         Returns
-        ----------  
+        ----------
         Q: np.ndarray
             obs x k mixture components for p(z=k|x)
 
         """
-        #Get params for each k
         if search_data.hist_type == "grid":
             raise ValueError("Mixture model not yet implemented for grid hist type")
-        elif search_data.hist_type == "unique":
-            n_cells = search_data.n_cells
-            logL = np.zeros((n_cells,self.k))
 
-            for k in list(self.theta.keys()):
-                
-                params, klds, obj_fun, d_time = self.theta[k]
-                logL_k = np.zeros(n_cells)
+        if search_data.hist_type != "unique":
+            raise ValueError(f"Unsupported hist_type: {search_data.hist_type}")
 
-                for gene_index in range(search_data.n_genes):
-                    S = search_data.layers[1][:,gene_index].astype(int)
-                    U = search_data.layers[0][:,gene_index].astype(int)
-                    x = np.array([U,S])
+        n_cells = search_data.n_cells
+        n_genes = search_data.n_genes
+        ks_present = sorted(self.theta.keys())
 
-                    proposal = model.eval_model_pss(params[gene_index], search_data.M[:, gene_index], self.regressor[gene_index])
-                    proposal[proposal < EPS] = EPS
+        # Rust fast-path: parallel PSS evaluation + per-cell log-likelihood accumulation
+        if (
+            _HAS_RUST
+            and ks_present
+            and model.bio_model in _RUST_MODELS_2D
+            and model.seq_model in ("None", "Poisson")
+            and model.amb_model == "None"
+            and model.quad_method == "fixed_quad"
+        ):
+            params_per_k = [self.theta[k][0].tolist() for k in ks_present]
+            limits_list = [[int(v) for v in search_data.M[:, g]] for g in range(n_genes)]
+            u_obs = [search_data.layers[0][:, g].astype(int).tolist() for g in range(n_genes)]
+            s_obs = [search_data.layers[1][:, g].astype(int).tolist() for g in range(n_genes)]
+            samp_list = None
+            if model.seq_model == "Poisson":
+                samp_list = [
+                    self.regressor[g].tolist() if self.regressor[g] is not None else None
+                    for g in range(n_genes)
+                ]
+            weights_subset = self.weights[ks_present].tolist()
 
-                    proposal = proposal[tuple(x)]
-                    logL_k += np.log(proposal) #logL for each obs, per gene
+            Q_sub, lower_bound, q_func = _mc.e_step_2d(
+                bio_model=model.bio_model,
+                params_per_k=params_per_k,
+                limits_list=limits_list,
+                u_obs=u_obs,
+                s_obs=s_obs,
+                weights=weights_subset,
+                fixed_quad_t=float(model.fixed_quad_T),
+                quad_order=int(model.quad_order),
+                samp_list=samp_list,
+                eps=EPS,
+            )
+            # Map back to full k dimension
+            Q = np.zeros((n_cells, self.k))
+            for i, k in enumerate(ks_present):
+                Q[:, k] = np.array(Q_sub)[:, i]
+            return Q, lower_bound, q_func
 
-                logL[:,k] = logL_k
+        # Python fallback
+        logL = np.zeros((n_cells, self.k))
+        for k in ks_present:
+            params, klds, obj_fun, d_time = self.theta[k]
+            logL_k = np.zeros(n_cells)
+            for gene_index in range(n_genes):
+                S = search_data.layers[1][:,gene_index].astype(int)
+                U = search_data.layers[0][:,gene_index].astype(int)
+                x = np.array([U,S])
+                proposal = model.eval_model_pss(params[gene_index], search_data.M[:, gene_index], self.regressor[gene_index])
+                proposal[proposal < EPS] = EPS
+                proposal = proposal[tuple(x)]
+                logL_k += np.log(proposal)
+            logL[:,k] = logL_k
 
-            logL += np.log(self.weights)[None,:]
-            Q = softmax(logL, axis=1) #Posterior
-            lower_bound = np.mean(logsumexp(a=logL, axis=1))
-            q_func = np.sum(Q*logL) #Full EM Q-function (Q(theta|theta_t))
-
-
-        return Q, lower_bound, q_func 
+        logL += np.log(self.weights)[None,:]
+        Q = softmax(logL, axis=1)
+        lower_bound = np.mean(logsumexp(a=logL, axis=1))
+        q_func = np.sum(Q*logL)
+        return Q, lower_bound, q_func
     
     def _fit(self,model,search_data,EPS=1e-15,num_cores=1): 
         """Update posterior p(z=k|x).
@@ -902,11 +948,83 @@ class GradientInference:
             runtime in seconds.
         """
         t1 = time.time()
+        n_genes = search_data.n_genes
 
+        # Rust fast-path: parallel L-BFGS-B optimization over all genes
+        if (
+            _HAS_RUST
+            and model.bio_model in _RUST_MODELS_2D
+            and model.seq_model in ("None", "Poisson")
+            and model.amb_model == "None"
+            and model.quad_method == "fixed_quad"
+            and search_data.hist_type == "unique"
+        ):
+            n_restarts = self.gradient_params["num_restarts"]
+
+            x0_all = []
+            for gi in range(n_genes):
+                x0 = (
+                    np.random.rand(n_restarts, self.n_phys_pars)
+                    * (self.phys_ub - self.phys_lb)
+                    + self.phys_lb
+                )
+                if self.gradient_params["init_pattern"] == "moments":
+                    warnings.filterwarnings("ignore", category=RuntimeWarning)
+                    x0[0] = model.get_MoM(
+                        search_data.moments[gi],
+                        self.phys_lb,
+                        self.phys_ub,
+                        self.regressor[gi],
+                    )
+                    warnings.resetwarnings()
+                x0_all.append(x0.tolist())
+
+            u_idx_list, s_idx_list, f_list, limits_list = [], [], [], []
+            for gi in range(n_genes):
+                x_data, f_data = search_data.hist[gi]
+                x_np = np.asarray(x_data, dtype=np.int64)
+                u_idx_list.append(x_np[:, 0].tolist())
+                s_idx_list.append(x_np[:, 1].tolist())
+                f_list.append(np.asarray(f_data).tolist())
+                limits_list.append([int(v) for v in search_data.M[:, gi]])
+
+            samp_list = None
+            if model.seq_model == "Poisson":
+                samp_list = [
+                    self.regressor[gi].tolist() if self.regressor[gi] is not None else None
+                    for gi in range(n_genes)
+                ]
+
+            params_arr, klds_arr = _mc.optimize_genes_2d(
+                bio_model=model.bio_model,
+                x0_list=x0_all,
+                lb=self.phys_lb.tolist(),
+                ub=self.phys_ub.tolist(),
+                limits_list=limits_list,
+                u_idx_list=u_idx_list,
+                s_idx_list=s_idx_list,
+                f_list=f_list,
+                fixed_quad_t=float(model.fixed_quad_T),
+                quad_order=int(model.quad_order),
+                fd_eps=1e-6,
+                maxiter=self.gradient_params["max_iterations"],
+                ftol=1e-10,
+                gtol=1e-6,
+                samp_list=samp_list,
+                eps=1e-15,
+                m_lbfgs=10,
+            )
+            param_estimates = np.asarray(params_arr)
+            klds = np.asarray(klds_arr)
+            obj_func = klds.sum()
+            t2 = time.time()
+            return param_estimates, klds, obj_func, t2 - t1
+
+        # Python fallback
         param_estimates, klds = zip(
             *[
                 self.optimize_gene(gene_index, model, search_data)
-                for gene_index in range(search_data.n_genes)
+                for gene_index in range(n_genes)
             ]
         )
 

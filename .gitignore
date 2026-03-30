@@ -18,6 +18,9 @@ dist/
 *.whl
 monod_core/target/
 
+# Notebook output figures
+figures/
+
 # Inference artifacts
 *.gp
 *.res

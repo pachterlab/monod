@@ -2231,6 +2231,135 @@ fn optimize_genes_2d(
 }
 
 // ============================================================================
+// E-step for MEK-Means EM algorithm
+// ============================================================================
+
+/// Compute the E-step for the MEK-Means EM algorithm in Rust with rayon parallelism.
+///
+/// For each cluster k, evaluates eval_model_pss_2d_seq for every gene (in parallel),
+/// looks up per-cell log-probabilities by indexing PSS[u_obs[g][c], s_obs[g][c]],
+/// and accumulates logL[c][k] = sum_genes log P(obs | theta_k).
+/// Adds log(weights[k]) and applies softmax to return Q, lower_bound, q_func.
+///
+/// Parameters
+/// ----------
+/// bio_model     : one of the six supported 2D models
+/// params_per_k  : n_k × n_genes × n_params (log10 param vectors)
+/// limits_list   : n_genes × 2 grid bounds [m_u, m_s]
+/// u_obs         : n_genes × n_cells unspliced count observations
+/// s_obs         : n_genes × n_cells spliced count observations
+/// weights       : n_k mixture weights (must sum to ~1)
+/// fixed_quad_t  : quadrature time-scale multiplier
+/// quad_order    : Gauss-Legendre quadrature order
+/// samp_list     : optional n_genes list of Poisson sampling params; None for seq_model="None"
+/// eps           : probability floor before log (default 1e-15)
+/// num_threads   : optional rayon thread-pool size
+///
+/// Returns (Q, lower_bound, q_func)
+///   Q            : n_cells × n_k posterior matrix
+///   lower_bound  : mean over cells of logsumexp(logL, axis=1)
+///   q_func       : sum of Q * logL (EM Q-function value)
+#[pyfunction]
+#[pyo3(signature = (bio_model, params_per_k, limits_list, u_obs, s_obs,
+                    weights, fixed_quad_t, quad_order,
+                    samp_list=None, eps=1e-15, num_threads=None))]
+#[allow(clippy::too_many_arguments)]
+fn e_step_2d(
+    py: Python<'_>,
+    bio_model: String,
+    params_per_k: Vec<Vec<Vec<f64>>>,
+    limits_list: Vec<Vec<usize>>,
+    u_obs: Vec<Vec<u64>>,
+    s_obs: Vec<Vec<u64>>,
+    weights: Vec<f64>,
+    fixed_quad_t: f64,
+    quad_order: usize,
+    samp_list: Option<Vec<Option<Vec<f64>>>>,
+    eps: f64,
+    num_threads: Option<usize>,
+) -> PyResult<(Vec<Vec<f64>>, f64, f64)> {
+    match bio_model.as_str() {
+        "Constitutive" | "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => {}
+        other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown bio_model for e_step_2d: {other}"
+        ))),
+    }
+    let n_k = params_per_k.len();
+    let n_genes = limits_list.len();
+    let n_cells = if n_genes > 0 && !u_obs.is_empty() { u_obs[0].len() } else { 0 };
+
+    let result = py.allow_threads(|| {
+        let run = || -> (Vec<Vec<f64>>, f64, f64) {
+            // logL[c][k] accumulated across genes
+            let mut logL = vec![vec![0.0_f64; n_k]; n_cells];
+
+            for k in 0..n_k {
+                // Parallel over genes: each produces a per-cell log-prob vector
+                let gene_log_probs: Vec<Vec<f64>> = (0..n_genes)
+                    .into_par_iter()
+                    .map(|g| {
+                        let samp = samp_list.as_ref().and_then(|sl| sl[g].as_deref());
+                        let pss = eval_model_pss_2d_seq(
+                            &bio_model,
+                            &params_per_k[k][g],
+                            &limits_list[g],
+                            fixed_quad_t,
+                            quad_order,
+                            samp,
+                        );
+                        let m_s = limits_list[g][1];
+                        u_obs[g].iter().zip(s_obs[g].iter()).map(|(&u, &s)| {
+                            let idx = u as usize * m_s + s as usize;
+                            let p = if idx < pss.len() { pss[idx] } else { 0.0 };
+                            p.max(eps).ln()
+                        }).collect::<Vec<f64>>()
+                    })
+                    .collect();
+
+                // Sum over genes into logL[c][k] and add log(weight)
+                let log_w = weights[k].max(f64::MIN_POSITIVE).ln();
+                for c in 0..n_cells {
+                    let gene_sum: f64 = gene_log_probs.iter().map(|lp| lp[c]).sum();
+                    logL[c][k] = gene_sum + log_w;
+                }
+            }
+
+            // Softmax row-wise → Q; accumulate logsumexp for lower_bound
+            let mut q_mat = vec![vec![0.0_f64; n_k]; n_cells];
+            let mut total_lse = 0.0_f64;
+            for c in 0..n_cells {
+                let max_val = logL[c].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let sum_exp: f64 = logL[c].iter().map(|&v| (v - max_val).exp()).sum();
+                let lse = max_val + sum_exp.ln();
+                total_lse += lse;
+                for k in 0..n_k {
+                    q_mat[c][k] = (logL[c][k] - max_val).exp() / sum_exp;
+                }
+            }
+            let lower_bound = if n_cells > 0 { total_lse / n_cells as f64 } else { 0.0 };
+
+            // q_func = sum(Q * logL)
+            let q_func: f64 = q_mat.iter().zip(logL.iter()).map(|(q_row, l_row)| {
+                q_row.iter().zip(l_row.iter()).map(|(&q, &l)| q * l).sum::<f64>()
+            }).sum();
+
+            (q_mat, lower_bound, q_func)
+        };
+
+        match num_threads {
+            Some(nt) => rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .map(|pool| pool.install(run))
+                .unwrap_or_else(|_| run()),
+            None => run(),
+        }
+    });
+
+    Ok(result)
+}
+
+// ============================================================================
 // PyO3 module
 // ============================================================================
 
@@ -2244,6 +2373,7 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(eval_kld_grad_2d, m)?)?;
     m.add_function(wrap_pyfunction!(optimize_gene_2d, m)?)?;
     m.add_function(wrap_pyfunction!(optimize_genes_2d, m)?)?;
+    m.add_function(wrap_pyfunction!(e_step_2d, m)?)?;
     m.add_function(wrap_pyfunction!(make_histograms_unique, m)?)?;
     m.add_function(wrap_pyfunction!(load_histograms_h5ad, m)?)?;
     m.add_function(wrap_pyfunction!(eval_custom_network_pgf, m)?)?;
