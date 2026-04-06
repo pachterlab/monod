@@ -28,7 +28,8 @@ use num_complex::Complex64;
 use ruanndata::{read_h5ad, ArrayValue, MatrixData};
 use pyo3::prelude::*;
 use rayon::prelude::*;
-use numpy::{PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2, PyUntypedArrayMethods};
+use ndarray::Array3;
 use realfft::RealFftPlanner;
 use rustfft::FftPlanner;
 use std::cell::RefCell;
@@ -508,7 +509,10 @@ fn protein_pgf(
 
     let dt = p.iter().map(|&v| 1.0 / v).fold(f64::INFINITY, f64::min) * min_fudge;
     let t_max = p.iter().map(|&v| 1.0 / v).fold(0.0_f64, f64::max) * max_fudge;
-    let num_tsteps = (t_max / dt).ceil() as usize;
+    // Cap num_tsteps so extreme params (tiny dt, huge t_max) can't cause multi-million
+    // step loops during optimizer exploration.  50_000 covers all realistic rate ranges
+    // (typical params give O(100–10_000) steps) while keeping gradients finite.
+    let num_tsteps = ((t_max / dt).ceil() as usize).min(50_000);
     let one = Complex64::new(1.0, 0.0);
 
     let phase1_fn = |k: usize| {
@@ -534,18 +538,21 @@ fn protein_pgf(
 
     // Phase 2: global-max termination — matches Python's
     // `while np.max(np.abs(u_tilde[0])) >= 1e-3`.
+    // max_while caps iterations so extreme parameters don't loop forever.
+    let max_while = 10 * num_tsteps + 10_000;
     let phase2_step = |s: &mut (Complex64, Complex64, Complex64, Complex64)| {
         let (nu0, nu1, nu2) = rk4_step(s.0, s.1, s.2, dt, beta, gamma, k_p, gamma_p);
         s.0 = nu0; s.1 = nu1; s.2 = nu2;
         s.3 += nu0 * b / (one - nu0 * b) * dt;
     };
+    let mut while_steps = 0usize;
     loop {
         let max_norm = if n_grid >= PAR_THRESHOLD {
             states.par_iter().map(|s| s.0.norm()).reduce(|| 0.0_f64, f64::max)
         } else {
             states.iter().map(|s| s.0.norm()).fold(0.0_f64, f64::max)
         };
-        if max_norm < 1e-3 {
+        if max_norm < 1e-3 || while_steps >= max_while {
             break;
         }
         if n_grid >= PAR_THRESHOLD {
@@ -553,6 +560,7 @@ fn protein_pgf(
         } else {
             states.iter_mut().for_each(phase2_step);
         }
+        while_steps += 1;
     }
 
     // Phase 3: final half-step.
@@ -1147,6 +1155,610 @@ thread_local! {
     static DENSE_BUF: RefCell<Vec<usize>> = RefCell::new(Vec::new());
 }
 
+/// Compute per-gene expression moments (mean, variance, covariance) in parallel.
+///
+/// Parameters
+/// ----------
+/// layers     : ordered list of 2-D int64 numpy arrays, each (n_cells, n_genes).
+/// layer_names: modality names matching the layer order (e.g. ["unspliced","spliced"]).
+///
+/// Returns
+/// -------
+/// List of length n_genes; each element is a dict with keys:
+///   "MOM_{name}_mean"          — per-layer population mean  (ddof=0)
+///   "MOM_{name}_var"           — per-layer population variance (ddof=0, matches numpy .var())
+///   "MOM_cov_{name_i}_{name_j}"— pairwise sample covariance (ddof=1, matches numpy.cov()[0,1])
+#[pyfunction]
+fn compute_moments(
+    py: Python<'_>,
+    layers: Vec<PyReadonlyArray2<'_, i64>>,
+    layer_names: Vec<String>,
+) -> PyResult<Vec<std::collections::HashMap<String, f64>>> {
+    if layers.is_empty() {
+        return Ok(Vec::new());
+    }
+    if layers.len() != layer_names.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "layers and layer_names must have the same length",
+        ));
+    }
+    let n_layers = layers.len();
+    let n_cells = layers[0].shape()[0];
+    let n_genes = layers[0].shape()[1];
+
+    // Materialise all layers as flat row-major Vec<f64> to avoid holding the GIL
+    // during computation.
+    let flat_layers: Vec<Vec<f64>> = layers
+        .iter()
+        .map(|arr| {
+            arr.as_slice()
+                .expect("layer array must be C-contiguous")
+                .iter()
+                .map(|&v| v as f64)
+                .collect()
+        })
+        .collect();
+
+    let result =
+        py.allow_threads(|| compute_moments_inner(&flat_layers, &layer_names, n_cells, n_genes));
+
+    Ok(result)
+}
+
+// ============================================================================
+// SearchData — pure-Rust Stage 3 container
+// ============================================================================
+
+/// Helper: compute moments from pre-flattened f64 layer data.
+/// `layers_flat[l]` is a row-major (n_cells × n_genes) f64 slice.
+fn compute_moments_inner(
+    layers_flat: &[Vec<f64>],
+    layer_names: &[String],
+    n_cells: usize,
+    n_genes: usize,
+) -> Vec<HashMap<String, f64>> {
+    let n_layers = layers_flat.len();
+    (0..n_genes)
+        .into_par_iter()
+        .map(|g| {
+            let mut dict = HashMap::new();
+            let mut means = Vec::with_capacity(n_layers);
+            for (l, flat) in layers_flat.iter().enumerate() {
+                let col: Vec<f64> = (0..n_cells).map(|c| flat[c * n_genes + g]).collect();
+                let mean = col.iter().sum::<f64>() / n_cells as f64;
+                let var = col.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>()
+                    / n_cells as f64;
+                dict.insert(format!("MOM_{}_mean", layer_names[l]), mean);
+                dict.insert(format!("MOM_{}_var", layer_names[l]), var);
+                means.push(mean);
+            }
+            for i in 0..n_layers {
+                for j in (i + 1)..n_layers {
+                    let col_i: Vec<f64> =
+                        (0..n_cells).map(|c| layers_flat[i][c * n_genes + g]).collect();
+                    let col_j: Vec<f64> =
+                        (0..n_cells).map(|c| layers_flat[j][c * n_genes + g]).collect();
+                    let cov = col_i
+                        .iter()
+                        .zip(col_j.iter())
+                        .map(|(xi, xj)| (xi - means[i]) * (xj - means[j]))
+                        .sum::<f64>()
+                        / (n_cells as f64 - 1.0);
+                    dict.insert(
+                        format!("MOM_cov_{}_{}", layer_names[i], layer_names[j]),
+                        cov,
+                    );
+                }
+            }
+            dict
+        })
+        .collect()
+}
+
+// ============================================================================
+// Method-of-Moments parameter initialisation
+// ============================================================================
+
+/// Compute Method-of-Moments (MoM) log10 parameter estimates for one gene.
+///
+/// Mirrors `cme_toolbox.CMEModel.get_MoM`.  Returns log10 estimates clipped to
+/// [lb_log, ub_log].  Falls back to the midpoint of that range when the formula
+/// produces non-finite values.
+///
+/// * `samp_lin` — sampling parameters already in **linear** space (10^samp).
+///   Pass `None` when `seq_model == "None"`.
+fn mom_x0_inner(
+    bio_model:  &str,
+    seq_model:  &str,
+    amb_model:  &str,
+    moments:    &HashMap<String, f64>,
+    lb_log:     &[f64],
+    ub_log:     &[f64],
+    samp_lin:   Option<&[f64]>,
+) -> Vec<f64> {
+    let get = |key: &str| moments.get(key).copied().unwrap_or(1.0);
+
+    let lb: Vec<f64> = lb_log.iter().map(|&x| 10f64.powf(x)).collect();
+    let ub: Vec<f64> = ub_log.iter().map(|&x| 10f64.powf(x)).collect();
+
+    let u_mean = get("MOM_unspliced_mean");
+    let u_var  = get("MOM_unspliced_var");
+    let s_mean = get("MOM_spliced_mean");
+
+    // Helper: map non-finite (div-by-zero, NaN) → f64::INFINITY so the final
+    // clamp brings it to ub[j], matching Python's numpy behaviour where
+    // 1.0/0.0 == inf and np.clip(inf, lb, ub) == ub.
+    let finite_or_inf = |v: f64| if v.is_nan() { f64::INFINITY } else { v };
+
+    let mut x0: Vec<f64> = match bio_model {
+        "Bursty" | "CIR" => {
+            let mut b = if u_mean > 0.0 { u_var / u_mean - 1.0 } else { 1.0 };
+            if !b.is_finite() { b = 1.0; }
+            if let Some(samp) = samp_lin {
+                match seq_model {
+                    "Bernoulli" => { b /= samp[0]; }
+                    "Poisson"   => { b = b / samp[0] - 1.0; }
+                    _ => {}
+                }
+            }
+            b = b.clamp(lb[0], ub[0]);
+            let beta  = finite_or_inf(b / u_mean);  // inf → clamp → ub
+            let gamma = finite_or_inf(b / s_mean);
+            vec![b, beta, gamma]
+        }
+        "ProteinBursty" => {
+            let p_mean = get("MOM_protein_mean");
+            let up_cov = get("MOM_cov_unspliced_protein");
+            let mut b = if u_mean > 0.0 { u_var / u_mean - 1.0 } else { 1.0 };
+            if !b.is_finite() { b = 1.0; }
+            if let Some(samp) = samp_lin {
+                match seq_model {
+                    "Bernoulli" => { b /= samp[0]; }
+                    "Poisson"   => { b = b / samp[0] - 1.0; }
+                    _ => {}
+                }
+            }
+            b = b.clamp(lb[0], ub[0]);
+            let beta  = finite_or_inf(b / u_mean);
+            let gamma = finite_or_inf(b / s_mean);
+            let r = finite_or_inf(p_mean * gamma / b);
+            let denom = b * b * r - up_cov * (beta + gamma);
+            let gamma_p = if denom.abs() > 1e-30 {
+                finite_or_inf(up_cov * (beta + gamma) * beta / denom)
+            } else {
+                f64::INFINITY
+            };
+            let gamma_p = gamma_p.clamp(lb[4], ub[4]);
+            let k_p     = (r * gamma_p).clamp(lb[3], ub[3]);
+            vec![b, beta, gamma, k_p, gamma_p]
+        }
+        "Delay" => {
+            let raw_b = if u_mean > 0.0 { u_var / u_mean - 1.0 } else { 1.0 };
+            let mut b = if raw_b.is_finite() { raw_b } else { 1.0 };
+            if let Some(samp) = samp_lin {
+                match seq_model {
+                    "Bernoulli" => { b /= samp[0]; }
+                    "Poisson"   => { b = b / samp[0] - 1.0; }
+                    _ => {}
+                }
+            }
+            b = b.clamp(lb[0], ub[0]);
+            let beta   = finite_or_inf(b / u_mean);
+            let tauinv = finite_or_inf(b / s_mean);
+            vec![b, beta, tauinv]
+        }
+        "DelayedSplicing" => {
+            let raw_b = if u_mean > 0.0 { (u_var / u_mean - 1.0) / 2.0 } else { 1.0 };
+            let b = if raw_b.is_finite() { raw_b } else { 1.0 };
+            let b = b.clamp(lb[0], ub[0]);
+            let tauinv = finite_or_inf(b / u_mean);
+            let gamma  = finite_or_inf(b / s_mean);
+            vec![b, tauinv, gamma]
+        }
+        "Constitutive" => {
+            let beta  = finite_or_inf(1.0 / u_mean);
+            let gamma = finite_or_inf(1.0 / s_mean);
+            vec![beta, gamma]
+        }
+        "Extrinsic" => {
+            let alpha = {
+                let raw = if seq_model == "Poisson" {
+                    let samp0 = samp_lin.map(|s| s[0]).unwrap_or(1.0);
+                    u_mean * u_mean / (u_var - u_mean * (1.0 + samp0))
+                } else {
+                    u_mean * u_mean / (u_var - u_mean)
+                };
+                finite_or_inf(raw)
+            };
+            let beta  = finite_or_inf(alpha / u_mean);
+            let gamma = finite_or_inf(alpha / s_mean);
+            vec![alpha, beta, gamma]
+        }
+        _ => {
+            // Unknown model: return midpoint
+            return lb_log.iter().zip(ub_log.iter())
+                .map(|(&l, &u)| (l + u) / 2.0)
+                .collect();
+        }
+    };
+
+    // Seq-model scaling of rate parameters (mirrors Python x0[1:] *= samp)
+    if let Some(samp) = samp_lin {
+        if matches!(seq_model, "Bernoulli" | "Poisson") {
+            match bio_model {
+                "Constitutive" => {
+                    for (xi, si) in x0.iter_mut().zip(samp.iter()) { *xi *= si; }
+                }
+                "ProteinBursty" => {
+                    // x0[[1,2]] *= samp[:2]; x0[-1] *= samp[2]/samp[1]
+                    if samp.len() > 0 { x0[1] *= samp[0]; }
+                    if samp.len() > 1 { x0[2] *= samp[1]; }
+                    if samp.len() > 2 && samp[1] > 0.0 {
+                        let last = x0.len() - 1;
+                        x0[last] *= samp[2] / samp[1];
+                    }
+                }
+                _ => {
+                    // x0[1:] *= samp
+                    for (xi, si) in x0[1..].iter_mut().zip(samp.iter()) { *xi *= si; }
+                }
+            }
+        }
+    }
+
+    // Ambiguity model appends
+    match amb_model {
+        "Equal"   => { x0.push(0.1); }
+        "Unequal" => { x0.push(0.1); x0.push(0.1); }
+        _ => {}
+    }
+
+    // Clip all parameters to [lb, ub] in linear space
+    let n_params = x0.len().min(lb.len());
+    for j in 0..n_params { x0[j] = x0[j].clamp(lb[j], ub[j]); }
+
+    // Convert to log10; fallback to midpoint on any non-finite
+    let x0_log: Vec<f64> = x0.iter().map(|&v| v.log10()).collect();
+    if x0_log.iter().any(|v| !v.is_finite()) {
+        return lb_log.iter().zip(ub_log.iter()).map(|(&l, &u)| (l + u) / 2.0).collect();
+    }
+    x0_log
+}
+
+/// Pure-Rust container for model-ready data (Stage 3).
+///
+/// Holds histogram data, grid limits, moments, raw layers, and metadata as
+/// Rust-native types.  All attributes are accessible from Python via properties
+/// that return the same types as the legacy Python `SearchData` class, so
+/// existing inference and visualisation code works without changes.
+///
+/// Construction
+/// ------------
+/// ```python
+/// sd = monod_core.SearchData(
+///     layers,          # list of (n_cells, n_genes) int64 C-contiguous arrays
+///     layer_names,     # list of modality name strings
+///     limits,          # (n_layers, n_genes) int64 numpy array  (= M)
+///     coords,          # list[list[list[int]]]  from make_histograms_unique
+///     freqs,           # list[list[float]]      from make_histograms_unique
+///     gene_names,      # list of gene-name strings
+///     n_cells,         # int
+///     hist_type,       # "unique" | "grid" | "none"
+///     gene_log_lengths=None,  # list[float] or None
+///     k=None,          # int or None
+///     epochs=None,     # int or None
+/// )
+/// ```
+#[pyclass(name = "SearchData")]
+pub struct SearchData {
+    coords: Vec<Vec<Vec<i64>>>,            // [gene][microstate][layer]
+    freqs: Vec<Vec<f64>>,                  // [gene][microstate]
+    limits: Vec<Vec<usize>>,               // [gene][layer]  (transpose of M)
+    moments: Vec<HashMap<String, f64>>,    // [gene] → {key → value}
+    layers_data: Vec<Vec<i64>>,            // [layer] → flat row-major (n_cells × n_genes)
+    n_layers: usize,
+    n_cells: usize,
+    n_genes: usize,
+    gene_names: Vec<String>,
+    hist_type: String,
+    layer_names: Vec<String>,
+    gene_log_lengths: Option<Vec<f64>>,
+    k: Option<usize>,
+    epochs: Option<usize>,
+}
+
+#[pymethods]
+impl SearchData {
+    #[new]
+    #[pyo3(signature = (layers, layer_names, limits, coords, freqs, gene_names,
+                        n_cells, hist_type,
+                        gene_log_lengths=None, k=None, epochs=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        layers: Vec<PyReadonlyArray2<'_, i64>>,
+        layer_names: Vec<String>,
+        limits: PyReadonlyArray2<'_, i64>,
+        coords: Vec<Vec<Vec<i64>>>,
+        freqs: Vec<Vec<f64>>,
+        gene_names: Vec<String>,
+        n_cells: usize,
+        hist_type: String,
+        gene_log_lengths: Option<Vec<f64>>,
+        k: Option<usize>,
+        epochs: Option<usize>,
+    ) -> PyResult<Self> {
+        let n_layers = layers.len();
+        let n_genes = if n_layers > 0 { layers[0].shape()[1] } else { 0 };
+
+        // Flatten each layer to a row-major Vec<i64> (n_cells × n_genes).
+        let layers_data: Vec<Vec<i64>> = layers
+            .iter()
+            .map(|arr| {
+                arr.as_slice()
+                    .map_err(|_| {
+                        pyo3::exceptions::PyValueError::new_err(
+                            "layer arrays must be C-contiguous",
+                        )
+                    })
+                    .map(|s| s.to_vec())
+            })
+            .collect::<PyResult<_>>()?;
+
+        // Transpose limits: (n_layers, n_cols) → limits_per_gene[g][l].
+        // n_cols may exceed n_genes when the Python caller passes a non-subsetted
+        // limits array (e.g. adata_sub.uns['M'] still has the original gene count).
+        // Use the actual column count from the limits shape as the row stride.
+        let limits_n_cols = limits.shape()[1];
+        let limits_slice = limits.as_slice().map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err("limits array must be C-contiguous")
+        })?;
+        let limits_per_gene: Vec<Vec<usize>> = (0..n_genes)
+            .map(|g| {
+                (0..n_layers)
+                    .map(|l| limits_slice[l * limits_n_cols + g] as usize)
+                    .collect()
+            })
+            .collect();
+
+        // Compute moments in parallel (GIL released).
+        let layers_flat: Vec<Vec<f64>> = layers_data
+            .iter()
+            .map(|v| v.iter().map(|&x| x as f64).collect())
+            .collect();
+        let moments =
+            py.allow_threads(|| compute_moments_inner(&layers_flat, &layer_names, n_cells, n_genes));
+
+        Ok(SearchData {
+            coords,
+            freqs,
+            limits: limits_per_gene,
+            moments,
+            layers_data,
+            n_layers,
+            n_cells,
+            n_genes,
+            gene_names,
+            hist_type,
+            layer_names,
+            gene_log_lengths,
+            k,
+            epochs,
+        })
+    }
+
+    // ── Simple scalar getters ─────────────────────────────────────────────
+
+    #[getter]
+    fn n_genes(&self) -> usize { self.n_genes }
+
+    #[getter]
+    fn n_cells(&self) -> usize { self.n_cells }
+
+    #[getter]
+    fn hist_type(&self) -> &str { &self.hist_type }
+
+    #[getter]
+    fn layer_names(&self) -> Vec<String> { self.layer_names.clone() }
+
+    #[getter]
+    fn gene_names(&self) -> Vec<String> { self.gene_names.clone() }
+
+    #[getter]
+    fn k(&self) -> Option<usize> { self.k }
+
+    #[getter]
+    fn epochs(&self) -> Option<usize> { self.epochs }
+
+    // ── Array getters ─────────────────────────────────────────────────────
+
+    /// Returns an optional 1-D float64 numpy array, or None.
+    #[getter]
+    fn gene_log_lengths<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
+        self.gene_log_lengths
+            .as_ref()
+            .map(|v| PyArray1::from_vec_bound(py, v.clone()))
+    }
+
+    /// Returns M as a (n_layers, n_genes) int64 numpy array.
+    ///
+    /// Matches `adata.uns['M']` shape; supports `M[:, gi]` column slicing.
+    #[getter(M)]
+    fn get_m<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<i64>>> {
+        let rows: Vec<Vec<i64>> = (0..self.n_layers)
+            .map(|l| (0..self.n_genes).map(|g| self.limits[g][l] as i64).collect())
+            .collect();
+        PyArray2::from_vec2_bound(py, &rows)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e}")))
+    }
+
+    /// Returns the raw count layers as a (n_layers, n_cells, n_genes) int64 numpy array.
+    #[getter]
+    fn layers<'py>(&self, py: Python<'py>) -> Bound<'py, numpy::PyArray<i64, ndarray::Ix3>> {
+        let arr = Array3::from_shape_fn(
+            (self.n_layers, self.n_cells, self.n_genes),
+            |(l, c, g)| self.layers_data[l][c * self.n_genes + g],
+        );
+        arr.into_pyarray_bound(py)
+    }
+
+    /// Returns hist as a Python list of (coords_array, freqs_array) tuples.
+    ///
+    /// `hist[gi]` → `(np.ndarray shape (n_microstates, n_layers) int64,
+    ///                np.ndarray shape (n_microstates,) float64)`
+    #[getter]
+    fn hist<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        use pyo3::types::{PyList, PyTuple};
+        let items: Vec<Bound<'py, PyTuple>> = self
+            .coords
+            .iter()
+            .zip(self.freqs.iter())
+            .map(|(c, f)| -> PyResult<Bound<'py, PyTuple>> {
+                let coords_arr = PyArray2::from_vec2_bound(py, c)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e}")))?;
+                let freqs_arr = PyArray1::from_vec_bound(py, f.clone());
+                Ok(PyTuple::new_bound(py, [coords_arr.into_any(), freqs_arr.into_any()]))
+            })
+            .collect::<PyResult<_>>()?;
+        Ok(PyList::new_bound(py, &items))
+    }
+
+    /// Returns moments as a Python list of dicts (one per gene).
+    ///
+    /// Keys: "MOM_{name}_mean", "MOM_{name}_var", "MOM_cov_{a}_{b}".
+    #[getter]
+    fn moments<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        use pyo3::types::{PyDict, PyList};
+        let dicts: Vec<Bound<'py, PyDict>> = self
+            .moments
+            .iter()
+            .map(|m| -> PyResult<Bound<'py, PyDict>> {
+                let d = PyDict::new_bound(py);
+                for (k, v) in m {
+                    d.set_item(k, v)?;
+                }
+                Ok(d)
+            })
+            .collect::<PyResult<_>>()?;
+        Ok(PyList::new_bound(py, &dicts))
+    }
+
+    // ── Pickle support ────────────────────────────────────────────────────
+
+    fn __getstate__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        use pyo3::types::PyDict;
+        let d = PyDict::new_bound(py);
+        d.set_item("coords", &self.coords)?;
+        d.set_item("freqs", &self.freqs)?;
+        d.set_item("limits", &self.limits)?;
+        d.set_item("moments_keys", self.moments.iter().map(|m| {
+            m.keys().cloned().collect::<Vec<_>>()
+        }).collect::<Vec<_>>())?;
+        d.set_item("moments_vals", self.moments.iter().map(|m| {
+            m.values().copied().collect::<Vec<_>>()
+        }).collect::<Vec<_>>())?;
+        d.set_item("layers_data", &self.layers_data)?;
+        d.set_item("n_layers", self.n_layers)?;
+        d.set_item("n_cells", self.n_cells)?;
+        d.set_item("n_genes", self.n_genes)?;
+        d.set_item("gene_names", &self.gene_names)?;
+        d.set_item("hist_type", &self.hist_type)?;
+        d.set_item("layer_names", &self.layer_names)?;
+        d.set_item("gene_log_lengths", &self.gene_log_lengths)?;
+        d.set_item("k", self.k)?;
+        d.set_item("epochs", self.epochs)?;
+        Ok(d)
+    }
+
+    fn __setstate__(&mut self, state: &Bound<'_, PyAny>) -> PyResult<()> {
+        use pyo3::types::PyDict;
+        let d = state.downcast::<PyDict>()?;
+        let get = |key: &str| -> PyResult<Bound<'_, PyAny>> {
+            d.get_item(key)?.ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!("missing key: {key}"))
+            })
+        };
+        self.coords = get("coords")?.extract()?;
+        self.freqs = get("freqs")?.extract()?;
+        self.limits = get("limits")?.extract()?;
+        let keys: Vec<Vec<String>> = get("moments_keys")?.extract()?;
+        let vals: Vec<Vec<f64>> = get("moments_vals")?.extract()?;
+        self.moments = keys
+            .into_iter()
+            .zip(vals)
+            .map(|(ks, vs)| ks.into_iter().zip(vs).collect())
+            .collect();
+        self.layers_data = get("layers_data")?.extract()?;
+        self.n_layers = get("n_layers")?.extract()?;
+        self.n_cells = get("n_cells")?.extract()?;
+        self.n_genes = get("n_genes")?.extract()?;
+        self.gene_names = get("gene_names")?.extract()?;
+        self.hist_type = get("hist_type")?.extract()?;
+        self.layer_names = get("layer_names")?.extract()?;
+        self.gene_log_lengths = get("gene_log_lengths")?.extract()?;
+        self.k = get("k")?.extract()?;
+        self.epochs = get("epochs")?.extract()?;
+        Ok(())
+    }
+
+    /// Matching the Python SearchData.store_on_disk interface.
+    fn store_on_disk(&self, py: Python<'_>, inference_string: &str) -> PyResult<String> {
+        let full_path = format!("{inference_string}/search_data.res");
+        let state = self.__getstate__(py)?;
+        let pickle = py.import_bound("pickle")?;
+        let builtins = py.import_bound("builtins")?;
+        let f = builtins.getattr("open")?.call1((&full_path, "wb"))?;
+        pickle.call_method1("dump", (state, &f))?;
+        f.call_method0("close")?;
+        Ok(full_path)
+    }
+
+    /// Compute Method-of-Moments log10 parameter estimates for all genes.
+    ///
+    /// Parameters
+    /// ----------
+    /// bio_model  : biological model name (e.g. "Bursty", "Constitutive").
+    /// seq_model  : sequencing model name ("None", "Poisson", "Bernoulli").
+    /// amb_model  : ambiguity model name ("None", "Equal", "Unequal").
+    /// lb         : log10 lower bounds on biological parameters.
+    /// ub         : log10 upper bounds on biological parameters.
+    /// samp_list  : per-gene sampling parameters in **log10** space, or None
+    ///              when seq_model == "None".  Each element may be None (no
+    ///              sampling for that gene) or a list of floats.
+    ///
+    /// Returns
+    /// -------
+    /// List of length n_genes, each element a list of log10 parameter estimates.
+    #[pyo3(signature = (bio_model, seq_model, amb_model, lb, ub, samp_list=None))]
+    fn mom_x0_all(
+        &self,
+        bio_model:  String,
+        seq_model:  String,
+        amb_model:  String,
+        lb:         Vec<f64>,
+        ub:         Vec<f64>,
+        samp_list:  Option<Vec<Option<Vec<f64>>>>,
+    ) -> Vec<Vec<f64>> {
+        (0..self.n_genes).map(|gi| {
+            // Convert per-gene log10 samp → linear samp
+            let samp_lin_vec: Option<Vec<f64>> = samp_list
+                .as_ref()
+                .and_then(|sl| sl.get(gi))
+                .and_then(|s| s.as_ref())
+                .map(|s| s.iter().map(|&v| 10f64.powf(v)).collect());
+            mom_x0_inner(
+                &bio_model,
+                &seq_model,
+                &amb_model,
+                &self.moments[gi],
+                &lb,
+                &ub,
+                samp_lin_vec.as_deref(),
+            )
+        }).collect()
+    }
+}
+
 /// Compute unique-microstate histograms for every gene (column) in parallel.
 ///
 /// Parameters
@@ -1389,6 +2001,217 @@ fn matrix_to_dense_i64(matrix: &MatrixData) -> Result<(usize, usize, Vec<i64>), 
 }
 
 
+// ── Private h5ad loading helper ──────────────────────────────────────────────
+
+/// All data extracted from an h5ad file, ready to build histograms or SearchData.
+struct H5adInner {
+    gene_names:      Vec<String>,
+    coords:          Vec<Vec<Vec<i64>>>,  // [gene][microstate][layer]
+    freqs:           Vec<Vec<f64>>,       // [gene][microstate]
+    limits_per_gene: Vec<Vec<usize>>,     // [gene][layer]
+    /// Subsetted raw counts: [layer][n_cells × n_sel_genes] row-major.
+    layers_sel:      Vec<Vec<i64>>,
+    n_cells:         usize,
+    n_sel_genes:     usize,
+}
+
+/// Core h5ad ingestion: read file, filter/select genes, compute histograms,
+/// and build a subsetted layer matrix for downstream moments.
+///
+/// Must be called outside the GIL (inside `py.allow_threads`).
+#[allow(clippy::too_many_arguments)]
+fn load_h5ad_inner(
+    filepath:   &str,
+    layer_names: &[String],
+    gene_names:  Option<&[String]>,
+    min_means:   &[f64],
+    max_maxes:   &[f64],
+    min_maxes:   &[f64],
+    padding:     usize,
+) -> Result<H5adInner, String> {
+    let n_layers = layer_names.len();
+
+    // ── Read h5ad ─────────────────────────────────────────────────────────
+    let adata = read_h5ad(filepath)
+        .map_err(|e| format!("read_h5ad failed: {e}"))?;
+    let all_gene_names: &[String] = &adata.var.index;
+    let n_total_genes = all_gene_names.len();
+
+    // ── Densify requested layers (n_cells × n_total_genes, row-major) ─────
+    let mut layers_flat: Vec<Vec<i64>> = Vec::with_capacity(n_layers);
+    let mut n_cells = 0usize;
+    for lname in layer_names {
+        let mat = adata.layers.get(lname)
+            .ok_or_else(|| format!("layer '{}' not found", lname))?;
+        let (nr, nc, flat) = matrix_to_dense_i64(mat)?;
+        if nc != n_total_genes {
+            return Err(format!(
+                "layer '{}': {} columns but var has {} genes", lname, nc, n_total_genes
+            ));
+        }
+        if layers_flat.is_empty() { n_cells = nr; }
+        else if nr != n_cells {
+            return Err(format!("layers have inconsistent cell counts ({} vs {})", n_cells, nr));
+        }
+        layers_flat.push(flat);
+    }
+
+    // ── Build (gene_name, gene_idx) list in requested order ───────────────
+    let ordered: Vec<(String, usize)> = if let Some(requested) = gene_names {
+        let name_to_idx: HashMap<&str, usize> = all_gene_names
+            .iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+        requested.iter().map(|g| {
+            let idx = name_to_idx.get(g.as_str())
+                .copied()
+                .ok_or_else(|| format!("gene '{}' not found in var", g))?;
+            Ok((g.clone(), idx))
+        }).collect::<Result<Vec<_>, String>>()?
+    } else {
+        let mut passing = Vec::new();
+        for gene in 0..n_total_genes {
+            let mut ok = true;
+            for (l, flat) in layers_flat.iter().enumerate() {
+                let (sum, max) = (0..n_cells).fold((0i64, 0i64), |(s, m), c| {
+                    let v = flat[c * n_total_genes + gene];
+                    (s + v, m.max(v))
+                });
+                let mean = sum as f64 / n_cells as f64;
+                let max  = max as f64;
+                if mean < min_means[l] || max > max_maxes[l] || max < min_maxes[l] {
+                    ok = false; break;
+                }
+            }
+            if ok { passing.push((all_gene_names[gene].clone(), gene)); }
+        }
+        passing
+    };
+
+    // Save column indices before the parallel iterator consumes `ordered`.
+    let gene_indices: Vec<usize> = ordered.iter().map(|(_, idx)| *idx).collect();
+
+    // ── Parallel histogram computation ────────────────────────────────────
+    let results: Vec<(String, Vec<Vec<i64>>, Vec<f64>, Vec<usize>)> = ordered
+        .into_par_iter()
+        .map(|(gname, gene_idx)| {
+            let cols: Vec<Vec<i64>> = layers_flat.iter()
+                .map(|flat| (0..n_cells).map(|c| flat[c * n_total_genes + gene_idx]).collect())
+                .collect();
+
+            let max_per_layer: Vec<usize> = cols.iter()
+                .map(|col| col.iter().copied().max().unwrap_or(0).max(0) as usize)
+                .collect();
+            let limits: Vec<usize> = max_per_layer.iter().map(|&m| m + padding).collect();
+            let total_states: usize = max_per_layer.iter().map(|&m| m + 1).product();
+
+            let (coords, freqs) = if total_states <= DENSE_THRESHOLD {
+                let mut strides = vec![1usize; n_layers];
+                for l in (0..n_layers - 1).rev() {
+                    strides[l] = strides[l + 1] * (max_per_layer[l + 1] + 1);
+                }
+                DENSE_BUF.with(|db| {
+                    let mut table = db.borrow_mut();
+                    if table.len() < total_states { table.resize(total_states, 0); }
+                    let table = &mut table[..total_states];
+                    table.fill(0);
+                    for cell in 0..n_cells {
+                        let idx: usize = cols.iter().zip(strides.iter())
+                            .map(|(col, &s)| col[cell] as usize * s).sum();
+                        table[idx] += 1;
+                    }
+                    let mut unique = Vec::new();
+                    let mut freqs  = Vec::new();
+                    for flat_idx in 0..total_states {
+                        if table[flat_idx] == 0 { continue; }
+                        let mut ms = vec![0i64; n_layers];
+                        let mut rem = flat_idx;
+                        for l in 0..n_layers {
+                            ms[l] = (rem / strides[l]) as i64;
+                            rem %= strides[l];
+                        }
+                        unique.push(ms);
+                        freqs.push(table[flat_idx] as f64 / n_cells as f64);
+                    }
+                    (unique, freqs)
+                })
+            } else {
+                FLAT_BUF.with(|fb| { ORDER_BUF.with(|ob| {
+                    let mut flat_b = fb.borrow_mut();
+                    let mut order  = ob.borrow_mut();
+                    let flat_len = n_cells * n_layers;
+                    if flat_b.len() < flat_len { flat_b.resize(flat_len, 0); }
+                    if order.len()  < n_cells  { order.resize(n_cells, 0); }
+                    let flat_b = &mut flat_b[..flat_len];
+                    let order  = &mut order[..n_cells];
+                    for cell in 0..n_cells {
+                        for (l, col) in cols.iter().enumerate() {
+                            flat_b[cell * n_layers + l] = col[cell];
+                        }
+                    }
+                    for (i, v) in order.iter_mut().enumerate() { *v = i; }
+                    order.sort_unstable_by(|&a, &b| {
+                        flat_b[a * n_layers..(a+1)*n_layers]
+                            .cmp(&flat_b[b * n_layers..(b+1)*n_layers])
+                    });
+                    let mut unique: Vec<Vec<i64>> = Vec::new();
+                    let mut counts: Vec<usize> = Vec::new();
+                    let mut prev_start = usize::MAX;
+                    for &idx in order.iter() {
+                        let rs = idx * n_layers;
+                        if prev_start != usize::MAX
+                            && flat_b[prev_start..prev_start+n_layers]
+                                == flat_b[rs..rs+n_layers]
+                        {
+                            *counts.last_mut().unwrap() += 1;
+                        } else {
+                            unique.push(flat_b[rs..rs+n_layers].to_vec());
+                            counts.push(1);
+                            prev_start = rs;
+                        }
+                    }
+                    let freqs = counts.iter().map(|&c| c as f64 / n_cells as f64).collect();
+                    (unique, freqs)
+                })})
+            };
+
+            (gname, coords, freqs, limits)
+        })
+        .collect();
+
+    let n_sel = results.len();
+    let mut gene_names_out  = Vec::with_capacity(n_sel);
+    let mut coords_out      = Vec::with_capacity(n_sel);
+    let mut freqs_out       = Vec::with_capacity(n_sel);
+    let mut limits_out      = Vec::with_capacity(n_sel);
+    for (name, coords, freqs, limits) in results {
+        gene_names_out.push(name);
+        coords_out.push(coords);
+        freqs_out.push(freqs);
+        limits_out.push(limits);
+    }
+
+    // ── Build subsetted layers for moments: [layer][n_cells × n_sel] ──────
+    let mut layers_sel: Vec<Vec<i64>> = vec![vec![0i64; n_cells * n_sel]; n_layers];
+    for (sel_g, &orig_g) in gene_indices.iter().enumerate() {
+        for (l, full_flat) in layers_flat.iter().enumerate() {
+            for c in 0..n_cells {
+                layers_sel[l][c * n_sel + sel_g] = full_flat[c * n_total_genes + orig_g];
+            }
+        }
+    }
+
+    Ok(H5adInner {
+        gene_names:      gene_names_out,
+        coords:          coords_out,
+        freqs:           freqs_out,
+        limits_per_gene: limits_out,
+        layers_sel,
+        n_cells,
+        n_sel_genes:     n_sel,
+    })
+}
+
+// ── Public pyfunction wrappers ────────────────────────────────────────────────
+
 /// Read an h5ad file, apply optional expression filter, compute unique histograms.
 ///
 /// Parameters
@@ -1436,162 +2259,98 @@ fn load_histograms_h5ad(
         ));
     }
 
-    let result = py.allow_threads(|| -> Result<_, String> {
-        // ── Read h5ad ─────────────────────────────────────────────────────────
-        let adata = read_h5ad(&filepath)
-            .map_err(|e| format!("read_h5ad failed: {e}"))?;
-        let all_gene_names: &[String] = &adata.var.index;
-        let n_total_genes = all_gene_names.len();
+    let result = py.allow_threads(|| {
+        load_h5ad_inner(
+            &filepath,
+            &layer_names,
+            gene_names.as_deref(),
+            &min_means,
+            &max_maxes,
+            &min_maxes,
+            padding,
+        ).map(|inner| (inner.gene_names, inner.coords, inner.freqs, inner.limits_per_gene))
+    });
 
-        // ── Densify requested layers (n_cells × n_total_genes, row-major) ─────
-        let mut layers_flat: Vec<Vec<i64>> = Vec::with_capacity(n_layers);
-        let mut n_cells = 0usize;
-        for lname in &layer_names {
-            let mat = adata.layers.get(lname)
-                .ok_or_else(|| format!("layer '{}' not found", lname))?;
-            let (nr, nc, flat) = matrix_to_dense_i64(mat)?;
-            if nc != n_total_genes {
-                return Err(format!(
-                    "layer '{}': {} columns but var has {} genes", lname, nc, n_total_genes
-                ));
-            }
-            if layers_flat.is_empty() { n_cells = nr; }
-            else if nr != n_cells {
-                return Err(format!("layers have inconsistent cell counts ({} vs {})", n_cells, nr));
-            }
-            layers_flat.push(flat);
-        }
+    result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+}
 
-        // ── Build (gene_name, gene_idx) list in requested order ───────────────
-        let ordered: Vec<(String, usize)> = if let Some(ref requested) = gene_names {
-            let name_to_idx: HashMap<&str, usize> = all_gene_names
-                .iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
-            requested.iter().map(|g| {
-                let idx = name_to_idx.get(g.as_str())
-                    .copied()
-                    .ok_or_else(|| format!("gene '{}' not found in var", g))?;
-                Ok((g.clone(), idx))
-            }).collect::<Result<Vec<_>, String>>()?
-        } else {
-            // Parallel per-gene means + maxes via ruanndata's col_sums_par + custom max.
-            let mut passing = Vec::new();
-            for gene in 0..n_total_genes {
-                let mut ok = true;
-                for (l, flat) in layers_flat.iter().enumerate() {
-                    let (sum, max) = (0..n_cells).fold((0i64, 0i64), |(s, m), c| {
-                        let v = flat[c * n_total_genes + gene];
-                        (s + v, m.max(v))
-                    });
-                    let mean = sum as f64 / n_cells as f64;
-                    let max  = max as f64;
-                    if mean < min_means[l] || max > max_maxes[l] || max < min_maxes[l] {
-                        ok = false; break;
-                    }
-                }
-                if ok { passing.push((all_gene_names[gene].clone(), gene)); }
-            }
-            passing
-        };
+/// Read an h5ad file and return a fully constructed `SearchData` object.
+///
+/// This is the zero-Python-roundtrip path: the file is read, genes filtered,
+/// unique histograms and moments computed, all inside a single GIL-free block.
+///
+/// Parameters are identical to `load_histograms_h5ad`, with the addition of:
+/// hist_type     : histogram type string stored on the SearchData (default "unique").
+///
+/// Returns
+/// -------
+/// A `SearchData` object ready for direct use with `optimize_genes_*_sd`.
+#[pyfunction]
+#[pyo3(signature = (filepath, layer_names, gene_names=None,
+                    min_means=None, max_maxes=None, min_maxes=None, padding=10,
+                    hist_type="unique"))]
+#[allow(clippy::too_many_arguments)]
+fn searchdata_from_h5ad(
+    py: Python<'_>,
+    filepath: String,
+    layer_names: Vec<String>,
+    gene_names: Option<Vec<String>>,
+    min_means: Option<Vec<f64>>,
+    max_maxes: Option<Vec<f64>>,
+    min_maxes: Option<Vec<f64>>,
+    padding: usize,
+    hist_type: &str,
+) -> PyResult<SearchData> {
+    let n_layers = layer_names.len();
+    if n_layers == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err("layer_names must not be empty"));
+    }
+    let min_means  = min_means .unwrap_or_else(|| vec![0.01;  n_layers]);
+    let max_maxes  = max_maxes .unwrap_or_else(|| vec![350.0; n_layers]);
+    let min_maxes  = min_maxes .unwrap_or_else(|| vec![4.0;   n_layers]);
+    if min_means.len() != n_layers || max_maxes.len() != n_layers || min_maxes.len() != n_layers {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "min_means, max_maxes, min_maxes must each have length == len(layer_names)",
+        ));
+    }
+    let hist_type = hist_type.to_string();
 
-        // ── Parallel histogram computation ────────────────────────────────────
-        let results: Vec<(String, Vec<Vec<i64>>, Vec<f64>, Vec<usize>)> = ordered
-            .into_par_iter()
-            .map(|(gname, gene_idx)| {
-                let cols: Vec<Vec<i64>> = layers_flat.iter()
-                    .map(|flat| (0..n_cells).map(|c| flat[c * n_total_genes + gene_idx]).collect())
-                    .collect();
+    let result = py.allow_threads(|| -> Result<SearchData, String> {
+        let inner = load_h5ad_inner(
+            &filepath,
+            &layer_names,
+            gene_names.as_deref(),
+            &min_means,
+            &max_maxes,
+            &min_maxes,
+            padding,
+        )?;
 
-                let max_per_layer: Vec<usize> = cols.iter()
-                    .map(|col| col.iter().copied().max().unwrap_or(0).max(0) as usize)
-                    .collect();
-                let limits: Vec<usize> = max_per_layer.iter().map(|&m| m + padding).collect();
-                let total_states: usize = max_per_layer.iter().map(|&m| m + 1).product();
+        let n_genes  = inner.n_sel_genes;
+        let n_cells  = inner.n_cells;
 
-                let (coords, freqs) = if total_states <= DENSE_THRESHOLD {
-                    let mut strides = vec![1usize; n_layers];
-                    for l in (0..n_layers - 1).rev() {
-                        strides[l] = strides[l + 1] * (max_per_layer[l + 1] + 1);
-                    }
-                    DENSE_BUF.with(|db| {
-                        let mut table = db.borrow_mut();
-                        if table.len() < total_states { table.resize(total_states, 0); }
-                        let table = &mut table[..total_states];
-                        table.fill(0);
-                        for cell in 0..n_cells {
-                            let idx: usize = cols.iter().zip(strides.iter())
-                                .map(|(col, &s)| col[cell] as usize * s).sum();
-                            table[idx] += 1;
-                        }
-                        let mut unique = Vec::new();
-                        let mut freqs  = Vec::new();
-                        for flat_idx in 0..total_states {
-                            if table[flat_idx] == 0 { continue; }
-                            let mut ms = vec![0i64; n_layers];
-                            let mut rem = flat_idx;
-                            for l in 0..n_layers {
-                                ms[l] = (rem / strides[l]) as i64;
-                                rem %= strides[l];
-                            }
-                            unique.push(ms);
-                            freqs.push(table[flat_idx] as f64 / n_cells as f64);
-                        }
-                        (unique, freqs)
-                    })
-                } else {
-                    FLAT_BUF.with(|fb| { ORDER_BUF.with(|ob| {
-                        let mut flat_b = fb.borrow_mut();
-                        let mut order  = ob.borrow_mut();
-                        let flat_len = n_cells * n_layers;
-                        if flat_b.len() < flat_len { flat_b.resize(flat_len, 0); }
-                        if order.len()  < n_cells  { order.resize(n_cells, 0); }
-                        let flat_b = &mut flat_b[..flat_len];
-                        let order  = &mut order[..n_cells];
-                        for cell in 0..n_cells {
-                            for (l, col) in cols.iter().enumerate() {
-                                flat_b[cell * n_layers + l] = col[cell];
-                            }
-                        }
-                        for (i, v) in order.iter_mut().enumerate() { *v = i; }
-                        order.sort_unstable_by(|&a, &b| {
-                            flat_b[a * n_layers..(a+1)*n_layers]
-                                .cmp(&flat_b[b * n_layers..(b+1)*n_layers])
-                        });
-                        let mut unique: Vec<Vec<i64>> = Vec::new();
-                        let mut counts: Vec<usize> = Vec::new();
-                        let mut prev_start = usize::MAX;
-                        for &idx in order.iter() {
-                            let rs = idx * n_layers;
-                            if prev_start != usize::MAX
-                                && flat_b[prev_start..prev_start+n_layers]
-                                    == flat_b[rs..rs+n_layers]
-                            {
-                                *counts.last_mut().unwrap() += 1;
-                            } else {
-                                unique.push(flat_b[rs..rs+n_layers].to_vec());
-                                counts.push(1);
-                                prev_start = rs;
-                            }
-                        }
-                        let freqs = counts.iter().map(|&c| c as f64 / n_cells as f64).collect();
-                        (unique, freqs)
-                    })})
-                };
-
-                (gname, coords, freqs, limits)
-            })
+        // Compute moments from subsetted layers
+        let layers_f64: Vec<Vec<f64>> = inner.layers_sel.iter()
+            .map(|v| v.iter().map(|&x| x as f64).collect())
             .collect();
+        let moments = compute_moments_inner(&layers_f64, &layer_names, n_cells, n_genes);
 
-        let mut out_names  = Vec::with_capacity(results.len());
-        let mut out_coords = Vec::with_capacity(results.len());
-        let mut out_freqs  = Vec::with_capacity(results.len());
-        let mut out_limits = Vec::with_capacity(results.len());
-        for (name, coords, freqs, limits) in results {
-            out_names.push(name);
-            out_coords.push(coords);
-            out_freqs.push(freqs);
-            out_limits.push(limits);
-        }
-        Ok((out_names, out_coords, out_freqs, out_limits))
+        Ok(SearchData {
+            coords:     inner.coords,
+            freqs:      inner.freqs,
+            limits:     inner.limits_per_gene,
+            moments,
+            layers_data: inner.layers_sel,
+            n_layers,
+            n_cells,
+            n_genes,
+            gene_names: inner.gene_names,
+            hist_type,
+            layer_names: layer_names.to_vec(),
+            gene_log_lengths: None,
+            k: None,
+            epochs: None,
+        })
     });
 
     result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
@@ -2230,6 +2989,861 @@ fn optimize_genes_2d(
     Ok((params, klds))
 }
 
+/// Optimize all genes in parallel using L-BFGS-B, reading histogram data directly
+/// from a Rust `SearchData` — no Python marshal loop required.
+///
+/// Equivalent to `optimize_genes_2d` but the per-gene `u_idx`, `s_idx`, `f`, and
+/// `limits` are extracted from `sd.coords`, `sd.freqs`, and `sd.limits` in Rust,
+/// bypassing the Python loop that converts numpy arrays to lists.
+///
+/// Only supports 2-modality models (coords columns 0 and 1 are the two layers).
+#[pyfunction]
+#[pyo3(signature = (sd, bio_model, x0_list, lb, ub, fixed_quad_t, quad_order,
+                    fd_eps=1e-6, maxiter=1000, ftol=1e-10, gtol=1e-6,
+                    samp_list=None, eps=1e-15, m_lbfgs=10, num_threads=None))]
+#[allow(clippy::too_many_arguments)]
+fn optimize_genes_2d_sd(
+    py: Python<'_>,
+    sd: &Bound<'_, SearchData>,
+    bio_model: String,
+    x0_list: Vec<Vec<Vec<f64>>>,   // n_genes × num_restarts × n_params
+    lb: Vec<f64>,
+    ub: Vec<f64>,
+    fixed_quad_t: f64,
+    quad_order: usize,
+    fd_eps: f64,
+    maxiter: usize,
+    ftol: f64,
+    gtol: f64,
+    samp_list: Option<Vec<Option<Vec<f64>>>>,
+    eps: f64,
+    m_lbfgs: usize,
+    num_threads: Option<usize>,
+) -> PyResult<(Vec<Vec<f64>>, Vec<f64>)> {
+    match bio_model.as_str() {
+        "Constitutive" | "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => {}
+        other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown bio_model for optimize_genes_2d_sd: {other}"
+        ))),
+    }
+
+    // Extract all needed data from the Rust struct while holding the GIL borrow.
+    // We collect into owned Vecs so they are Send and can cross the allow_threads boundary.
+    let (u_idx_list, s_idx_list, f_list, limits_list, n_genes) = {
+        let sd_ref = sd.borrow();
+        if sd_ref.n_layers < 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "optimize_genes_2d_sd requires at least 2 layers (2D models only)",
+            ));
+        }
+        let n = sd_ref.n_genes;
+        // coords[gene][microstate] = [layer0_count, layer1_count, ...]
+        let u: Vec<Vec<u64>> = sd_ref.coords.iter()
+            .map(|gc| gc.iter().map(|m| m[0] as u64).collect())
+            .collect();
+        let s: Vec<Vec<u64>> = sd_ref.coords.iter()
+            .map(|gc| gc.iter().map(|m| m[1] as u64).collect())
+            .collect();
+        let f: Vec<Vec<f64>> = sd_ref.freqs.clone();
+        let lim: Vec<Vec<usize>> = sd_ref.limits.clone();
+        (u, s, f, lim, n)
+    }; // sd_ref dropped — GIL borrow released before allow_threads
+
+    const ERR_THRESH: f64 = 0.99;
+    let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
+        let run = || {
+            (0..n_genes)
+                .into_par_iter()
+                .map(|gi| {
+                    let samp = samp_list.as_ref().and_then(|sl| sl[gi].as_deref());
+                    let mut best_x: Vec<f64> = (0..lb.len())
+                        .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
+                        .collect();
+                    let mut best_kld = f64::INFINITY;
+                    for x0 in &x0_list[gi] {
+                        let (x_opt, kld) = lbfgsb_minimize(
+                            &bio_model, x0, &lb, &ub, &limits_list[gi],
+                            &u_idx_list[gi], &s_idx_list[gi], &f_list[gi],
+                            fixed_quad_t, quad_order, fd_eps,
+                            maxiter, ftol, gtol,
+                            samp, eps, m_lbfgs,
+                        );
+                        if kld < best_kld * ERR_THRESH {
+                            best_x = x_opt;
+                            best_kld = kld;
+                        }
+                    }
+                    (best_x, best_kld)
+                })
+                .collect()
+        };
+        match num_threads {
+            Some(nt) => rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .map(|pool| pool.install(run))
+                .unwrap_or_else(|_| run()),
+            None => run(),
+        }
+    });
+
+    let params: Vec<Vec<f64>> = results.iter().map(|(x, _)| x.clone()).collect();
+    let klds: Vec<f64> = results.iter().map(|(_, k)| *k).collect();
+    Ok((params, klds))
+}
+
+// ============================================================================
+// N-dimensional sparse KLD helper and row-major strides
+// ============================================================================
+
+/// KLD(data ‖ model) for a sparse N-D histogram.
+///
+/// pss     : flat PSS, shape [l0, l1, …, l_{N-1}] in row-major order
+/// strides : row-major strides[i] = product(limits[i+1..])
+/// coords  : per-microstate count vectors, coords[ms][i] = count in layer i
+/// f       : fractional frequencies matching coords
+/// eps     : probability floor
+#[inline]
+fn compute_kld_sparse_nd(
+    pss:     &[f64],
+    strides: &[usize],
+    coords:  &[Vec<i64>],
+    f:       &[f64],
+    eps:     f64,
+) -> f64 {
+    coords
+        .iter()
+        .zip(f.iter())
+        .map(|(ms, &fi)| {
+            let idx: usize = ms
+                .iter()
+                .zip(strides.iter())
+                .map(|(&c, &s)| c as usize * s)
+                .sum();
+            let pval = pss[idx].max(eps);
+            fi * (fi / pval).ln()
+        })
+        .sum()
+}
+
+/// Build row-major strides for a shape given by `limits`.
+/// strides[i] = product(limits[i+1..])
+fn row_major_strides(limits: &[usize]) -> Vec<usize> {
+    let n = limits.len();
+    let mut strides = vec![1usize; n];
+    for i in (0..n - 1).rev() {
+        strides[i] = strides[i + 1] * limits[i + 1];
+    }
+    strides
+}
+
+// ============================================================================
+// ProteinBursty L-BFGS-B optimizer (3-D, no GIL round-trips)
+// ============================================================================
+
+/// Evaluate ProteinBursty PSS in-process (no PyO3 overhead).
+fn eval_model_pss_protein_bursty_seq(
+    p_log:         &[f64],
+    limits:        &[usize],
+    fit_unspliced: bool,
+    protein_limit: f64,
+    min_fudge:     f64,
+    max_fudge:     f64,
+) -> Vec<f64> {
+    let (gf, mx, lims) =
+        protein_bursty_core(p_log, limits, fit_unspliced, protein_limit, min_fudge, max_fudge);
+    let pss_raw = irfftn_3d(&gf, mx[0], mx[2], lims[0], lims[1], lims[2]);
+    let abs_sum: f64 = pss_raw.iter().map(|x| x.abs()).sum();
+    pss_raw.iter().map(|x| x.abs() / abs_sum).collect()
+}
+
+/// KLD + forward finite-difference gradient for ProteinBursty (sequential).
+/// Called from within rayon tasks — no nested parallelism.
+fn eval_kld_and_grad_seq_protein_bursty(
+    x:             &[f64],
+    limits:        &[usize],
+    strides:       &[usize],
+    coords:        &[Vec<i64>],
+    f_data:        &[f64],
+    fit_unspliced: bool,
+    protein_limit: f64,
+    min_fudge:     f64,
+    max_fudge:     f64,
+    fd_eps:        f64,
+    eps:           f64,
+) -> (f64, Vec<f64>) {
+    let n = x.len();
+    let pss0 = eval_model_pss_protein_bursty_seq(
+        x, limits, fit_unspliced, protein_limit, min_fudge, max_fudge,
+    );
+    let kld0 = compute_kld_sparse_nd(&pss0, strides, coords, f_data, eps);
+    let grad: Vec<f64> = (0..n)
+        .map(|i| {
+            let mut x_eps = x.to_vec();
+            x_eps[i] += fd_eps;
+            let pss = eval_model_pss_protein_bursty_seq(
+                &x_eps, limits, fit_unspliced, protein_limit, min_fudge, max_fudge,
+            );
+            let kld = compute_kld_sparse_nd(&pss, strides, coords, f_data, eps);
+            (kld - kld0) / fd_eps
+        })
+        .collect();
+    (kld0, grad)
+}
+
+/// L-BFGS-B box-constrained minimization for ProteinBursty.
+fn lbfgsb_minimize_protein_bursty(
+    x0:            &[f64],
+    lb:            &[f64],
+    ub:            &[f64],
+    limits:        &[usize],
+    strides:       &[usize],
+    coords:        &[Vec<i64>],
+    f_data:        &[f64],
+    fit_unspliced: bool,
+    protein_limit: f64,
+    min_fudge:     f64,
+    max_fudge:     f64,
+    fd_eps:        f64,
+    maxiter:       usize,
+    ftol:          f64,
+    gtol:          f64,
+    eps:           f64,
+    m_mem:         usize,
+) -> (Vec<f64>, f64) {
+    let n = x0.len();
+    let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
+    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol);
+    let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
+        eval_kld_and_grad_seq_protein_bursty(
+            xx, limits, strides, coords, f_data,
+            fit_unspliced, protein_limit, min_fudge, max_fudge, fd_eps, eps,
+        )
+    };
+    let mut prev_f = f64::INFINITY;
+    let mut callback = |info: &lbfgsb_rs_pure::IterationInfo, _x: &[f64]| {
+        let improve = (prev_f - info.f).abs() / prev_f.abs().max(1.0);
+        prev_f = info.f;
+        if improve < ftol {
+            IterationControl::StopConverged
+        } else {
+            IterationControl::Continue
+        }
+    };
+    match solver.minimize_with_callback(&mut x, lb, ub, &mut f_and_grad, &mut callback) {
+        Ok(sol) => (sol.x, sol.f),
+        Err(_) => {
+            let (f0, _) = f_and_grad(&x);
+            (x, f0)
+        }
+    }
+}
+
+/// Optimize all genes with the ProteinBursty model in parallel, reading histogram
+/// data directly from a Rust `SearchData` — no Python marshal loop.
+#[pyfunction]
+#[pyo3(signature = (sd, x0_list, lb, ub, fit_unspliced, protein_limit, min_fudge, max_fudge,
+                    fd_eps=1e-6, maxiter=1000, ftol=1e-10, gtol=1e-6,
+                    eps=1e-15, m_lbfgs=10, num_threads=None))]
+#[allow(clippy::too_many_arguments)]
+fn optimize_genes_protein_bursty_sd(
+    py: Python<'_>,
+    sd: &Bound<'_, SearchData>,
+    x0_list: Vec<Vec<Vec<f64>>>,   // n_genes × num_restarts × n_params
+    lb: Vec<f64>,
+    ub: Vec<f64>,
+    fit_unspliced: bool,
+    protein_limit: f64,
+    min_fudge: f64,
+    max_fudge: f64,
+    fd_eps: f64,
+    maxiter: usize,
+    ftol: f64,
+    gtol: f64,
+    eps: f64,
+    m_lbfgs: usize,
+    num_threads: Option<usize>,
+) -> PyResult<(Vec<Vec<f64>>, Vec<f64>)> {
+    let (coords_list, f_list, limits_list, n_genes) = {
+        let sd_ref = sd.borrow();
+        if sd_ref.n_layers < 3 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "optimize_genes_protein_bursty_sd requires at least 3 layers",
+            ));
+        }
+        let n = sd_ref.n_genes;
+        (sd_ref.coords.clone(), sd_ref.freqs.clone(), sd_ref.limits.clone(), n)
+    };
+
+    const ERR_THRESH: f64 = 0.99;
+    let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
+        let run = || {
+            (0..n_genes)
+                .into_par_iter()
+                .map(|gi| {
+                    let lims = &limits_list[gi];
+                    let strides = row_major_strides(lims);
+                    let mut best_x: Vec<f64> = (0..lb.len())
+                        .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
+                        .collect();
+                    let mut best_kld = f64::INFINITY;
+                    for x0 in &x0_list[gi] {
+                        let (x_opt, kld) = lbfgsb_minimize_protein_bursty(
+                            x0, &lb, &ub, lims, &strides,
+                            &coords_list[gi], &f_list[gi],
+                            fit_unspliced, protein_limit, min_fudge, max_fudge,
+                            fd_eps, maxiter, ftol, gtol, eps, m_lbfgs,
+                        );
+                        if kld < best_kld * ERR_THRESH {
+                            best_x = x_opt;
+                            best_kld = kld;
+                        }
+                    }
+                    (best_x, best_kld)
+                })
+                .collect()
+        };
+        match num_threads {
+            Some(nt) => rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .map(|pool| pool.install(run))
+                .unwrap_or_else(|_| run()),
+            None => run(),
+        }
+    });
+
+    let params: Vec<Vec<f64>> = results.iter().map(|(x, _)| x.clone()).collect();
+    let klds: Vec<f64> = results.iter().map(|(_, k)| *k).collect();
+    Ok((params, klds))
+}
+
+// ============================================================================
+// 2-D amb_model L-BFGS-B optimizer (Equal / Unequal ambient noise)
+// ============================================================================
+
+/// Evaluate 2-D PSS with ambient-noise model (no PyO3 overhead).
+///
+/// p_log layout: [bio_params..., amb_params] where:
+///   amb_model="Equal"   → 1 ambient param appended (log10 p_amb)
+///   amb_model="Unequal" → 2 ambient params appended (log10 p_amb0, log10 p_amb1)
+/// limits: [l0, l1, l_amb]
+fn eval_model_pss_2d_amb_seq(
+    bio_model:    &str,
+    p_log:        &[f64],
+    limits:       &[usize],
+    fixed_quad_t: f64,
+    quad_order:   usize,
+    samp_log:     Option<&[f64]>,
+    amb_model:    &str,   // "Equal" or "Unequal"
+) -> Vec<f64> {
+    let n_amb: usize = if amb_model == "Equal" { 1 } else { 2 };
+    let n_bio = p_log.len() - n_amb;
+    let p: Vec<f64> = p_log[..n_bio].iter().map(|&v| 10.0_f64.powf(v)).collect();
+    let amb = &p_log[n_bio..];
+
+    let (l0, l1, l2) = (limits[0], limits[1], limits[2]);
+    let mx2 = l2 / 2 + 1;
+
+    let (p_amb0, p_amb1): (f64, f64) = if amb_model == "Equal" {
+        let v = 10.0_f64.powf(amb[0]);
+        (v, v)
+    } else {
+        (10.0_f64.powf(amb[0]), 10.0_f64.powf(amb[1]))
+    };
+
+    let mesh3 = build_mesh_3d_cached(l0, l1, l2);
+    let (g0_base, g1_base, g_amb_base) = (&mesh3.0, &mesh3.1, &mesh3.2);
+
+    let one  = Complex64::new(1.0, 0.0);
+    let q0   = Complex64::new(1.0 - p_amb0, 0.0);
+    let pa0  = Complex64::new(p_amb0, 0.0);
+    let q1   = Complex64::new(1.0 - p_amb1, 0.0);
+    let pa1  = Complex64::new(p_amb1, 0.0);
+
+    let mut g0_eff: Vec<Complex64> = g0_base
+        .iter()
+        .zip(g_amb_base.iter())
+        .map(|(&g0, &ga)| g0 * q0 + ga * pa0)
+        .collect();
+    let mut g1_eff: Vec<Complex64> = g1_base
+        .iter()
+        .zip(g_amb_base.iter())
+        .map(|(&g1, &ga)| g1 * q1 + ga * pa1)
+        .collect();
+
+    if let Some(samp) = samp_log {
+        let lam0 = 10.0_f64.powf(samp[0]);
+        let lam1 = 10.0_f64.powf(samp[1]);
+        g0_eff.iter_mut().for_each(|z| *z = (*z * lam0).exp() - one);
+        g1_eff.iter_mut().for_each(|z| *z = (*z * lam1).exp() - one);
+    }
+
+    let gf_log = match bio_model {
+        "Constitutive"    => pgf_constitutive(&g0_eff, &g1_eff, &p),
+        "Extrinsic"       => pgf_extrinsic(&g0_eff, &g1_eff, &p),
+        "Delay"           => pgf_delay(&g0_eff, &g1_eff, &p),
+        "DelayedSplicing" => pgf_delayed_splicing(&g0_eff, &g1_eff, &p),
+        "Bursty" => {
+            let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
+            pgf_bursty(&g0_eff, &g1_eff, &p, t, quad_order)
+        }
+        "CIR" => {
+            let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
+            pgf_cir(&g0_eff, &g1_eff, &p, t, quad_order)
+        }
+        other => panic!("Unknown bio_model in eval_model_pss_2d_amb_seq: {other}"),
+    };
+
+    let gf: Vec<Complex64> = gf_log.iter().map(|z| z.exp()).collect();
+    let pss_raw = irfftn_3d(&gf, l0, mx2, l0, l1, l2);
+    let abs_sum: f64 = pss_raw.iter().map(|x| x.abs()).sum();
+    pss_raw.iter().map(|x| x.abs() / abs_sum).collect()
+}
+
+/// KLD + forward finite-difference gradient for 2-D amb_model (sequential).
+fn eval_kld_and_grad_seq_amb(
+    bio_model:    &str,
+    x:            &[f64],
+    limits:       &[usize],
+    strides:      &[usize],
+    coords:       &[Vec<i64>],
+    f_data:       &[f64],
+    fixed_quad_t: f64,
+    quad_order:   usize,
+    samp_log:     Option<&[f64]>,
+    amb_model:    &str,
+    fd_eps:       f64,
+    eps:          f64,
+) -> (f64, Vec<f64>) {
+    let n = x.len();
+    let pss0 = eval_model_pss_2d_amb_seq(
+        bio_model, x, limits, fixed_quad_t, quad_order, samp_log, amb_model,
+    );
+    let kld0 = compute_kld_sparse_nd(&pss0, strides, coords, f_data, eps);
+    let grad: Vec<f64> = (0..n)
+        .map(|i| {
+            let mut x_eps = x.to_vec();
+            x_eps[i] += fd_eps;
+            let pss = eval_model_pss_2d_amb_seq(
+                bio_model, &x_eps, limits, fixed_quad_t, quad_order, samp_log, amb_model,
+            );
+            let kld = compute_kld_sparse_nd(&pss, strides, coords, f_data, eps);
+            (kld - kld0) / fd_eps
+        })
+        .collect();
+    (kld0, grad)
+}
+
+/// L-BFGS-B box-constrained minimization for 2-D amb_model.
+fn lbfgsb_minimize_amb(
+    bio_model:    &str,
+    amb_model:    &str,
+    x0:           &[f64],
+    lb:           &[f64],
+    ub:           &[f64],
+    limits:       &[usize],
+    strides:      &[usize],
+    coords:       &[Vec<i64>],
+    f_data:       &[f64],
+    fixed_quad_t: f64,
+    quad_order:   usize,
+    samp_log:     Option<&[f64]>,
+    fd_eps:       f64,
+    maxiter:      usize,
+    ftol:         f64,
+    gtol:         f64,
+    eps:          f64,
+    m_mem:        usize,
+) -> (Vec<f64>, f64) {
+    let n = x0.len();
+    let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
+    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol);
+    let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
+        eval_kld_and_grad_seq_amb(
+            bio_model, xx, limits, strides, coords, f_data,
+            fixed_quad_t, quad_order, samp_log, amb_model, fd_eps, eps,
+        )
+    };
+    let mut prev_f = f64::INFINITY;
+    let mut callback = |info: &lbfgsb_rs_pure::IterationInfo, _x: &[f64]| {
+        let improve = (prev_f - info.f).abs() / prev_f.abs().max(1.0);
+        prev_f = info.f;
+        if improve < ftol {
+            IterationControl::StopConverged
+        } else {
+            IterationControl::Continue
+        }
+    };
+    match solver.minimize_with_callback(&mut x, lb, ub, &mut f_and_grad, &mut callback) {
+        Ok(sol) => (sol.x, sol.f),
+        Err(_) => {
+            let (f0, _) = f_and_grad(&x);
+            (x, f0)
+        }
+    }
+}
+
+/// Optimize all genes with a 2-D bio_model + ambient noise, reading histogram data
+/// directly from a Rust `SearchData` — no Python marshal loop.
+///
+/// p_log layout: [bio_params..., amb_params] where n_amb = 1 (Equal) or 2 (Unequal).
+/// `limits` for each gene must be [l0, l1, l_amb] (3 entries).
+#[pyfunction]
+#[pyo3(signature = (sd, bio_model, amb_model, x0_list, lb, ub, fixed_quad_t, quad_order,
+                    fd_eps=1e-6, maxiter=1000, ftol=1e-10, gtol=1e-6,
+                    samp_list=None, eps=1e-15, m_lbfgs=10, num_threads=None))]
+#[allow(clippy::too_many_arguments)]
+fn optimize_genes_2d_amb_sd(
+    py: Python<'_>,
+    sd: &Bound<'_, SearchData>,
+    bio_model: String,
+    amb_model: String,
+    x0_list: Vec<Vec<Vec<f64>>>,   // n_genes × num_restarts × n_params
+    lb: Vec<f64>,
+    ub: Vec<f64>,
+    fixed_quad_t: f64,
+    quad_order: usize,
+    fd_eps: f64,
+    maxiter: usize,
+    ftol: f64,
+    gtol: f64,
+    samp_list: Option<Vec<Option<Vec<f64>>>>,
+    eps: f64,
+    m_lbfgs: usize,
+    num_threads: Option<usize>,
+) -> PyResult<(Vec<Vec<f64>>, Vec<f64>)> {
+    match bio_model.as_str() {
+        "Constitutive" | "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => {}
+        other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown bio_model for optimize_genes_2d_amb_sd: {other}"
+        ))),
+    }
+    match amb_model.as_str() {
+        "Equal" | "Unequal" => {}
+        other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "optimize_genes_2d_amb_sd requires amb_model=Equal or Unequal, got: {other}"
+        ))),
+    }
+
+    let (coords_list, f_list, limits_list, n_genes) = {
+        let sd_ref = sd.borrow();
+        if sd_ref.n_layers < 3 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "optimize_genes_2d_amb_sd requires at least 3 layers (u, s, ambient)",
+            ));
+        }
+        let n = sd_ref.n_genes;
+        (sd_ref.coords.clone(), sd_ref.freqs.clone(), sd_ref.limits.clone(), n)
+    };
+
+    const ERR_THRESH: f64 = 0.99;
+    let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
+        let run = || {
+            (0..n_genes)
+                .into_par_iter()
+                .map(|gi| {
+                    let lims = &limits_list[gi];
+                    let strides = row_major_strides(lims);
+                    let samp = samp_list.as_ref().and_then(|sl| sl[gi].as_deref());
+                    let mut best_x: Vec<f64> = (0..lb.len())
+                        .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
+                        .collect();
+                    let mut best_kld = f64::INFINITY;
+                    for x0 in &x0_list[gi] {
+                        let (x_opt, kld) = lbfgsb_minimize_amb(
+                            &bio_model, &amb_model, x0, &lb, &ub,
+                            lims, &strides, &coords_list[gi], &f_list[gi],
+                            fixed_quad_t, quad_order, samp,
+                            fd_eps, maxiter, ftol, gtol, eps, m_lbfgs,
+                        );
+                        if kld < best_kld * ERR_THRESH {
+                            best_x = x_opt;
+                            best_kld = kld;
+                        }
+                    }
+                    (best_x, best_kld)
+                })
+                .collect()
+        };
+        match num_threads {
+            Some(nt) => rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .map(|pool| pool.install(run))
+                .unwrap_or_else(|_| run()),
+            None => run(),
+        }
+    });
+
+    let params: Vec<Vec<f64>> = results.iter().map(|(x, _)| x.clone()).collect();
+    let klds: Vec<f64> = results.iter().map(|(_, k)| *k).collect();
+    Ok((params, klds))
+}
+
+// ============================================================================
+// Custom reaction-network L-BFGS-B optimizer
+// ============================================================================
+
+/// Build `Vec<RxnInfo>` from flat topology arrays.
+fn build_rxns(
+    rxn_kinds:     &[u8],
+    rxn_rate_idxs: &[u32],
+    rxn_extra1:    &[i32],
+    rxn_extra2:    &[i32],
+    prod_off:      &[u32],
+) -> Vec<RxnInfo> {
+    (0..rxn_kinds.len())
+        .map(|i| RxnInfo {
+            kind:       rxn_kinds[i],
+            rate_idx:   rxn_rate_idxs[i],
+            extra1:     rxn_extra1[i],
+            extra2:     rxn_extra2[i],
+            prod_start: prod_off[i],
+            prod_end:   prod_off[i + 1],
+        })
+        .collect()
+}
+
+/// Evaluate the custom-network PSS in-process (no PyO3).
+///
+/// Supports 2-D and 3-D species counts; panics for any other N.
+fn eval_custom_network_pss_seq(
+    n_species:        usize,
+    limits:           &[usize],
+    rxns:             &[RxnInfo],
+    prod_sp:          &[u32],
+    prod_st:          &[u32],
+    params_linear:    &[f64],
+    dt:               f64,
+    n_steps:          usize,
+    max_while_steps:  usize,
+) -> Vec<f64> {
+    let (g, mx, n_grid) = build_mesh_nd(limits);
+    let exp_phi = custom_pgf_parallel(
+        &g, params_linear, rxns, prod_sp, prod_st,
+        n_species, n_grid, dt, n_steps, max_while_steps,
+    );
+
+    let pss_raw: Vec<f64> = match n_species {
+        2 => irfftn_2d(&exp_phi, limits[0], limits[1]),
+        3 => irfftn_3d(&exp_phi, mx[0], mx[2], limits[0], limits[1], limits[2]),
+        _ => panic!("eval_custom_network_pss_seq: only 2- and 3-species networks supported"),
+    };
+
+    let abs_sum: f64 = pss_raw.iter().map(|x| x.abs()).sum();
+    pss_raw.iter().map(|x| x.abs() / abs_sum).collect()
+}
+
+/// Derive `params_linear`, `dt`, `n_steps`, and `max_while` from the log10 optimizer
+/// state `x`.  `x` covers all rate parameters; `norm_rate = 1.0` is appended if present.
+fn custom_network_integration_params(
+    x:             &[f64],
+    has_norm_rate: bool,
+    min_fudge:     f64,
+    max_fudge:     f64,
+) -> (Vec<f64>, f64, usize, usize) {
+    let p_lin: Vec<f64> = x.iter().map(|&v| 10.0_f64.powf(v)).collect();
+    let dt_f  = p_lin.iter().map(|&v| 1.0 / v).fold(f64::INFINITY, f64::min) * min_fudge;
+    let t_max = p_lin.iter().map(|&v| 1.0 / v).fold(0.0_f64, f64::max) * max_fudge;
+    let n_steps   = (t_max / dt_f).ceil() as usize;
+    let max_while = 10 * n_steps + 10_000;
+    let mut params_linear = p_lin;
+    if has_norm_rate {
+        params_linear.push(1.0);
+    }
+    (params_linear, dt_f, n_steps, max_while)
+}
+
+/// KLD + forward finite-difference gradient for a custom network (sequential).
+fn eval_kld_and_grad_seq_custom(
+    x:             &[f64],
+    n_species:     usize,
+    limits:        &[usize],
+    strides:       &[usize],
+    rxns:          &[RxnInfo],
+    prod_sp:       &[u32],
+    prod_st:       &[u32],
+    coords:        &[Vec<i64>],
+    f_data:        &[f64],
+    has_norm_rate: bool,
+    min_fudge:     f64,
+    max_fudge:     f64,
+    fd_eps:        f64,
+    eps:           f64,
+) -> (f64, Vec<f64>) {
+    let n = x.len();
+    let (params, dt, n_steps, max_while) =
+        custom_network_integration_params(x, has_norm_rate, min_fudge, max_fudge);
+    let pss0 = eval_custom_network_pss_seq(
+        n_species, limits, rxns, prod_sp, prod_st, &params, dt, n_steps, max_while,
+    );
+    let kld0 = compute_kld_sparse_nd(&pss0, strides, coords, f_data, eps);
+
+    let grad: Vec<f64> = (0..n)
+        .map(|i| {
+            let mut x_eps = x.to_vec();
+            x_eps[i] += fd_eps;
+            let (params_eps, dt_eps, ns_eps, mw_eps) =
+                custom_network_integration_params(&x_eps, has_norm_rate, min_fudge, max_fudge);
+            let pss = eval_custom_network_pss_seq(
+                n_species, limits, rxns, prod_sp, prod_st,
+                &params_eps, dt_eps, ns_eps, mw_eps,
+            );
+            let kld = compute_kld_sparse_nd(&pss, strides, coords, f_data, eps);
+            (kld - kld0) / fd_eps
+        })
+        .collect();
+    (kld0, grad)
+}
+
+/// L-BFGS-B box-constrained minimization for a custom reaction network.
+fn lbfgsb_minimize_custom(
+    x0:            &[f64],
+    lb:            &[f64],
+    ub:            &[f64],
+    n_species:     usize,
+    limits:        &[usize],
+    strides:       &[usize],
+    rxns:          &[RxnInfo],
+    prod_sp:       &[u32],
+    prod_st:       &[u32],
+    coords:        &[Vec<i64>],
+    f_data:        &[f64],
+    has_norm_rate: bool,
+    min_fudge:     f64,
+    max_fudge:     f64,
+    fd_eps:        f64,
+    maxiter:       usize,
+    ftol:          f64,
+    gtol:          f64,
+    eps:           f64,
+    m_mem:         usize,
+) -> (Vec<f64>, f64) {
+    let n = x0.len();
+    let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
+    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol);
+    let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
+        eval_kld_and_grad_seq_custom(
+            xx, n_species, limits, strides, rxns, prod_sp, prod_st,
+            coords, f_data, has_norm_rate, min_fudge, max_fudge, fd_eps, eps,
+        )
+    };
+    let mut prev_f = f64::INFINITY;
+    let mut callback = |info: &lbfgsb_rs_pure::IterationInfo, _x: &[f64]| {
+        let improve = (prev_f - info.f).abs() / prev_f.abs().max(1.0);
+        prev_f = info.f;
+        if improve < ftol {
+            IterationControl::StopConverged
+        } else {
+            IterationControl::Continue
+        }
+    };
+    match solver.minimize_with_callback(&mut x, lb, ub, &mut f_and_grad, &mut callback) {
+        Ok(sol) => (sol.x, sol.f),
+        Err(_) => {
+            let (f0, _) = f_and_grad(&x);
+            (x, f0)
+        }
+    }
+}
+
+/// Optimize all genes with a custom reaction network in parallel, reading histogram
+/// data directly from a Rust `SearchData` — no Python marshal loop.
+///
+/// Only 2- and 3-species networks are supported.
+/// Reaction topology is passed as flat arrays (same encoding as `eval_custom_network_pgf`).
+#[pyfunction]
+#[pyo3(signature = (sd, x0_list, lb, ub, n_species,
+                    rxn_kinds, rxn_rate_idxs, rxn_extra1, rxn_extra2,
+                    prod_sp, prod_st, prod_off,
+                    has_norm_rate, min_fudge, max_fudge,
+                    fd_eps=1e-6, maxiter=1000, ftol=1e-10, gtol=1e-6,
+                    eps=1e-15, m_lbfgs=10, num_threads=None))]
+#[allow(clippy::too_many_arguments)]
+fn optimize_genes_custom_sd(
+    py: Python<'_>,
+    sd: &Bound<'_, SearchData>,
+    x0_list: Vec<Vec<Vec<f64>>>,   // n_genes × num_restarts × n_params
+    lb: Vec<f64>,
+    ub: Vec<f64>,
+    n_species: usize,
+    rxn_kinds:     Vec<u8>,
+    rxn_rate_idxs: Vec<u32>,
+    rxn_extra1:    Vec<i32>,
+    rxn_extra2:    Vec<i32>,
+    prod_sp:       Vec<u32>,
+    prod_st:       Vec<u32>,
+    prod_off:      Vec<u32>,
+    has_norm_rate: bool,
+    min_fudge:     f64,
+    max_fudge:     f64,
+    fd_eps:        f64,
+    maxiter:       usize,
+    ftol:          f64,
+    gtol:          f64,
+    eps:           f64,
+    m_lbfgs:       usize,
+    num_threads:   Option<usize>,
+) -> PyResult<(Vec<Vec<f64>>, Vec<f64>)> {
+    if n_species != 2 && n_species != 3 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "optimize_genes_custom_sd only supports 2- and 3-species custom networks",
+        ));
+    }
+
+    let (coords_list, f_list, limits_list, n_genes) = {
+        let sd_ref = sd.borrow();
+        let n = sd_ref.n_genes;
+        (sd_ref.coords.clone(), sd_ref.freqs.clone(), sd_ref.limits.clone(), n)
+    };
+
+    let rxns = build_rxns(&rxn_kinds, &rxn_rate_idxs, &rxn_extra1, &rxn_extra2, &prod_off);
+
+    const ERR_THRESH: f64 = 0.99;
+    let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
+        let run = || {
+            (0..n_genes)
+                .into_par_iter()
+                .map(|gi| {
+                    let lims = &limits_list[gi];
+                    let strides = row_major_strides(lims);
+                    let mut best_x: Vec<f64> = (0..lb.len())
+                        .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
+                        .collect();
+                    let mut best_kld = f64::INFINITY;
+                    for x0 in &x0_list[gi] {
+                        let (x_opt, kld) = lbfgsb_minimize_custom(
+                            x0, &lb, &ub, n_species, lims, &strides,
+                            &rxns, &prod_sp, &prod_st,
+                            &coords_list[gi], &f_list[gi],
+                            has_norm_rate, min_fudge, max_fudge,
+                            fd_eps, maxiter, ftol, gtol, eps, m_lbfgs,
+                        );
+                        if kld < best_kld * ERR_THRESH {
+                            best_x = x_opt;
+                            best_kld = kld;
+                        }
+                    }
+                    (best_x, best_kld)
+                })
+                .collect()
+        };
+        match num_threads {
+            Some(nt) => rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .map(|pool| pool.install(run))
+                .unwrap_or_else(|_| run()),
+            None => run(),
+        }
+    });
+
+    let params: Vec<Vec<f64>> = results.iter().map(|(x, _)| x.clone()).collect();
+    let klds: Vec<f64> = results.iter().map(|(_, k)| *k).collect();
+    Ok((params, klds))
+}
+
 // ============================================================================
 // E-step for MEK-Means EM algorithm
 // ============================================================================
@@ -2359,6 +3973,85 @@ fn e_step_2d(
     Ok(result)
 }
 
+/// E-step accumulation from precomputed PSS grids (PSS caching support).
+///
+/// `grids_per_k[k][g]` is the flat PSS array for cluster k, gene g.
+/// `limits_list[g] = [m_u, m_s]` — `m_s` is used to index into the flat grid.
+/// Returns (Q, lower_bound, q_func) identical to e_step_2d but skips PSS computation.
+#[pyfunction]
+#[pyo3(signature = (grids_per_k, limits_list, u_obs, s_obs, weights, eps=1e-15, num_threads=None))]
+fn e_step_2d_from_grids(
+    py: Python<'_>,
+    grids_per_k: Vec<Vec<Vec<f64>>>,   // n_k × n_genes × grid_flat
+    limits_list: Vec<Vec<usize>>,
+    u_obs: Vec<Vec<u64>>,
+    s_obs: Vec<Vec<u64>>,
+    weights: Vec<f64>,
+    eps: f64,
+    num_threads: Option<usize>,
+) -> PyResult<(Vec<Vec<f64>>, f64, f64)> {
+    let n_k = grids_per_k.len();
+    let n_genes = limits_list.len();
+    let n_cells = if n_genes > 0 && !u_obs.is_empty() { u_obs[0].len() } else { 0 };
+
+    let result = py.allow_threads(|| {
+        let run = || -> (Vec<Vec<f64>>, f64, f64) {
+            let mut logL = vec![vec![0.0_f64; n_k]; n_cells];
+
+            for k in 0..n_k {
+                let gene_log_probs: Vec<Vec<f64>> = (0..n_genes)
+                    .into_par_iter()
+                    .map(|g| {
+                        let pss = &grids_per_k[k][g];
+                        let m_s = limits_list[g][1];
+                        u_obs[g].iter().zip(s_obs[g].iter()).map(|(&u, &s)| {
+                            let idx = u as usize * m_s + s as usize;
+                            let p = if idx < pss.len() { pss[idx] } else { 0.0 };
+                            p.max(eps).ln()
+                        }).collect::<Vec<f64>>()
+                    })
+                    .collect();
+
+                let log_w = weights[k].max(f64::MIN_POSITIVE).ln();
+                for c in 0..n_cells {
+                    let gene_sum: f64 = gene_log_probs.iter().map(|lp| lp[c]).sum();
+                    logL[c][k] = gene_sum + log_w;
+                }
+            }
+
+            // Softmax row-wise → Q; logsumexp → lower_bound; Q·logL → q_func
+            let mut q_mat = vec![vec![0.0_f64; n_k]; n_cells];
+            let mut total_lse = 0.0_f64;
+            for c in 0..n_cells {
+                let max_val = logL[c].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let sum_exp: f64 = logL[c].iter().map(|&v| (v - max_val).exp()).sum();
+                let lse = max_val + sum_exp.ln();
+                total_lse += lse;
+                for k in 0..n_k {
+                    q_mat[c][k] = (logL[c][k] - max_val).exp() / sum_exp;
+                }
+            }
+            let lower_bound = if n_cells > 0 { total_lse / n_cells as f64 } else { 0.0 };
+            let q_func: f64 = q_mat.iter().zip(logL.iter()).map(|(q_row, l_row)| {
+                q_row.iter().zip(l_row.iter()).map(|(&q, &l)| q * l).sum::<f64>()
+            }).sum();
+
+            (q_mat, lower_bound, q_func)
+        };
+
+        match num_threads {
+            Some(nt) => rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .map(|pool| pool.install(run))
+                .unwrap_or_else(|_| run()),
+            None => run(),
+        }
+    });
+
+    Ok(result)
+}
+
 // ============================================================================
 // PyO3 module
 // ============================================================================
@@ -2373,9 +4066,17 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(eval_kld_grad_2d, m)?)?;
     m.add_function(wrap_pyfunction!(optimize_gene_2d, m)?)?;
     m.add_function(wrap_pyfunction!(optimize_genes_2d, m)?)?;
+    m.add_function(wrap_pyfunction!(optimize_genes_2d_sd, m)?)?;
+    m.add_function(wrap_pyfunction!(optimize_genes_protein_bursty_sd, m)?)?;
+    m.add_function(wrap_pyfunction!(optimize_genes_2d_amb_sd, m)?)?;
+    m.add_function(wrap_pyfunction!(optimize_genes_custom_sd, m)?)?;
     m.add_function(wrap_pyfunction!(e_step_2d, m)?)?;
+    m.add_function(wrap_pyfunction!(e_step_2d_from_grids, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_moments, m)?)?;
+    m.add_class::<SearchData>()?;
     m.add_function(wrap_pyfunction!(make_histograms_unique, m)?)?;
     m.add_function(wrap_pyfunction!(load_histograms_h5ad, m)?)?;
+    m.add_function(wrap_pyfunction!(searchdata_from_h5ad, m)?)?;
     m.add_function(wrap_pyfunction!(eval_custom_network_pgf, m)?)?;
     Ok(())
 }

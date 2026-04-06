@@ -26,6 +26,133 @@ except ImportError:
 
 _RUST_MODELS_2D = {"Constitutive", "Bursty", "CIR", "Extrinsic", "Delay", "DelayedSplicing"}
 
+# MPS (Apple Metal) fast-path for E-step gather+accumulate.
+# Requires: arm64 Python, torch >= 2.3, Rust extension (for PSS computation).
+# PSS grids are computed in Rust (float64); MPS handles the batched
+# per-cell gather + log-sum + softmax (float32).
+try:
+    import torch as _torch
+    if (
+        _HAS_RUST
+        and hasattr(_torch.backends, "mps")
+        and _torch.backends.mps.is_available()
+    ):
+        _MPS_DEVICE = _torch.device("mps")
+        _HAS_MPS = True
+    else:
+        _MPS_DEVICE = None
+        _HAS_MPS = False
+except ImportError:
+    _torch = None
+    _MPS_DEVICE = None
+    _HAS_MPS = False
+
+
+def _e_step_mps(theta, ks_present, search_data, model, weights, eps=1e-15,
+                pss_cache=None):
+    """Hybrid MPS E-step: Rust PSS (float64) + MPS gather/accumulate (float32).
+
+    For each cluster k, evaluates all gene PSS grids in a single rayon-parallel
+    Rust call (only recomputing grids that have changed since the last call),
+    then transfers to the Metal GPU for a batched indexed gather,
+    log-sum over genes, and softmax — all in one fused tensor operation.
+
+    Parameters
+    ----------
+    theta       : GradientInference.theta dict
+    ks_present  : sorted list of cluster keys present in theta
+    search_data : SearchData with layers (2, n_cells, n_genes) and M (2, n_genes)
+    model       : CMEModel (bio_model, fixed_quad_T, quad_order)
+    weights     : 1-D array of length self.k (full weight vector)
+    eps         : probability floor before log
+    pss_cache   : optional dict mapping (k, g) -> (params_array, grid).
+                  Updated in-place; recomputation is skipped for cache hits.
+
+    Returns
+    -------
+    (Q, lower_bound, q_func)  matching the signature of _e_step
+    """
+    n_k     = len(ks_present)
+    n_genes = search_data.n_genes
+    n_cells = search_data.n_cells
+    limits  = [[int(v) for v in search_data.M[:, g]] for g in range(n_genes)]
+
+    # ── Step 1: PSS grids via Rust (float64, cached, rayon-parallel) ─────────
+    pss_per_k = []
+    for k in ks_present:
+        params_k = theta[k][0]   # numpy: n_genes × n_params
+
+        # Find which genes need recomputation
+        stale = []
+        for g in range(n_genes):
+            key = (k, g)
+            if pss_cache is None or key not in pss_cache:
+                stale.append(g)
+            else:
+                cached_params, _ = pss_cache[key]
+                if not np.allclose(params_k[g], cached_params, rtol=1e-3, atol=1e-3):
+                    stale.append(g)
+
+        if stale:
+            new_grids = _mc.eval_model_pss_2d_batch(
+                model.bio_model,
+                [params_k[g].tolist() for g in stale],
+                [limits[g] for g in stale],
+                float(model.fixed_quad_T), int(model.quad_order),
+            )
+            if pss_cache is not None:
+                for i, g in enumerate(stale):
+                    pss_cache[(k, g)] = (params_k[g].copy(), new_grids[i])
+
+        # Assemble full grid list from cache + newly computed
+        stale_set = set(stale)
+        stale_pos = {g: i for i, g in enumerate(stale)}
+        grids_k = []
+        for g in range(n_genes):
+            if g in stale_set:
+                grids_k.append(new_grids[stale_pos[g]])
+            else:
+                _, grid = pss_cache[(k, g)]
+                grids_k.append(grid)
+        pss_per_k.append(grids_k)
+
+    # ── Step 2: Pack PSS grids into a padded float32 tensor on MPS ───────────
+    grid_sizes = [len(pss_per_k[0][g]) for g in range(n_genes)]
+    max_grid   = max(grid_sizes)
+
+    pss_np = np.zeros((n_k, n_genes, max_grid), dtype=np.float32)
+    for ki in range(n_k):
+        for g in range(n_genes):
+            v = pss_per_k[ki][g]
+            pss_np[ki, g, :len(v)] = v
+    pss_t = _torch.tensor(pss_np, device=_MPS_DEVICE)    # (n_k, n_genes, max_grid)
+
+    # ── Step 3: Flat observation indices (n_genes, n_cells) on MPS ───────────
+    m_s = [limits[g][1] for g in range(n_genes)]
+    flat_idx = np.array([
+        search_data.layers[0][:, g].astype(np.int64) * m_s[g] +
+        search_data.layers[1][:, g].astype(np.int64)
+        for g in range(n_genes)
+    ], dtype=np.int64)                                     # (n_genes, n_cells)
+    idx_t = _torch.tensor(flat_idx, device=_MPS_DEVICE)   # (n_genes, n_cells)
+
+    # ── Step 4: Batched gather → log → sum_genes → add log(w) → softmax ──────
+    idx_exp     = idx_t.unsqueeze(0).expand(n_k, -1, -1)       # (n_k, n_genes, n_cells)
+    pss_gath    = _torch.gather(pss_t, 2, idx_exp)              # (n_k, n_genes, n_cells)
+    logL        = _torch.log(pss_gath.clamp(min=eps)).sum(dim=1).T  # (n_cells, n_k)
+
+    log_w = _torch.tensor(
+        [float(np.log(max(float(weights[k]), 1e-300))) for k in ks_present],
+        device=_MPS_DEVICE, dtype=_torch.float32,
+    )
+    logL = logL + log_w.unsqueeze(0)
+
+    Q_t         = _torch.softmax(logL, dim=1)
+    lower_bound = _torch.logsumexp(logL, dim=1).mean().item()
+    q_func      = (Q_t * logL).sum().item()
+
+    return Q_t.cpu().numpy(), lower_bound, q_func
+
 from tqdm import tqdm
 
 # from tqdm.contrib.concurrent import process_map  # or thread_map
@@ -734,7 +861,33 @@ class GradientInference:
         n_genes = search_data.n_genes
         ks_present = sorted(self.theta.keys())
 
-        # Rust fast-path: parallel PSS evaluation + per-cell log-likelihood accumulation
+        # PSS cache (dict of (k, g) -> (params_array, grid)); used by MPS path only.
+        # For the Rust CPU path, e_step_2d computes everything inside Rust in one shot,
+        # which is faster than Python-level cache checking + e_step_2d_from_grids at
+        # typical scales (≤100 genes).  The cache is valuable for MPS where GPU transfer
+        # cost and convergence-phase cache hits dominate at large gene counts.
+        if not hasattr(self, '_pss_cache'):
+            self._pss_cache = {}
+
+        # MPS fast-path: Rust PSS (float64, cached) + Metal GPU gather/accumulate (float32)
+        if (
+            _HAS_MPS
+            and ks_present
+            and model.bio_model in _RUST_MODELS_2D
+            and model.seq_model == "None"
+            and model.amb_model == "None"
+            and model.quad_method == "fixed_quad"
+        ):
+            Q_sub, lower_bound, q_func = _e_step_mps(
+                self.theta, ks_present, search_data, model, self.weights, eps=EPS,
+                pss_cache=self._pss_cache,
+            )
+            Q = np.zeros((n_cells, self.k))
+            for i, k in enumerate(ks_present):
+                Q[:, k] = Q_sub[:, i]
+            return Q, lower_bound, q_func
+
+        # Rust CPU fast-path: all PSS + accumulate + softmax in one Rust call (rayon)
         if (
             _HAS_RUST
             and ks_present
@@ -767,7 +920,6 @@ class GradientInference:
                 samp_list=samp_list,
                 eps=EPS,
             )
-            # Map back to full k dimension
             Q = np.zeros((n_cells, self.k))
             for i, k in enumerate(ks_present):
                 Q[:, k] = np.array(Q_sub)[:, i]

@@ -289,60 +289,72 @@ def searchdata_from_adata(adata):
 
     n_genes = adata.n_vars
 
-    # NB the order of the layers here will be enforced to be the same as the order of the model 
+    # NB the order of the layers here will be enforced to be the same as the order of the model
     # modalities defined in cme_toolbox.
     modality_name_dict = adata.uns['modality_name_dict']
     model = _uns_unpack(adata.uns['model'])
 
     ordered_modalities = model.model_modalities
     ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
-    
-    layers = np.array([adata.layers[layer_name] for layer_name in ordered_layer_names])
 
     M = adata.uns['M']
-
     hist = _uns_unpack(adata.uns['hist'])
-
-    moments = get_gene_moments(adata)
-
-    gene_names = adata.var.index
-
     n_cells = adata.n_obs
-
     hist_type = get_hist_type_adata(adata)
+    gene_names = list(adata.var.index)
 
-    attr_names = [
-        "M",
-        "hist",
-        "moments",
-        "n_genes",
-        "gene_names",
-        "n_cells",
-        "layers",
-        "hist_type",
-        "layer_names"
-    ]
-
-    attr_values = [M, hist, moments, n_genes, gene_names, n_cells, layers, hist_type, ordered_layer_names]
-
+    gene_log_lengths = None
     try:
-        gene_log_lengths = adata.var['log_lengths']
-        attr_names += ['gene_log_lengths']
-        attr_values += [gene_log_lengths]
-        
+        gene_log_lengths = list(adata.var['log_lengths'])
     except KeyError:
         pass
 
-    try:
-        k, epochs = adata.uns['k'], adata.uns['epochs']
-        attr_names += ['k', 'epochs']
+    k = adata.uns.get('k', None)
+    epochs = adata.uns.get('epochs', None)
+
+    if _mc is not None and hist_type == "unique":
+        # Build the pure-Rust SearchData container.
+        from scipy.sparse import issparse as _issparse
+        def _to_c_int64(arr):
+            a = arr.toarray() if _issparse(arr) else np.asarray(arr)
+            return np.ascontiguousarray(a, dtype=np.int64)
+        rust_layers = [_to_c_int64(adata.layers[ln]) for ln in ordered_layer_names]
+        coords_list = [h[0].tolist() for h in hist]
+        freqs_list  = [h[1].tolist() for h in hist]
+        limits_arr  = np.ascontiguousarray(M, dtype=np.int64)
+        return _mc.SearchData(
+            rust_layers,
+            ordered_layer_names,
+            limits_arr,
+            coords_list,
+            freqs_list,
+            gene_names,
+            n_cells,
+            hist_type,
+            gene_log_lengths,
+            k,
+            epochs,
+        )
+
+    # Python fallback (grid/none hist_type or Rust unavailable).
+    layers  = np.array([adata.layers[layer_name] for layer_name in ordered_layer_names])
+    moments = get_gene_moments(adata)
+
+    attr_names = [
+        "M", "hist", "moments", "n_genes", "gene_names",
+        "n_cells", "layers", "hist_type", "layer_names"
+    ]
+    attr_values = [M, hist, moments, n_genes, gene_names, n_cells, layers, hist_type, ordered_layer_names]
+
+    if gene_log_lengths is not None:
+        attr_names  += ['gene_log_lengths']
+        attr_values += [gene_log_lengths]
+
+    if k is not None:
+        attr_names  += ['k', 'epochs']
         attr_values += [k, epochs]
-    except KeyError:
-        pass        
-    
-    search_data = SearchData(attr_names, *attr_values)
-    
-    return search_data
+
+    return SearchData(attr_names, *attr_values)
 
 
 def get_gene_moments(adata):
@@ -1102,19 +1114,39 @@ class GradientInference:
         self._restart_range = self._restart_ub - self._restart_lb
 
         if self.gradient_params["init_pattern"] == "moments":
-            warnings.filterwarnings("ignore", category=RuntimeWarning)
-            self.param_MoM = np.asarray(
-                [
-                    model.get_MoM(
-                        search_data.moments[i],
-                        global_parameters.phys_lb,
-                        global_parameters.phys_ub,
-                        regressor[i],
+            _sd_is_rust_sd = _mc is not None and isinstance(search_data, _mc.SearchData)
+            if _sd_is_rust_sd:
+                # Zero-Python-loop path: Rust computes MoM for all genes at once.
+                samp_list_mom = None
+                if model.seq_model in ("Poisson", "Bernoulli"):
+                    samp_list_mom = [
+                        (regressor[gi].tolist() if regressor[gi] is not None else None)
+                        for gi in range(search_data.n_genes)
+                    ]
+                self.param_MoM = np.asarray(
+                    search_data.mom_x0_all(
+                        model.bio_model,
+                        model.seq_model,
+                        model.amb_model,
+                        global_parameters.phys_lb.tolist(),
+                        global_parameters.phys_ub.tolist(),
+                        samp_list_mom,
                     )
-                    for i in range(search_data.n_genes)
-                ]
-            )
-            warnings.resetwarnings()
+                )
+            else:
+                warnings.filterwarnings("ignore", category=RuntimeWarning)
+                self.param_MoM = np.asarray(
+                    [
+                        model.get_MoM(
+                            search_data.moments[i],
+                            global_parameters.phys_lb,
+                            global_parameters.phys_ub,
+                            regressor[i],
+                        )
+                        for i in range(search_data.n_genes)
+                    ]
+                )
+                warnings.resetwarnings()
 
     def optimize_gene(self, gene_index, model, search_data):
         """Fit the data for a single gene using KL divergence gradient descent.
@@ -1228,26 +1260,50 @@ class GradientInference:
         use_batch = self.gradient_params.get("use_batch_optimizer", False)
         hist_type = get_hist_type(search_data)
 
-        # --- Rust L-BFGS-B fast path: runs the full optimization loop in Rust
+        # --- Rust L-BFGS-B fast paths: run the full optimization loop in Rust
         # with rayon parallelism over genes. No Python callbacks, no GIL round-trips.
         # Opt-in: set gradient_params["use_rust_lbfgsb"] = True to enable.
-        # Supported when: Rust available, 2D models, unique histograms, not Adam batch.
-        use_rust_lbfgsb = (
+        _use_rust_opt = (
             _mc is not None
             and self.gradient_params.get("use_rust_lbfgsb", False)
             and not use_batch
+            and hist_type == "unique"
+        )
+        _sd_is_rust = _mc is not None and isinstance(search_data, _mc.SearchData)
+
+        use_rust_lbfgsb = (
+            _use_rust_opt
             and model.bio_model in _LBFGSB_RUST_MODELS_2D
             and model.seq_model in ("None", "Poisson")
             and model.amb_model == "None"
             and model.quad_method == "fixed_quad"
-            and hist_type == "unique"
         )
-        if use_rust_lbfgsb:
-            num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
-            n_genes = search_data.n_genes
-            n_restarts = self.gradient_params["num_restarts"]
+        use_rust_protein_bursty = (
+            _use_rust_opt
+            and _sd_is_rust
+            and model.bio_model == "ProteinBursty"
+            and model.seq_model == "None"
+            and model.amb_model == "None"
+        )
+        use_rust_amb = (
+            _use_rust_opt
+            and _sd_is_rust
+            and model.bio_model in _LBFGSB_RUST_MODELS_2D
+            and model.seq_model in ("None", "Poisson")
+            and model.amb_model in ("Equal", "Unequal")
+            and model.quad_method == "fixed_quad"
+        )
+        use_rust_custom = (
+            _use_rust_opt
+            and _sd_is_rust
+            and model.bio_model == "Custom"
+            and not model.network._has_delays
+            and model.seq_model == "None"
+            and model.amb_model == "None"
+            and len(model.network.species) in (2, 3)
+        )
 
-            # Build per-gene initial points: n_genes × n_restarts × n_params
+        def _build_x0_all(n_genes, n_restarts):
             x0_all = []
             for gi in range(n_genes):
                 x0 = (
@@ -1260,16 +1316,13 @@ class GradientInference:
                 if self.warm_start is not None:
                     x0[0] = np.clip(self.warm_start[gi], self.phys_lb, self.phys_ub)
                 x0_all.append(x0.tolist())
+            return x0_all
 
-            # Per-gene histogram data
-            u_idx_list, s_idx_list, f_list, limits_list = [], [], [], []
-            for gi in range(n_genes):
-                x_data, f_data = search_data.hist[gi]
-                x_np = np.asarray(x_data, dtype=np.int64)
-                u_idx_list.append(x_np[:, 0].tolist())
-                s_idx_list.append(x_np[:, 1].tolist())
-                f_list.append(np.asarray(f_data).tolist())
-                limits_list.append([int(v) for v in search_data.M[:, gi]])
+        if use_rust_lbfgsb:
+            num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
+            n_genes = search_data.n_genes
+            n_restarts = self.gradient_params["num_restarts"]
+            x0_all = _build_x0_all(n_genes, n_restarts)
 
             samp_list = None
             if model.seq_model == "Poisson":
@@ -1278,15 +1331,90 @@ class GradientInference:
                     for gi in range(n_genes)
                 ]
 
-            params_arr, klds_arr = _mc.optimize_genes_2d(
+            _common_kwargs = dict(
                 bio_model=model.bio_model,
                 x0_list=x0_all,
                 lb=self.phys_lb.tolist(),
                 ub=self.phys_ub.tolist(),
-                limits_list=limits_list,
-                u_idx_list=u_idx_list,
-                s_idx_list=s_idx_list,
-                f_list=f_list,
+                fixed_quad_t=float(model.fixed_quad_T),
+                quad_order=int(model.quad_order),
+                fd_eps=1e-6,
+                maxiter=self.gradient_params["max_iterations"],
+                ftol=1e-10,
+                gtol=1e-6,
+                samp_list=samp_list,
+                eps=1e-15,
+                m_lbfgs=10,
+                num_threads=num_threads,
+            )
+
+            if _sd_is_rust:
+                # Zero round-trip path: coords/freqs/limits extracted from Rust
+                # memory directly — no Python marshal loop.
+                params_arr, klds_arr = _mc.optimize_genes_2d_sd(
+                    search_data, **_common_kwargs
+                )
+            else:
+                # Python SearchData fallback: unpack hist into lists first.
+                u_idx_list, s_idx_list, f_list, limits_list = [], [], [], []
+                for gi in range(n_genes):
+                    x_data, f_data = search_data.hist[gi]
+                    x_np = np.asarray(x_data, dtype=np.int64)
+                    u_idx_list.append(x_np[:, 0].tolist())
+                    s_idx_list.append(x_np[:, 1].tolist())
+                    f_list.append(np.asarray(f_data).tolist())
+                    limits_list.append([int(v) for v in search_data.M[:, gi]])
+                params_arr, klds_arr = _mc.optimize_genes_2d(
+                    limits_list=limits_list,
+                    u_idx_list=u_idx_list,
+                    s_idx_list=s_idx_list,
+                    f_list=f_list,
+                    **_common_kwargs,
+                )
+            param_estimates = np.asarray(params_arr)
+            klds = np.asarray(klds_arr)
+
+        elif use_rust_protein_bursty:
+            num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
+            n_genes = search_data.n_genes
+            x0_all = _build_x0_all(n_genes, self.gradient_params["num_restarts"])
+            params_arr, klds_arr = _mc.optimize_genes_protein_bursty_sd(
+                search_data,
+                x0_list=x0_all,
+                lb=self.phys_lb.tolist(),
+                ub=self.phys_ub.tolist(),
+                fit_unspliced=bool(model.fit_unspliced),
+                protein_limit=float(model.protein_limit),
+                min_fudge=float(model.min_fudge),
+                max_fudge=float(model.max_fudge),
+                fd_eps=1e-6,
+                maxiter=self.gradient_params["max_iterations"],
+                ftol=1e-10,
+                gtol=1e-6,
+                eps=1e-15,
+                m_lbfgs=10,
+                num_threads=num_threads,
+            )
+            param_estimates = np.asarray(params_arr)
+            klds = np.asarray(klds_arr)
+
+        elif use_rust_amb:
+            num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
+            n_genes = search_data.n_genes
+            x0_all = _build_x0_all(n_genes, self.gradient_params["num_restarts"])
+            samp_list = None
+            if model.seq_model == "Poisson":
+                samp_list = [
+                    (self.regressor[gi].tolist() if self.regressor[gi] is not None else None)
+                    for gi in range(n_genes)
+                ]
+            params_arr, klds_arr = _mc.optimize_genes_2d_amb_sd(
+                search_data,
+                bio_model=model.bio_model,
+                amb_model=model.amb_model,
+                x0_list=x0_all,
+                lb=self.phys_lb.tolist(),
+                ub=self.phys_ub.tolist(),
                 fixed_quad_t=float(model.fixed_quad_T),
                 quad_order=int(model.quad_order),
                 fd_eps=1e-6,
@@ -1300,6 +1428,69 @@ class GradientInference:
             )
             param_estimates = np.asarray(params_arr)
             klds = np.asarray(klds_arr)
+
+        elif use_rust_custom:
+            num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
+            n_genes = search_data.n_genes
+            x0_all = _build_x0_all(n_genes, self.gradient_params["num_restarts"])
+            # Serialise the network topology (constant across all L-BFGS-B evaluations).
+            net = model.network
+            name_to_idx = {name: i for i, name in enumerate(
+                list(net.all_params) + ([net._norm_rate] if net._norm_rate else [])
+            )}
+            sp_idx_map = {s: i for i, s in enumerate(net.species)}
+            rxn_kinds_list, rxn_rate_idxs_list = [], []
+            rxn_extra1_list, rxn_extra2_list   = [], []
+            prod_sp_flat, prod_st_flat, prod_off_list = [], [], [0]
+            for rxn in net.reactions:
+                rate_idx = name_to_idx[rxn.rate_name]
+                if not rxn.reactants and rxn.burst_param is not None:
+                    rxn_kinds_list.append(0)
+                    rxn_rate_idxs_list.append(rate_idx)
+                    rxn_extra1_list.append(name_to_idx[rxn.burst_param])
+                    rxn_extra2_list.append(sp_idx_map[rxn.burst_species])
+                elif not rxn.reactants:
+                    rxn_kinds_list.append(1)
+                    rxn_rate_idxs_list.append(rate_idx)
+                    rxn_extra1_list.append(-1)
+                    rxn_extra2_list.append(-1)
+                else:
+                    src = next(iter(rxn.reactants))
+                    rxn_kinds_list.append(2)
+                    rxn_rate_idxs_list.append(rate_idx)
+                    rxn_extra1_list.append(sp_idx_map[src])
+                    rxn_extra2_list.append(-1)
+                for sp, st in rxn.products.items():
+                    prod_sp_flat.append(sp_idx_map[sp])
+                    prod_st_flat.append(st)
+                prod_off_list.append(len(prod_sp_flat))
+            params_arr, klds_arr = _mc.optimize_genes_custom_sd(
+                search_data,
+                x0_list=x0_all,
+                lb=self.phys_lb.tolist(),
+                ub=self.phys_ub.tolist(),
+                n_species=len(net.species),
+                rxn_kinds=rxn_kinds_list,
+                rxn_rate_idxs=rxn_rate_idxs_list,
+                rxn_extra1=rxn_extra1_list,
+                rxn_extra2=rxn_extra2_list,
+                prod_sp=prod_sp_flat,
+                prod_st=prod_st_flat,
+                prod_off=prod_off_list,
+                has_norm_rate=(net._norm_rate is not None),
+                min_fudge=float(model.min_fudge),
+                max_fudge=float(model.max_fudge),
+                fd_eps=1e-6,
+                maxiter=self.gradient_params["max_iterations"],
+                ftol=1e-10,
+                gtol=1e-6,
+                eps=1e-15,
+                m_lbfgs=10,
+                num_threads=num_threads,
+            )
+            param_estimates = np.asarray(params_arr)
+            klds = np.asarray(klds_arr)
+
         elif n_gene_cores != 1:
             num_threads = None if n_gene_cores < 0 else n_gene_cores
             if use_batch and _HAS_RUST:

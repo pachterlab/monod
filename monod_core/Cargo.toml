@@ -14,6 +14,7 @@ rustfft = "6"
 realfft = "3"
 rayon = "1"
 numpy = "0.22"
+ndarray = "0.15"
 lbfgsb-rs-pure = "0.1.1"
 ruanndata = { path = "../../ruanndata", default-features = false, features = ["h5ad"] }
 

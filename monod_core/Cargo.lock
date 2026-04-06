@@ -275,6 +275,7 @@ name = "monod_core"
 version = "0.2.0"
 dependencies = [
  "lbfgsb-rs-pure",
+ "ndarray",
  "num-complex",
  "numpy",
  "pyo3",
