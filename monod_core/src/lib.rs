@@ -25,6 +25,7 @@
 
 use lbfgsb_rs_pure::{IterationControl, LBFGSB};
 use num_complex::Complex64;
+#[cfg(feature = "ruanndata")]
 use ruanndata::{read_h5ad, ArrayValue, MatrixData};
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -433,6 +434,186 @@ fn pgf_cir(
         gf.iter_mut().for_each(|v| *v /= 2.0);
     }
     gf
+}
+
+// ============================================================================
+// Bursty/CIR analytic gradient — single quadrature pass for phi + dphi
+// ============================================================================
+
+/// Compute log-PGF (phi) and its gradient w.r.t. log10 parameters in one
+/// Gauss-Legendre quadrature pass.
+///
+/// Returns [phi, dphi_db, dphi_dbeta, dphi_dgamma] as four Vec<Complex64>.
+/// For Bursty: integrand = U/(1-U), d(integrand)/dU = 1/(1-U)^2
+/// For CIR:    integrand = (1-sqrt(1-4U))/2, d(integrand)/dU = 1/sqrt(1-4U)
+/// d phi / d log10(param) = param * ln10 * ∫ d(integrand)/dU * dU/d(param) dt
+fn pgf_bursty_cir_with_dphi(
+    bio_model: &str,
+    g0: &[Complex64],
+    g1: &[Complex64],
+    p: &[f64],
+    t: f64,
+    quad_order: usize,
+) -> [Vec<Complex64>; 4] {
+    let (b, beta, gamma) = (p[0], p[1], p[2]);
+    let ln10 = f64::ln(10.0);
+    let one = Complex64::new(1.0, 0.0);
+    let four = Complex64::new(4.0, 0.0);
+    let is_cir = bio_model == "CIR";
+    let gl = gauss_legendre_cached(quad_order);
+    let t_half = t / 2.0;
+    let close = np_isclose(beta, gamma);
+    let f_factor = if !close { beta / (beta - gamma) } else { 0.0 };
+    // Precompute per-quadrature-point values (shared across grid points)
+    let xs: Vec<f64>  = gl.0.iter().map(|&xi| t_half + t_half * xi).collect();
+    let eb: Vec<f64>  = xs.iter().map(|&x| (-beta  * x).exp()).collect();
+    let eg: Vec<f64>  = xs.iter().map(|&x| (-gamma * x).exp()).collect();
+    let ws: Vec<f64>  = gl.1.iter().map(|&wi| wi * t_half).collect();
+    let nq = xs.len();
+    // Scale factors for dphi_dbeta and dphi_dgamma (these have no k-dependence)
+    let bg2 = if !close { gamma / (beta - gamma).powi(2) } else { 0.0 };
+    let bb2 = if !close { beta  / (beta - gamma).powi(2) } else { 0.0 };
+
+    let compute = |k: usize| {
+        let mut phi_k        = Complex64::new(0.0, 0.0);
+        let mut d_phi_db_k   = Complex64::new(0.0, 0.0);
+        let mut d_phi_dbeta_k  = Complex64::new(0.0, 0.0);
+        let mut d_phi_dgamma_k = Complex64::new(0.0, 0.0);
+
+        if close {
+            // U = b * (g0 * exp(-beta*t) + g1 * beta * t * exp(-gamma*t))
+            for q in 0..nq {
+                let u = (g0[k] * eb[q] + g1[k] * (xs[q] * beta * eg[q])) * b;
+                let (integrand, d_intg_du) = if is_cir {
+                    let sq = (one - four * u).sqrt();
+                    ((one - sq) * 0.5, one / sq * 0.5)
+                } else {
+                    let inv = one / (one - u);
+                    (u * inv, inv * inv)
+                };
+                phi_k += integrand * ws[q];
+                // d phi / d log10(b): param*dU/d(param) = b*(U/b) = U
+                d_phi_db_k += d_intg_du * u * ws[q];
+                // dU/dbeta = b*(-g0*t*eb + g1*t*eg)
+                let du_dbeta = (Complex64::new(-xs[q], 0.0) * g0[k] * eb[q]
+                              + Complex64::new( xs[q], 0.0) * g1[k] * eg[q]) * b;
+                d_phi_dbeta_k += d_intg_du * du_dbeta * ws[q];
+                // dU/dgamma = -b*g1*beta*t^2*eg
+                let du_dgamma = g1[k] * Complex64::new(-beta * xs[q] * xs[q] * eg[q] * b, 0.0);
+                d_phi_dgamma_k += d_intg_du * du_dgamma * ws[q];
+            }
+        } else {
+            let c2k = g1[k] * f_factor;
+            let c1k = g0[k] - c2k;
+            for q in 0..nq {
+                let u = (c1k * eb[q] + c2k * eg[q]) * b;
+                let (integrand, d_intg_du) = if is_cir {
+                    let sq = (one - four * u).sqrt();
+                    ((one - sq) * 0.5, one / sq * 0.5)
+                } else {
+                    let inv = one / (one - u);
+                    (u * inv, inv * inv)
+                };
+                phi_k += integrand * ws[q];
+                d_phi_db_k += d_intg_du * u * ws[q];
+                // dU/dbeta = b * [g1*gamma/(beta-gamma)^2 * (eb-eg) - c1*t*eb]
+                let du_dbeta = (g1[k] * bg2 * (eb[q] - eg[q]) - c1k * xs[q] * eb[q]) * b;
+                d_phi_dbeta_k += d_intg_du * du_dbeta * ws[q];
+                // dU/dgamma = b * [g1*beta/(beta-gamma)^2 * (eg-eb) - c2*t*eg]
+                let du_dgamma = (g1[k] * bb2 * (eg[q] - eb[q]) - c2k * xs[q] * eg[q]) * b;
+                d_phi_dgamma_k += d_intg_du * du_dgamma * ws[q];
+            }
+        }
+        // Apply param * LN10 factors
+        (
+            phi_k,
+            d_phi_db_k   * Complex64::new(ln10,        0.0),  // b*LN10 * integral(d_intg/dU * U/b) = LN10 * integral(...)
+            d_phi_dbeta_k  * Complex64::new(beta  * ln10, 0.0),
+            d_phi_dgamma_k * Complex64::new(gamma * ln10, 0.0),
+        )
+    };
+
+    let n = g0.len();
+    let tuples: Vec<(Complex64, Complex64, Complex64, Complex64)> = if n >= PAR_THRESHOLD {
+        (0..n).into_par_iter().map(compute).collect()
+    } else {
+        (0..n).map(compute).collect()
+    };
+    let mut phi        = Vec::with_capacity(n);
+    let mut dphi_db    = Vec::with_capacity(n);
+    let mut dphi_dbeta = Vec::with_capacity(n);
+    let mut dphi_dgamma = Vec::with_capacity(n);
+    for (a, b_, c, d) in tuples {
+        phi.push(a); dphi_db.push(b_); dphi_dbeta.push(c); dphi_dgamma.push(d);
+    }
+    [phi, dphi_db, dphi_dbeta, dphi_dgamma]
+}
+
+/// Evaluate KLD + analytic gradient for Bursty or CIR.
+/// Called from within rayon tasks — pure Rust, no GIL, no nested rayon.
+fn eval_kld_and_grad_analytic_seq(
+    bio_model: &str,
+    x: &[f64],
+    limits: &[usize],
+    u_idx: &[u64],
+    s_idx: &[u64],
+    f_data: &[f64],
+    fixed_quad_t: f64,
+    quad_order: usize,
+    samp_log: Option<&[f64]>,
+    eps: f64,
+) -> (f64, Vec<f64>) {
+    let p: Vec<f64> = x.iter().map(|&v| 10.0_f64.powf(v)).collect();
+    let (l0, l1) = (limits[0], limits[1]);
+    let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
+
+    // Build mesh (with optional Poisson transform).
+    let mesh = if let Some(samp) = samp_log {
+        let lam0 = 10.0_f64.powf(samp[0]);
+        let lam1 = 10.0_f64.powf(samp[1]);
+        build_mesh_2d_poisson_cached(l0, l1, lam0, lam1)
+    } else {
+        build_mesh_2d_cached(l0, l1)
+    };
+    let (g0, g1) = (&mesh.0, &mesh.1);
+
+    // Single quadrature pass: phi and all three dphi.
+    let [phi, dphi_db, dphi_dbeta, dphi_dgamma] =
+        pgf_bursty_cir_with_dphi(bio_model, g0, g1, &p, t, quad_order);
+
+    // G = exp(phi), PSS_unnorm = irfft2d(G), norm = sum(|pss_unnorm|)
+    let n_freq = phi.len();
+    let g_exp: Vec<Complex64> = phi.iter().map(|z| z.exp()).collect();
+    let pss_unnorm = irfftn_2d(&g_exp, l0, l1);
+    let norm: f64 = pss_unnorm.iter().map(|v| v.abs()).sum();
+    if norm == 0.0 {
+        // Degenerate — fall back to large KLD, zero grad.
+        return (f64::MAX / 2.0, vec![0.0; x.len()]);
+    }
+    // Normalized PSS for KLD (take abs, same as eval_model_pss_2d_seq).
+    let pss: Vec<f64> = pss_unnorm.iter().map(|v| v.abs() / norm).collect();
+    let kld = compute_kld_sparse(&pss, l1, u_idx, s_idx, f_data, eps);
+
+    // Gradient: for each parameter i, compute dR_i = irfft2d(G * dphi_i).real
+    let dphi_list: [&Vec<Complex64>; 3] = [&dphi_db, &dphi_dbeta, &dphi_dgamma];
+    let n_data = u_idx.len();
+    let grad: Vec<f64> = dphi_list.iter().map(|dphi_i| {
+        // dG_i = G .* dphi_i
+        let dg_i: Vec<Complex64> = g_exp.iter().zip(dphi_i.iter()).map(|(g, d)| g * d).collect();
+        let dr_i = irfftn_2d(&dg_i, l0, l1);
+        let dn_i: f64 = dr_i.iter().sum();
+        // Gradient accumulation over data points.
+        let sum_term: f64 = (0..n_data).map(|j| {
+            let u = u_idx[j] as usize;
+            let s = s_idx[j] as usize;
+            let dr_j = dr_i[u * l1 + s];
+            let pss_unnorm_j = pss_unnorm[u * l1 + s].max(eps * norm);
+            f_data[j] * dr_j / pss_unnorm_j
+        }).sum();
+        -sum_term + dn_i / norm
+    }).collect();
+
+    (kld, grad)
 }
 
 // ============================================================================
@@ -1949,11 +2130,12 @@ fn make_histograms_unique(
 }
 
 // ============================================================================
-// ruanndata h5ad I/O helpers
+// ruanndata h5ad I/O helpers  (feature-gated: only built when "ruanndata" is enabled)
 // ============================================================================
 
 /// Convert any MatrixData variant to a flat row-major (n_cells × n_genes) Vec<i64>.
 /// Returns (n_cells, n_genes, flat).
+#[cfg(feature = "ruanndata")]
 fn matrix_to_dense_i64(matrix: &MatrixData) -> Result<(usize, usize, Vec<i64>), String> {
     /// Cast one element of an ArrayValue to i64.
     fn av_get(av: &ArrayValue, idx: usize) -> i64 {
@@ -2019,6 +2201,7 @@ struct H5adInner {
 /// and build a subsetted layer matrix for downstream moments.
 ///
 /// Must be called outside the GIL (inside `py.allow_threads`).
+#[cfg(feature = "ruanndata")]
 #[allow(clippy::too_many_arguments)]
 fn load_h5ad_inner(
     filepath:   &str,
@@ -2232,6 +2415,7 @@ fn load_h5ad_inner(
 ///   coords[g]   : unique microstates (each a Vec<i64> of length n_layers)
 ///   freqs[g]    : normalised frequencies corresponding to coords[g]
 ///   limits[g]   : Vec<usize> per-layer grid bound (max_val + padding)
+#[cfg(feature = "ruanndata")]
 #[pyfunction]
 #[pyo3(signature = (filepath, layer_names, gene_names=None,
                     min_means=None, max_maxes=None, min_maxes=None, padding=10))]
@@ -2285,6 +2469,7 @@ fn load_histograms_h5ad(
 /// Returns
 /// -------
 /// A `SearchData` object ready for direct use with `optimize_genes_*_sd`.
+#[cfg(feature = "ruanndata")]
 #[pyfunction]
 #[pyo3(signature = (filepath, layer_names, gene_names=None,
                     min_means=None, max_maxes=None, min_maxes=None, padding=10,
@@ -2716,11 +2901,22 @@ fn eval_kld_grad_2d(
             "Unknown bio_model for eval_kld_grad_2d: {other}"
         ))),
     }
-    let n_params = p_log.len();
-    let l1 = limits[1];
     let samp_ref: Option<Vec<f64>> = samp_log;
 
-    // Evaluate base point + n_params perturbations in parallel (all with GIL released).
+    // Bursty and CIR: use the semi-analytical gradient (faster and more accurate).
+    if bio_model == "Bursty" || bio_model == "CIR" {
+        let (kld0, grad) = py.allow_threads(|| {
+            eval_kld_and_grad_analytic_seq(
+                &bio_model, &p_log, &limits, &u_idx, &s_idx, &f,
+                fixed_quad_t, quad_order, samp_ref.as_deref(), eps,
+            )
+        });
+        return Ok((kld0, grad));
+    }
+
+    let n_params = p_log.len();
+    let l1 = limits[1];
+    // Other models: parallel forward FD.
     let all_klds: Vec<f64> = py.allow_threads(|| {
         (0..=n_params)
             .into_par_iter()
@@ -2816,7 +3012,8 @@ fn lbfgsb_minimize(
 
     let mut solver = LBFGSB::new(m_mem)
         .with_max_iter(maxiter)
-        .with_pgtol(gtol);
+        .with_pgtol(gtol)
+        .with_ftol(ftol);
 
     let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
         eval_kld_and_grad_seq(
@@ -2825,16 +3022,10 @@ fn lbfgsb_minimize(
         )
     };
 
-    // Track previous f for relative-improvement ftol check.
-    let mut prev_f = f64::INFINITY;
-    let mut callback = |info: &lbfgsb_rs_pure::IterationInfo, _x: &[f64]| {
-        let improve = (prev_f - info.f).abs() / prev_f.abs().max(1.0);
-        prev_f = info.f;
-        if improve < ftol {
-            IterationControl::StopConverged
-        } else {
-            IterationControl::Continue
-        }
+    // ftol is now handled inside the patched solver (scipy-compatible normalization).
+    // The callback is a no-op; convergence is driven by pgtol and ftol in the solver.
+    let mut callback = |_info: &lbfgsb_rs_pure::IterationInfo, _x: &[f64]| {
+        IterationControl::Continue
     };
 
     match solver.minimize_with_callback(&mut x, lb, ub, &mut f_and_grad, &mut callback) {
@@ -3213,7 +3404,7 @@ fn lbfgsb_minimize_protein_bursty(
 ) -> (Vec<f64>, f64) {
     let n = x0.len();
     let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
-    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol);
+    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol).with_ftol(ftol);
     let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
         eval_kld_and_grad_seq_protein_bursty(
             xx, limits, strides, coords, f_data,
@@ -3458,7 +3649,7 @@ fn lbfgsb_minimize_amb(
 ) -> (Vec<f64>, f64) {
     let n = x0.len();
     let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
-    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol);
+    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol).with_ftol(ftol);
     let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
         eval_kld_and_grad_seq_amb(
             bio_model, xx, limits, strides, coords, f_data,
@@ -3722,7 +3913,7 @@ fn lbfgsb_minimize_custom(
 ) -> (Vec<f64>, f64) {
     let n = x0.len();
     let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
-    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol);
+    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol).with_ftol(ftol);
     let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
         eval_kld_and_grad_seq_custom(
             xx, n_species, limits, strides, rxns, prod_sp, prod_st,
@@ -4075,7 +4266,9 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_moments, m)?)?;
     m.add_class::<SearchData>()?;
     m.add_function(wrap_pyfunction!(make_histograms_unique, m)?)?;
+    #[cfg(feature = "ruanndata")]
     m.add_function(wrap_pyfunction!(load_histograms_h5ad, m)?)?;
+    #[cfg(feature = "ruanndata")]
     m.add_function(wrap_pyfunction!(searchdata_from_h5ad, m)?)?;
     m.add_function(wrap_pyfunction!(eval_custom_network_pgf, m)?)?;
     Ok(())

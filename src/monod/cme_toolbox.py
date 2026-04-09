@@ -661,11 +661,19 @@ class CMEModel:
 
         p = np.asarray(p, dtype=float)
 
-        # Analytical gradient path: Constitutive, Extrinsic, Delay, DelayedSplicing
-        # with Python fallback (seq_model="None"/"Poisson"/"Bernoulli", no ambiguity).
-        _ANALYTIC_GRAD_MODELS = {"Constitutive", "Extrinsic",
-                                 "Delay", "DelayedSplicing"}
-        if (self.bio_model in _ANALYTIC_GRAD_MODELS
+        # Analytical gradient path.
+        # Closed-form models (Constitutive, Extrinsic, Delay, DelayedSplicing) use
+        # pure algebra — fast and exact, always preferred over FD.
+        # Quadrature-based models (Bursty, CIR) require a quadrature pass in Python
+        # which is slower than the Rust FD path; use them only when Rust is unavailable.
+        _FAST_ANALYTIC_MODELS = {"Constitutive", "Extrinsic",
+                                  "Delay", "DelayedSplicing"}
+        _QUAD_ANALYTIC_MODELS = {"Bursty", "CIR"}
+        _use_analytic = (
+            self.bio_model in _FAST_ANALYTIC_MODELS
+            or (self.bio_model in _QUAD_ANALYTIC_MODELS and not _HAS_RUST)
+        )
+        if (_use_analytic
                 and self.amb_model == "None"
                 and hist_type in ("unique", "grid")):
             result = self._eval_kld_analytic_grad(p, limits, samp, data,
@@ -815,6 +823,74 @@ class CMEModel:
                 -b * g1 * tau / C * (dA_dtau / (A * beta) + 1.0)
             ) * LN10
             dphi = [dphi_db, dphi_dbeta, dphi_dtauinv]
+        elif self.bio_model in ("Bursty", "CIR"):
+            # Semi-analytical gradient via the same Gauss-Legendre quadrature used
+            # for the PSS.  phi = integral of integrand(U) dt over [0,T] where
+            #   Bursty:  integrand = U / (1 - U)
+            #   CIR:     integrand = (1/2) * (1 - sqrt(1 - 4*U))
+            # and U(t) = b * (c1*exp(-beta*t) + c2*exp(-gamma*t)).
+            # All three d phi / d log10(param) integrals are accumulated in the
+            # same quadrature loop — no extra function evaluations.
+            if self.quad_method != "fixed_quad":
+                return None  # quad_vec integration: fall back to FD
+            from numpy.polynomial.legendre import leggauss
+            b, beta, gamma = p_lin
+            T = self.fixed_quad_T * (1.0 / beta + 1.0 / gamma + 1.0)
+            t_half = T / 2.0
+            xi, wi = leggauss(self.quad_order)
+            x = t_half + t_half * xi   # (Q,) quadrature points in [0, T]
+            w_T = t_half * wi           # (Q,) weights (Jacobian of [0,T] transform)
+
+            # Frequency-mesh arrays g0, g1 have shape (N_freq,); broadcast to
+            # (N_freq, 1) so they multiply cleanly against (Q,) arrays.
+            g0e = g0[:, None]          # (N_freq, 1)
+            g1e = g1[:, None]          # (N_freq, 1)
+            eb = np.exp(-beta  * x)    # (Q,)
+            eg = np.exp(-gamma * x)    # (Q,)
+
+            if np.isclose(beta, gamma):
+                # Limiting form as gamma -> beta to avoid cancellation.
+                # U = b * (g0 * exp(-beta*t) + g1 * beta * t * exp(-gamma*t))
+                U = b * (g0e * eb + g1e * (beta * x * eg))  # (N_freq, Q)
+                # dU/dbeta: differentiate b*(g0*exp(-beta*t) + g1*beta*t*exp(-gamma*t)) w.r.t. beta
+                #   d/dbeta[g0*exp(-beta*t)] = -g0*t*exp(-beta*t)
+                #   d/dbeta[g1*beta*t*exp(-gamma*t)] = g1*t*exp(-gamma*t)  (gamma fixed)
+                dU_dbeta  = b * (-g0e * x * eb + g1e * x * eg)
+                # dU/dgamma = b * g1 * beta * t * (-t) * eg = -b*g1*beta*t^2*eg
+                dU_dgamma = -b * g1e * beta * x**2 * eg
+            else:
+                f  = beta / (beta - gamma)
+                c2 = g1e * f            # (N_freq, 1)
+                c1 = g0e - c2           # (N_freq, 1)
+                U  = b * (c1 * eb + c2 * eg)  # (N_freq, Q)
+                # ∂c2/∂beta = g1 * (-gamma/(beta-gamma)^2)
+                # ∂c1/∂beta = -∂c2/∂beta = g1 * gamma/(beta-gamma)^2
+                bg2 = b * g1e * gamma / (beta - gamma)**2
+                dU_dbeta  = bg2 * (eb - eg) - b * c1 * x * eb
+                # ∂c2/∂gamma = g1 * beta/(beta-gamma)^2
+                # ∂c1/∂gamma = -∂c2/∂gamma
+                bb2 = b * g1e * beta / (beta - gamma)**2
+                dU_dgamma = bb2 * (eg - eb) - b * c2 * x * eg
+
+            if self.bio_model == "Bursty":
+                # phi = integral U/(1-U) dt;  d(integrand)/dU = 1/(1-U)^2
+                inv1mU    = 1.0 / (1.0 - U)            # (N_freq, Q)
+                phi       = (U * inv1mU     * w_T).sum(axis=1)  # (N_freq,)
+                d_intg_dU = inv1mU**2                   # (N_freq, Q)
+            else:  # CIR
+                # phi = (1/2) * integral (1 - sqrt(1-4U)) dt;
+                # d(integrand)/dU = 2/sqrt(1-4U)
+                sqrt_term = np.sqrt(1.0 - 4.0 * U)     # (N_freq, Q)
+                phi       = 0.5 * ((1.0 - sqrt_term) * w_T).sum(axis=1)
+                d_intg_dU = 2.0 / sqrt_term             # (N_freq, Q)  [× 1/2 from phi]
+                d_intg_dU = d_intg_dU * 0.5             # absorb the 1/2 prefactor
+
+            # d phi / d log10(param) = param_lin * LN10 * integral d(integrand)/dU * dU/d(param_lin) dt
+            # For b: dU/db = U/b, so param_lin * dU/d(param_lin) = b * (U/b) = U.
+            dphi_db     = LN10         * (d_intg_dU * U         * w_T).sum(axis=1)
+            dphi_dbeta  = beta  * LN10 * (d_intg_dU * dU_dbeta  * w_T).sum(axis=1)
+            dphi_dgamma = gamma * LN10 * (d_intg_dU * dU_dgamma * w_T).sum(axis=1)
+            dphi = [dphi_db, dphi_dbeta, dphi_dgamma]
         else:
             return None  # unsupported model
 

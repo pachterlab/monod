@@ -1,0 +1,10 @@
+[package]
+name = "lbfgsb-rs-pure"
+version = "0.1.1"
+edition = "2024"
+description = "Patched local copy of lbfgsb-rs-pure with scipy-compatible sty threshold and ftol stopping."
+license = "BSD-3-Clause"
+
+[lib]
+name = "lbfgsb_rs_pure"
+path = "src/lib.rs"
