@@ -586,9 +586,17 @@ where
     }
 
     let mut stp = 1.0_f64;
-    // reasonable More'-Thuente defaults used in many implementations
     let stpmin = 1e-20_f64;
-    let stpmax = 1.0e20_f64;
+    // scipy-compatible stpmax: maximum step that keeps x within [lower, upper].
+    // matches the Fortran `stpmx` computation in lnsrlb.f.
+    let stpmax = {
+        let mut smax = 1.0e20_f64;
+        for i in 0..x.len() {
+            if d[i] > 0.0 { smax = smax.min((upper[i] - x[i]) / d[i]); }
+            else if d[i] < 0.0 { smax = smax.min((lower[i] - x[i]) / d[i]); }
+        }
+        smax.max(stpmin)
+    };
     let ftol = 1e-4_f64;
     let gtol = 0.9_f64;
     let xtol = 1e-6_f64;

@@ -53,8 +53,8 @@ pub use crate::blas::*;
 pub use crate::linesearch::*;
 pub use crate::solver::{IterationControl, IterationInfo, LBFGSB};
 
-/// Maximum number of backtracking line search iterations used by convenience routines.
-pub const MAX_BACKTRACK: usize = 50;
+/// Maximum number of line search function evaluations — matches scipy's `maxls=20`.
+pub const MAX_BACKTRACK: usize = 20;
 
 /// Minimum curvature s'y to accept BFGS update.
 pub const CURVATURE_EPS: f64 = 1e-12;

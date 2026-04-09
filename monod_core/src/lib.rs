@@ -2965,6 +2965,14 @@ fn eval_kld_and_grad_seq(
     samp_log: Option<&[f64]>,
     eps: f64,
 ) -> (f64, Vec<f64>) {
+    // Bursty and CIR: semi-analytical gradient (same path as the scipy callback).
+    if bio_model == "Bursty" || bio_model == "CIR" {
+        return eval_kld_and_grad_analytic_seq(
+            bio_model, x, limits, u_idx, s_idx, f_data,
+            fixed_quad_t, quad_order, samp_log, eps,
+        );
+    }
+    // All other models: forward finite differences.
     let l1 = limits[1];
     let n = x.len();
     let pss0 = eval_model_pss_2d_seq(bio_model, x, limits, fixed_quad_t, quad_order, samp_log);

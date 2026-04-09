@@ -64,7 +64,7 @@ def perform_inference(h5ad_filepath,
     gradient_params={
         "max_iterations": 10,
         "init_pattern": "moments",
-        "num_restarts": 1,
+        "num_restarts": 3,
         "num_gene_cores": 1,
         "n_jac_jobs": 1,
     },
@@ -686,7 +686,7 @@ class InferenceParameters:
         gradient_params={
             "max_iterations": 10,
             "init_pattern": "moments",
-            "num_restarts": 1,
+            "num_restarts": 3,
             "num_gene_cores": 1,
             "n_jac_jobs": 1,
         },
@@ -746,7 +746,14 @@ class InferenceParameters:
         if gridsize is None:
             gridsize = model.seq_bounds['gridsize']
         
-        self.gradient_params = gradient_params
+        _gp_defaults = {
+            "max_iterations": 10,
+            "init_pattern": "moments",
+            "num_restarts": 3,
+            "num_gene_cores": 1,
+            "n_jac_jobs": 1,
+        }
+        self.gradient_params = {**_gp_defaults, **gradient_params}
         self.phys_lb = np.array(phys_lb)
         self.phys_ub = np.array(phys_ub)
         self.grad_bnd = scipy.optimize.Bounds(phys_lb, phys_ub)
@@ -1148,7 +1155,7 @@ class GradientInference:
                 )
                 warnings.resetwarnings()
 
-    def optimize_gene(self, gene_index, model, search_data):
+    def optimize_gene(self, gene_index, model, search_data, x0=None):
         """Fit the data for a single gene using KL divergence gradient descent.
 
         If init_pattern = moments, the first search's starting point is set to the
@@ -1164,6 +1171,9 @@ class GradientInference:
             CME model used for inference.
         search_data: monod.extract_data.SearchData
             SearchData object with the data to fit.
+        x0: array-like or None
+            Pre-built starting points (n_restarts × n_params). If None, starting
+            points are drawn fresh with np.random.rand.
 
         Returns
         -------
@@ -1172,24 +1182,18 @@ class GradientInference:
         err: float
             Kullback-Leibler divergence of the model at x, relative to data.
         """
-        # Draw random restart initialisations within the pre-allocated bounds.
-        x0 = (
-            np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
-            * self._restart_range
-            + self._restart_lb
-        )
-        # x0 = (
-        #     np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
-        #     * (self.phys_ub - self.phys_lb)
-        #     + self.phys_lb
-        # )
-        if (
-            self.gradient_params["init_pattern"] == "moments"
-        ):  # this can be extended to other initialization patterns, like latin squares
-            x0[0] = self.param_MoM[gene_index]
-        # Warm-start: override first restart with previous grid point's solution
-        if self.warm_start is not None:
-            x0[0] = np.clip(self.warm_start[gene_index], self.phys_lb, self.phys_ub)
+        if x0 is None:
+            x0 = (
+                np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
+                * self._restart_range
+                + self._restart_lb
+            )
+            if self.gradient_params["init_pattern"] == "moments":
+                x0[0] = self.param_MoM[gene_index]
+            if self.warm_start is not None:
+                x0[0] = np.clip(self.warm_start[gene_index], self.phys_lb, self.phys_ub)
+        else:
+            x0 = np.asarray(x0)
         err = np.inf
         ERR_THRESH = 0.99
         if log.isEnabledFor(logging.DEBUG):
@@ -1318,11 +1322,14 @@ class GradientInference:
                 x0_all.append(x0.tolist())
             return x0_all
 
+        # Build starting points once so scipy and Rust paths share identical restarts.
+        x0_all_shared = _build_x0_all(search_data.n_genes, self.gradient_params["num_restarts"])
+
         if use_rust_lbfgsb:
             num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
             n_genes = search_data.n_genes
             n_restarts = self.gradient_params["num_restarts"]
-            x0_all = _build_x0_all(n_genes, n_restarts)
+            x0_all = x0_all_shared
 
             samp_list = None
             if model.seq_model == "Poisson":
@@ -1377,7 +1384,7 @@ class GradientInference:
         elif use_rust_protein_bursty:
             num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
             n_genes = search_data.n_genes
-            x0_all = _build_x0_all(n_genes, self.gradient_params["num_restarts"])
+            x0_all = x0_all_shared
             params_arr, klds_arr = _mc.optimize_genes_protein_bursty_sd(
                 search_data,
                 x0_list=x0_all,
@@ -1401,7 +1408,7 @@ class GradientInference:
         elif use_rust_amb:
             num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
             n_genes = search_data.n_genes
-            x0_all = _build_x0_all(n_genes, self.gradient_params["num_restarts"])
+            x0_all = x0_all_shared
             samp_list = None
             if model.seq_model == "Poisson":
                 samp_list = [
@@ -1432,7 +1439,7 @@ class GradientInference:
         elif use_rust_custom:
             num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
             n_genes = search_data.n_genes
-            x0_all = _build_x0_all(n_genes, self.gradient_params["num_restarts"])
+            x0_all = x0_all_shared
             # Serialise the network topology (constant across all L-BFGS-B evaluations).
             net = model.network
             name_to_idx = {name: i for i, name in enumerate(
@@ -1508,7 +1515,8 @@ class GradientInference:
                     futures = {
                         pool.submit(
                             self.optimize_gene,
-                            gene_index=i, model=model, search_data=search_data
+                            gene_index=i, model=model, search_data=search_data,
+                            x0=x0_all_shared[i],
                         ): i
                         for i in range(search_data.n_genes)
                     }
@@ -1518,8 +1526,9 @@ class GradientInference:
         else:
             param_estimates, klds = zip(
                 *[
-                    self.optimize_gene(gene_index=gene_index, model=model, search_data=search_data)
-                    for gene_index in range(search_data.n_genes)
+                    self.optimize_gene(gene_index=gi, model=model, search_data=search_data,
+                                       x0=x0_all_shared[gi])
+                    for gi in range(search_data.n_genes)
                 ]
             )
 
