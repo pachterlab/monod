@@ -120,8 +120,11 @@ def perform_inference(h5ad_filepath,
     log.info('Search data created.')
 
     if not transcriptome_filepath:
-        use_lengths = False
-        log.info('Lengths have not been given so are not being used')
+        if 'log_lengths' in monod_adata.var.columns:
+            log.info('Gene lengths found in adata.var, using for inference.')
+        else:
+            use_lengths = False
+            log.info('Lengths have not been given so are not being used')
 
     if not mek_means_params:
         inference_parameters = InferenceParameters(
@@ -1104,6 +1107,7 @@ class GradientInference:
         self.grid_point = global_parameters.sampl_vals[point_index]
         self.point_index = point_index
         self.regressor = regressor
+        self.use_lengths = global_parameters.use_lengths
         self.grad_bnd = global_parameters.grad_bnd
         self.gradient_params = global_parameters.gradient_params
         self.phys_lb = global_parameters.phys_lb
@@ -1335,17 +1339,9 @@ class GradientInference:
         if use_rust_lbfgsb:
             num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
             n_genes = search_data.n_genes
-            n_restarts = self.gradient_params["num_restarts"]
             x0_all = x0_all_shared
 
-            samp_list = None
-            if model.seq_model in ("Poisson", "Bernoulli"):
-                samp_list = [
-                    (self.regressor[gi].tolist() if self.regressor[gi] is not None else None)
-                    for gi in range(n_genes)
-                ]
-
-            _common_kwargs = dict(
+            _base_kwargs = dict(
                 bio_model=model.bio_model,
                 x0_list=x0_all,
                 lb=self.phys_lb.tolist(),
@@ -1356,7 +1352,6 @@ class GradientInference:
                 maxiter=self.gradient_params["max_iterations"],
                 ftol=1e-10,
                 gtol=1e-6,
-                samp_list=samp_list,
                 eps=1e-15,
                 m_lbfgs=10,
                 num_threads=num_threads,
@@ -1364,13 +1359,29 @@ class GradientInference:
             )
 
             if _sd_is_rust:
-                # Zero round-trip path: coords/freqs/limits extracted from Rust
-                # memory directly — no Python marshal loop.
+                # Zero round-trip path: Rust reads coords/freqs/limits from SearchData
+                # and computes per-gene samp inside the rayon loop — no Python marshal.
+                use_lengths_rust = self.use_lengths and model.seq_model == "Poisson"
+                if model.seq_model in ("Poisson", "Bernoulli"):
+                    # When using gene lengths, pass raw grid_point so Rust adds per-gene
+                    # log-lengths. Otherwise pass regressor[0] (same for all genes).
+                    base_samp = list(self.grid_point) if use_lengths_rust else self.regressor[0].tolist()
+                else:
+                    base_samp = None
                 params_arr, klds_arr = _mc.optimize_genes_2d_sd(
-                    search_data, **_common_kwargs
+                    search_data,
+                    base_samp=base_samp,
+                    use_lengths=use_lengths_rust,
+                    **_base_kwargs,
                 )
             else:
-                # Python SearchData fallback: unpack hist into lists first.
+                # Python SearchData fallback: build per-gene samp_list, unpack hist.
+                samp_list = None
+                if model.seq_model in ("Poisson", "Bernoulli"):
+                    samp_list = [
+                        (self.regressor[gi].tolist() if self.regressor[gi] is not None else None)
+                        for gi in range(n_genes)
+                    ]
                 u_idx_list, s_idx_list, f_list, limits_list = [], [], [], []
                 for gi in range(n_genes):
                     x_data, f_data = search_data.hist[gi]
@@ -1384,7 +1395,8 @@ class GradientInference:
                     u_idx_list=u_idx_list,
                     s_idx_list=s_idx_list,
                     f_list=f_list,
-                    **_common_kwargs,
+                    samp_list=samp_list,
+                    **_base_kwargs,
                 )
             param_estimates = np.asarray(params_arr)
             klds = np.asarray(klds_arr)

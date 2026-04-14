@@ -3267,8 +3267,8 @@ fn optimize_genes_2d(
 #[pyfunction]
 #[pyo3(signature = (sd, bio_model, x0_list, lb, ub, fixed_quad_t, quad_order,
                     fd_eps=1e-6, maxiter=1000, ftol=1e-10, gtol=1e-6,
-                    samp_list=None, eps=1e-15, m_lbfgs=10, num_threads=None,
-                    seq_model="Poisson"))]
+                    base_samp=None, use_lengths=false, eps=1e-15, m_lbfgs=10,
+                    num_threads=None, seq_model="Poisson"))]
 #[allow(clippy::too_many_arguments)]
 fn optimize_genes_2d_sd(
     py: Python<'_>,
@@ -3283,7 +3283,8 @@ fn optimize_genes_2d_sd(
     maxiter: usize,
     ftol: f64,
     gtol: f64,
-    samp_list: Option<Vec<Option<Vec<f64>>>>,
+    base_samp: Option<Vec<f64>>,   // grid-point sampling params (log10); length offset added per-gene if use_lengths
+    use_lengths: bool,              // if true, add gene_log_lengths[gi] to base_samp[0] per gene
     eps: f64,
     m_lbfgs: usize,
     num_threads: Option<usize>,
@@ -3294,7 +3295,7 @@ fn optimize_genes_2d_sd(
 
     // Extract all needed data from the Rust struct while holding the GIL borrow.
     // We collect into owned Vecs so they are Send and can cross the allow_threads boundary.
-    let (u_idx_list, s_idx_list, f_list, limits_list, n_genes) = {
+    let (u_idx_list, s_idx_list, f_list, limits_list, n_genes, gene_log_lengths) = {
         let sd_ref = sd.borrow();
         if sd_ref.n_layers < 2 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -3311,16 +3312,26 @@ fn optimize_genes_2d_sd(
             .collect();
         let f: Vec<Vec<f64>> = sd_ref.freqs.clone();
         let lim: Vec<Vec<usize>> = sd_ref.limits.clone();
-        (u, s, f, lim, n)
+        let gll = sd_ref.gene_log_lengths.clone();
+        (u, s, f, lim, n, gll)
     }; // sd_ref dropped — GIL borrow released before allow_threads
-
 
     let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
         run_with_pool(num_threads, || {
             (0..n_genes)
                 .into_par_iter()
                 .map(|gi| {
-                    let samp = samp_list.as_ref().and_then(|sl| sl[gi].as_deref());
+                    // Compute per-gene samp: start from base_samp, add gene_log_lengths[gi]
+                    // to channel 0 if use_lengths is set (Poisson length bias).
+                    let samp_gene: Option<Vec<f64>> = base_samp.as_ref().map(|bs| {
+                        let mut s = bs.clone();
+                        if use_lengths {
+                            if let Some(ref gll) = gene_log_lengths {
+                                s[0] += gll[gi];
+                            }
+                        }
+                        s
+                    });
                     let mut best_x: Vec<f64> = (0..lb.len())
                         .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
                         .collect();
@@ -3331,7 +3342,7 @@ fn optimize_genes_2d_sd(
                             &u_idx_list[gi], &s_idx_list[gi], &f_list[gi],
                             fixed_quad_t, quad_order, fd_eps,
                             maxiter, ftol, gtol,
-                            samp, eps, m_lbfgs, &seq_model,
+                            samp_gene.as_deref(), eps, m_lbfgs, &seq_model,
                         );
                         if kld < best_kld * ERR_THRESH {
                             best_x = x_opt;

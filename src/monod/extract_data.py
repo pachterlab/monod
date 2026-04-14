@@ -247,14 +247,23 @@ def extract_data(
     # if this is ever necessary, just make a different reference list.
     
     if transcriptome_filepath:
-        
+
         # Add gene attribute indicating whether each gene's length is included in the transcriptome,
         # and add an attribute called 'lengths' containing the lengths, and log_lengths.
         monod_adata = add_gene_lengths(monod_adata, transcriptome_dict, attribute_name='length_given')
-        
+
         # Filter the data based on whether the length is given.
         gene_filter = monod_adata.var['length_given'] == 1
         monod_adata = monod_adata[:, gene_filter].copy()
+
+    elif 'log_lengths' in monod_adata.var.columns:
+        # log_lengths already present — use as-is (no gene filtering needed).
+        log.info('Using log_lengths from adata.var for gene length bias.')
+
+    elif 'gene_length' in monod_adata.var.columns:
+        # Compute log10 lengths from raw gene_length column (same convention as transcriptome path).
+        monod_adata.var['log_lengths'] = np.log10(monod_adata.var['gene_length'])
+        log.info('Computed log_lengths from adata.var[gene_length] for gene length bias.')
 
     # Filter genes, then pick a number of random genes to make up the total desired number of genes.
     monod_adata = process_adata(monod_adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes, transcriptome_dict=transcriptome_dict, seed=seed)
