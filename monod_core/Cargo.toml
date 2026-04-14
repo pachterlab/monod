@@ -16,8 +16,8 @@ rayon = "1"
 numpy = "0.22"
 ndarray = "0.15"
 lbfgsb-rs-pure = "0.1.1"
-# ruanndata = { git = "https://github.com/pachterlab/ruanndata", default-features = false, features = ["h5ad"], optional = true }
-ruanndata = { path = "../../ruanndata", default-features = false, features = ["h5ad"], optional = true }
+ruanndata = { git = "https://github.com/pachterlab/ruanndata", default-features = false, features = ["h5ad"], optional = true }
+# ruanndata = { path = "../../ruanndata", default-features = false, features = ["h5ad"], optional = true }
 
 [features]
 default = ["ruanndata"]
