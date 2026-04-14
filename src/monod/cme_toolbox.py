@@ -582,7 +582,7 @@ class CMEModel:
             and self.bio_model in _KLD_RUST_MODELS
             and self.amb_model == "None"
             and self.quad_method == "fixed_quad"
-            and (samp is None or self.seq_model == "Poisson")
+            and (samp is None or self.seq_model in ("Poisson", "Bernoulli"))
         ):
             x, f = data
             x_np = np.asarray(x, dtype=np.int64)
@@ -597,6 +597,7 @@ class CMEModel:
                 int(self.quad_order),
                 samp.tolist() if samp is not None else None,
                 float(EPS),
+                self.seq_model,
             )
 
         proposal = self.eval_model_pss(p, limits, samp)
@@ -1003,13 +1004,11 @@ class CMEModel:
             pss = np.array(pss_flat).reshape(int(limits[0]), int(limits[1]))
             return pss.squeeze()
 
-        # Rust fast-path for Poisson technical noise (all six 2-D models).
-        # Poisson transform g → exp(λ·g) − 1 is applied inside Rust via the
-        # cached Poisson mesh, avoiding an extra Python exp() broadcast.
+        # Rust fast-path for Poisson or Bernoulli technical noise (all six 2-D models).
         if (
             _HAS_RUST
             and self.bio_model in _FAST_MODELS_2D
-            and self.seq_model == "Poisson"
+            and self.seq_model in ("Poisson", "Bernoulli")
             and self.amb_model == "None"
             and self.quad_method == "fixed_quad"
             and samp is not None
@@ -1021,6 +1020,7 @@ class CMEModel:
                 float(self.fixed_quad_T),
                 int(self.quad_order),
                 samp.tolist(),
+                seq_model=self.seq_model,
             )
             pss = np.array(pss_flat).reshape(int(limits[0]), int(limits[1]))
             return pss.squeeze()
@@ -1249,7 +1249,7 @@ class CMEModel:
             and self.bio_model in _RUST_BATCH_MODELS
             and self.amb_model == "None"
             and self.quad_method == "fixed_quad"
-            and self.seq_model in ("None", "Poisson")
+            and self.seq_model in ("None", "Poisson", "Bernoulli")
         )
         if not _batch_ok:
             return [
@@ -1275,6 +1275,7 @@ class CMEModel:
             int(self.quad_order),
             samp_py,
             num_threads,
+            self.seq_model,
         )
         return [
             np.array(flat).reshape(int(lim[0]), int(lim[1])).squeeze()

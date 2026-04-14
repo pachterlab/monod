@@ -1278,7 +1278,7 @@ class GradientInference:
         use_rust_lbfgsb = (
             _use_rust_opt
             and model.bio_model in _LBFGSB_RUST_MODELS_2D
-            and model.seq_model in ("None", "Poisson")
+            and model.seq_model in ("None", "Poisson", "Bernoulli")
             and model.amb_model == "None"
             and model.quad_method == "fixed_quad"
         )
@@ -1339,7 +1339,7 @@ class GradientInference:
             x0_all = x0_all_shared
 
             samp_list = None
-            if model.seq_model == "Poisson":
+            if model.seq_model in ("Poisson", "Bernoulli"):
                 samp_list = [
                     (self.regressor[gi].tolist() if self.regressor[gi] is not None else None)
                     for gi in range(n_genes)
@@ -1360,6 +1360,7 @@ class GradientInference:
                 eps=1e-15,
                 m_lbfgs=10,
                 num_threads=num_threads,
+                seq_model=model.seq_model,
             )
 
             if _sd_is_rust:

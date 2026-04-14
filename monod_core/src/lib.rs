@@ -202,6 +202,35 @@ fn build_mesh_2d_poisson_cached(
     mesh
 }
 
+/// Bernoulli-transformed 2-D mesh cache — keyed by (l0, l1, s0_bits, s1_bits).
+/// The Bernoulli transform is a simple scalar multiply: g_i *= s_i.
+/// s0 and s1 are the raw sampling parameters (log10 capture rates as stored in
+/// regressor_optimum — used directly without 10^ conversion, matching Python).
+static MESH_CACHE_BERNOULLI: OnceLock<Mutex<HashMap<(usize, usize, u64, u64), Arc<(Vec<Complex64>, Vec<Complex64>)>>>> =
+    OnceLock::new();
+
+fn build_mesh_2d_bernoulli_cached(
+    l0: usize,
+    l1: usize,
+    s0: f64,
+    s1: f64,
+) -> Arc<(Vec<Complex64>, Vec<Complex64>)> {
+    let key = (l0, l1, s0.to_bits(), s1.to_bits());
+    let cache = MESH_CACHE_BERNOULLI.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap();
+    if let Some(mesh) = map.get(&key) {
+        return Arc::clone(mesh);
+    }
+    let base = build_mesh_2d_cached(l0, l1);
+    let cs0 = Complex64::new(s0, 0.0);
+    let cs1 = Complex64::new(s1, 0.0);
+    let g0t: Vec<Complex64> = base.0.iter().map(|&z| z * cs0).collect();
+    let g1t: Vec<Complex64> = base.1.iter().map(|&z| z * cs1).collect();
+    let mesh = Arc::new((g0t, g1t));
+    map.insert(key, Arc::clone(&mesh));
+    mesh
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -562,18 +591,21 @@ fn eval_kld_and_grad_analytic_seq(
     quad_order: usize,
     samp_log: Option<&[f64]>,
     eps: f64,
+    seq_model: &str,
 ) -> (f64, Vec<f64>) {
     let p: Vec<f64> = x.iter().map(|&v| 10.0_f64.powf(v)).collect();
     let (l0, l1) = (limits[0], limits[1]);
     let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
 
-    // Build mesh (with optional Poisson transform).
-    let mesh = if let Some(samp) = samp_log {
-        let lam0 = 10.0_f64.powf(samp[0]);
-        let lam1 = 10.0_f64.powf(samp[1]);
-        build_mesh_2d_poisson_cached(l0, l1, lam0, lam1)
-    } else {
-        build_mesh_2d_cached(l0, l1)
+    // Build mesh with the appropriate sequencing model transform.
+    let mesh = match (samp_log, seq_model) {
+        (Some(samp), "Poisson") => {
+            build_mesh_2d_poisson_cached(l0, l1, 10f64.powf(samp[0]), 10f64.powf(samp[1]))
+        }
+        (Some(samp), "Bernoulli") => {
+            build_mesh_2d_bernoulli_cached(l0, l1, samp[0], samp[1])
+        }
+        _ => build_mesh_2d_cached(l0, l1),
     };
     let (g0, g1) = (&mesh.0, &mesh.1);
 
@@ -1025,7 +1057,7 @@ fn eval_pgf_2d(
 }
 
 #[pyfunction]
-#[pyo3(signature = (bio_model, p_log, limits, fixed_quad_t, quad_order, samp_log=None, amb_model="None", amb_log=None))]
+#[pyo3(signature = (bio_model, p_log, limits, fixed_quad_t, quad_order, samp_log=None, amb_model="None", amb_log=None, seq_model="Poisson"))]
 fn eval_model_pss_2d(
     bio_model: &str,
     p_log: Vec<f64>,
@@ -1035,18 +1067,21 @@ fn eval_model_pss_2d(
     samp_log: Option<Vec<f64>>,
     amb_model: &str,
     amb_log: Option<Vec<f64>>,
+    seq_model: &str,
 ) -> PyResult<Vec<f64>> {
     let p: Vec<f64> = p_log.iter().map(|&x| 10.0_f64.powf(x)).collect();
 
     if amb_model == "None" {
-        // --- existing 2-D path ---
+        // --- 2-D path (no ambient model) ---
         let (l0, l1) = (limits[0], limits[1]);
-        let mesh = if let Some(ref samp) = samp_log {
-            let lam0 = 10.0_f64.powf(samp[0]);
-            let lam1 = 10.0_f64.powf(samp[1]);
-            build_mesh_2d_poisson_cached(l0, l1, lam0, lam1)
-        } else {
-            build_mesh_2d_cached(l0, l1)
+        let mesh = match (samp_log.as_deref(), seq_model) {
+            (Some(samp), "Poisson") => {
+                build_mesh_2d_poisson_cached(l0, l1, 10f64.powf(samp[0]), 10f64.powf(samp[1]))
+            }
+            (Some(samp), "Bernoulli") => {
+                build_mesh_2d_bernoulli_cached(l0, l1, samp[0], samp[1])
+            }
+            _ => build_mesh_2d_cached(l0, l1),
         };
         let (g0, g1) = (&mesh.0, &mesh.1);
         let gf_log = eval_pgf_2d(bio_model, g0, g1, &p, fixed_quad_t, quad_order)?;
@@ -1149,16 +1184,19 @@ fn eval_model_pss_2d_seq(
     fixed_quad_t: f64,
     quad_order: usize,
     samp_log: Option<&[f64]>,
+    seq_model: &str,
 ) -> Vec<f64> {
     let p: Vec<f64> = p_log.iter().map(|&x| 10.0_f64.powf(x)).collect();
     let (l0, l1) = (limits[0], limits[1]);
 
-    let mesh = if let Some(samp) = samp_log {
-        let lam0 = 10.0_f64.powf(samp[0]);
-        let lam1 = 10.0_f64.powf(samp[1]);
-        build_mesh_2d_poisson_cached(l0, l1, lam0, lam1)
-    } else {
-        build_mesh_2d_cached(l0, l1)
+    let mesh = match (samp_log, seq_model) {
+        (Some(samp), "Poisson") => {
+            build_mesh_2d_poisson_cached(l0, l1, 10f64.powf(samp[0]), 10f64.powf(samp[1]))
+        }
+        (Some(samp), "Bernoulli") => {
+            build_mesh_2d_bernoulli_cached(l0, l1, samp[0], samp[1])
+        }
+        _ => build_mesh_2d_cached(l0, l1),
     };
     let (g0, g1) = (&mesh.0, &mesh.1);
 
@@ -1213,10 +1251,11 @@ fn eval_model_pss_2d_seq(
 /// limits_list  : grid dimensions per call
 /// fixed_quad_t : quadrature time-scale multiplier
 /// quad_order   : number of Gauss-Legendre quadrature points
-/// samp_list    : optional list of Poisson sampling params per call
+/// samp_list    : optional list of sampling params per call
 ///                (pass None for seq_model="None"; list entries may be None)
+/// seq_model    : sequencing model ("None", "Poisson", or "Bernoulli"); default "Poisson"
 #[pyfunction]
-#[pyo3(signature = (bio_model, params_list, limits_list, fixed_quad_t, quad_order, samp_list=None, num_threads=None))]
+#[pyo3(signature = (bio_model, params_list, limits_list, fixed_quad_t, quad_order, samp_list=None, num_threads=None, seq_model="Poisson"))]
 fn eval_model_pss_2d_batch(
     py: Python<'_>,
     bio_model: String,
@@ -1226,9 +1265,11 @@ fn eval_model_pss_2d_batch(
     quad_order: usize,
     samp_list: Option<Vec<Option<Vec<f64>>>>,
     num_threads: Option<usize>,
+    seq_model: &str,
 ) -> PyResult<Vec<Vec<f64>>> {
     // Validate bio_model once, before releasing the GIL.
     validate_bio_model_2d(&bio_model, "eval_model_pss_2d_batch")?;
+    let seq_model = seq_model.to_owned();
     let n = params_list.len();
     let results = py.allow_threads(|| {
         let run = || {
@@ -1245,6 +1286,7 @@ fn eval_model_pss_2d_batch(
                         fixed_quad_t,
                         quad_order,
                         samp,
+                        &seq_model,
                     )
                 })
                 .collect::<Vec<Vec<f64>>>()
@@ -2872,12 +2914,13 @@ fn compute_kld_sparse(
 /// f            : fractional frequency per microstate (counts / n_cells)
 /// fixed_quad_t : quadrature time-scale multiplier
 /// quad_order   : number of Gauss-Legendre quadrature points
-/// samp_log     : optional log10 Poisson sampling parameters [lam0, lam1]
+/// samp_log     : optional log10 sampling parameters [s0, s1]
 /// eps          : minimum probability floor (default 1e-15)
+/// seq_model    : sequencing model ("None", "Poisson", or "Bernoulli"); default "Poisson"
 ///
 /// Returns the scalar KLD value.
 #[pyfunction]
-#[pyo3(signature = (bio_model, p_log, limits, u_idx, s_idx, f, fixed_quad_t, quad_order, samp_log=None, eps=1e-15))]
+#[pyo3(signature = (bio_model, p_log, limits, u_idx, s_idx, f, fixed_quad_t, quad_order, samp_log=None, eps=1e-15, seq_model="Poisson"))]
 #[allow(clippy::too_many_arguments)]
 fn eval_kld_2d(
     bio_model: &str,
@@ -2890,6 +2933,7 @@ fn eval_kld_2d(
     quad_order: usize,
     samp_log: Option<Vec<f64>>,
     eps: f64,
+    seq_model: &str,
 ) -> PyResult<f64> {
     let pss = eval_model_pss_2d_seq(
         bio_model,
@@ -2898,6 +2942,7 @@ fn eval_kld_2d(
         fixed_quad_t,
         quad_order,
         samp_log.as_deref(),
+        seq_model,
     );
     let l1 = limits[1];
     Ok(compute_kld_sparse(&pss, l1, &u_idx, &s_idx, &f, eps))
@@ -2916,7 +2961,7 @@ fn eval_kld_2d(
 ///
 /// Returns (kld: float, grad: list[float]) where grad[i] = d KLD / d log10(θ_i).
 #[pyfunction]
-#[pyo3(signature = (bio_model, p_log, limits, u_idx, s_idx, f, fixed_quad_t, quad_order, fd_eps=1e-6, samp_log=None, eps=1e-15))]
+#[pyo3(signature = (bio_model, p_log, limits, u_idx, s_idx, f, fixed_quad_t, quad_order, fd_eps=1e-6, samp_log=None, eps=1e-15, seq_model="Poisson"))]
 #[allow(clippy::too_many_arguments)]
 fn eval_kld_grad_2d(
     py: Python<'_>,
@@ -2931,9 +2976,11 @@ fn eval_kld_grad_2d(
     fd_eps: f64,
     samp_log: Option<Vec<f64>>,
     eps: f64,
+    seq_model: &str,
 ) -> PyResult<(f64, Vec<f64>)> {
     // Validate model before releasing GIL.
     validate_bio_model_2d(&bio_model, "eval_kld_grad_2d")?;
+    let seq_model = seq_model.to_owned();
     let samp_ref: Option<Vec<f64>> = samp_log;
 
     // Bursty and CIR: use the semi-analytical gradient (faster and more accurate).
@@ -2941,7 +2988,7 @@ fn eval_kld_grad_2d(
         let (kld0, grad) = py.allow_threads(|| {
             eval_kld_and_grad_analytic_seq(
                 &bio_model, &p_log, &limits, &u_idx, &s_idx, &f,
-                fixed_quad_t, quad_order, samp_ref.as_deref(), eps,
+                fixed_quad_t, quad_order, samp_ref.as_deref(), eps, &seq_model,
             )
         });
         return Ok((kld0, grad));
@@ -2968,6 +3015,7 @@ fn eval_kld_grad_2d(
                     fixed_quad_t,
                     quad_order,
                     samp_ref.as_deref(),
+                    &seq_model,
                 );
                 compute_kld_sparse(&pss, l1, &u_idx, &s_idx, &f, eps)
             })
@@ -2997,24 +3045,25 @@ fn eval_kld_and_grad_seq(
     fd_eps: f64,
     samp_log: Option<&[f64]>,
     eps: f64,
+    seq_model: &str,
 ) -> (f64, Vec<f64>) {
     // Bursty and CIR: semi-analytical gradient (same path as the scipy callback).
     if bio_model == "Bursty" || bio_model == "CIR" {
         return eval_kld_and_grad_analytic_seq(
             bio_model, x, limits, u_idx, s_idx, f_data,
-            fixed_quad_t, quad_order, samp_log, eps,
+            fixed_quad_t, quad_order, samp_log, eps, seq_model,
         );
     }
     // All other models: forward finite differences.
     let l1 = limits[1];
     let n = x.len();
-    let pss0 = eval_model_pss_2d_seq(bio_model, x, limits, fixed_quad_t, quad_order, samp_log);
+    let pss0 = eval_model_pss_2d_seq(bio_model, x, limits, fixed_quad_t, quad_order, samp_log, seq_model);
     let kld0 = compute_kld_sparse(&pss0, l1, u_idx, s_idx, f_data, eps);
     let grad: Vec<f64> = (0..n)
         .map(|i| {
             let mut x_eps = x.to_vec();
             x_eps[i] += fd_eps;
-            let pss = eval_model_pss_2d_seq(bio_model, &x_eps, limits, fixed_quad_t, quad_order, samp_log);
+            let pss = eval_model_pss_2d_seq(bio_model, &x_eps, limits, fixed_quad_t, quad_order, samp_log, seq_model);
             let kld = compute_kld_sparse(&pss, l1, u_idx, s_idx, f_data, eps);
             (kld - kld0) / fd_eps
         })
@@ -3047,6 +3096,7 @@ fn lbfgsb_minimize(
     samp_log: Option<&[f64]>,
     eps: f64,
     m_mem: usize,
+    seq_model: &str,
 ) -> (Vec<f64>, f64) {
     let n = x0.len();
     let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
@@ -3059,7 +3109,7 @@ fn lbfgsb_minimize(
     let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
         eval_kld_and_grad_seq(
             bio_model, xx, limits, u_idx, s_idx, f_data,
-            fixed_quad_t, quad_order, fd_eps, samp_log, eps,
+            fixed_quad_t, quad_order, fd_eps, samp_log, eps, seq_model,
         )
     };
 
@@ -3087,7 +3137,8 @@ fn lbfgsb_minimize(
 #[pyfunction]
 #[pyo3(signature = (bio_model, x0_list, lb, ub, limits, u_idx, s_idx, f,
                     fixed_quad_t, quad_order, fd_eps=1e-6, maxiter=1000,
-                    ftol=1e-10, gtol=1e-6, samp_log=None, eps=1e-15, m_lbfgs=10))]
+                    ftol=1e-10, gtol=1e-6, samp_log=None, eps=1e-15, m_lbfgs=10,
+                    seq_model="Poisson"))]
 #[allow(clippy::too_many_arguments)]
 fn optimize_gene_2d(
     py: Python<'_>,
@@ -3108,8 +3159,10 @@ fn optimize_gene_2d(
     samp_log: Option<Vec<f64>>,
     eps: f64,
     m_lbfgs: usize,
+    seq_model: &str,
 ) -> PyResult<(Vec<f64>, f64)> {
     validate_bio_model_2d(&bio_model, "optimize_gene_2d")?;
+    let seq_model = seq_model.to_owned();
 
     let result = py.allow_threads(|| {
         let mut best_x: Vec<f64> = (0..lb.len())
@@ -3122,7 +3175,7 @@ fn optimize_gene_2d(
                 &u_idx, &s_idx, &f,
                 fixed_quad_t, quad_order, fd_eps,
                 maxiter, ftol, gtol,
-                samp_log.as_deref(), eps, m_lbfgs,
+                samp_log.as_deref(), eps, m_lbfgs, &seq_model,
             );
             if kld < best_kld * ERR_THRESH {
                 best_x = x_opt;
@@ -3142,7 +3195,7 @@ fn optimize_gene_2d(
 #[pyo3(signature = (bio_model, x0_list, lb, ub, limits_list, u_idx_list, s_idx_list, f_list,
                     fixed_quad_t, quad_order, fd_eps=1e-6, maxiter=1000,
                     ftol=1e-10, gtol=1e-6, samp_list=None, eps=1e-15,
-                    m_lbfgs=10, num_threads=None))]
+                    m_lbfgs=10, num_threads=None, seq_model="Poisson"))]
 #[allow(clippy::too_many_arguments)]
 fn optimize_genes_2d(
     py: Python<'_>,
@@ -3164,8 +3217,10 @@ fn optimize_genes_2d(
     eps: f64,
     m_lbfgs: usize,
     num_threads: Option<usize>,
+    seq_model: &str,
 ) -> PyResult<(Vec<Vec<f64>>, Vec<f64>)> {
     validate_bio_model_2d(&bio_model, "optimize_genes_2d")?;
+    let seq_model = seq_model.to_owned();
     let n_genes = x0_list.len();
 
     let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
@@ -3184,7 +3239,7 @@ fn optimize_genes_2d(
                             &u_idx_list[gi], &s_idx_list[gi], &f_list[gi],
                             fixed_quad_t, quad_order, fd_eps,
                             maxiter, ftol, gtol,
-                            samp, eps, m_lbfgs,
+                            samp, eps, m_lbfgs, &seq_model,
                         );
                         if kld < best_kld * ERR_THRESH {
                             best_x = x_opt;
@@ -3212,7 +3267,8 @@ fn optimize_genes_2d(
 #[pyfunction]
 #[pyo3(signature = (sd, bio_model, x0_list, lb, ub, fixed_quad_t, quad_order,
                     fd_eps=1e-6, maxiter=1000, ftol=1e-10, gtol=1e-6,
-                    samp_list=None, eps=1e-15, m_lbfgs=10, num_threads=None))]
+                    samp_list=None, eps=1e-15, m_lbfgs=10, num_threads=None,
+                    seq_model="Poisson"))]
 #[allow(clippy::too_many_arguments)]
 fn optimize_genes_2d_sd(
     py: Python<'_>,
@@ -3231,8 +3287,10 @@ fn optimize_genes_2d_sd(
     eps: f64,
     m_lbfgs: usize,
     num_threads: Option<usize>,
+    seq_model: &str,
 ) -> PyResult<(Vec<Vec<f64>>, Vec<f64>)> {
     validate_bio_model_2d(&bio_model, "optimize_genes_2d_sd")?;
+    let seq_model = seq_model.to_owned();
 
     // Extract all needed data from the Rust struct while holding the GIL borrow.
     // We collect into owned Vecs so they are Send and can cross the allow_threads boundary.
@@ -3273,7 +3331,7 @@ fn optimize_genes_2d_sd(
                             &u_idx_list[gi], &s_idx_list[gi], &f_list[gi],
                             fixed_quad_t, quad_order, fd_eps,
                             maxiter, ftol, gtol,
-                            samp, eps, m_lbfgs,
+                            samp, eps, m_lbfgs, &seq_model,
                         );
                         if kld < best_kld * ERR_THRESH {
                             best_x = x_opt;
@@ -4025,9 +4083,10 @@ fn optimize_genes_custom_sd(
 /// weights       : n_k mixture weights (must sum to ~1)
 /// fixed_quad_t  : quadrature time-scale multiplier
 /// quad_order    : Gauss-Legendre quadrature order
-/// samp_list     : optional n_genes list of Poisson sampling params; None for seq_model="None"
+/// samp_list     : optional n_genes list of sampling params; None for seq_model="None"
 /// eps           : probability floor before log (default 1e-15)
 /// num_threads   : optional rayon thread-pool size
+/// seq_model     : sequencing model ("None", "Poisson", or "Bernoulli"); default "Poisson"
 ///
 /// Returns (Q, lower_bound, q_func)
 ///   Q            : n_cells × n_k posterior matrix
@@ -4036,7 +4095,7 @@ fn optimize_genes_custom_sd(
 #[pyfunction]
 #[pyo3(signature = (bio_model, params_per_k, limits_list, u_obs, s_obs,
                     weights, fixed_quad_t, quad_order,
-                    samp_list=None, eps=1e-15, num_threads=None))]
+                    samp_list=None, eps=1e-15, num_threads=None, seq_model="Poisson"))]
 #[allow(clippy::too_many_arguments)]
 fn e_step_2d(
     py: Python<'_>,
@@ -4051,8 +4110,10 @@ fn e_step_2d(
     samp_list: Option<Vec<Option<Vec<f64>>>>,
     eps: f64,
     num_threads: Option<usize>,
+    seq_model: &str,
 ) -> PyResult<(Vec<Vec<f64>>, f64, f64)> {
     validate_bio_model_2d(&bio_model, "e_step_2d")?;
+    let seq_model = seq_model.to_owned();
     let n_k = params_per_k.len();
     let n_genes = limits_list.len();
     let n_cells = if n_genes > 0 && !u_obs.is_empty() { u_obs[0].len() } else { 0 };
@@ -4075,6 +4136,7 @@ fn e_step_2d(
                             fixed_quad_t,
                             quad_order,
                             samp,
+                            &seq_model,
                         );
                         let m_s = limits_list[g][1];
                         u_obs[g].iter().zip(s_obs[g].iter()).map(|(&u, &s)| {
