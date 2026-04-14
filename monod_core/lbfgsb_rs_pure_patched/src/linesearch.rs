@@ -564,57 +564,330 @@ where
     }
 }
 
-/// Convenience wrapper around `lnsrlb` that mirrors the previous
-/// `line_search_and_update` signature used by the solver. It sets standard
-/// More'-Thuente parameters and calls `lnsrlb`.
-pub fn lnsrlb_search<F>(
-    x: &[f64],
-    d: &[f64],
-    f: &mut f64,
-    grad: &mut Vec<f64>,
+// ── Task codes for scipy-compatible dcsrch ───────────────────────────────────
+const DCSRCH_START: i32 = 1;
+const DCSRCH_FG:    i32 = 10;
+const DCSRCH_CONV:  i32 = 20;
+const DCSRCH_WARN:  i32 = 100;
+// const DCSRCH_ERROR: i32 = 200;  // reserved
+
+/// Faithful port of the Fortran `dcsrch` subroutine from L-BFGS-B / MINPACK-2.
+///
+/// Two-stage More'-Thuente line search.  The caller drives it in a loop:
+///   1. Set `task = DCSRCH_START`, call once to initialise.
+///   2. Evaluate f,g at the new `stp`.  Call again with current f,g.
+///   3. Repeat while `task == DCSRCH_FG`.
+///   4. Stop when `task == DCSRCH_CONV` (success) or `DCSRCH_WARN` (best found).
+///
+/// Key algorithmic features (all absent in the previous custom dcsrch):
+/// * Two-stage: stage-1 uses a *modified* function (f - stp*gtest) to drive
+///   dcstep, so the bracket tracks the Armijo level correctly before switching.
+/// * Dynamic internal bracket [stmin, stmax]: expands (×1.1/×4) when not
+///   bracketed; contracts to [min(stx,sty), max(stx,sty)] when bracketed.
+/// * Forced bisection when |sty-stx| ≥ 0.66·width1 (bracket not shrinking).
+///
+/// dsave layout (0-indexed, matches Fortran dsave(1..13)):
+///   [0]ginit [1]gtest [2]gx [3]gy [4]finit [5]fx [6]fy
+///   [7]stx   [8]sty   [9]stmin [10]stmax [11]width [12]width1
+///
+/// isave: [0]=brackt (0/1)  [1]=stage (1/2)
+#[allow(clippy::too_many_arguments)]
+pub fn dcsrch_scipy(
+    f:       f64,
+    g:       f64,
+    stp:     &mut f64,
+    ftol:    f64,
+    gtol:    f64,
+    xtol:    f64,
+    stpmin:  f64,
+    stpmax:  f64,
+    task:    &mut i32,
+    isave:   &mut [i32; 2],
+    dsave:   &mut [f64; 13],
+) {
+    const P5:    f64 = 0.5;
+    const P66:   f64 = 0.66;
+    const XTRAPL: f64 = 1.1;
+    const XTRAPU: f64 = 4.0;
+
+    // ── Initialisation ────────────────────────────────────────────────────────
+    if *task == DCSRCH_START {
+        isave[0] = 0; // brackt = false
+        isave[1] = 1; // stage  = 1
+
+        let gtest  = ftol * g;              // ftol * ginit (negative)
+        let width  = stpmax - stpmin;
+        let width1 = width / P5;            // 2*(stpmax-stpmin)
+
+        dsave[0]  = g;                      // ginit
+        dsave[1]  = gtest;
+        dsave[2]  = g;                      // gx
+        dsave[3]  = g;                      // gy
+        dsave[4]  = f;                      // finit
+        dsave[5]  = f;                      // fx
+        dsave[6]  = f;                      // fy
+        dsave[7]  = 0.0;                    // stx
+        dsave[8]  = 0.0;                    // sty
+        dsave[9]  = 0.0;                    // stmin
+        dsave[10] = *stp + XTRAPU * *stp;  // stmax (internal; expands when not bracketed)
+        dsave[11] = width;
+        dsave[12] = width1;
+
+        *task = DCSRCH_FG;
+        return;
+    }
+
+    // ── Restore saved state ───────────────────────────────────────────────────
+    let mut brackt = isave[0] != 0;
+    let mut stage  = isave[1];
+    let ginit  = dsave[0];
+    let gtest  = dsave[1];
+    let mut gx = dsave[2];
+    let mut gy = dsave[3];
+    let finit  = dsave[4];
+    let mut fx = dsave[5];
+    let mut fy = dsave[6];
+    let mut stx    = dsave[7];
+    let mut sty    = dsave[8];
+    let mut stmin  = dsave[9];
+    let mut stmax  = dsave[10];
+    let mut width  = dsave[11];
+    let mut width1 = dsave[12];
+
+    let ftest = finit + *stp * gtest; // Armijo level
+
+    // Stage transition: matches Fortran `if (stage1 .and. f .le. ftest1
+    //   .and. g .ge. min(ftol,gtol)*ginit)`.  With ftol=1e-3 < gtol=0.9,
+    // min(ftol,gtol)*ginit = ftol*ginit = gtest (a small negative number).
+    // Using g >= 0.0 would be too strict and delay stage transition.
+    if stage == 1 && f <= ftest && g >= gtest {
+        stage = 2;
+    }
+
+    // ── Warning conditions ────────────────────────────────────────────────────
+    if brackt && (*stp <= stmin || *stp >= stmax) {
+        *task = DCSRCH_WARN; // rounding errors prevent progress
+    }
+    if brackt && stmax - stmin <= xtol * stmax {
+        *task = DCSRCH_WARN; // xtol test satisfied
+    }
+    if *stp == stpmax && f <= ftest && g <= gtest {
+        *task = DCSRCH_WARN; // stp = stpmax
+    }
+    if *stp == stpmin && (f > ftest || g >= gtest) {
+        *task = DCSRCH_WARN; // stp = stpmin
+    }
+
+    // ── Convergence ───────────────────────────────────────────────────────────
+    if f <= ftest && g.abs() <= gtol * (-ginit) {
+        *task = DCSRCH_CONV;
+    }
+
+    // ── If done, save and return ──────────────────────────────────────────────
+    if *task == DCSRCH_WARN || *task == DCSRCH_CONV {
+        isave[0] = if brackt { 1 } else { 0 };
+        isave[1] = stage;
+        dsave[2] = gx; dsave[3] = gy;
+        dsave[5] = fx; dsave[6] = fy;
+        dsave[7] = stx; dsave[8] = sty;
+        dsave[9] = stmin; dsave[10] = stmax;
+        dsave[11] = width; dsave[12] = width1;
+        return;
+    }
+
+    // ── Compute new trial step via dcstep ─────────────────────────────────────
+    if stage == 1 && f <= fx && f > ftest {
+        // Stage-1 and f between ftest and fx:
+        // Use the MODIFIED function psi(stp) = f(stp) - finit - stp*gtest
+        // so dcstep tracks the Armijo level instead of f itself.
+        let mut fxm = fx - stx * gtest;
+        let mut gxm = gx - gtest;
+        let mut fym = fy - sty * gtest;
+        let mut gym = gy - gtest;
+        let fm = f - *stp * gtest;
+        let gm = g - gtest;
+        dcstep(
+            &mut stx, &mut fxm, &mut gxm,
+            &mut sty, &mut fym, &mut gym,
+            stp, fm, gm, &mut brackt, stmin, stmax,
+        );
+        // Restore fx, fy, gx, gy from the modified counterparts and new stx/sty
+        fx = fxm + stx * gtest;
+        fy = fym + sty * gtest;
+        gx = gxm + gtest;
+        gy = gym + gtest;
+    } else {
+        dcstep(
+            &mut stx, &mut fx, &mut gx,
+            &mut sty, &mut fy, &mut gy,
+            stp, f, g, &mut brackt, stmin, stmax,
+        );
+    }
+
+    // ── Forced bisection if bracket not shrinking ─────────────────────────────
+    if brackt {
+        if (sty - stx).abs() >= P66 * width1 {
+            *stp = stx + P5 * (sty - stx);
+        }
+        width1 = width;
+        width  = (sty - stx).abs();
+    }
+
+    // ── Update internal [stmin, stmax] ────────────────────────────────────────
+    if brackt {
+        stmin = stx.min(sty);
+        stmax = stx.max(sty);
+    } else {
+        stmin = *stp + XTRAPL * (*stp - stx);
+        stmax = *stp + XTRAPU * (*stp - stx);
+    }
+
+    // Clamp to the caller-supplied outer [stpmin, stpmax] — matches Fortran
+    // `stp = max(stp, stpmin); stp = min(stp, stpmax)`.
+    *stp = stp.max(stpmin).min(stpmax);
+
+    *task = DCSRCH_FG;
+
+    // ── Save state ────────────────────────────────────────────────────────────
+    isave[0] = if brackt { 1 } else { 0 };
+    isave[1] = stage;
+    dsave[2] = gx; dsave[3] = gy;
+    dsave[5] = fx; dsave[6] = fy;
+    dsave[7] = stx; dsave[8] = sty;
+    dsave[9] = stmin; dsave[10] = stmax;
+    dsave[11] = width; dsave[12] = width1;
+}
+
+/// Scipy-compatible More'-Thuente line search driver.
+///
+/// Replaces `lnsrlb_search`.  Uses the faithful `dcsrch_scipy` state machine
+/// with parameters that exactly match the Fortran `lnsrlb` subroutine:
+///   ftol = 1e-3  (Armijo sufficient-decrease tolerance)
+///   gtol = 0.9   (curvature / strong-Wolfe tolerance)
+///   xtol = 0.1   (relative step-width tolerance)
+///   stpmin = 0
+///   maxls = MAX_BACKTRACK (= 20, matching scipy's default)
+///
+/// Returns `Ok((x_new, f_new, g_new, stp, gdold))` on success.
+///   `stp`   — accepted step length (needed for scipy-matching BFGS skip check).
+///   `gdold` — initial directional derivative g_0ᵀ d (negative; needed for skip check).
+/// Returns `Err(...)` on line-search failure; the caller's `*f` and `*grad` are
+/// *not* modified in that case, so the caller can restore the previous iterate.
+pub fn lnsrlb_scipy_search<F>(
+    x:     &[f64],
+    d:     &[f64],
+    f:     &mut f64,
+    grad:  &mut Vec<f64>,
     lower: &[f64],
     upper: &[f64],
-    func: &mut F,
-) -> Result<(Vec<f64>, f64, Vec<f64>), crate::Status>
+    func:  &mut F,
+) -> Result<(Vec<f64>, f64, Vec<f64>, f64, f64), crate::Status>
 where
     F: FnMut(&[f64]) -> (f64, Vec<f64>),
 {
-    // initial directional derivative along d
-    let g0_dot_d = blas::ddot(grad, d);
-    if g0_dot_d >= 0.0 {
+    let n = x.len();
+
+    // Initial directional derivative — must be negative for descent
+    let gdold = blas::ddot(grad, d);
+    if gdold >= 0.0 {
         return Err(crate::Status::NumericalFailure);
     }
 
-    let mut stp = 1.0_f64;
-    let stpmin = 1e-20_f64;
-    // scipy-compatible stpmax: maximum step that keeps x within [lower, upper].
-    // matches the Fortran `stpmx` computation in lnsrlb.f.
-    let stpmax = {
-        let mut smax = 1.0e20_f64;
-        for i in 0..x.len() {
-            if d[i] > 0.0 { smax = smax.min((upper[i] - x[i]) / d[i]); }
-            else if d[i] < 0.0 { smax = smax.min((lower[i] - x[i]) / d[i]); }
+    // Parameters matching Fortran lnsrlb
+    let ftol:   f64 = 1e-3;   // Armijo tolerance (Fortran uses 1e-3, NOT 1e-4)
+    let gtol:   f64 = 0.9;
+    let xtol:   f64 = 0.1;
+    let stpmin: f64 = 0.0;    // Fortran uses zero
+    // stpmax: maximum step that stays within box (matches Fortran stpmx computation)
+    let stpmax: f64 = {
+        let mut smax = 1.0e10_f64; // "big" in Fortran lnsrlb
+        for i in 0..n {
+            if d[i] > 0.0 && upper[i].is_finite() {
+                let gap = upper[i] - x[i];
+                if gap <= 0.0 { smax = 0.0; } else { smax = smax.min(gap / d[i]); }
+            } else if d[i] < 0.0 && lower[i].is_finite() {
+                let gap = lower[i] - x[i]; // negative
+                if gap >= 0.0 { smax = 0.0; } else { smax = smax.min(gap / d[i]); }
+            }
         }
-        smax.max(stpmin)
+        smax.max(0.0)
     };
-    let ftol = 1e-4_f64;
-    let gtol = 0.9_f64;
-    let xtol = 1e-6_f64;
-    let maxfev = crate::MAX_BACKTRACK as i32;
 
-    // call the safeguarded driver
-    match lnsrlb(
-        x, d, *f, g0_dot_d, &mut stp, stpmin, stpmax, ftol, gtol, xtol, maxfev, lower, upper, func,
-    ) {
-        Ok((x_new, f_new, grad_new)) => {
-            // update caller-supplied f and grad to accepted values
-            *f = f_new;
-            *grad = grad_new.clone();
-            Ok((x_new, f_new, grad_new))
+    let mut stp:  f64 = 1.0;
+    let maxls = crate::MAX_BACKTRACK;
+
+    let mut task:  i32      = DCSRCH_START;
+    let mut isave: [i32; 2] = [0; 2];
+    let mut dsave: [f64;13] = [0.0; 13];
+
+    // Initialise the state machine (does not evaluate f/g)
+    dcsrch_scipy(*f, gdold, &mut stp, ftol, gtol, xtol, stpmin, stpmax,
+                 &mut task, &mut isave, &mut dsave);
+
+    let f_init = *f; // starting value — used for improvement check below
+    let mut x_try  = vec![0.0f64; n];
+    let mut f_try  = *f;
+    let mut g_try  = grad.clone();
+    let mut nfev   = 0usize;
+
+    loop {
+        if task != DCSRCH_FG { break; }
+
+        if nfev >= maxls {
+            // Exhausted line-search budget — return failure.
+            // Caller's *f and *grad are unchanged; caller can restore old iterate.
+            return Err(crate::Status::LineSearchFailure);
         }
-        Err(e) => Err(e),
+
+        // Evaluate at projected trial point x + stp·d
+        for i in 0..n {
+            let xi = x[i] + stp * d[i];
+            x_try[i] = xi.max(lower[i]).min(upper[i]);
+        }
+        let (fn_val, gn_val) = func(&x_try);
+        f_try = fn_val;
+        g_try = gn_val;
+        nfev += 1;
+
+        // Directional derivative at trial point (g_trial^T d)
+        let gd = blas::ddot(&g_try, d);
+
+        dcsrch_scipy(f_try, gd, &mut stp, ftol, gtol, xtol, stpmin, stpmax,
+                     &mut task, &mut isave, &mut dsave);
+    }
+
+    if task == DCSRCH_CONV || task == DCSRCH_WARN {
+        if f_try < f_init {
+            // Last evaluated point improved — standard acceptance.
+            *f    = f_try;
+            *grad = g_try.clone();
+            return Ok((x_try, f_try, g_try, stp, gdold));
+        }
+        // WARN/CONV but the last evaluated point didn't improve f.  This can
+        // happen when WARN fires due to rounding (stp stuck at bracket
+        // boundary) before a decrease was found.  Try to recover the best
+        // bracket point stx (dsave[7]) whose f-value is dsave[5].
+        let stx    = dsave[7]; // best step length in bracket
+        let fx_stx = dsave[5]; // f at stx (may be < f_init if stx > 0)
+        if stx > 0.0 && fx_stx < f_init {
+            for i in 0..n {
+                x_try[i] = (x[i] + stx * d[i]).max(lower[i]).min(upper[i]);
+            }
+            let (fn_stx, gn_stx) = func(&x_try);
+            if fn_stx < f_init {
+                *f    = fn_stx;
+                *grad = gn_stx.clone();
+                return Ok((x_try, fn_stx, gn_stx, stx, gdold));
+            }
+        }
+        // Could not find an improving point — signal failure so the caller
+        // can reset L-BFGS memory and retry from a gradient step.
+        Err(crate::Status::LineSearchFailure)
+    } else {
+        Err(crate::Status::LineSearchFailure)
     }
 }
+
 
 #[cfg(test)]
 mod tests {

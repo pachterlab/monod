@@ -1228,12 +1228,7 @@ fn eval_model_pss_2d_batch(
     num_threads: Option<usize>,
 ) -> PyResult<Vec<Vec<f64>>> {
     // Validate bio_model once, before releasing the GIL.
-    match bio_model.as_str() {
-        "Constitutive" | "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => {}
-        other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown bio_model for eval_model_pss_2d_batch: {other}"
-        ))),
-    }
+    validate_bio_model_2d(&bio_model, "eval_model_pss_2d_batch")?;
     let n = params_list.len();
     let results = py.allow_threads(|| {
         let run = || {
@@ -1327,6 +1322,20 @@ fn protein_bursty_pgf(
 // covers max_count ≈ 128 per layer, which handles the vast majority of real
 // RNA-seq genes.
 const DENSE_THRESHOLD: usize = 1 << 14; // 16384
+
+/// Fraction by which a new restart's KLD must beat the current best to be accepted.
+const ERR_THRESH: f64 = 0.99;
+
+/// Validate that a bio_model string names a supported 2-D model, returning a
+/// `PyValueError` with a descriptive message if not.
+fn validate_bio_model_2d(bio_model: &str, caller: &str) -> pyo3::PyResult<()> {
+    match bio_model {
+        "Constitutive" | "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => Ok(()),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown bio_model for {caller}: {other}"
+        ))),
+    }
+}
 
 // Per-thread scratch buffers reused across genes — avoids one allocation per
 // gene for the sort-based fallback path.
@@ -1937,6 +1946,35 @@ impl SearchData {
                 samp_lin_vec.as_deref(),
             )
         }).collect()
+    }
+}
+
+impl SearchData {
+    /// Clone the three fields consumed by every `optimize_genes_*_sd` function.
+    ///
+    /// Called under the GIL borrow; returns owned `Vec`s that are `Send` and
+    /// can be moved across the `py.allow_threads` boundary.
+    fn extract_for_parallel(
+        &self,
+    ) -> (Vec<Vec<Vec<i64>>>, Vec<Vec<f64>>, Vec<Vec<usize>>, usize) {
+        (self.coords.clone(), self.freqs.clone(), self.limits.clone(), self.n_genes)
+    }
+}
+
+/// Run `run` on a rayon thread pool of the requested size, falling back to the
+/// global pool if `num_threads` is `None` or pool creation fails.
+fn run_with_pool<T, F>(num_threads: Option<usize>, run: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn() -> Vec<T> + Send + Sync,
+{
+    match num_threads {
+        Some(nt) => rayon::ThreadPoolBuilder::new()
+            .num_threads(nt)
+            .build()
+            .map(|pool| pool.install(&run))
+            .unwrap_or_else(|_| run()),
+        None => run(),
     }
 }
 
@@ -2895,12 +2933,7 @@ fn eval_kld_grad_2d(
     eps: f64,
 ) -> PyResult<(f64, Vec<f64>)> {
     // Validate model before releasing GIL.
-    match bio_model.as_str() {
-        "Constitutive" | "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => {}
-        other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown bio_model for eval_kld_grad_2d: {other}"
-        ))),
-    }
+    validate_bio_model_2d(&bio_model, "eval_kld_grad_2d")?;
     let samp_ref: Option<Vec<f64>> = samp_log;
 
     // Bursty and CIR: use the semi-analytical gradient (faster and more accurate).
@@ -3076,13 +3109,8 @@ fn optimize_gene_2d(
     eps: f64,
     m_lbfgs: usize,
 ) -> PyResult<(Vec<f64>, f64)> {
-    match bio_model.as_str() {
-        "Constitutive" | "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => {}
-        other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown bio_model for optimize_gene_2d: {other}"
-        ))),
-    }
-    const ERR_THRESH: f64 = 0.99;
+    validate_bio_model_2d(&bio_model, "optimize_gene_2d")?;
+
     let result = py.allow_threads(|| {
         let mut best_x: Vec<f64> = (0..lb.len())
             .map(|i| x0_list[0][i].max(lb[i]).min(ub[i]))
@@ -3137,17 +3165,11 @@ fn optimize_genes_2d(
     m_lbfgs: usize,
     num_threads: Option<usize>,
 ) -> PyResult<(Vec<Vec<f64>>, Vec<f64>)> {
-    match bio_model.as_str() {
-        "Constitutive" | "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => {}
-        other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown bio_model for optimize_genes_2d: {other}"
-        ))),
-    }
+    validate_bio_model_2d(&bio_model, "optimize_genes_2d")?;
     let n_genes = x0_list.len();
-    const ERR_THRESH: f64 = 0.99;
 
     let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
-        let run = || {
+        run_with_pool(num_threads, || {
             (0..n_genes)
                 .into_par_iter()
                 .map(|gi| {
@@ -3172,19 +3194,10 @@ fn optimize_genes_2d(
                     (best_x, best_kld)
                 })
                 .collect()
-        };
-        match num_threads {
-            Some(nt) => rayon::ThreadPoolBuilder::new()
-                .num_threads(nt)
-                .build()
-                .map(|pool| pool.install(run))
-                .unwrap_or_else(|_| run()),
-            None => run(),
-        }
+        })
     });
 
-    let params: Vec<Vec<f64>> = results.iter().map(|(x, _)| x.clone()).collect();
-    let klds: Vec<f64> = results.iter().map(|(_, k)| *k).collect();
+    let (params, klds): (Vec<Vec<f64>>, Vec<f64>) = results.into_iter().unzip();
     Ok((params, klds))
 }
 
@@ -3219,12 +3232,7 @@ fn optimize_genes_2d_sd(
     m_lbfgs: usize,
     num_threads: Option<usize>,
 ) -> PyResult<(Vec<Vec<f64>>, Vec<f64>)> {
-    match bio_model.as_str() {
-        "Constitutive" | "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => {}
-        other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown bio_model for optimize_genes_2d_sd: {other}"
-        ))),
-    }
+    validate_bio_model_2d(&bio_model, "optimize_genes_2d_sd")?;
 
     // Extract all needed data from the Rust struct while holding the GIL borrow.
     // We collect into owned Vecs so they are Send and can cross the allow_threads boundary.
@@ -3248,9 +3256,9 @@ fn optimize_genes_2d_sd(
         (u, s, f, lim, n)
     }; // sd_ref dropped — GIL borrow released before allow_threads
 
-    const ERR_THRESH: f64 = 0.99;
+
     let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
-        let run = || {
+        run_with_pool(num_threads, || {
             (0..n_genes)
                 .into_par_iter()
                 .map(|gi| {
@@ -3275,19 +3283,10 @@ fn optimize_genes_2d_sd(
                     (best_x, best_kld)
                 })
                 .collect()
-        };
-        match num_threads {
-            Some(nt) => rayon::ThreadPoolBuilder::new()
-                .num_threads(nt)
-                .build()
-                .map(|pool| pool.install(run))
-                .unwrap_or_else(|_| run()),
-            None => run(),
-        }
+        })
     });
 
-    let params: Vec<Vec<f64>> = results.iter().map(|(x, _)| x.clone()).collect();
-    let klds: Vec<f64> = results.iter().map(|(_, k)| *k).collect();
+    let (params, klds): (Vec<Vec<f64>>, Vec<f64>) = results.into_iter().unzip();
     Ok((params, klds))
 }
 
@@ -3470,13 +3469,12 @@ fn optimize_genes_protein_bursty_sd(
                 "optimize_genes_protein_bursty_sd requires at least 3 layers",
             ));
         }
-        let n = sd_ref.n_genes;
-        (sd_ref.coords.clone(), sd_ref.freqs.clone(), sd_ref.limits.clone(), n)
+        sd_ref.extract_for_parallel()
     };
 
-    const ERR_THRESH: f64 = 0.99;
+
     let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
-        let run = || {
+        run_with_pool(num_threads, || {
             (0..n_genes)
                 .into_par_iter()
                 .map(|gi| {
@@ -3501,19 +3499,10 @@ fn optimize_genes_protein_bursty_sd(
                     (best_x, best_kld)
                 })
                 .collect()
-        };
-        match num_threads {
-            Some(nt) => rayon::ThreadPoolBuilder::new()
-                .num_threads(nt)
-                .build()
-                .map(|pool| pool.install(run))
-                .unwrap_or_else(|_| run()),
-            None => run(),
-        }
+        })
     });
 
-    let params: Vec<Vec<f64>> = results.iter().map(|(x, _)| x.clone()).collect();
-    let klds: Vec<f64> = results.iter().map(|(_, k)| *k).collect();
+    let (params, klds): (Vec<Vec<f64>>, Vec<f64>) = results.into_iter().unzip();
     Ok((params, klds))
 }
 
@@ -3712,12 +3701,7 @@ fn optimize_genes_2d_amb_sd(
     m_lbfgs: usize,
     num_threads: Option<usize>,
 ) -> PyResult<(Vec<Vec<f64>>, Vec<f64>)> {
-    match bio_model.as_str() {
-        "Constitutive" | "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => {}
-        other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown bio_model for optimize_genes_2d_amb_sd: {other}"
-        ))),
-    }
+    validate_bio_model_2d(&bio_model, "optimize_genes_2d_amb_sd")?;
     match amb_model.as_str() {
         "Equal" | "Unequal" => {}
         other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -3732,13 +3716,12 @@ fn optimize_genes_2d_amb_sd(
                 "optimize_genes_2d_amb_sd requires at least 3 layers (u, s, ambient)",
             ));
         }
-        let n = sd_ref.n_genes;
-        (sd_ref.coords.clone(), sd_ref.freqs.clone(), sd_ref.limits.clone(), n)
+        sd_ref.extract_for_parallel()
     };
 
-    const ERR_THRESH: f64 = 0.99;
+
     let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
-        let run = || {
+        run_with_pool(num_threads, || {
             (0..n_genes)
                 .into_par_iter()
                 .map(|gi| {
@@ -3764,19 +3747,10 @@ fn optimize_genes_2d_amb_sd(
                     (best_x, best_kld)
                 })
                 .collect()
-        };
-        match num_threads {
-            Some(nt) => rayon::ThreadPoolBuilder::new()
-                .num_threads(nt)
-                .build()
-                .map(|pool| pool.install(run))
-                .unwrap_or_else(|_| run()),
-            None => run(),
-        }
+        })
     });
 
-    let params: Vec<Vec<f64>> = results.iter().map(|(x, _)| x.clone()).collect();
-    let klds: Vec<f64> = results.iter().map(|(_, k)| *k).collect();
+    let (params, klds): (Vec<Vec<f64>>, Vec<f64>) = results.into_iter().unzip();
     Ok((params, klds))
 }
 
@@ -3991,17 +3965,13 @@ fn optimize_genes_custom_sd(
         ));
     }
 
-    let (coords_list, f_list, limits_list, n_genes) = {
-        let sd_ref = sd.borrow();
-        let n = sd_ref.n_genes;
-        (sd_ref.coords.clone(), sd_ref.freqs.clone(), sd_ref.limits.clone(), n)
-    };
+    let (coords_list, f_list, limits_list, n_genes) = sd.borrow().extract_for_parallel();
 
     let rxns = build_rxns(&rxn_kinds, &rxn_rate_idxs, &rxn_extra1, &rxn_extra2, &prod_off);
 
-    const ERR_THRESH: f64 = 0.99;
+
     let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
-        let run = || {
+        run_with_pool(num_threads, || {
             (0..n_genes)
                 .into_par_iter()
                 .map(|gi| {
@@ -4027,19 +3997,10 @@ fn optimize_genes_custom_sd(
                     (best_x, best_kld)
                 })
                 .collect()
-        };
-        match num_threads {
-            Some(nt) => rayon::ThreadPoolBuilder::new()
-                .num_threads(nt)
-                .build()
-                .map(|pool| pool.install(run))
-                .unwrap_or_else(|_| run()),
-            None => run(),
-        }
+        })
     });
 
-    let params: Vec<Vec<f64>> = results.iter().map(|(x, _)| x.clone()).collect();
-    let klds: Vec<f64> = results.iter().map(|(_, k)| *k).collect();
+    let (params, klds): (Vec<Vec<f64>>, Vec<f64>) = results.into_iter().unzip();
     Ok((params, klds))
 }
 
@@ -4091,12 +4052,7 @@ fn e_step_2d(
     eps: f64,
     num_threads: Option<usize>,
 ) -> PyResult<(Vec<Vec<f64>>, f64, f64)> {
-    match bio_model.as_str() {
-        "Constitutive" | "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => {}
-        other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown bio_model for e_step_2d: {other}"
-        ))),
-    }
+    validate_bio_model_2d(&bio_model, "e_step_2d")?;
     let n_k = params_per_k.len();
     let n_genes = limits_list.len();
     let n_cells = if n_genes > 0 && !u_obs.is_empty() { u_obs[0].len() } else { 0 };

@@ -1307,6 +1307,8 @@ class GradientInference:
             and len(model.network.species) in (2, 3)
         )
 
+        _rust_opt_active = use_rust_lbfgsb or use_rust_protein_bursty or use_rust_amb or use_rust_custom
+
         def _build_x0_all(n_genes, n_restarts):
             x0_all = []
             for gi in range(n_genes):
@@ -1317,7 +1319,12 @@ class GradientInference:
                 )
                 if self.gradient_params["init_pattern"] == "moments":
                     x0[0] = self.param_MoM[gi]
-                if self.warm_start is not None:
+                # Warm-start override: skip for Rust optimizer paths.
+                # The Rust optimizer runs >10× faster so warm starts give no speed benefit,
+                # and propagating a bad solution from an earlier grid point can cascade into
+                # poor local minima for all subsequent grid points (the landscape shifts
+                # significantly across the grid). MoM is already a strong starting point.
+                if self.warm_start is not None and not _rust_opt_active:
                     x0[0] = np.clip(self.warm_start[gi], self.phys_lb, self.phys_ub)
                 x0_all.append(x0.tolist())
             return x0_all

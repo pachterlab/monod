@@ -23,5 +23,5 @@ ruanndata = { path = "../../ruanndata", default-features = false, features = ["h
 default = ["ruanndata"]
 
 [patch.crates-io]
-hdf5-metno-sys = { path = "../../Random/hdf5-metno-sys-patched" }
+hdf5-metno-sys = { path = "hdf5_metno_sys_patched" }
 lbfgsb-rs-pure = { path = "lbfgsb_rs_pure_patched" }

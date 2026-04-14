@@ -281,15 +281,17 @@ impl LBFGSB {
 
             // ── Line search ───────────────────────────────────────────────────
             let f_prev = f;
-            match linesearch::lnsrlb_search(x, &d, &mut f, &mut grad, lower, upper, &mut func) {
-                Ok((x_new, f_new, g_new)) => {
+            match linesearch::lnsrlb_scipy_search(x, &d, &mut f, &mut grad, lower, upper, &mut func) {
+                Ok((x_new, f_new, g_new, stp_accepted, gdold)) => {
                     let s_vec = sub_vecs(&x_new, x);
                     let y_vec = sub_vecs(&g_new, &grad);
                     let sty = blas::ddot(&s_vec, &y_vec);
                     let yy  = blas::ddot(&y_vec, &y_vec);
-                    // Relative sty threshold — matches reference Fortran `ys > epsmch * yy`.
-                    if sty > f64::EPSILON * yy {
-                        self.push_correction(s_vec.clone(), y_vec.clone());
+                    // Match scipy Fortran: skip if s'y <= eps * |g0'd| * stp
+                    // i.e., sty <= eps * (-gdold * stp_accepted)
+                    let ddum = (-gdold * stp_accepted).max(0.0);
+                    if sty > f64::EPSILON * ddum {
+                        self.push_correction(&s_vec, &y_vec);
                         self.iupdat += 1;
                         let _ = subalgorithms::matupd(
                             n, self.m,
@@ -312,14 +314,36 @@ impl LBFGSB {
                     f = f_new;
                     grad = g_new;
                 }
-                Err(status) => {
-                    return Ok(crate::Solution { x: x.to_vec(), f,
-                                                iterations: iter - 1, status });
+                Err(_) => {
+                    // Match Fortran mainlb: if memory is non-empty, reset and restart.
+                    // If memory is empty (col==0), the step itself failed — return error.
+                    if self.col > 0 {
+                        self.col = 0;
+                        self.head = 0;
+                        self.iupdat = 0;
+                        self.theta = 1.0;
+                        self.s.clear();
+                        self.y.clear();
+                        self.rho.clear();
+                        for v in self.ws.iter_mut() { *v = 0.0; }
+                        for v in self.wy.iter_mut() { *v = 0.0; }
+                        for v in self.sy.iter_mut() { *v = 0.0; }
+                        for v in self.ss.iter_mut() { *v = 0.0; }
+                        for v in self.wt.iter_mut() { *v = 0.0; }
+                        continue;
+                    } else {
+                        return Ok(crate::Solution { x: x.to_vec(), f,
+                                                    iterations: iter - 1,
+                                                    status: crate::Status::LineSearchFailure });
+                    }
                 }
             }
 
             // ── ftol check ────────────────────────────────────────────────────
-            if self.ftol > 0.0 {
+            // Only declare convergence when f actually decreased (f < f_prev)
+            // but the improvement was negligible.  Never fire when f got worse
+            // (that would terminate at a bad point after a WARN-restart).
+            if self.ftol > 0.0 && f < f_prev {
                 let denom = f_prev.abs().max(f.abs()).max(1.0);
                 if (f_prev - f) / denom <= self.ftol {
                     return Ok(crate::Solution { x: x.to_vec(), f, iterations: iter,
@@ -557,8 +581,8 @@ impl LBFGSB {
     }
 
     /// Push a new correction pair (s, y) into the L-BFGS memory.
-    fn push_correction(&mut self, s_vec: Vec<f64>, y_vec: Vec<f64>) {
-        let sty = blas::ddot(&s_vec, &y_vec);
+    fn push_correction(&mut self, s_vec: &[f64], y_vec: &[f64]) {
+        let sty = blas::ddot(s_vec, y_vec);
         if sty == 0.0 { return; }
         let rho_val = 1.0 / sty;
         if self.s.len() == self.m {
@@ -566,8 +590,8 @@ impl LBFGSB {
             self.y.remove(0);
             self.rho.remove(0);
         }
-        self.s.push(s_vec);
-        self.y.push(y_vec);
+        self.s.push(s_vec.to_vec());
+        self.y.push(y_vec.to_vec());
         self.rho.push(rho_val);
     }
 }
