@@ -308,7 +308,7 @@ def searchdata_from_adata(adata):
 
     gene_log_lengths = None
     try:
-        gene_log_lengths = list(adata.var['log_lengths'])
+        gene_log_lengths = np.asarray(adata.var['log_lengths'], dtype=np.float64)
     except KeyError:
         pass
 
