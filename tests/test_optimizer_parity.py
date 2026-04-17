@@ -63,7 +63,7 @@ def _build_sd(layers, layer_names, limits_arr):
     n_cells = layers[0].shape[0]
     n_genes = layers[0].shape[1]
     gene_names = [f"G{i}" for i in range(n_genes)]
-    return _mc.SearchData(
+    return _mc.searchdata_from_arrays(
         layers, layer_names,
         np.ascontiguousarray(limits_arr, dtype=np.int64),
         coords_list, freqs_list,

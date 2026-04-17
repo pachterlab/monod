@@ -123,7 +123,7 @@ def perform_inference(h5ad_filepath,
         if 'log_lengths' in monod_adata.var.columns:
             log.info('Gene lengths found in adata.var, using for inference.')
         else:
-            use_lengths = False
+            use_lengths = None
             log.info('Lengths have not been given so are not being used')
 
     if not mek_means_params:
@@ -323,7 +323,7 @@ def searchdata_from_adata(adata):
         rust_layers = [_to_c_int64(adata.layers[ln]) for ln in ordered_layer_names]
         coords_list, freqs_list = _mc.make_state_dist(rust_layers)
         limits_arr  = np.ascontiguousarray(M, dtype=np.int64)
-        return _mc.SearchData(
+        return _mc.searchdata_from_arrays(
             rust_layers,
             ordered_layer_names,
             limits_arr,
@@ -651,10 +651,12 @@ class InferenceParameters:
         log10 upper bounds on biological parameters.
     grad_bnd: scipy.optimize.Bounds
         log10 lower and upper bounds on biological parameters.
-    use_lengths: bool
-        if True, the nascent Poisson model technical variation parameter is a
-        coefficient multiplied by gene length.
-        if False, the parameter is the genome-wide nascent sampling rate.
+    use_lengths: None | "unspliced" | "spliced" | "both"
+        Controls which Poisson sampling channels receive a per-gene log-length offset.
+        None: no length correction (genome-wide sampling rate for all channels).
+        "unspliced": add log10(gene_length) to the unspliced sampling parameter.
+        "spliced": add log10(gene_length) to the spliced sampling parameter.
+        "both": add log10(gene_length) to both sampling parameters.
     samp_lb: np.ndarray
         log10 lower bounds on technical variation parameters.
     samp_ub: np.ndarray
@@ -722,10 +724,11 @@ class InferenceParameters:
             dataset-specific directory location.
         model: monod.cme_toolbox.CMEModel
             CME model used for inference.
-        use_lengths: bool, optional
-            if True, the nascent Poisson model technical variation parameter is a
-            coefficient multiplied by gene length.
-            if False, the parameter is the genome-wide nascent sampling rate.
+        use_lengths: None | "unspliced" | "spliced" | "both", optional
+            Which Poisson sampling channels receive a per-gene log-length offset.
+            None: no correction. "unspliced": unspliced channel only.
+            "spliced": spliced channel only. "both": both channels.
+            Legacy bool values are accepted: True → "unspliced", False → None.
         gradient_params: dict, optional
             settings for gradient descent.
             "max_iterations" defines the maximum number of gradient descent iterations.
@@ -763,6 +766,17 @@ class InferenceParameters:
         self.phys_ub = np.array(phys_ub)
         self.grad_bnd = scipy.optimize.Bounds(phys_lb, phys_ub)
 
+        # Normalise use_lengths to one of: None, "unspliced", "spliced", "both".
+        # Accept legacy bool for backward compatibility.
+        if use_lengths is True:
+            use_lengths = "unspliced"
+        elif use_lengths is False:
+            use_lengths = None
+        if use_lengths not in (None, "unspliced", "spliced", "both"):
+            raise ValueError(
+                "use_lengths must be None, 'unspliced', 'spliced', or 'both'; "
+                f"got {use_lengths!r}"
+            )
         self.use_lengths = use_lengths
         self.poisson_average_log_length = poisson_average_log_length
 
@@ -1012,7 +1026,7 @@ class GradientInference:
         the index of the current point, within [0, n_grid_points).
     regressor: np.ndarray
         gene-specific technical variation parameter values at the current grid point.
-        these values will be different for each gene if use_lengths=True in the
+        these values will be different for each gene if use_lengths is not None in the
         InferenceParameters constructor.
     grad_bnd: scipy.optimize.Bounds
         log10 lower and upper bounds on biological parameters.
@@ -1057,7 +1071,7 @@ class GradientInference:
             the index of the current point, within [0, n_grid_points).
         regressor: np.ndarray
             gene-specific technical variation parameter values at the current grid point.
-            these values will be different for each gene if use_lengths=True in the
+            these values will be different for each gene if use_lengths is not None in the
             InferenceParameters constructor.
         grad_bnd: scipy.optimize.Bounds
             log10 lower and upper bounds on biological parameters.
@@ -1085,7 +1099,8 @@ class GradientInference:
             [global_parameters.sampl_vals[point_index]] * search_data.n_genes
         )
 
-        if global_parameters.use_lengths:
+        use_lengths_mode = global_parameters.use_lengths
+        if use_lengths_mode is not None:
             if model.seq_model == "Bernoulli":
                 raise ValueError(
                     "The Bernoulli model does not yet have a physical length-based model."
@@ -1095,12 +1110,15 @@ class GradientInference:
                     "The model without technical noise has no length effects."
                 )
             elif model.seq_model == "Poisson":
-                regressor[:, 0] += search_data.gene_log_lengths
+                lengths = search_data.gene_log_lengths
+                if use_lengths_mode in ("unspliced", "both"):
+                    regressor[:, 0] += lengths
+                if use_lengths_mode in ("spliced", "both"):
+                    regressor[:, 1] += lengths
             else:
                 raise ValueError(
                     "Please select a technical noise model from {Poisson}, {Bernoulli}, {None}."
                 )
-
         else:
             # If no specific lengths given, multiply the unspliced sampling rate by an average length value for all genes.
             if model.seq_model == "Poisson" and getattr(model, 'fit_unspliced', False):
@@ -1363,17 +1381,21 @@ class GradientInference:
             if _sd_is_rust:
                 # Zero round-trip path: Rust reads coords/freqs/limits from SearchData
                 # and computes per-gene samp inside the rayon loop — no Python marshal.
-                use_lengths_rust = self.use_lengths and model.seq_model == "Poisson"
+                _ul = self.use_lengths if model.seq_model == "Poisson" else None
+                use_lengths_unsp = _ul in ("unspliced", "both")
+                use_lengths_spl  = _ul in ("spliced", "both")
+                use_lengths_any  = use_lengths_unsp or use_lengths_spl
                 if model.seq_model in ("Poisson", "Bernoulli"):
                     # When using gene lengths, pass raw grid_point so Rust adds per-gene
                     # log-lengths. Otherwise pass regressor[0] (same for all genes).
-                    base_samp = list(self.grid_point) if use_lengths_rust else self.regressor[0].tolist()
+                    base_samp = list(self.grid_point) if use_lengths_any else self.regressor[0].tolist()
                 else:
                     base_samp = None
                 params_arr, klds_arr = _mc.optimize_genes_2d_sd(
                     search_data,
                     base_samp=base_samp,
-                    use_lengths=use_lengths_rust,
+                    use_lengths_unspliced=use_lengths_unsp,
+                    use_lengths_spliced=use_lengths_spl,
                     **_base_kwargs,
                 )
             else:
@@ -1800,7 +1822,7 @@ class GridPointResults:
         runtime in seconds.
     regressor: np.ndarray
         gene-specific technical variation parameter values at the current grid point.
-        these values will be different for each gene if use_lengths=True in the
+        these values will be different for each gene if use_lengths is not None in the
         InferenceParameters constructor.
     grid_point: list of floats
         genome-wide technical variation parameter values at the current grid point.
@@ -1886,7 +1908,7 @@ class SearchResults:
     regressor: float np.ndarray
         gene-specific technical variation parameter values at each grid point.
         an n_grid_pts x n_genes array.
-        these values will be different for each gene if use_lengths=True in the
+        these values will be different for each gene if use_lengths is not None in the
         InferenceParameters constructor.
     analysis_figure_string: str
         directory for analysis figures.

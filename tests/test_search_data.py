@@ -95,7 +95,7 @@ def _build_sd(n_cells=200, n_genes=10, n_layers=2,
     limits = _make_limits(n_layers, n_genes)
     coords_list, freqs_list = _make_hist_unique(layers, n_layers, n_genes)
     gene_names = [f"GENE{i}" for i in range(n_genes)]
-    return _mc.SearchData(
+    return _mc.searchdata_from_arrays(
         layers, layer_names, limits,
         coords_list, freqs_list,
         gene_names, n_cells, "unique",
@@ -247,7 +247,7 @@ class TestMoments:
         layers = _make_layers(n_cells, n_genes, 2)
         limits = _make_limits(2, n_genes)
         coords_list, freqs_list = _make_hist_unique(layers, 2, n_genes)
-        sd = _mc.SearchData(layers, layer_names, limits, coords_list, freqs_list,
+        sd = _mc.searchdata_from_arrays(layers, layer_names, limits, coords_list, freqs_list,
                             [f"G{i}" for i in range(n_genes)], n_cells, "unique")
         ref = _ref_moments(layers, layer_names)
         for g in range(n_genes):
@@ -261,7 +261,7 @@ class TestMoments:
         layers = _make_layers(n_cells, n_genes, 3)
         limits = _make_limits(3, n_genes)
         c, f = _make_hist_unique(layers, 3, n_genes)
-        sd = _mc.SearchData(layers, layer_names, limits, c, f,
+        sd = _mc.searchdata_from_arrays(layers, layer_names, limits, c, f,
                             [f"G{i}" for i in range(n_genes)], n_cells, "unique")
         ref = _ref_moments(layers, layer_names)
         for g in range(n_genes):
@@ -427,7 +427,7 @@ class TestOptimizeGenes2dSd:
         )
         coords_list, freqs_list = _mc.make_state_dist(layers)
         gene_names = ["G0", "G1", "G2"]
-        sd = _mc.SearchData(layers, layer_names, limits, coords_list, freqs_list,
+        sd = _mc.searchdata_from_arrays(layers, layer_names, limits, coords_list, freqs_list,
                             gene_names, n_cells, "unique")
         return sd, layers, limits, coords_list, freqs_list
 
@@ -490,7 +490,7 @@ class TestOptimizeGenes2dSd:
         layers = [np.ascontiguousarray(rng.integers(0, 10, (n_cells, n_genes)), dtype=np.int64)]
         limits = np.ascontiguousarray(np.array([[20, 20]], dtype=np.int64))
         coords_list, freqs_list = _mc.make_state_dist(layers)
-        sd = _mc.SearchData(layers, ["unspliced"], limits, coords_list, freqs_list,
+        sd = _mc.searchdata_from_arrays(layers, ["unspliced"], limits, coords_list, freqs_list,
                             ["G0", "G1"], n_cells, "unique")
         with pytest.raises(Exception, match="2 layers"):
             _mc.optimize_genes_2d_sd(
