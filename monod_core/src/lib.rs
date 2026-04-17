@@ -1698,9 +1698,10 @@ pub struct SearchData {
     pub gene_names:       Vec<String>,
     pub hist_type:        String,
     pub layer_names:      Vec<String>,
-    pub gene_log_lengths: Option<Vec<f64>>,
-    pub k:                Option<usize>,
-    pub epochs:           Option<usize>,
+    pub gene_log_lengths:         Option<Vec<f64>>,
+    pub gene_log_lengths_spliced: Option<Vec<f64>>,
+    pub k:                        Option<usize>,
+    pub epochs:                   Option<usize>,
 }
 
 impl SearchData {
@@ -1716,14 +1717,15 @@ impl SearchData {
         gene_names:       Vec<String>,
         hist_type:        String,
         layer_names:      Vec<String>,
-        gene_log_lengths: Option<Vec<f64>>,
-        k:                Option<usize>,
-        epochs:           Option<usize>,
+        gene_log_lengths:         Option<Vec<f64>>,
+        gene_log_lengths_spliced: Option<Vec<f64>>,
+        k:                        Option<usize>,
+        epochs:                   Option<usize>,
     ) -> Self {
         Self {
             coords, freqs, limits, moments, layers_data,
             n_layers, n_cells, n_genes, gene_names, hist_type,
-            layer_names, gene_log_lengths, k, epochs,
+            layer_names, gene_log_lengths, gene_log_lengths_spliced, k, epochs,
         }
     }
 
@@ -1787,6 +1789,13 @@ impl PySearchData {
     #[getter]
     fn gene_log_lengths<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
         self.inner.gene_log_lengths
+            .as_ref()
+            .map(|v| PyArray1::from_vec_bound(py, v.clone()))
+    }
+
+    #[getter]
+    fn gene_log_lengths_spliced<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
+        self.inner.gene_log_lengths_spliced
             .as_ref()
             .map(|v| PyArray1::from_vec_bound(py, v.clone()))
     }
@@ -1862,8 +1871,9 @@ impl PySearchData {
         d.set_item("gene_names",       &self.inner.gene_names)?;
         d.set_item("hist_type",        &self.inner.hist_type)?;
         d.set_item("layer_names",      &self.inner.layer_names)?;
-        d.set_item("gene_log_lengths", &self.inner.gene_log_lengths)?;
-        d.set_item("k",                self.inner.k)?;
+        d.set_item("gene_log_lengths",         &self.inner.gene_log_lengths)?;
+        d.set_item("gene_log_lengths_spliced", &self.inner.gene_log_lengths_spliced)?;
+        d.set_item("k",                        self.inner.k)?;
         d.set_item("epochs",           self.inner.epochs)?;
         Ok(d)
     }
@@ -1891,8 +1901,9 @@ impl PySearchData {
         self.inner.gene_names       = get("gene_names")?.extract()?;
         self.inner.hist_type        = get("hist_type")?.extract()?;
         self.inner.layer_names      = get("layer_names")?.extract()?;
-        self.inner.gene_log_lengths = get("gene_log_lengths")?.extract()?;
-        self.inner.k                = get("k")?.extract()?;
+        self.inner.gene_log_lengths         = get("gene_log_lengths")?.extract()?;
+        self.inner.gene_log_lengths_spliced = get("gene_log_lengths_spliced")?.extract()?;
+        self.inner.k                        = get("k")?.extract()?;
         self.inner.epochs           = get("epochs")?.extract()?;
         Ok(())
     }
@@ -1934,7 +1945,8 @@ impl PySearchData {
 #[pyfunction]
 #[pyo3(signature = (layers, layer_names, limits, coords, freqs, gene_names,
                     n_cells, hist_type,
-                    gene_log_lengths=None, k=None, epochs=None))]
+                    gene_log_lengths=None, gene_log_lengths_spliced=None,
+                    k=None, epochs=None))]
 #[allow(clippy::too_many_arguments)]
 fn searchdata_from_arrays(
     py: Python<'_>,
@@ -1947,6 +1959,7 @@ fn searchdata_from_arrays(
     n_cells: usize,
     hist_type: String,
     gene_log_lengths: Option<Vec<f64>>,
+    gene_log_lengths_spliced: Option<Vec<f64>>,
     k: Option<usize>,
     epochs: Option<usize>,
 ) -> PyResult<PySearchData> {
@@ -1987,7 +2000,7 @@ fn searchdata_from_arrays(
         inner: SearchData::new(
             coords, freqs, limits_per_gene, moments, layers_data,
             n_layers, n_cells, n_genes, gene_names, hist_type,
-            layer_names, gene_log_lengths, k, epochs,
+            layer_names, gene_log_lengths, gene_log_lengths_spliced, k, epochs,
         ),
         #[cfg(feature = "ruanndata")]
         adata: None,
@@ -2674,7 +2687,8 @@ fn load_histograms_h5ad(
 #[pyfunction]
 #[pyo3(signature = (filepath, layer_names, gene_names=None,
                     min_means=None, max_maxes=None, min_maxes=None, padding=10,
-                    hist_type="unique"))]
+                    hist_type="unique", log_lengths_col=None,
+                    spliced_log_lengths_col=None))]
 #[allow(clippy::too_many_arguments)]
 fn searchdata_from_h5ad(
     py: Python<'_>,
@@ -2686,6 +2700,8 @@ fn searchdata_from_h5ad(
     min_maxes: Option<Vec<f64>>,
     padding: usize,
     hist_type: &str,
+    log_lengths_col: Option<String>,
+    spliced_log_lengths_col: Option<String>,
 ) -> PyResult<PySearchData> {
     let n_layers = layer_names.len();
     if n_layers == 0 {
@@ -2724,10 +2740,22 @@ fn searchdata_from_h5ad(
         let limits          = extract_limits(&inner.adata_sub, n_genes, n_layers)?;
         let gene_names_out  = inner.adata_sub.var.index.clone();
 
+        let read_float64_col = |col: &str| -> Option<Vec<f64>> {
+            inner.adata_sub.var.columns.get(col).and_then(|series| {
+                if let SeriesData::Float64 { values } = series {
+                    Some(values.iter().map(|v| v.unwrap_or(f64::NAN)).collect())
+                } else {
+                    None
+                }
+            })
+        };
+        let gene_log_lengths         = log_lengths_col.as_deref().and_then(read_float64_col);
+        let gene_log_lengths_spliced = spliced_log_lengths_col.as_deref().and_then(read_float64_col);
+
         let sd = SearchData::new(
             coords, freqs, limits, moments, inner.layers_sel,
             n_layers, n_cells, n_genes, gene_names_out, hist_type,
-            layer_names.to_vec(), None, None, None,
+            layer_names.to_vec(), gene_log_lengths, gene_log_lengths_spliced, None, None,
         );
         Ok((sd, inner.adata_sub))
     });
@@ -3412,7 +3440,7 @@ fn optimize_genes_2d_sd(
 
     // Extract all needed data from the Rust struct while holding the GIL borrow.
     // We collect into owned Vecs so they are Send and can cross the allow_threads boundary.
-    let (u_idx_list, s_idx_list, f_list, limits_list, n_genes, gene_log_lengths) = {
+    let (u_idx_list, s_idx_list, f_list, limits_list, n_genes, gene_log_lengths, gene_log_lengths_spliced) = {
         let sd_ref = sd.borrow();
         if sd_ref.n_layers < 2 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -3429,8 +3457,9 @@ fn optimize_genes_2d_sd(
             .collect();
         let f: Vec<Vec<f64>> = sd_ref.freqs.clone();
         let lim: Vec<Vec<usize>> = sd_ref.limits.clone();
-        let gll = sd_ref.gene_log_lengths.clone();
-        (u, s, f, lim, n, gll)
+        let gll   = sd_ref.gene_log_lengths.clone();
+        let gll_s = sd_ref.gene_log_lengths_spliced.clone();
+        (u, s, f, lim, n, gll, gll_s)
     }; // sd_ref dropped — GIL borrow released before allow_threads
 
     let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
@@ -3439,12 +3468,17 @@ fn optimize_genes_2d_sd(
                 .into_par_iter()
                 .map(|gi| {
                     // Compute per-gene samp: add gene_log_lengths[gi] to the
-                    // appropriate channels based on use_lengths_unspliced / use_lengths_spliced.
+                    // appropriate channels. Spliced channel uses gene_log_lengths_spliced
+                    // when present, falling back to gene_log_lengths.
                     let samp_gene: Option<Vec<f64>> = base_samp.as_ref().map(|bs| {
                         let mut s = bs.clone();
-                        if let Some(ref gll) = gene_log_lengths {
-                            if use_lengths_unspliced && s.len() > 0 { s[0] += gll[gi]; }
-                            if use_lengths_spliced   && s.len() > 1 { s[1] += gll[gi]; }
+                        if use_lengths_unspliced && s.len() > 0 {
+                            if let Some(ref gll) = gene_log_lengths { s[0] += gll[gi]; }
+                        }
+                        if use_lengths_spliced && s.len() > 1 {
+                            let spl_lengths = gene_log_lengths_spliced.as_ref()
+                                .or(gene_log_lengths.as_ref());
+                            if let Some(ref gll) = spl_lengths { s[1] += gll[gi]; }
                         }
                         s
                     });

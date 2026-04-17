@@ -99,7 +99,7 @@ def _build_sd(n_cells=200, n_genes=10, n_layers=2,
         layers, layer_names, limits,
         coords_list, freqs_list,
         gene_names, n_cells, "unique",
-        gene_log_lengths, k, epochs,
+        gene_log_lengths=gene_log_lengths, k=k, epochs=epochs,
     ), layers, limits, coords_list, freqs_list, layer_names, gene_names
 
 

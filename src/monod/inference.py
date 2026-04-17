@@ -311,6 +311,14 @@ def searchdata_from_adata(adata):
     except KeyError:
         pass
 
+    gene_log_lengths_spliced = None
+    spliced_lengths_col = adata.uns.get('spliced_lengths_col', None)
+    if spliced_lengths_col is not None:
+        try:
+            gene_log_lengths_spliced = np.asarray(adata.var[spliced_lengths_col], dtype=np.float64)
+        except KeyError:
+            pass
+
     k = adata.uns.get('k', None)
     epochs = adata.uns.get('epochs', None)
 
@@ -333,6 +341,7 @@ def searchdata_from_adata(adata):
             n_cells,
             hist_type,
             gene_log_lengths,
+            gene_log_lengths_spliced,
             k,
             epochs,
         )
@@ -1110,11 +1119,13 @@ class GradientInference:
                     "The model without technical noise has no length effects."
                 )
             elif model.seq_model == "Poisson":
-                lengths = search_data.gene_log_lengths
                 if use_lengths_mode in ("unspliced", "both"):
-                    regressor[:, 0] += lengths
+                    regressor[:, 0] += search_data.gene_log_lengths
                 if use_lengths_mode in ("spliced", "both"):
-                    regressor[:, 1] += lengths
+                    spl_lengths = getattr(search_data, 'gene_log_lengths_spliced', None)
+                    if spl_lengths is None:
+                        spl_lengths = search_data.gene_log_lengths
+                    regressor[:, 1] += spl_lengths
             else:
                 raise ValueError(
                     "Please select a technical noise model from {Poisson}, {Bernoulli}, {None}."
