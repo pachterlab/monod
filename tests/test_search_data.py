@@ -59,8 +59,8 @@ def _make_limits(n_layers, n_genes, base=40):
 
 
 def _make_hist_unique(layers, n_layers, n_genes):
-    """Python reference: same output shape as make_histograms_unique."""
-    coords_list, freqs_list = _mc.make_histograms_unique(layers)
+    """Python reference: same output shape as make_state_dist."""
+    coords_list, freqs_list = _mc.make_state_dist(layers)
     return coords_list, freqs_list
 
 
@@ -425,7 +425,7 @@ class TestOptimizeGenes2dSd:
         limits = np.ascontiguousarray(
             np.array([[25, 25, 25], [20, 20, 20]], dtype=np.int64)
         )
-        coords_list, freqs_list = _mc.make_histograms_unique(layers)
+        coords_list, freqs_list = _mc.make_state_dist(layers)
         gene_names = ["G0", "G1", "G2"]
         sd = _mc.SearchData(layers, layer_names, limits, coords_list, freqs_list,
                             gene_names, n_cells, "unique")
@@ -489,7 +489,7 @@ class TestOptimizeGenes2dSd:
         rng = np.random.default_rng(0)
         layers = [np.ascontiguousarray(rng.integers(0, 10, (n_cells, n_genes)), dtype=np.int64)]
         limits = np.ascontiguousarray(np.array([[20, 20]], dtype=np.int64))
-        coords_list, freqs_list = _mc.make_histograms_unique(layers)
+        coords_list, freqs_list = _mc.make_state_dist(layers)
         sd = _mc.SearchData(layers, ["unspliced"], limits, coords_list, freqs_list,
                             ["G0", "G1"], n_cells, "unique")
         with pytest.raises(Exception, match="2 layers"):

@@ -37,6 +37,11 @@ from conftest import check_snapshot
 from cme_toolbox import CMEModel
 from extract_data import extract_data, _uns_unpack
 
+try:
+    import monod_core as _mc
+except ImportError:
+    _mc = None
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -146,6 +151,14 @@ def _limits(adata):
 
 def _histogram(adata):
     """Return the (coords, freqs) unique histogram for gene 0."""
+    if _mc is not None:
+        modality_name_dict = adata.uns['modality_name_dict']
+        model = _uns_unpack(adata.uns['model'])
+        ordered_layer_names = [modality_name_dict[m] for m in model.model_modalities]
+        layers = [np.ascontiguousarray(adata.layers[ln], dtype=np.int64)
+                  for ln in ordered_layer_names]
+        coords_list, freqs_list = _mc.make_state_dist(layers)
+        return (np.array(coords_list[0], dtype=np.int64), np.array(freqs_list[0]))
     return _uns_unpack(adata.uns["hist"])[0]
 
 
@@ -230,9 +243,14 @@ class TestExtractDataAllModels:
         check_snapshot(_snap(processed["bio_model"], "extract_data_moments"), moments)
 
     def test_histogram_is_list(self, processed):
-        hist = _uns_unpack(processed["adata"].uns["hist"])
-        assert isinstance(hist, list)
-        assert len(hist) == 1
+        adata = processed["adata"]
+        if _mc is not None:
+            coords, freqs = _histogram(adata)
+            assert coords.ndim == 2 and freqs.ndim == 1
+        else:
+            hist = _uns_unpack(adata.uns["hist"])
+            assert isinstance(hist, list)
+            assert len(hist) == 1
 
     def test_histogram_coords_shape(self, processed):
         coords, freqs = _histogram(processed["adata"])

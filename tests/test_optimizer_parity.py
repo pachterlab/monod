@@ -59,7 +59,7 @@ def _make_layers(n_cells, n_genes, n_layers, high=25):
 
 def _build_sd(layers, layer_names, limits_arr):
     """Build SearchData from pre-computed layers + limits (n_layers × n_genes)."""
-    coords_list, freqs_list = _mc.make_histograms_unique(layers)
+    coords_list, freqs_list = _mc.make_state_dist(layers)
     n_cells = layers[0].shape[0]
     n_genes = layers[0].shape[1]
     gene_names = [f"G{i}" for i in range(n_genes)]

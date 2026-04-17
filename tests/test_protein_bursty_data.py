@@ -35,6 +35,24 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "monod")
 from cme_toolbox import CMEModel
 from extract_data import extract_data, _uns_unpack
 
+try:
+    import monod_core as _mc
+except ImportError:
+    _mc = None
+
+
+def _hist_from_adata(adata):
+    """Return (coords, freqs) for gene 0, computing from layers when Rust is available."""
+    if _mc is not None:
+        modality_name_dict = adata.uns['modality_name_dict']
+        model = _uns_unpack(adata.uns['model'])
+        ordered_layer_names = [modality_name_dict[m] for m in model.model_modalities]
+        layers = [np.ascontiguousarray(adata.layers[ln], dtype=np.int64)
+                  for ln in ordered_layer_names]
+        coords_list, freqs_list = _mc.make_state_dist(layers)
+        return (np.array(coords_list[0], dtype=np.int64), np.array(freqs_list[0]))
+    return _uns_unpack(adata.uns["hist"])[0]
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -457,21 +475,18 @@ class TestExtractDataPipeline:
         check_snapshot("extract_data_usp_moments", moments)
 
     def test_usp_histogram_type(self, processed_usp):
-        """Histogram should be a list of (coords, freqs) tuples for unique hist_type."""
-        hist = _uns_unpack(processed_usp.uns["hist"])
-        assert isinstance(hist, list)
-        assert len(hist) == processed_usp.n_vars
-        coords, freqs = hist[0]
+        """Histogram should be a (coords, freqs) pair with 3-column coords for ProteinBursty."""
+        coords, freqs = _hist_from_adata(processed_usp)
         assert coords.ndim == 2
         assert coords.shape[1] == 3  # unspliced, spliced, protein
         assert freqs.ndim == 1
 
     def test_usp_histogram_freqs_sum_to_one(self, processed_usp):
-        _, freqs = _uns_unpack(processed_usp.uns["hist"])[0]
+        _, freqs = _hist_from_adata(processed_usp)
         np.testing.assert_allclose(freqs.sum(), 1.0, rtol=1e-5)
 
     def test_sp_histogram_freqs_sum_to_one(self, processed_sp):
-        _, freqs = _uns_unpack(processed_sp.uns["hist"])[0]
+        _, freqs = _hist_from_adata(processed_sp)
         np.testing.assert_allclose(freqs.sum(), 1.0, rtol=1e-5)
 
     def test_usp_moments_match_usp_test_stored(self, processed_usp, usp_adata):

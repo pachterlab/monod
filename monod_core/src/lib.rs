@@ -1671,8 +1671,8 @@ fn mom_x0_inner(
 ///     layers,          # list of (n_cells, n_genes) int64 C-contiguous arrays
 ///     layer_names,     # list of modality name strings
 ///     limits,          # (n_layers, n_genes) int64 numpy array  (= M)
-///     coords,          # list[list[list[int]]]  from make_histograms_unique
-///     freqs,           # list[list[float]]      from make_histograms_unique
+///     coords,          # list[list[list[int]]]  from make_state_dist
+///     freqs,           # list[list[float]]      from make_state_dist
 ///     gene_names,      # list of gene-name strings
 ///     n_cells,         # int
 ///     hist_type,       # "unique" | "grid" | "none"
@@ -2034,7 +2034,7 @@ where
 ///               with one entry per layer, length = n_layers
 ///   freqs[g]  — corresponding normalised frequencies (count / n_cells)
 #[pyfunction]
-fn make_histograms_unique(
+fn make_state_dist(
     py: Python<'_>,
     layers: Vec<PyReadonlyArray2<'_, i64>>,
 ) -> PyResult<(Vec<Vec<Vec<i64>>>, Vec<Vec<f64>>)> {
@@ -4302,7 +4302,7 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(e_step_2d_from_grids, m)?)?;
     m.add_function(wrap_pyfunction!(compute_moments, m)?)?;
     m.add_class::<SearchData>()?;
-    m.add_function(wrap_pyfunction!(make_histograms_unique, m)?)?;
+    m.add_function(wrap_pyfunction!(make_state_dist, m)?)?;
     #[cfg(feature = "ruanndata")]
     m.add_function(wrap_pyfunction!(load_histograms_h5ad, m)?)?;
     #[cfg(feature = "ruanndata")]

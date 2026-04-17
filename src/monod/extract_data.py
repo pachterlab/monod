@@ -103,7 +103,7 @@ def extract_data(
     genes_to_fit=[],
     hist_type = 'grid',
     padding=None,
-    mek_means_params=None
+    mek_means_params=None,
 ):
     """Extract data for selected genes from a single dataset.
 
@@ -314,21 +314,9 @@ def extract_data(
     
     monod_adata.uns['model'] = _uns_pack(model)
 
-    if _HAS_RUST and hist_type == "unique":
-        # Build C-contiguous int64 arrays (n_cells, n_genes) per layer.
-        def _to_dense_int(arr):
-            a = arr.toarray() if issparse(arr) else np.asarray(arr)
-            return np.ascontiguousarray(a, dtype=np.int64)
-        rust_layers = [_to_dense_int(monod_adata.layers[ln]) for ln in ordered_layer_names]
-        coords_list, freqs_list = _mc.make_histograms_unique(rust_layers)
-        hist = [
-            (np.array(c, dtype=np.int64), np.array(f))
-            for c, f in zip(coords_list, freqs_list)
-        ]
-    else:
+    if not (_HAS_RUST and hist_type == "unique"):
         hist = make_histogram(monod_adata, hist_type, M)
-
-    monod_adata.uns['hist'] = _uns_pack(hist)
+        monod_adata.uns['hist'] = _uns_pack(hist)
     # Save adata?
     if mek_means_params:
         monod_adata.uns['k'] = k

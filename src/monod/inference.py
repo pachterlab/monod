@@ -8,7 +8,7 @@ import scipy
 from scipy import optimize, stats
 import mminference
 
-from extract_data import make_dir, log, extract_data
+from extract_data import make_dir, log, extract_data, make_histogram
 from cme_toolbox import CMEModel, _HAS_RUST  # may be unnecessary
 try:
     import monod_core as _mc
@@ -301,7 +301,6 @@ def searchdata_from_adata(adata):
     ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
 
     M = adata.uns['M']
-    hist = _uns_unpack(adata.uns['hist'])
     n_cells = adata.n_obs
     hist_type = get_hist_type_adata(adata)
     gene_names = list(adata.var.index)
@@ -322,8 +321,7 @@ def searchdata_from_adata(adata):
             a = arr.toarray() if _issparse(arr) else np.asarray(arr)
             return np.ascontiguousarray(a, dtype=np.int64)
         rust_layers = [_to_c_int64(adata.layers[ln]) for ln in ordered_layer_names]
-        coords_list = [h[0].tolist() for h in hist]
-        freqs_list  = [h[1].tolist() for h in hist]
+        coords_list, freqs_list = _mc.make_state_dist(rust_layers)
         limits_arr  = np.ascontiguousarray(M, dtype=np.int64)
         return _mc.SearchData(
             rust_layers,
@@ -340,6 +338,10 @@ def searchdata_from_adata(adata):
         )
 
     # Python fallback (grid/none hist_type or Rust unavailable).
+    if 'hist' in adata.uns:
+        hist = _uns_unpack(adata.uns['hist'])
+    else:
+        hist = make_histogram(adata, hist_type, M)
     layers  = np.array([adata.layers[layer_name] for layer_name in ordered_layer_names])
     moments = get_gene_moments(adata)
 
