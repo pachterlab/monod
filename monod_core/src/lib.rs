@@ -25,8 +25,8 @@
 
 use lbfgsb_rs_pure::{IterationControl, LBFGSB};
 use num_complex::Complex64;
-#[cfg(feature = "ruanndata")]
-use ruanndata::{read_h5ad, write_h5ad, ArrayData, ArrayValue, MatrixData, RuAnnData, SeriesData, UnsValue};
+use indexmap::IndexMap;
+use ruanndata::{read_h5ad, write_h5ad, ArrayData, ArrayValue, DataFrame, MatrixData, RuAnnData, SeriesData, UnsValue};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
@@ -1685,22 +1685,20 @@ fn mom_x0_inner(
 // Construction from Python-side arrays goes through `searchdata_from_arrays`.
 
 pub struct SearchData {
+    pub adata:            RuAnnData,             // owns raw counts, var metadata, annotation
     pub coords:           Vec<Vec<Vec<i64>>>,    // [gene][microstate][layer] — kept for 3-D optimizers
     pub coords_by_layer:  Vec<Vec<Vec<u64>>>,    // [layer][gene][microstate] — pre-split for 2-D optimizer
     pub freqs:            Vec<Vec<f64>>,         // [gene][microstate]
     pub limits:           Vec<usize>,            // flat [gene * n_layers + layer]
-    pub moments:          Vec<HashMap<String, f64>>,
-    pub layers_data:      Vec<Vec<i64>>,         // [layer][g * n_cells + c] column-major
+    pub moments:          Vec<HashMap<String, f64>>, // derived cache for MoM initialisation
     pub n_layers:         usize,
     pub n_cells:          usize,
     pub n_genes:          usize,
     pub gene_names:       Vec<String>,
     pub hist_type:        String,
     pub layer_names:      Vec<String>,
-    pub gene_log_lengths:         Option<Vec<f64>>,
-    pub gene_log_lengths_spliced: Option<Vec<f64>>,
-    pub k:                        Option<usize>,
-    pub epochs:                   Option<usize>,
+    pub k:                Option<usize>,
+    pub epochs:           Option<usize>,
 }
 
 /// Build the `[layer][gene][microstate]` u64 view from `[gene][microstate][layer]` i64 coords.
@@ -1718,28 +1716,44 @@ fn build_coords_by_layer(coords: &[Vec<Vec<i64>>], n_genes: usize, n_layers: usi
 
 impl SearchData {
     pub fn new(
+        adata:            RuAnnData,
         coords:           Vec<Vec<Vec<i64>>>,
         freqs:            Vec<Vec<f64>>,
         limits:           Vec<usize>,
         moments:          Vec<HashMap<String, f64>>,
-        layers_data:      Vec<Vec<i64>>,
         n_layers:         usize,
         n_cells:          usize,
         n_genes:          usize,
         gene_names:       Vec<String>,
         hist_type:        String,
         layer_names:      Vec<String>,
-        gene_log_lengths:         Option<Vec<f64>>,
-        gene_log_lengths_spliced: Option<Vec<f64>>,
-        k:                        Option<usize>,
-        epochs:                   Option<usize>,
+        k:                Option<usize>,
+        epochs:           Option<usize>,
     ) -> Self {
         let coords_by_layer = build_coords_by_layer(&coords, n_genes, n_layers);
         Self {
-            coords, coords_by_layer, freqs, limits, moments, layers_data,
+            adata, coords, coords_by_layer, freqs, limits, moments,
             n_layers, n_cells, n_genes, gene_names, hist_type,
-            layer_names, gene_log_lengths, gene_log_lengths_spliced, k, epochs,
+            layer_names, k, epochs,
         }
+    }
+
+    /// Read gene_log_lengths from adata.var (returns None if column absent).
+    pub fn extract_gene_log_lengths(&self) -> Option<Vec<f64>> {
+        self.adata.var.columns.get("gene_log_lengths").and_then(|s| {
+            if let SeriesData::Float64 { values } = s {
+                Some(values.iter().map(|v| v.unwrap_or(f64::NAN)).collect())
+            } else { None }
+        })
+    }
+
+    /// Read gene_log_lengths_spliced from adata.var (returns None if column absent).
+    pub fn extract_gene_log_lengths_spliced(&self) -> Option<Vec<f64>> {
+        self.adata.var.columns.get("gene_log_lengths_spliced").and_then(|s| {
+            if let SeriesData::Float64 { values } = s {
+                Some(values.iter().map(|v| v.unwrap_or(f64::NAN)).collect())
+            } else { None }
+        })
     }
 
     /// Clone the fields consumed by 3-D / custom-network `optimize_genes_*_sd` functions.
@@ -1773,13 +1787,85 @@ impl SearchData {
     }
 }
 
+/// Construct a minimal `RuAnnData` from raw count arrays.
+///
+/// `layers_row_major[l]` must be row-major flat (n_cells × n_genes): `[c * n_genes + g]`.
+/// `gene_log_lengths` / `gene_log_lengths_spliced` are stored in `var.columns` when provided.
+fn make_minimal_adata(
+    gene_names:               &[String],
+    layer_names:              &[String],
+    layers_row_major:         &[Vec<i64>],
+    n_cells:                  usize,
+    n_genes:                  usize,
+    gene_log_lengths:         Option<Vec<f64>>,
+    gene_log_lengths_spliced: Option<Vec<f64>>,
+) -> RuAnnData {
+    let obs_names: Vec<String> = (0..n_cells).map(|i| i.to_string()).collect();
+
+    let mut var_columns: IndexMap<String, SeriesData> = IndexMap::new();
+    if let Some(gll) = gene_log_lengths {
+        var_columns.insert(
+            "gene_log_lengths".to_string(),
+            SeriesData::Float64 { values: gll.into_iter().map(Some).collect() },
+        );
+    }
+    if let Some(glls) = gene_log_lengths_spliced {
+        var_columns.insert(
+            "gene_log_lengths_spliced".to_string(),
+            SeriesData::Float64 { values: glls.into_iter().map(Some).collect() },
+        );
+    }
+
+    let obs = DataFrame {
+        index_name: "obs_names".to_string(),
+        index:      obs_names,
+        columns:    IndexMap::new(),
+    };
+    let var = DataFrame {
+        index_name: "var_names".to_string(),
+        index:      gene_names.to_vec(),
+        columns:    var_columns,
+    };
+
+    let x_flat = if layers_row_major.is_empty() {
+        vec![0i64; n_cells * n_genes]
+    } else {
+        layers_row_major[0].clone()
+    };
+    let x = MatrixData::Dense {
+        array: ArrayData { shape: vec![n_cells, n_genes], values: ArrayValue::Int64(x_flat) },
+    };
+
+    let mut layers: IndexMap<String, MatrixData> = IndexMap::new();
+    for (l, lname) in layer_names.iter().enumerate() {
+        layers.insert(lname.clone(), MatrixData::Dense {
+            array: ArrayData {
+                shape: vec![n_cells, n_genes],
+                values: ArrayValue::Int64(layers_row_major[l].clone()),
+            },
+        });
+    }
+
+    RuAnnData {
+        format_version: "0.1.0".to_string(),
+        x,
+        obs,
+        var,
+        raw:  None,
+        layers,
+        obsm: IndexMap::new(),
+        varm: IndexMap::new(),
+        obsp: IndexMap::new(),
+        varp: IndexMap::new(),
+        uns:  IndexMap::new(),
+    }
+}
+
 // ── Thin Python wrapper ────────────────────────────────────────────────────────
 
 #[pyclass(name = "SearchData")]
 pub struct PySearchData {
     pub inner: SearchData,
-    #[cfg(feature = "ruanndata")]
-    pub adata: Option<RuAnnData>,
 }
 
 impl std::ops::Deref for PySearchData {
@@ -1801,16 +1887,14 @@ impl PySearchData {
 
     #[getter]
     fn gene_log_lengths<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
-        self.inner.gene_log_lengths
-            .as_ref()
-            .map(|v| PyArray1::from_vec_bound(py, v.clone()))
+        self.inner.extract_gene_log_lengths()
+            .map(|v| PyArray1::from_vec_bound(py, v))
     }
 
     #[getter]
     fn gene_log_lengths_spliced<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
-        self.inner.gene_log_lengths_spliced
-            .as_ref()
-            .map(|v| PyArray1::from_vec_bound(py, v.clone()))
+        self.inner.extract_gene_log_lengths_spliced()
+            .map(|v| PyArray1::from_vec_bound(py, v))
     }
 
     /// Returns M as a (n_layers, n_genes) int64 numpy array.
@@ -1826,13 +1910,23 @@ impl PySearchData {
 
     /// Returns the raw count layers as a (n_layers, n_cells, n_genes) int64 numpy array.
     #[getter]
-    fn layers<'py>(&self, py: Python<'py>) -> Bound<'py, numpy::PyArray<i64, ndarray::Ix3>> {
+    fn layers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, numpy::PyArray<i64, ndarray::Ix3>>> {
         let nc = self.inner.n_cells;
-        let arr = Array3::from_shape_fn(
-            (self.inner.n_layers, nc, self.inner.n_genes),
-            |(l, c, g)| self.inner.layers_data[l][g * nc + c],
-        );
-        arr.into_pyarray_bound(py)
+        let ng = self.inner.n_genes;
+        let nl = self.inner.n_layers;
+        let mut dense: Vec<Vec<i64>> = Vec::with_capacity(nl);
+        for lname in &self.inner.layer_names {
+            let mat = self.inner.adata.layers.get(lname)
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(
+                    format!("layer '{}' not found in adata", lname)
+                ))?;
+            let (_, _, flat) = matrix_to_dense_i64(mat)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            // flat is row-major [c * ng + g]
+            dense.push(flat);
+        }
+        let arr = Array3::from_shape_fn((nl, nc, ng), |(l, c, g)| dense[l][c * ng + g]);
+        Ok(arr.into_pyarray_bound(py))
     }
 
     /// Returns hist as a Python list of (coords_array, freqs_array) tuples.
@@ -1879,15 +1973,27 @@ impl PySearchData {
             .map(|m| m.keys().cloned().collect::<Vec<_>>()).collect::<Vec<_>>())?;
         d.set_item("moments_vals", self.inner.moments.iter()
             .map(|m| m.values().copied().collect::<Vec<_>>()).collect::<Vec<_>>())?;
-        d.set_item("layers_data",      &self.inner.layers_data)?;
+        // Serialize layers as row-major flat vecs from adata.layers.
+        let layers_data: Vec<Vec<i64>> = self.inner.layer_names.iter()
+            .map(|lname| {
+                let mat = self.inner.adata.layers.get(lname)
+                    .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(
+                        format!("layer '{}' not found in adata", lname)
+                    ))?;
+                let (_, _, flat) = matrix_to_dense_i64(mat)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+                Ok(flat)
+            })
+            .collect::<PyResult<_>>()?;
+        d.set_item("layers_data",      layers_data)?;
         d.set_item("n_layers",         self.inner.n_layers)?;
         d.set_item("n_cells",          self.inner.n_cells)?;
         d.set_item("n_genes",          self.inner.n_genes)?;
         d.set_item("gene_names",       &self.inner.gene_names)?;
         d.set_item("hist_type",        &self.inner.hist_type)?;
         d.set_item("layer_names",      &self.inner.layer_names)?;
-        d.set_item("gene_log_lengths",         &self.inner.gene_log_lengths)?;
-        d.set_item("gene_log_lengths_spliced", &self.inner.gene_log_lengths_spliced)?;
+        d.set_item("gene_log_lengths",         self.inner.extract_gene_log_lengths())?;
+        d.set_item("gene_log_lengths_spliced", self.inner.extract_gene_log_lengths_spliced())?;
         d.set_item("k",                        self.inner.k)?;
         // coords_by_layer is derived from coords and not serialized.
         d.set_item("epochs",           self.inner.epochs)?;
@@ -1910,17 +2016,28 @@ impl PySearchData {
         self.inner.moments = keys.into_iter().zip(vals)
             .map(|(ks, vs)| ks.into_iter().zip(vs).collect())
             .collect();
-        self.inner.layers_data      = get("layers_data")?.extract()?;
-        self.inner.n_layers         = get("n_layers")?.extract()?;
-        self.inner.n_cells          = get("n_cells")?.extract()?;
-        self.inner.n_genes          = get("n_genes")?.extract()?;
-        self.inner.gene_names       = get("gene_names")?.extract()?;
-        self.inner.hist_type        = get("hist_type")?.extract()?;
-        self.inner.layer_names      = get("layer_names")?.extract()?;
-        self.inner.gene_log_lengths         = get("gene_log_lengths")?.extract()?;
-        self.inner.gene_log_lengths_spliced = get("gene_log_lengths_spliced")?.extract()?;
-        self.inner.k                        = get("k")?.extract()?;
-        self.inner.epochs                   = get("epochs")?.extract()?;
+        // layers_data stored as row-major [c * n_genes + g] per layer.
+        let layers_data: Vec<Vec<i64>>  = get("layers_data")?.extract()?;
+        self.inner.n_layers             = get("n_layers")?.extract()?;
+        self.inner.n_cells              = get("n_cells")?.extract()?;
+        self.inner.n_genes              = get("n_genes")?.extract()?;
+        self.inner.gene_names           = get("gene_names")?.extract()?;
+        self.inner.hist_type            = get("hist_type")?.extract()?;
+        self.inner.layer_names          = get("layer_names")?.extract()?;
+        let gene_log_lengths: Option<Vec<f64>>         = get("gene_log_lengths")?.extract()?;
+        let gene_log_lengths_spliced: Option<Vec<f64>> = get("gene_log_lengths_spliced")?.extract()?;
+        self.inner.k                    = get("k")?.extract()?;
+        self.inner.epochs               = get("epochs")?.extract()?;
+        // Reconstruct adata from serialised components.
+        self.inner.adata = make_minimal_adata(
+            &self.inner.gene_names,
+            &self.inner.layer_names,
+            &layers_data,
+            self.inner.n_cells,
+            self.inner.n_genes,
+            gene_log_lengths,
+            gene_log_lengths_spliced,
+        );
         // Recompute derived field.
         self.inner.coords_by_layer = build_coords_by_layer(
             &self.inner.coords, self.inner.n_genes, self.inner.n_layers,
@@ -1986,48 +2103,47 @@ fn searchdata_from_arrays(
     let n_layers = layers.len();
     let n_genes = if n_layers > 0 { layers[0].shape()[1] } else { 0 };
 
-    // Transpose each (n_cells, n_genes) row-major layer to column-major [g * n_cells + c].
-    let layers_data: Vec<Vec<i64>> = layers
-        .iter()
-        .map(|arr| {
-            let slice = arr.as_slice().map_err(|_| pyo3::exceptions::PyValueError::new_err(
-                "layer arrays must be C-contiguous",
-            ))?;
-            let mut col_major = vec![0i64; n_cells * n_genes];
-            for c in 0..n_cells {
-                for g in 0..n_genes {
-                    col_major[g * n_cells + c] = slice[c * n_genes + g];
-                }
+    // Borrow row-major slices from numpy (for adata storage) and build column-major
+    // copies (for moments computation).
+    let mut layers_row_major: Vec<Vec<i64>> = Vec::with_capacity(n_layers);
+    let mut layers_col_major: Vec<Vec<f64>> = Vec::with_capacity(n_layers);
+    for arr in &layers {
+        let slice = arr.as_slice().map_err(|_| pyo3::exceptions::PyValueError::new_err(
+            "layer arrays must be C-contiguous",
+        ))?;
+        layers_row_major.push(slice.to_vec());
+        let mut col_major = vec![0f64; n_cells * n_genes];
+        for c in 0..n_cells {
+            for g in 0..n_genes {
+                col_major[g * n_cells + c] = slice[c * n_genes + g] as f64;
             }
-            Ok(col_major)
-        })
-        .collect::<PyResult<_>>()?;
+        }
+        layers_col_major.push(col_major);
+    }
 
     let limits_n_cols = limits.shape()[1];
     let limits_slice = limits.as_slice().map_err(|_| {
         pyo3::exceptions::PyValueError::new_err("limits array must be C-contiguous")
     })?;
-    // Flat limits: index = g * n_layers + l.
     let limits_flat: Vec<usize> = (0..n_genes)
         .flat_map(|g| (0..n_layers).map(move |l| limits_slice[l * limits_n_cols + g] as usize))
         .collect();
 
-    // Cast to f64 in column-major order for moments computation.
-    let layers_flat: Vec<Vec<f64>> = layers_data.iter()
-        .map(|v| v.iter().map(|&x| x as f64).collect())
-        .collect();
     let moments = py.allow_threads(|| {
-        compute_moments_inner(&layers_flat, &layer_names, n_cells, n_genes)
+        compute_moments_inner(&layers_col_major, &layer_names, n_cells, n_genes)
     });
+
+    let adata = make_minimal_adata(
+        &gene_names, &layer_names, &layers_row_major,
+        n_cells, n_genes, gene_log_lengths, gene_log_lengths_spliced,
+    );
 
     Ok(PySearchData {
         inner: SearchData::new(
-            coords, freqs, limits_flat, moments, layers_data,
+            adata, coords, freqs, limits_flat, moments,
             n_layers, n_cells, n_genes, gene_names, hist_type,
-            layer_names, gene_log_lengths, gene_log_lengths_spliced, k, epochs,
+            layer_names, k, epochs,
         ),
-        #[cfg(feature = "ruanndata")]
-        adata: None,
     })
 }
 
@@ -2243,7 +2359,6 @@ fn make_state_dist(
 
 /// Convert any MatrixData variant to a flat row-major (n_cells × n_genes) Vec<i64>.
 /// Returns (n_cells, n_genes, flat).
-#[cfg(feature = "ruanndata")]
 fn matrix_to_dense_i64(matrix: &MatrixData) -> Result<(usize, usize, Vec<i64>), String> {
     /// Cast one element of an ArrayValue to i64.
     fn av_get(av: &ArrayValue, idx: usize) -> i64 {
@@ -2300,20 +2415,14 @@ fn matrix_to_dense_i64(matrix: &MatrixData) -> Result<(usize, usize, Vec<i64>), 
 ///   - `uns["state_dist_coords"]`: `List` of per-gene Int64 arrays, shape `[n_states, n_layers]`
 ///   - `uns["state_dist_freqs"]`:  `List` of per-gene Float64 arrays, length `n_states`
 ///   - `uns["limits"]`:            Int64 array, shape `[n_genes, n_layers]` (max + padding)
-///   Both state-dist keys are registered in `uns_var_keys` for correct `slice_var` behaviour.
-///
-/// `layers_sel` holds the dense subsetted counts column-major: `[layer][g * n_cells + c]`.
-#[cfg(feature = "ruanndata")]
+/// `adata_sub.layers` holds the subsetted count matrices (from `slice_var`).
 struct H5adInner {
-    adata_sub:  RuAnnData,
-    layers_sel: Vec<Vec<i64>>,
+    adata_sub: RuAnnData,
 }
 
-/// Core h5ad ingestion: read file, filter/select genes, compute histograms,
-/// and build a subsetted layer matrix for downstream moments.
+/// Core h5ad ingestion: read file, filter/select genes, compute histograms.
 ///
 /// Must be called outside the GIL (inside `py.allow_threads`).
-#[cfg(feature = "ruanndata")]
 #[allow(clippy::too_many_arguments)]
 fn load_h5ad_inner(
     filepath:   &str,
@@ -2482,16 +2591,6 @@ fn load_h5ad_inner(
         limits_out.push(limits);
     }
 
-    // ── Build subsetted layers for moments: [layer][g * n_cells + c] column-major ──
-    let mut layers_sel: Vec<Vec<i64>> = vec![vec![0i64; n_cells * n_sel]; n_layers];
-    for (sel_g, &orig_g) in gene_indices.iter().enumerate() {
-        for (l, full_flat) in layers_flat.iter().enumerate() {
-            for c in 0..n_cells {
-                layers_sel[l][sel_g * n_cells + c] = full_flat[c * n_total_genes + orig_g];
-            }
-        }
-    }
-
     // ── Slice adata to selected genes and store state dists + limits in uns ─
     let mut adata_sub = adata
         .slice_var(&gene_indices)
@@ -2523,14 +2622,13 @@ fn load_h5ad_inner(
         shape: vec![n_sel, n_layers],
         values: ArrayValue::Int64(limits_flat),
     }));
-    Ok(H5adInner { adata_sub, layers_sel })
+    Ok(H5adInner { adata_sub })
 }
 
 // ── H5adInner accessors ───────────────────────────────────────────────────────
 
 /// Extract (gene_names, coords, freqs, limits) from an `H5adInner` for the
 /// `load_histograms_h5ad` return type.
-#[cfg(feature = "ruanndata")]
 fn h5ad_inner_to_histograms(
     inner: H5adInner,
     n_layers: usize,
@@ -2552,7 +2650,6 @@ fn h5ad_inner_to_histograms(
 ///
 /// Returns `(flat_coords, n_layers, freqs)` where `flat_coords` is shape
 /// `[n_states × n_layers]` and `freqs` is length `n_states`.
-#[cfg(feature = "ruanndata")]
 fn get_state_dist(adata: &RuAnnData, gene_idx: usize) -> Option<(&[i64], usize, &[f64])> {
     let coords_entry = match adata.uns.get("state_dist_coords")? {
         UnsValue::List(v) => v.get(gene_idx)?,
@@ -2590,7 +2687,6 @@ fn get_state_dist(adata: &RuAnnData, gene_idx: usize) -> Option<(&[i64], usize, 
 
 /// Unpack `uns["state_dist_coords"]` and `uns["state_dist_freqs"]` into the
 /// `Vec<Vec<Vec<i64>>>` / `Vec<Vec<f64>>` shapes expected by `SearchData`.
-#[cfg(feature = "ruanndata")]
 fn extract_state_dists(
     adata: &RuAnnData,
     n_genes: usize,
@@ -2614,7 +2710,6 @@ fn extract_state_dists(
 }
 
 /// Unpack `uns["limits"]` (shape `[n_genes, n_layers]`) into per-gene `Vec<Vec<usize>>`.
-#[cfg(feature = "ruanndata")]
 fn extract_limits(
     adata: &RuAnnData,
     n_genes: usize,
@@ -2657,7 +2752,6 @@ fn extract_limits(
 ///   coords[g]   : unique microstates (each a Vec<i64> of length n_layers)
 ///   freqs[g]    : normalised frequencies corresponding to coords[g]
 ///   limits[g]   : Vec<usize> per-layer grid bound (max_val + padding)
-#[cfg(feature = "ruanndata")]
 #[pyfunction]
 #[pyo3(signature = (filepath, layer_names, gene_names=None,
                     min_means=None, max_maxes=None, min_maxes=None, padding=10))]
@@ -2712,7 +2806,6 @@ fn load_histograms_h5ad(
 /// Returns
 /// -------
 /// A `SearchData` object ready for direct use with `optimize_genes_*_sd`.
-#[cfg(feature = "ruanndata")]
 #[pyfunction]
 #[pyo3(signature = (filepath, layer_names, gene_names=None,
                     min_means=None, max_maxes=None, min_maxes=None, padding=10,
@@ -2746,8 +2839,8 @@ fn searchdata_from_h5ad(
     }
     let hist_type = hist_type.to_string();
 
-    let result = py.allow_threads(|| -> Result<(SearchData, RuAnnData), String> {
-        let inner = load_h5ad_inner(
+    let result = py.allow_threads(|| -> Result<SearchData, String> {
+        let mut inner = load_h5ad_inner(
             &filepath,
             &layer_names,
             gene_names.as_deref(),
@@ -2760,37 +2853,56 @@ fn searchdata_from_h5ad(
         let n_genes = inner.adata_sub.n_vars();
         let n_cells = inner.adata_sub.n_obs();
 
-        let layers_f64: Vec<Vec<f64>> = inner.layers_sel.iter()
-            .map(|v| v.iter().map(|&x| x as f64).collect())
-            .collect();
-        let moments = compute_moments_inner(&layers_f64, &layer_names, n_cells, n_genes);
+        // Compute moments from adata_sub.layers (row-major) — transpose to column-major.
+        let layers_col_major: Vec<Vec<f64>> = layer_names.iter()
+            .map(|lname| {
+                let mat = inner.adata_sub.layers.get(lname)
+                    .ok_or_else(|| format!("layer '{}' missing after slice_var", lname))?;
+                let (nr, nc, flat_row) = matrix_to_dense_i64(mat)?;
+                let mut col = vec![0f64; nr * nc];
+                for c in 0..nr { for g in 0..nc { col[g * nr + c] = flat_row[c * nc + g] as f64; } }
+                Ok(col)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let moments = compute_moments_inner(&layers_col_major, &layer_names, n_cells, n_genes);
 
         let (coords, freqs) = extract_state_dists(&inner.adata_sub, n_genes, n_layers)?;
         let limits          = extract_limits(&inner.adata_sub, n_genes, n_layers)?;
         let gene_names_out  = inner.adata_sub.var.index.clone();
 
-        let read_float64_col = |col: &str| -> Option<Vec<f64>> {
-            inner.adata_sub.var.columns.get(col).and_then(|series| {
-                if let SeriesData::Float64 { values } = series {
-                    Some(values.iter().map(|v| v.unwrap_or(f64::NAN)).collect())
-                } else {
-                    None
-                }
-            })
-        };
-        let gene_log_lengths         = log_lengths_col.as_deref().and_then(read_float64_col);
-        let gene_log_lengths_spliced = spliced_log_lengths_col.as_deref().and_then(read_float64_col);
+        // Read optional length columns into owned Vecs, then store under canonical names.
+        let gene_log_lengths: Option<Vec<f64>> = log_lengths_col.as_deref()
+            .and_then(|col| inner.adata_sub.var.columns.get(col))
+            .and_then(|s| if let SeriesData::Float64 { values } = s {
+                Some(values.iter().map(|v| v.unwrap_or(f64::NAN)).collect())
+            } else { None });
+        let gene_log_lengths_spliced: Option<Vec<f64>> = spliced_log_lengths_col.as_deref()
+            .and_then(|col| inner.adata_sub.var.columns.get(col))
+            .and_then(|s| if let SeriesData::Float64 { values } = s {
+                Some(values.iter().map(|v| v.unwrap_or(f64::NAN)).collect())
+            } else { None });
+        if let Some(ref vals) = gene_log_lengths {
+            inner.adata_sub.var.columns.insert(
+                "gene_log_lengths".to_string(),
+                SeriesData::Float64 { values: vals.iter().map(|&v| Some(v)).collect() },
+            );
+        }
+        if let Some(ref vals) = gene_log_lengths_spliced {
+            inner.adata_sub.var.columns.insert(
+                "gene_log_lengths_spliced".to_string(),
+                SeriesData::Float64 { values: vals.iter().map(|&v| Some(v)).collect() },
+            );
+        }
 
-        let sd = SearchData::new(
-            coords, freqs, limits, moments, inner.layers_sel,
+        Ok(SearchData::new(
+            inner.adata_sub, coords, freqs, limits, moments,
             n_layers, n_cells, n_genes, gene_names_out, hist_type,
-            layer_names.to_vec(), gene_log_lengths, gene_log_lengths_spliced, None, None,
-        );
-        Ok((sd, inner.adata_sub))
+            layer_names.to_vec(), None, None,
+        ))
     });
 
     result
-        .map(|(sd, adata_sub)| PySearchData { inner: sd, adata: Some(adata_sub) })
+        .map(|sd| PySearchData { inner: sd })
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
 }
 
@@ -3482,9 +3594,9 @@ fn optimize_genes_2d_sd(
         let u = sd_ref.coords_by_layer[0].clone();
         let s = sd_ref.coords_by_layer[1].clone();
         let f = sd_ref.freqs.clone();
-        let lim  = sd_ref.limits.clone();
-        let gll  = sd_ref.gene_log_lengths.clone();
-        let gll_s = sd_ref.gene_log_lengths_spliced.clone();
+        let lim   = sd_ref.limits.clone();
+        let gll   = sd_ref.extract_gene_log_lengths();
+        let gll_s = sd_ref.extract_gene_log_lengths_spliced();
         (u, s, f, lim, n_lm, n, gll, gll_s)
     }; // sd_ref dropped — GIL borrow released before allow_threads
 
@@ -4471,7 +4583,6 @@ fn e_step_2d_from_grids(
 /// params       : 2-D array, shape [n_genes, n_params], log10 parameter values
 /// klds         : 1-D array, shape [n_genes], per-gene KLD at optimum
 /// output_path  : destination h5ad path
-#[cfg(feature = "ruanndata")]
 #[pyfunction]
 fn annotate_inference_results(
     py: Python<'_>,
@@ -4482,12 +4593,7 @@ fn annotate_inference_results(
     output_path: String,
 ) -> PyResult<()> {
     let sd = search_data.borrow();
-    let mut adata = sd.adata
-        .as_ref()
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(
-            "search_data has no attached RuAnnData; build it with searchdata_from_h5ad",
-        ))?
-        .clone();
+    let mut adata = sd.inner.adata.clone();
 
     let n_genes = adata.n_vars();
     let params_arr = params.as_array();
@@ -4523,7 +4629,7 @@ fn annotate_inference_results(
 
     // Strip internal monod scaffolding that uses encoding types Python anndata cannot read.
     for key in &["state_dist_coords", "state_dist_freqs", "limits"] {
-        adata.uns.remove(*key);
+        adata.uns.shift_remove(*key);
     }
 
     py.allow_threads(|| {
@@ -4555,11 +4661,8 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySearchData>()?;
     m.add_function(wrap_pyfunction!(searchdata_from_arrays, m)?)?;
     m.add_function(wrap_pyfunction!(make_state_dist, m)?)?;
-    #[cfg(feature = "ruanndata")]
     m.add_function(wrap_pyfunction!(load_histograms_h5ad, m)?)?;
-    #[cfg(feature = "ruanndata")]
     m.add_function(wrap_pyfunction!(searchdata_from_h5ad, m)?)?;
-    #[cfg(feature = "ruanndata")]
     m.add_function(wrap_pyfunction!(annotate_inference_results, m)?)?;
     m.add_function(wrap_pyfunction!(eval_custom_network_pgf, m)?)?;
     Ok(())

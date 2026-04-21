@@ -272,6 +272,7 @@ dependencies = [
 name = "monod_core"
 version = "0.2.0"
 dependencies = [
+ "indexmap",
  "lbfgsb-rs-pure",
  "ndarray",
  "num-complex",
