@@ -3233,6 +3233,393 @@ fn eval_kld_2d(
     Ok(compute_kld_sparse(&pss, l1, &u_idx, &s_idx, &f, eps))
 }
 
+// ============================================================================
+// Chi-squared goodness-of-fit testing
+// ============================================================================
+
+/// Log-gamma via Lanczos approximation (7-term, good to ~15 significant figures).
+fn lgamma(z: f64) -> f64 {
+    const G: f64 = 7.0;
+    const C: [f64; 9] = [
+        0.999_999_999_999_809_93,
+        676.520_368_121_885_1,
+        -1259.139_216_722_402_8,
+        771.323_428_777_653_13,
+        -176.615_029_162_140_59,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    let z = z - 1.0;
+    let x: f64 = C[0] + C[1..].iter().enumerate()
+        .map(|(i, &c)| c / (z + i as f64 + 1.0))
+        .sum::<f64>();
+    let t = z + G + 0.5;
+    0.5 * std::f64::consts::TAU.ln() + (z + 0.5) * t.ln() - t + x.ln()
+}
+
+/// Regularized lower incomplete gamma P(a, x) via series expansion.
+fn gamma_series(a: f64, x: f64) -> f64 {
+    if x <= 0.0 { return 0.0; }
+    let mut ap = a;
+    let mut del = 1.0 / a;
+    let mut sum = del;
+    for _ in 0..300 {
+        ap += 1.0;
+        del *= x / ap;
+        sum += del;
+        if del.abs() < sum.abs() * 3e-10 { break; }
+    }
+    sum * (-x + a * x.ln() - lgamma(a)).exp()
+}
+
+/// Regularized upper incomplete gamma Q(a, x) via Lentz continued fraction.
+fn gamma_cf(a: f64, x: f64) -> f64 {
+    let mut b = x + 1.0 - a;
+    let mut c = 1.0 / 1e-300;
+    let mut d = 1.0 / b;
+    let mut h = d;
+    for i in 1..=300i32 {
+        let an = -(i as f64) * (i as f64 - a);
+        b += 2.0;
+        d = (an * d + b).max(1e-300).min(1e300);
+        c = (b + an / c).max(1e-300).min(1e300);
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < 3e-10 { break; }
+    }
+    (-x + a * x.ln() - lgamma(a)).exp() * h
+}
+
+/// Chi-squared survival function P(X > stat | df degrees of freedom).
+fn chi2_sf(stat: f64, df: usize) -> f64 {
+    if stat <= 0.0 || df == 0 { return 1.0; }
+    let a = df as f64 / 2.0;
+    let x = stat / 2.0;
+    if x < a + 1.0 { 1.0 - gamma_series(a, x) } else { gamma_cf(a, x) }
+}
+
+/// Group (obs, exp) count pairs into merged bins until both accumulators >= thr.
+/// Leftover counts at the end are folded into the last completed bin.
+fn group_bins(obs: &[f64], exp: &[f64], thr: f64) -> (Vec<f64>, Vec<f64>) {
+    let mut bin_obs: Vec<f64> = Vec::new();
+    let mut bin_exp: Vec<f64> = Vec::new();
+    let mut run_obs = 0.0f64;
+    let mut run_exp = 0.0f64;
+    for (&o, &e) in obs.iter().zip(exp.iter()) {
+        run_obs += o;
+        run_exp += e;
+        if run_obs.min(run_exp) >= thr {
+            bin_obs.push(run_obs);
+            bin_exp.push(run_exp);
+            run_obs = 0.0;
+            run_exp = 0.0;
+        }
+    }
+    if bin_obs.is_empty() {
+        bin_obs.push(run_obs);
+        bin_exp.push(run_exp);
+    } else {
+        *bin_obs.last_mut().unwrap() += run_obs;
+        *bin_exp.last_mut().unwrap() += run_exp;
+    }
+    (bin_obs, bin_exp)
+}
+
+/// Pearson chi-squared statistic: Σ (O−E)²/E (skips bins with E=0).
+fn chi2_statistic(obs: &[f64], exp: &[f64]) -> f64 {
+    obs.iter().zip(exp.iter())
+        .map(|(&o, &e)| if e > 0.0 { (o - e).powi(2) / e } else { 0.0 })
+        .sum()
+}
+
+/// Hellinger distance between observed and expected count arrays.
+///
+/// H = (1/√2) * Σ (√(e_i/n) − √(o_i/n))²
+fn hellinger_distance(obs: &[f64], exp: &[f64], n_cells: f64) -> f64 {
+    let sum: f64 = obs.iter().zip(exp.iter())
+        .map(|(&o, &e)| {
+            let d = (e / n_cells).sqrt() - (o / n_cells).sqrt();
+            d * d
+        })
+        .sum();
+    sum / 2.0_f64.sqrt()
+}
+
+/// Compute chi-squared goodness-of-fit statistics for all genes in parallel,
+/// reading histogram data directly from a Rust `SearchData`.
+///
+/// For each gene:
+///   1. Evaluates PSS at the given biological + sampling parameters.
+///   2. Computes Hellinger distance between observed and expected distributions.
+///   3. Groups bins until both observed and expected counts reach `grouping_thr`.
+///   4. Computes Pearson chi-squared statistic and survival-function p-value.
+///
+/// Parameters
+/// ----------
+/// sd            : Rust SearchData (2-layer only)
+/// bio_model     : model name
+/// phys_optimum  : n_genes × n_params log10 biological parameters
+/// samp_list     : n_genes optional sampling parameters; pass None for seq_model="None"
+/// fixed_quad_t  : quadrature time horizon
+/// quad_order    : number of Gauss-Legendre points
+/// n_params_ddof : degrees of freedom consumed by parameter fitting (= number of bio params)
+/// grouping_thr  : minimum bin count before finalising a bin (default 5)
+/// eps           : PSS probability floor (default 1e-15)
+/// seq_model     : "None", "Poisson", or "Bernoulli"
+/// num_threads   : rayon thread-pool size (None = all available)
+///
+/// Returns (csq, pval, hellinger) — three Vec<f64> of length n_genes.
+#[pyfunction]
+#[pyo3(signature = (sd, bio_model, phys_optimum, samp_list=None,
+                    fixed_quad_t=200.0, quad_order=40,
+                    n_params_ddof=3, grouping_thr=5.0, eps=1e-15,
+                    seq_model="Poisson", num_threads=None))]
+#[allow(clippy::too_many_arguments)]
+fn chisquare_testing_2d_sd(
+    py: Python<'_>,
+    sd: &Bound<'_, PySearchData>,
+    bio_model: String,
+    phys_optimum: Vec<Vec<f64>>,
+    samp_list: Option<Vec<Option<Vec<f64>>>>,
+    fixed_quad_t: f64,
+    quad_order: usize,
+    n_params_ddof: usize,
+    grouping_thr: f64,
+    eps: f64,
+    seq_model: &str,
+    num_threads: Option<usize>,
+) -> PyResult<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+    validate_bio_model_2d(&bio_model, "chisquare_testing_2d_sd")?;
+    let seq_model = seq_model.to_owned();
+
+    let (u_list, s_list, f_list, limits_flat, n_lim, n_genes, n_cells) = {
+        let sd_ref = sd.borrow();
+        if sd_ref.n_layers < 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "chisquare_testing_2d_sd requires at least 2 layers",
+            ));
+        }
+        let n_lm = sd_ref.n_layers;
+        let n    = sd_ref.n_genes;
+        let u    = sd_ref.coords_by_layer[0].clone();
+        let s    = sd_ref.coords_by_layer[1].clone();
+        let f    = sd_ref.freqs.clone();
+        let lim  = sd_ref.limits.clone();
+        let nc   = sd_ref.n_cells;
+        (u, s, f, lim, n_lm, n, nc)
+    };
+    let nc_f = n_cells as f64;
+
+    let results: Vec<(f64, f64, f64)> = py.allow_threads(|| {
+        run_with_pool(num_threads, || {
+            (0..n_genes).into_par_iter().map(|gi| {
+                let samp = samp_list.as_ref().and_then(|sl| sl[gi].as_deref());
+                let limits: Vec<usize> = (0..n_lim)
+                    .map(|l| limits_flat[gi * n_lim + l])
+                    .collect();
+                let l1 = limits[1];
+
+                let pss = eval_model_pss_2d_seq(
+                    &bio_model, &phys_optimum[gi], &limits,
+                    fixed_quad_t, quad_order, samp, &seq_model,
+                );
+
+                let u   = &u_list[gi];
+                let s   = &s_list[gi];
+                let f   = &f_list[gi];
+                let n_obs = u.len();
+
+                // Build (obs_counts, exp_counts) with a remainder bin appended.
+                let mut obs: Vec<f64> = Vec::with_capacity(n_obs + 1);
+                let mut exp: Vec<f64> = Vec::with_capacity(n_obs + 1);
+                let mut exp_sum = 0.0f64;
+                for k in 0..n_obs {
+                    let o_k = f[k] * nc_f;
+                    let e_k = pss[u[k] as usize * l1 + s[k] as usize].max(eps) * nc_f;
+                    obs.push(o_k);
+                    exp.push(e_k);
+                    exp_sum += e_k;
+                }
+                obs.push(0.0);
+                exp.push((nc_f - exp_sum).max(0.0));
+
+                // Hellinger distance (before normalisation, matching Python).
+                let h = hellinger_distance(&obs, &exp, nc_f);
+
+                // Normalise expected if sums differ (numerical safety).
+                let obs_sum: f64 = obs.iter().sum();
+                let exp_sum_total: f64 = exp.iter().sum();
+                if (obs_sum - exp_sum_total).abs() > 1e-9 * obs_sum.abs() && exp_sum_total > 0.0 {
+                    let scale = obs_sum / exp_sum_total;
+                    for e in &mut exp { *e *= scale; }
+                }
+
+                // Bin grouping + chi-squared.
+                let (bin_obs, bin_exp) = group_bins(&obs, &exp, grouping_thr);
+                let stat = chi2_statistic(&bin_obs, &bin_exp);
+                let dof  = (bin_obs.len() as i64 - 1 - n_params_ddof as i64).max(1) as usize;
+                let pval = chi2_sf(stat, dof);
+
+                (stat, pval, h)
+            }).collect()
+        })
+    });
+
+    let csq: Vec<f64>      = results.iter().map(|r| r.0).collect();
+    let pval: Vec<f64>     = results.iter().map(|r| r.1).collect();
+    let hellinger: Vec<f64> = results.iter().map(|r| r.2).collect();
+    Ok((csq, pval, hellinger))
+}
+
+// ============================================================================
+// Log-likelihood evaluation (sparse "unique" histogram)
+// ============================================================================
+
+/// Compute log-likelihood of data under model from a sparse histogram.
+///
+/// pss     : flat PSS array of length l0*l1 (row-major: index = u*l1 + s)
+/// l1      : number of spliced bins (second dimension)
+/// u_idx   : unspliced indices of observed microstates
+/// s_idx   : spliced indices of observed microstates
+/// f       : fractional frequencies (counts / n_cells), same length as u_idx
+/// n_cells : number of cells (scales the result)
+/// eps     : minimum probability floor
+///
+/// Returns n_cells * sum_i f[i] * ln(pss[u[i],s[i]].max(eps)).
+#[inline]
+fn compute_logl_sparse(
+    pss: &[f64],
+    l1: usize,
+    u_idx: &[u64],
+    s_idx: &[u64],
+    f: &[f64],
+    n_cells: f64,
+    eps: f64,
+) -> f64 {
+    let s: f64 = u_idx
+        .iter()
+        .zip(s_idx.iter())
+        .zip(f.iter())
+        .map(|((&u, &s), &fi)| {
+            let pval = pss[u as usize * l1 + s as usize].max(eps);
+            fi * pval.ln()
+        })
+        .sum();
+    n_cells * s
+}
+
+/// Evaluate the log-likelihood of data under a 2-D CME model.
+///
+/// Parameters (Python-visible)
+/// ---------------------------
+/// bio_model    : model name (same as eval_model_pss_2d)
+/// p_log        : log10 biological parameters
+/// limits       : [l0, l1] grid dimensions
+/// u_idx        : unspliced bin indices for each unique observed microstate
+/// s_idx        : spliced bin indices for each unique observed microstate
+/// f            : fractional frequency per microstate (counts / n_cells)
+/// n_cells      : number of cells
+/// fixed_quad_t : quadrature time-scale multiplier
+/// quad_order   : number of Gauss-Legendre quadrature points
+/// samp_log     : optional log10 sampling parameters [s0, s1]
+/// eps          : minimum probability floor (default 1e-15)
+/// seq_model    : sequencing model ("None", "Poisson", or "Bernoulli"); default "Poisson"
+///
+/// Returns the scalar log-likelihood value.
+#[pyfunction]
+#[pyo3(signature = (bio_model, p_log, limits, u_idx, s_idx, f, n_cells, fixed_quad_t, quad_order, samp_log=None, eps=1e-15, seq_model="Poisson"))]
+#[allow(clippy::too_many_arguments)]
+fn eval_logl_2d(
+    bio_model: &str,
+    p_log: Vec<f64>,
+    limits: Vec<usize>,
+    u_idx: Vec<u64>,
+    s_idx: Vec<u64>,
+    f: Vec<f64>,
+    n_cells: f64,
+    fixed_quad_t: f64,
+    quad_order: usize,
+    samp_log: Option<Vec<f64>>,
+    eps: f64,
+    seq_model: &str,
+) -> PyResult<f64> {
+    let pss = eval_model_pss_2d_seq(
+        bio_model,
+        &p_log,
+        &limits,
+        fixed_quad_t,
+        quad_order,
+        samp_log.as_deref(),
+        seq_model,
+    );
+    let l1 = limits[1];
+    Ok(compute_logl_sparse(&pss, l1, &u_idx, &s_idx, &f, n_cells, eps))
+}
+
+/// Evaluate log-likelihood for all genes in a SearchData in parallel.
+///
+/// Returns a Vec<f64> of length n_genes: logL[g] = n_cells * sum_i f[i] * ln(pss[u[i],s[i]].max(eps))
+#[pyfunction]
+#[pyo3(signature = (sd, bio_model, phys_optimum, n_cells, samp_list=None,
+                    fixed_quad_t=200.0, quad_order=40,
+                    eps=1e-20, seq_model="Poisson", num_threads=None))]
+fn eval_logl_2d_sd(
+    py: Python<'_>,
+    sd: &Bound<'_, PySearchData>,
+    bio_model: String,
+    phys_optimum: Vec<Vec<f64>>,
+    n_cells: f64,
+    samp_list: Option<Vec<Option<Vec<f64>>>>,
+    fixed_quad_t: f64,
+    quad_order: usize,
+    eps: f64,
+    seq_model: &str,
+    num_threads: Option<usize>,
+) -> PyResult<Vec<f64>> {
+    validate_bio_model_2d(&bio_model, "eval_logl_2d_sd")?;
+    let seq_model = seq_model.to_owned();
+
+    let (u_list, s_list, f_list, limits_flat, n_lim, n_genes) = {
+        let sd_ref = sd.borrow();
+        if sd_ref.n_layers < 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "eval_logl_2d_sd requires at least 2 layers",
+            ));
+        }
+        let n_lm = sd_ref.n_layers;
+        let n    = sd_ref.n_genes;
+        let u    = sd_ref.coords_by_layer[0].clone();
+        let s    = sd_ref.coords_by_layer[1].clone();
+        let f    = sd_ref.freqs.clone();
+        let lim  = sd_ref.limits.clone();
+        (u, s, f, lim, n_lm, n)
+    };
+
+    let logl: Vec<f64> = py.allow_threads(|| {
+        run_with_pool(num_threads, || {
+            (0..n_genes).into_par_iter().map(|gi| {
+                let samp = samp_list.as_ref().and_then(|sl| sl[gi].as_deref());
+                let limits: Vec<usize> = (0..n_lim)
+                    .map(|l| limits_flat[gi * n_lim + l])
+                    .collect();
+                let l1 = limits[1];
+
+                let pss = eval_model_pss_2d_seq(
+                    &bio_model, &phys_optimum[gi], &limits,
+                    fixed_quad_t, quad_order, samp, &seq_model,
+                );
+
+                compute_logl_sparse(&pss, l1, &u_list[gi], &s_list[gi], &f_list[gi], n_cells, eps)
+            }).collect()
+        })
+    });
+
+    Ok(logl)
+}
+
 /// Evaluate the KLD and its forward finite-difference gradient for a 2-D CME model.
 ///
 /// All (n_params + 1) PSS evaluations (base point + one per parameter) are run
@@ -4648,6 +5035,9 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(eval_model_pss_protein_bursty, m)?)?;
     m.add_function(wrap_pyfunction!(protein_bursty_pgf, m)?)?;
     m.add_function(wrap_pyfunction!(eval_kld_2d, m)?)?;
+    m.add_function(wrap_pyfunction!(eval_logl_2d, m)?)?;
+    m.add_function(wrap_pyfunction!(eval_logl_2d_sd, m)?)?;
+    m.add_function(wrap_pyfunction!(chisquare_testing_2d_sd, m)?)?;
     m.add_function(wrap_pyfunction!(eval_kld_grad_2d, m)?)?;
     m.add_function(wrap_pyfunction!(optimize_gene_2d, m)?)?;
     m.add_function(wrap_pyfunction!(optimize_genes_2d, m)?)?;

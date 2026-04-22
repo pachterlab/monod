@@ -8,7 +8,7 @@ import scipy
 from scipy import optimize, stats
 import mminference
 
-from extract_data import make_dir, log, extract_data, make_histogram
+from extract_data import make_dir, log, extract_data, make_histogram, _uns_pack, _uns_unpack, _build_sampling_grid
 from cme_toolbox import CMEModel, _HAS_RUST  # may be unnecessary
 try:
     import monod_core as _mc
@@ -25,25 +25,6 @@ from plot_aesthetics import aesthetics
 
 from tqdm import tqdm
 code_ver_global = "029"  # bumping up version April 2024
-
-# ---------------------------------------------------------------------------
-# uns serialization helpers (mirrors extract_data._uns_pack / _uns_unpack)
-# ---------------------------------------------------------------------------
-
-def _uns_pack(obj):
-    """Pickle *obj* to a uint8 array for storage in adata.uns."""
-    return np.frombuffer(pickle.dumps(obj), dtype=np.uint8)
-
-def _uns_unpack(v):
-    """Restore an object previously packed with _uns_pack (no-op otherwise)."""
-    if isinstance(v, (bytes, np.ndarray)) and (
-        isinstance(v, bytes) or (isinstance(v, np.ndarray) and v.dtype == np.uint8)
-    ):
-        try:
-            return pickle.loads(bytes(v))
-        except Exception:
-            pass
-    return v
 
 # from tqdm.contrib.concurrent import process_map  # or thread_map
 # warnings.filterwarnings("ignore", category=DeprecationWarning) #let's do more gargeted stuff...
@@ -302,7 +283,6 @@ def searchdata_from_adata(adata):
 
     M = adata.uns['M']
     n_cells = adata.n_obs
-    hist_type = get_hist_type_adata(adata)
     gene_names = list(adata.var.index)
 
     gene_log_lengths = None
@@ -322,7 +302,7 @@ def searchdata_from_adata(adata):
     k = adata.uns.get('k', None)
     epochs = adata.uns.get('epochs', None)
 
-    if _mc is not None and hist_type == "unique":
+    if _mc is not None:
         # Build the pure-Rust SearchData container.
         from scipy.sparse import issparse as _issparse
         def _to_c_int64(arr):
@@ -339,18 +319,18 @@ def searchdata_from_adata(adata):
             freqs_list,
             gene_names,
             n_cells,
-            hist_type,
+            "unique",
             gene_log_lengths,
             gene_log_lengths_spliced,
             k,
             epochs,
         )
 
-    # Python fallback (grid/none hist_type or Rust unavailable).
+    # Python fallback (Rust unavailable).
     if 'hist' in adata.uns:
         hist = _uns_unpack(adata.uns['hist'])
     else:
-        hist = make_histogram(adata, hist_type, M)
+        hist = make_histogram(adata, "unique", M)
     layers  = np.array([adata.layers[layer_name] for layer_name in ordered_layer_names])
     moments = get_gene_moments(adata)
 
@@ -358,7 +338,7 @@ def searchdata_from_adata(adata):
         "M", "hist", "moments", "n_genes", "gene_names",
         "n_cells", "layers", "hist_type", "layer_names"
     ]
-    attr_values = [M, hist, moments, n_genes, gene_names, n_cells, layers, hist_type, ordered_layer_names]
+    attr_values = [M, hist, moments, n_genes, gene_names, n_cells, layers, "unique", ordered_layer_names]
 
     if gene_log_lengths is not None:
         attr_names  += ['gene_log_lengths']
@@ -388,135 +368,6 @@ def get_gene_moments(adata):
     list_of_dicts = selected_data.to_dict(orient='records')
     
     return list_of_dicts
-
-
-def get_gene_moments_single(adata, gene_index):
-
-    # Create an empty dictionary to store the gene attributes
-    gene_moment_dict = {}
-    
-    # Iterate through each column in adata.var and add it to the dictionary
-    for column in adata.var.columns:
-        if 'MOM_' in column:
-            gene_moment_dict[column[4:]] = adata.var[column].tolist()[gene_index]
-
-    return gene_moment_dict
-
-
-def reject_genes(adata, viz=False,
-        EPS=1e-15,
-        threshold=0.05,
-        bonferroni=True,
-        reject_at_bounds=True,
-        bound_thr=0.01,
-        grouping_thr=5,
-        use_hellinger=True,
-        hellinger_thr=0.05,
-        mek_means=False,
-        save_csq=True,
-                save_pval=False,
-                save_hellinger=False):
-    '''
-    Perform chi-squared testing and add list of rejected genes to anndata object.
-
-    Parameters
-    ------------------
-    save_csq: boolean
-        whether to save chi-squared values per cluster if performing mek-means 
-    save_pval: boolean
-        whether to save p-values per cluster if performing mek-means analysis
-    '''
-
-    if not mek_means:
-        search_data = _uns_unpack(adata.uns['search_data'])
-        try:
-            search_result = _uns_unpack(adata.uns['search_result'])
-        except AttributeError:
-            log.error('Did you mean to run with meK-Means? If so, make sure to set mek_means=True')
-    
-        csq, pval, hellinger = search_result.chisquare_testing(search_data,
-            viz=viz,
-            EPS=EPS,
-            threshold=threshold,
-            bonferroni=bonferroni,
-            reject_at_bounds=reject_at_bounds,
-            bound_thr=bound_thr,
-            grouping_thr=grouping_thr,
-            use_hellinger=use_hellinger,
-            hellinger_thr=hellinger_thr)
-    
-        # Save chi-squared values, p-values, and rejected genes to adata.
-        adata.var['csq'] = csq
-        log.info('Chi-squared values for each gene have been added as \"csq\" in .var')
-
-        adata.var['pval'] = pval
-        log.info('P-values for each gene have been added as \"pval\" in .var')
-
-        adata.var['hellinger'] = hellinger
-        log.info('Hellinger distances for each gene have been added as \"hellinger\" in .var')
-
-        adata.var['rejected_genes'] = search_result.rejected_genes
-        log.info('Rejected genes are recorded in \"rejected_genes\" in .var')
-
-        
-        # Reset search_data and search_result.
-        adata.uns['search_data'] = _uns_pack(search_data)
-        adata.uns['search_result'] = _uns_pack(search_result)
-        adata.uns['rejection_index'] = search_result.rejection_index
-
-    else:
-        search_data = _uns_unpack(adata.uns['search_data'])
-        search_result_list = _uns_unpack(adata.uns['search_result_list'])
-
-        new_sr_list = []
-        
-        for i in range(len(search_result_list)):
-            
-            sr = search_result_list[i]
-            sd =  sr._subset_search_data(search_data)
-            cluster_filter = sr.filt
-            cluster = sr.assigns
-            
-            csq, pval, hellinger = sr.chisquare_testing(sd,
-            viz=viz,
-            EPS=EPS,
-            threshold=threshold,
-            bonferroni=bonferroni,
-            reject_at_bounds=reject_at_bounds,
-            bound_thr=bound_thr,
-            grouping_thr=grouping_thr,
-            use_hellinger=use_hellinger,
-            hellinger_thr=hellinger_thr)
-
-            # Save chi-squared values, p-values, and rejected genes to adata.
-            if save_csq:
-                adata.var['{}_csq'.format(cluster)] = csq
-
-            if save_pval:
-                adata.var['{}_pval'.format(cluster)] = pval
-
-            if save_hellinger:
-                adata.var['{}_hellinger'.format(cluster)] = hellinger
-
-            adata.var['{}_rejected_genes'.format(cluster)] = sr.rejected_genes
-
-            new_sr_list += [sr]
-
-        log.info('Rejected genes in cluster i have been recorded under \"ci_rejected_genes\" in .var')
-        if save_csq:
-            log.info('Chi-squared values for each gene in cluster i have been added as \"ci_csq\" in .var')
-        if save_pval:
-            log.info('P-values for each gene in cluster i have been added as \"ci_pval\" in .var')
-        if save_hellinger:
-            log.info('Hellinger distances for each gene in cluster i have been added as \"ci_hellinger\" in .var')
-            
-        # Reset search_data and search_result.
-        adata.uns['search_result_list'] = _uns_pack(new_sr_list)
-        # This is the same for all clusters (all sr objects), so can be set once (correct?)
-        adata.uns['rejection_index'] = sr.rejection_index
-
-    # Return list of rejected genes.
-    return adata
 
 
 # Use class to make inference faster.
@@ -618,29 +469,6 @@ def AIC_per_gene(search_result, monod_adata):
     monod_adata.var['AIC'] = AIC
     
     return AIC
-
-def get_hist_type(search_data):
-    """A helper function for backwards compatibility.
-
-    If the histogram type is not specified in the SearchData object, assume it is the legacy
-    type "grid".
-
-    Parameters
-    ----------
-    search_data: monod.extract_data.SearchData
-        SearchData object with the data to fit.
-
-    Returns
-    -------
-    hist_type: str
-        flavor of histogram used to generate search_data, either "unique" or "grid" or "none".
-    """
-
-    if hasattr(search_data, "hist_type") and search_data.hist_type == "unique" or "none":
-        hist_type = search_data.hist_type
-    else:
-        hist_type = "grid"
-    return hist_type
 
 
 
@@ -833,18 +661,12 @@ class InferenceParameters:
             list of grid points.
         grid_values_sampl: list of np.ndarrays
             grid point values representing sampling parameters for each modality.
-        n_grid_pts: int
+        n_grid_points: int
             total number of grid points to evaluate.
         """
-        linspaces = [np.linspace(self.samp_lb[i], self.samp_ub[i], self.gridsize[i]) for i in range(len(self.gridsize))]
-        grid_values_sampl = np.meshgrid(*linspaces, indexing="ij")
-        
-        grid_values_sampl = [i.flatten() for i in grid_values_sampl]
-        self.grid_values_sampl = grid_values_sampl
-        
-        self.sampl_vals = list(zip(*grid_values_sampl))
-        
-        self.n_grid_points = len(grid_values_sampl[0])
+        self.grid_values_sampl, self.sampl_vals, self.n_grid_points = _build_sampling_grid(
+            self.samp_lb, self.samp_ub, self.gridsize
+        )
 
     def store_inference_parameters(self, inference_parameter_string):
         """This helper method attempts to save the InferenceParameters object.
@@ -1234,7 +1056,6 @@ class GradientInference:
         if log.isEnabledFor(logging.DEBUG):
             log.debug('Optimizing gene %d with initial value %s', gene_index, np.array2string(10**x0))
         
-        hist_type = get_hist_type(search_data)
         for restart in range(self.gradient_params["num_restarts"]):
             n_jac_jobs = self.gradient_params.get("n_jac_jobs", 1)
 
@@ -1244,7 +1065,6 @@ class GradientInference:
                     limits=search_data.M[:, gene_index],
                     samp=self.regressor[gene_index],
                     data=search_data.hist[gene_index],
-                    hist_type=hist_type,
                     n_jobs=n_jac_jobs,
                 )
 
@@ -1297,7 +1117,6 @@ class GradientInference:
 
         n_gene_cores = self.gradient_params.get("num_gene_cores", 1)
         use_batch = self.gradient_params.get("use_batch_optimizer", False)
-        hist_type = get_hist_type(search_data)
 
         # --- Rust L-BFGS-B fast paths: run the full optimization loop in Rust
         # with rayon parallelism over genes. No Python callbacks, no GIL round-trips.
@@ -1306,7 +1125,6 @@ class GradientInference:
             _mc is not None
             and self.gradient_params.get("use_rust_lbfgsb", False)
             and not use_batch
-            and hist_type == "unique"
         )
         _sd_is_rust = _mc is not None and isinstance(search_data, _mc.SearchData)
 
@@ -1629,7 +1447,6 @@ class GradientInference:
         """
         n_genes   = search_data.n_genes
         n_params  = self.n_phys_pars
-        hist_type = get_hist_type(search_data)
         EPS       = 1e-15
         eps_fd    = self.gradient_params.get("batch_fd_eps", 1e-4)
         # Default: 4× scipy max_iterations so Adam can match L-BFGS-B quality.
@@ -1655,16 +1472,8 @@ class GradientInference:
             """Compute KLD between a flat PSS and the gene's empirical histogram."""
             pss = np.array(pss_flat).reshape(int(limits[0]), int(limits[1])).squeeze()
             np.clip(pss, EPS, None, out=pss)
-            if hist_type == "unique":
-                x, f = search_data.hist[gene_idx]
-                return float(np.sum(f * np.log(f / pss[tuple(x.T)])))
-            elif hist_type == "grid":
-                filt = search_data.hist[gene_idx] > 0
-                h = search_data.hist[gene_idx][filt]
-                q = pss[filt]
-                return float(np.sum(h * np.log(h / q)))
-            else:
-                raise ValueError(f"Unsupported hist_type '{hist_type}' for batch mode")
+            x, f = search_data.hist[gene_idx]
+            return float(np.sum(f * np.log(f / pss[tuple(x.T)])))
 
         def _batch_kld(params_mat):
             """Evaluate KLD for all genes given params_mat (n_genes, n_params)."""
@@ -1787,32 +1596,6 @@ class GradientInference:
 ########################
 ## Helper functions
 ########################
-
-
-def get_hist_type_adata(monod_adata):
-    """A helper function for backwards compatibility.
-
-    If the histogram type is not specified in the anndata object, assume it is the legacy
-    type "grid".
-
-    Parameters
-    ----------
-    monod_adata: Anndata
-        anndata object with the data to fit.
-
-    Returns
-    -------
-    hist_type: str
-        flavor of histogram used to generate monod_adata, either "unique" or "grid" or "none".
-    """
-    
-    if "hist_type" in monod_adata.uns and monod_adata.uns["hist_type"] in {"unique", "none"}:
-        hist_type = monod_adata.uns["hist_type"]
-        
-    else:
-        hist_type = "grid"
-        
-    return hist_type
 
 
 ########################
@@ -2438,7 +2221,65 @@ class SearchResults:
 
         """
         t1 = time.time()
-        hist_type = get_hist_type(search_data)
+
+        _CSQ_RUST_MODELS = {
+            "Constitutive", "Bursty", "CIR",
+            "Extrinsic", "Delay", "DelayedSplicing",
+        }
+        _sd_is_rust = _mc is not None and isinstance(search_data, _mc.SearchData)
+        if (
+            _sd_is_rust
+            and self.model.bio_model in _CSQ_RUST_MODELS
+            and self.model.amb_model == "None"
+            and self.model.quad_method == "fixed_quad"
+            and self.model.seq_model in ("None", "Poisson", "Bernoulli")
+        ):
+            samp_list = None
+            if self.model.seq_model in ("Poisson", "Bernoulli"):
+                samp_list = [
+                    (self.regressor_optimum[gi].tolist()
+                     if self.regressor_optimum[gi] is not None else None)
+                    for gi in range(self.n_genes)
+                ]
+            csq, pval, hellinger = _mc.chisquare_testing_2d_sd(
+                search_data,
+                self.model.bio_model,
+                [row.tolist() for row in self.phys_optimum],
+                samp_list,
+                float(self.model.fixed_quad_T),
+                int(self.model.quad_order),
+                int(self.model.get_num_params()),
+                float(grouping_thr),
+                float(EPS),
+                self.model.seq_model,
+            )
+            csq = np.asarray(csq)
+            pval = np.asarray(pval)
+            hellinger = np.asarray(hellinger)
+
+            if bonferroni:
+                threshold /= self.n_genes
+            self.rejected_genes = pval < threshold
+            if use_hellinger:
+                self.rejected_genes = self.rejected_genes & (hellinger > hellinger_thr)
+            if reject_at_bounds:
+                bound_range = self.sp.phys_ub - self.sp.phys_lb
+                lb_b = self.sp.phys_lb + bound_range * bound_thr
+                ub_b = self.sp.phys_ub - bound_range * bound_thr
+                self.rejected_genes = self.rejected_genes | (
+                    (self.phys_optimum < lb_b) | (self.phys_optimum > ub_b)
+                ).any(1)
+            self.pval = pval
+            self.csq = csq
+            self.hellinger = hellinger
+            self.rejection_index = self.samp_optimum_ind
+            t2 = time.time()
+            log.info(
+                "Chi-square computation complete (Rust). Rejected {:.0f} genes out of {:.0f}. Runtime: {:.1f} seconds.".format(
+                    np.sum(self.rejected_genes), self.n_genes, t2 - t1
+                )
+            )
+            return csq, pval, hellinger
 
         csqarr = []
         hellinger = []
@@ -2457,33 +2298,24 @@ class SearchResults:
             # expected_freq /= expected_freq.sum()
             # PROPOSAL = search_data.n_cells * expected_freq
 
-            if hist_type == "grid":
-                raise ValueError("Not implemented in current version.")
-            elif hist_type == "unique":
-                counts = np.concatenate(
-                    (search_data.n_cells * search_data.hist[gene_index][1], [0])
-                )
-                # print(search_data.hist)
-                number_of_modalities = len(search_data.hist[gene_index][0][0])
-                if number_of_modalities == 2:
-                    expect_freq = expect_freq[
-                        search_data.hist[gene_index][0][:, 0],
-                        search_data.hist[gene_index][0][:, 1],
-                    ]
-                elif number_of_modalities == 3:
-                    expect_freq = expect_freq[
-                        search_data.hist[gene_index][0][:, 0],
-                        search_data.hist[gene_index][0][:, 1],
-                        search_data.hist[gene_index][0][:, 2]
-                    ]
-
-                # expect_freq = expect_freq[ [
-                #     search_data.hist[gene_index][0][:, i] for i in range(len(search_data.hist[gene_index][0][0]))
-                # ]]
-
-                expect_freq = np.concatenate(
-                    (expect_freq, [search_data.n_cells - expect_freq.sum()])
-                )
+            counts = np.concatenate(
+                (search_data.n_cells * search_data.hist[gene_index][1], [0])
+            )
+            number_of_modalities = len(search_data.hist[gene_index][0][0])
+            if number_of_modalities == 2:
+                expect_freq = expect_freq[
+                    search_data.hist[gene_index][0][:, 0],
+                    search_data.hist[gene_index][0][:, 1],
+                ]
+            elif number_of_modalities == 3:
+                expect_freq = expect_freq[
+                    search_data.hist[gene_index][0][:, 0],
+                    search_data.hist[gene_index][0][:, 1],
+                    search_data.hist[gene_index][0][:, 2]
+                ]
+            expect_freq = np.concatenate(
+                (expect_freq, [search_data.n_cells - expect_freq.sum()])
+            )
 
             hellinger_ = (
                 1
@@ -2622,18 +2454,12 @@ class SearchResults:
         import numdifftools  # this will fail if numdifftools has not been evaluted.
 
         gene_index, search_data = inputs
-        hist_type = get_hist_type(search_data)
-        # if hasattr(search_data, "hist_type") and search_data.hist_type == "unique":
-        #     hist_type = "unique"
-        # else:
-        #     hist_type = "grid"
         Hfun = numdifftools.Hessian(
             lambda x: self.model.eval_model_kld(
                 p=x,
                 limits=search_data.M[:, gene_index],
                 samp=self.regressor_optimum[gene_index],
                 data=search_data.hist[gene_index],
-                hist_type=hist_type,
             )
         )
         hess = Hfun(self.phys_optimum[gene_index])
@@ -3212,25 +3038,50 @@ class SearchResults:
         Output:
         logL: a vector of size n_genes containing model log-likelihoods.
         """
-        hist_type = get_hist_type(search_data)
-        logL = np.zeros(self.n_genes)
+        _LOGL_RUST_MODELS = {
+            "Constitutive", "Bursty", "CIR",
+            "Extrinsic", "Delay", "DelayedSplicing",
+        }
+        model = self.model
+        if (
+            _HAS_RUST
+            and offs == 0
+            and isinstance(search_data, _mc.SearchData)
+            and model.bio_model in _LOGL_RUST_MODELS
+            and model.amb_model == "None"
+            and model.quad_method == "fixed_quad"
+            and (model.seq_model == "None" or model.seq_model in ("Poisson", "Bernoulli"))
+        ):
+            phys_optimum = [p.tolist() for p in self.phys_optimum]
+            if model.seq_model == "None":
+                samp_list = None
+            else:
+                samp_list = [
+                    r.tolist() if r is not None else None
+                    for r in self.regressor_optimum
+                ]
+            return np.array(_mc.eval_logl_2d_sd(
+                search_data,
+                model.bio_model,
+                phys_optimum,
+                float(n_cells),
+                samp_list,
+                float(model.fixed_quad_T),
+                int(model.quad_order),
+                float(EPS),
+                model.seq_model,
+            ))
 
+        logL = np.zeros(self.n_genes)
         for gene_index in range(self.n_genes):
-            logL[gene_index] = self.model.eval_model_logL(
+            logL[gene_index] = model.eval_model_logL(
                 p=self.phys_optimum[gene_index],
                 limits=search_data.M[:, gene_index] + offs,
                 samp=self.regressor_optimum[gene_index],
                 data=search_data.hist[gene_index],
                 n_cells=n_cells,
-                hist_type=hist_type,
                 EPS=EPS,
             )
-            # Pss = self.model.eval_model_pss(self.phys_optimum[gene_index],lm,samp)
-            # if np.any(Pss<EPS):
-            #     Pss[Pss<EPS] = EPS
-            # expected_log_lik = np.log(Pss)
-            # eval_model_kld(self, p, limits, samp, data, hist_type="unique", EPS=EPS)
-            # logL[gene_index] = expected_log_lik[search_data.U[gene_index].astype(int),search_data.S[gene_index].astype(int)].sum()
         return logL
 
     def get_noise_decomp(self):

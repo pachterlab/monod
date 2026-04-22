@@ -312,21 +312,21 @@ class TestEvalModelKLD:
         p = np.array([0.3, 0.0, -0.1])
         pss = bursty_none.eval_model_pss(p, self.LIMITS)
         data = _pss_to_unique_data(pss)
-        kld = bursty_none.eval_model_kld(p, self.LIMITS, None, data, "unique")
+        kld = bursty_none.eval_model_kld(p, self.LIMITS, None, data)
         np.testing.assert_allclose(kld, 0.0, atol=1e-5)
 
     def test_constitutive_self_kld_near_zero(self, constitutive_none):
         p = np.array([0.0, 0.0])
         pss = constitutive_none.eval_model_pss(p, self.LIMITS)
         data = _pss_to_unique_data(pss)
-        kld = constitutive_none.eval_model_kld(p, self.LIMITS, None, data, "unique")
+        kld = constitutive_none.eval_model_kld(p, self.LIMITS, None, data)
         np.testing.assert_allclose(kld, 0.0, atol=1e-5)
 
     def test_extrinsic_self_kld_near_zero(self, extrinsic_none):
         p = np.array([0.5, 0.0, 0.0])
         pss = extrinsic_none.eval_model_pss(p, self.LIMITS)
         data = _pss_to_unique_data(pss)
-        kld = extrinsic_none.eval_model_kld(p, self.LIMITS, None, data, "unique")
+        kld = extrinsic_none.eval_model_kld(p, self.LIMITS, None, data)
         np.testing.assert_allclose(kld, 0.0, atol=1e-5)
 
     def test_bursty_kld_nonnegative(self, bursty_none):
@@ -334,7 +334,7 @@ class TestEvalModelKLD:
         p_fit = np.array([0.2, 0.1, 0.0])
         pss = bursty_none.eval_model_pss(p_true, self.LIMITS)
         data = _pss_to_unique_data(pss)
-        kld = bursty_none.eval_model_kld(p_fit, self.LIMITS, None, data, "unique")
+        kld = bursty_none.eval_model_kld(p_fit, self.LIMITS, None, data)
         assert kld >= 0.0
 
     def test_bursty_cross_kld_snapshot(self, bursty_none):
@@ -342,7 +342,7 @@ class TestEvalModelKLD:
         p_fit = np.array([0.2, 0.1, 0.0])
         pss = bursty_none.eval_model_pss(p_true, self.LIMITS)
         data = _pss_to_unique_data(pss)
-        kld = bursty_none.eval_model_kld(p_fit, self.LIMITS, None, data, "unique")
+        kld = bursty_none.eval_model_kld(p_fit, self.LIMITS, None, data)
         check_snapshot("eval_model_kld_bursty_none_cross", np.array([kld]))
 
     def test_constitutive_cross_kld_snapshot(self, constitutive_none):
@@ -350,7 +350,7 @@ class TestEvalModelKLD:
         p_fit = np.array([0.1, -0.1])
         pss = constitutive_none.eval_model_pss(p_true, self.LIMITS)
         data = _pss_to_unique_data(pss)
-        kld = constitutive_none.eval_model_kld(p_fit, self.LIMITS, None, data, "unique")
+        kld = constitutive_none.eval_model_kld(p_fit, self.LIMITS, None, data)
         check_snapshot("eval_model_kld_constitutive_none_cross", np.array([kld]))
 
     def test_extrinsic_cross_kld_snapshot(self, extrinsic_none):
@@ -358,7 +358,7 @@ class TestEvalModelKLD:
         p_fit = np.array([0.3, 0.1, -0.1])
         pss = extrinsic_none.eval_model_pss(p_true, self.LIMITS)
         data = _pss_to_unique_data(pss)
-        kld = extrinsic_none.eval_model_kld(p_fit, self.LIMITS, None, data, "unique")
+        kld = extrinsic_none.eval_model_kld(p_fit, self.LIMITS, None, data)
         check_snapshot("eval_model_kld_extrinsic_none_cross", np.array([kld]))
 
 

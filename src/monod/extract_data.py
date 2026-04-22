@@ -48,6 +48,19 @@ def _uns_unpack(v):
             pass
     return v
 
+def _build_sampling_grid(samp_lb, samp_ub, gridsize):
+    """Build a flat meshgrid over the sampling-parameter space.
+
+    Returns (grid_values, sampl_vals, n_grid_points) where grid_values is a
+    list of flattened per-axis arrays, sampl_vals is a list of (v0, v1, ...)
+    tuples, and n_grid_points is the total number of points.
+    """
+    linspaces = [np.linspace(samp_lb[i], samp_ub[i], gridsize[i]) for i in range(len(gridsize))]
+    grid_values = np.meshgrid(*linspaces, indexing="ij")
+    grid_values = [g.flatten() for g in grid_values]
+    sampl_vals = list(zip(*grid_values))
+    return grid_values, sampl_vals, len(grid_values[0])
+
 import logging, sys
 from scipy.sparse import csr_matrix
 from scipy.sparse import issparse
@@ -101,7 +114,7 @@ def extract_data(
     code_ver=code_ver_global,
     exp_filter_threshold=1,
     genes_to_fit=[],
-    hist_type = 'grid',
+    hist_type = 'unique',
     padding=None,
     mek_means_params=None,
 ):
@@ -235,8 +248,6 @@ def extract_data(
     monod_adata.uns['modality_name_dict'] = modality_name_dict
     monod_adata.uns['model'] = _uns_pack(model)
 
-
-    
     if padding is None:
         padding = np.asarray([10] * len(ordered_layer_names))
 
@@ -314,7 +325,7 @@ def extract_data(
     
     monod_adata.uns['model'] = _uns_pack(model)
 
-    if not (_HAS_RUST and hist_type == "unique"):
+    if not _HAS_RUST:
         hist = make_histogram(monod_adata, hist_type, M)
         monod_adata.uns['hist'] = _uns_pack(hist)
     # Save adata?
@@ -326,33 +337,6 @@ def extract_data(
     monod_adata.raw = raw_adata
     
     return monod_adata
-
-def sparse_to_arrays(adata):
-
-    # Assuming `adata` is your existing AnnData object
-    adata_dense_layers = ad.AnnData(
-        X=adata.X.copy(),
-        obs=adata.obs.copy(),
-        var=adata.var.copy(),
-        obsm=adata.obsm.copy(),
-        varm=adata.varm.copy(),
-        obsp=adata.obsp.copy(),
-        varp=adata.varp.copy(),
-        uns=adata.uns.copy()
-    )
-    
-    # Replace sparse layers with dense NumPy arrays
-    for layer in adata.layers:
-        if issparse(adata.layers[layer]):
-            adata_dense_layers.layers[layer] = adata.layers[layer].toarray()  # Convert to dense array
-        else:
-            adata_dense_layers.layers[layer] = adata.layers[layer].copy()  # Copy if already dense
-    
-    # Preserve obs_names and var_names
-    adata_dense_layers.obs_names = adata.obs_names
-    adata_dense_layers.var_names = adata.var_names
-
-    return adata_dense_layers
 
 def CSRDataset_to_arrays(adata):
 
@@ -515,15 +499,8 @@ def _make_histogram_one_gene(gene_index, layers, hist_type, M, n_cells):
     ]
     stacked = np.column_stack(gene_cols)  # (n_cells, n_modalities) — built once
 
-    if hist_type == "grid":
-        bins = [np.arange(M[layer_i][gene_index] + 1) - 0.5 for layer_i in range(len(layers))]
-        H, _ = np.histogramdd(stacked, bins=bins, density=True)
-    elif hist_type == "unique":
-        unique, unique_counts = np.unique(stacked, axis=0, return_counts=True)
-        H = (unique.astype(int), unique_counts / n_cells)
-    else:  # "none"
-        H = [col for col in gene_cols]
-    return H
+    unique, unique_counts = np.unique(stacked, axis=0, return_counts=True)
+    return (unique.astype(int), unique_counts / n_cells)
 
 
 def make_histogram(monod_adata, hist_type, M, n_jobs=1):
@@ -533,7 +510,7 @@ def make_histogram(monod_adata, hist_type, M, n_jobs=1):
     ----------
     monod_adata : AnnData
     hist_type : str
-        "unique", "grid", or "none".
+        Must be "unique".
     M : array-like
         Grid limits per layer per gene.
     n_jobs : int
@@ -606,7 +583,11 @@ def get_noise_decomp(
         # Copy the layer to a temporary AnnData object for normalization
         temp_adata = anndata.AnnData(X=adata.layers[layer])
 
-        temp_adata = normalize_count_matrix(temp_adata, sizefactor=sizefactor, lognormalize=lognormalize, pcount=pcount)
+        if sizefactor is not None:
+            target = temp_adata.X.sum(0).mean() if sizefactor == "pf" else sizefactor
+            sc.pp.normalize_total(temp_adata, target_sum=target, inplace=True)
+        if lognormalize:
+            sc.pp.log1p(temp_adata)
 
         # Compute variance before and after normalization
         original_variance = var_fun(anndata.AnnData(X=adata.layers[layer]), which_variance_measure)
@@ -634,45 +615,6 @@ def var_fun(adata, measure):
         variance = adata.X.var(axis=1).A1
         return variance / mean
 
-
-def normalize_count_matrix(
-    adata, sizefactor="pf", lognormalize=True, pcount=1, logbase=np.e
-):
-    """
-    This function performs normalization and variance stabilization on a raw data matrix in an AnnData object
-    using Scanpy's built-in functions.
-
-    Parameters
-    ----------
-    adata: anndata.AnnData
-        AnnData object with a gene x cell count matrix in adata.X.
-    sizefactor: str, float, int, or None, optional
-        What size factor to use.
-        If 'pf', use proportional fitting; set the size of each cell to the mean size.
-        If int or float, use this number (e.g., 1e4 for cp10k).
-        If None, do not do size/depth normalization.
-    lognormalize: bool, optional
-        Whether to apply log transformation.
-    pcount: int or float, optional
-        Pseudocount added in size normalization to ensure division by zero does not occur.
-    logbase: int or float
-        log base for scanpy.
-
-    Returns
-    -------
-    adata: anndata.AnnData
-        AnnData object with normalized and transformed count matrix in adata.X.
-    """
-    if sizefactor is not None:
-        if sizefactor == "pf":
-            sc.pp.normalize_total(adata, target_sum=adata.X.sum(0).mean(), inplace=True)
-        else:
-            sc.pp.normalize_total(adata, target_sum=sizefactor, inplace=True)
-
-    if lognormalize:
-        sc.pp.log1p(adata, base=logbase)
-    
-    return adata
 
 ########################
 ## Main code

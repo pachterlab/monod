@@ -502,7 +502,7 @@ class CMEModel:
             numpars += 2
         return numpars
 
-    def eval_model_logL(self, p, limits, samp, data,n_cells, hist_type="unique", EPS=1e-15):
+    def eval_model_logL(self, p, limits, samp, data, n_cells, EPS=1e-15):
         """Compute the log-likelihood of data under a set of parameters.
 
         Parameters
@@ -515,10 +515,6 @@ class CMEModel:
             sampling parameters, if applicable.
         data: tuple or np.ndarray
             experimental data histogram.
-        hist_type: str, optional
-            if "grid": the search data histogram was generated using np.histogramdd.
-            if "unique": the search data histogram was generated using np.unique.
-            "unique" is the preferred method for histogram generation, as it requires less memory to store.
         EPS: float, optional
             minimum allowed proposal probability mass. anything below this value is rounded up to EPS.
 
@@ -527,24 +523,41 @@ class CMEModel:
         logL: float
             log-likelihood.
         """
-        if hist_type == "grid":
-            raise ValueError("Not yet implemented!")
-            # proposal = self.eval_model_pss(p, limits, samp)
-            # proposal[proposal < EPS] = EPS
-            # filt = data > 0
-            # data = data[filt]
-            # proposal = proposal[filt]
-            # d = data * np.log(data / proposal)
-            # return np.sum(d)
-        elif hist_type == "unique":
+        _LOGL_RUST_MODELS = {
+            "Constitutive", "Bursty", "CIR",
+            "Extrinsic", "Delay", "DelayedSplicing",
+        }
+        if (
+            _HAS_RUST
+            and self.bio_model in _LOGL_RUST_MODELS
+            and self.amb_model == "None"
+            and self.quad_method == "fixed_quad"
+            and (samp is None or self.seq_model in ("Poisson", "Bernoulli"))
+        ):
             x, f = data
-            proposal = self.eval_model_pss(p, limits, samp)
-            proposal[proposal < EPS] = EPS
-            proposal = proposal[tuple(x.T)]
-            logL = np.log(proposal)*f*n_cells
-            return np.sum(logL)
+            x_np = np.asarray(x, dtype=np.int64)
+            return _mc.eval_logl_2d(
+                self.bio_model,
+                np.asarray(p, dtype=float).tolist(),
+                [int(v) for v in limits],
+                x_np[:, 0].tolist(),
+                x_np[:, 1].tolist(),
+                np.asarray(f, dtype=float).tolist(),
+                float(n_cells),
+                float(self.fixed_quad_T),
+                int(self.quad_order),
+                samp.tolist() if samp is not None else None,
+                float(EPS),
+                self.seq_model,
+            )
 
-    def eval_model_kld(self, p, limits, samp, data, hist_type, EPS=1e-15):
+        x, f = data
+        proposal = self.eval_model_pss(p, limits, samp)
+        proposal[proposal < EPS] = EPS
+        proposal = proposal[tuple(x.T)]
+        return np.sum(np.log(proposal) * f * n_cells)
+
+    def eval_model_kld(self, p, limits, samp, data, EPS=1e-15):
         """Compute the Kullback-Leibler divergence between data and a fit.
 
         Parameters
@@ -557,11 +570,6 @@ class CMEModel:
             sampling parameters, if applicable.
         data: tuple or np.ndarray
             experimental data histogram.
-        hist_type: str, optional
-            if "grid": the search data histogram was generated using np.histogramdd.
-            if "none": the counts were stored.
-            if "unique": the search data histogram was generated using np.unique.
-            "unique" is the preferred method for histogram generation, as it requires less memory to store.
         EPS: float, optional
             minimum allowed proposal probability mass. anything below this value is rounded up to EPS.
 
@@ -578,7 +586,6 @@ class CMEModel:
         # Python round-trip for histogram indexing and log/sum operations.
         if (
             _HAS_RUST
-            and hist_type == "unique"
             and self.bio_model in _KLD_RUST_MODELS
             and self.amb_model == "None"
             and self.quad_method == "fixed_quad"
@@ -600,29 +607,18 @@ class CMEModel:
                 self.seq_model,
             )
 
+        x, f = data
         proposal = self.eval_model_pss(p, limits, samp)
         proposal[proposal < EPS] = EPS
-
-        if hist_type == "grid":
-            filt = data > 0
-            data = data[filt]
-            proposal = proposal[filt]
-            d = data * np.log(data / proposal)
-
-        elif hist_type == "unique":
-            x, f = data
-            proposal = proposal[tuple(x.T)]
-            d = f * np.log(f / proposal)
-
-        elif hist_type == "none":
-            d = -np.log([proposal[tuple(idx)] for idx in np.array(data,dtype=int).T])
+        proposal = proposal[tuple(x.T)]
+        d = f * np.log(f / proposal)
 
         if log.isEnabledFor(logging.DEBUG):
             log.debug('The KL divergence with parameter %s is %.10f', np.array2string(10**p), np.sum(d))
 
         return np.sum(d)
 
-    def eval_model_kld_and_grad(self, p, limits, samp, data, hist_type,
+    def eval_model_kld_and_grad(self, p, limits, samp, data,
                                 EPS=1e-15, eps=1e-6, n_jobs=1):
         """Compute KLD and its gradient w.r.t. log10 parameters.
 
@@ -643,8 +639,6 @@ class CMEModel:
             sampling parameters.
         data: tuple or np.ndarray
             experimental histogram.
-        hist_type: str
-            histogram type ("unique", "grid", or "none").
         EPS: float
             minimum allowed probability mass.
         eps: float
@@ -675,10 +669,8 @@ class CMEModel:
             or (self.bio_model in _QUAD_ANALYTIC_MODELS and not _HAS_RUST)
         )
         if (_use_analytic
-                and self.amb_model == "None"
-                and hist_type in ("unique", "grid")):
-            result = self._eval_kld_analytic_grad(p, limits, samp, data,
-                                                   hist_type, EPS)
+                and self.amb_model == "None"):
+            result = self._eval_kld_analytic_grad(p, limits, samp, data, EPS)
             if result is not None:
                 return result
 
@@ -690,7 +682,6 @@ class CMEModel:
         }
         if (
             _HAS_RUST
-            and hist_type == "unique"
             and self.bio_model in _RUST_FD_MODELS
             and self.amb_model == "None"
             and self.quad_method == "fixed_quad"
@@ -714,12 +705,12 @@ class CMEModel:
             return kld0, np.array(grad_list)
 
         # Python fallback: forward finite differences.
-        kld0 = self.eval_model_kld(p, limits, samp, data, hist_type, EPS)
+        kld0 = self.eval_model_kld(p, limits, samp, data, EPS)
 
         def _perturbed(i):
             p_eps = p.copy()
             p_eps[i] += eps
-            return self.eval_model_kld(p_eps, limits, samp, data, hist_type, EPS)
+            return self.eval_model_kld(p_eps, limits, samp, data, EPS)
 
         n_params = len(p)
         if n_jobs == 1:
@@ -731,7 +722,7 @@ class CMEModel:
         grad = (np.array(klds_eps) - kld0) / eps
         return kld0, grad
 
-    def _eval_kld_analytic_grad(self, p, limits, samp, data, hist_type, EPS):
+    def _eval_kld_analytic_grad(self, p, limits, samp, data, EPS):
         """Analytical KLD gradient via chain rule through log-PGF → IFFT.
 
         Computes d KLD / d log10(θ_i) = -(1/N) * dot(f/pss, dR_i) + dN_i/N
@@ -904,16 +895,10 @@ class CMEModel:
         pss_flat = np.abs(pss_unnorm_flat) / norm
 
         # KLD value.
-        if hist_type == "unique":
-            coords, freqs = data
-            proposal = pss_unnorm.reshape(limits)[tuple(coords.T)] / norm
-            proposal_clipped = np.clip(proposal.real, EPS, None)
-            kld = float(np.sum(freqs * np.log(freqs / proposal_clipped)))
-        else:  # "grid"
-            H = data
-            pss_grid = pss_unnorm.real / norm
-            pss_clipped = np.clip(pss_grid, EPS, None)
-            kld = float(np.sum(H * np.log(H / pss_clipped)))
+        coords, freqs = data
+        proposal = pss_unnorm.reshape(limits)[tuple(coords.T)] / norm
+        proposal_clipped = np.clip(proposal.real, EPS, None)
+        kld = float(np.sum(freqs * np.log(freqs / proposal_clipped)))
 
         # Analytical gradient: d KLD / d θ_i = -(1/N)*dot(f/pss, dR_i) + dN_i/N
         grad = np.empty(len(dphi))
@@ -921,17 +906,11 @@ class CMEModel:
             dG_i = G * dphi_i
             dR_i = irfftn(dG_i.reshape(shape_mx), s=tuple(limits)).flatten().real
             dN_i = float(np.sum(dR_i))
-            if hist_type == "unique":
-                dR_at_data = dR_i.reshape(limits)[tuple(coords.T)]
-                grad[i] = float(
-                    -(1.0 / norm) * np.sum(freqs / proposal_clipped * dR_at_data)
-                    + dN_i / norm
-                )
-            else:
-                grad[i] = float(
-                    -(1.0 / norm) * np.sum(H / pss_clipped * dR_i.reshape(limits))
-                    + dN_i / norm
-                )
+            dR_at_data = dR_i.reshape(limits)[tuple(coords.T)]
+            grad[i] = float(
+                -(1.0 / norm) * np.sum(freqs / proposal_clipped * dR_at_data)
+                + dN_i / norm
+            )
         return kld, grad
 
     def eval_model_pss(self, p, limits, samp=None):

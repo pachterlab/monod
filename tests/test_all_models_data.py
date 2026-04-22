@@ -348,7 +348,7 @@ class TestKLDAtMOMAllModels:
         p = _mom_params(model, adata)
         limits = _limits(adata)
         coords, freqs = _histogram(adata)
-        kld = model.eval_model_kld(p, limits, None, (coords, freqs), "unique")
+        kld = model.eval_model_kld(p, limits, None, (coords, freqs))
         assert np.isfinite(kld)
 
     def test_kld_nonnegative(self, processed):
@@ -357,7 +357,7 @@ class TestKLDAtMOMAllModels:
         p = _mom_params(model, adata)
         limits = _limits(adata)
         coords, freqs = _histogram(adata)
-        kld = model.eval_model_kld(p, limits, None, (coords, freqs), "unique")
+        kld = model.eval_model_kld(p, limits, None, (coords, freqs))
         assert kld >= 0.0
 
     def test_kld_snapshot(self, processed):
@@ -366,7 +366,7 @@ class TestKLDAtMOMAllModels:
         p = _mom_params(model, adata)
         limits = _limits(adata)
         coords, freqs = _histogram(adata)
-        kld = model.eval_model_kld(p, limits, None, (coords, freqs), "unique")
+        kld = model.eval_model_kld(p, limits, None, (coords, freqs))
         check_snapshot(_snap(processed["bio_model"], "kld_mom"), np.array([kld]))
 
 

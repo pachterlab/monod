@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
 from scipy.special import logsumexp, softmax
-from extract_data import make_dir, log
+from extract_data import make_dir, log, _build_sampling_grid
 from cme_toolbox import CMEModel  # may be unnecessary
 import multiprocessing
 import os
@@ -296,7 +296,9 @@ class InferenceParameters:
         self.samp_ub = np.array(samp_ub)
         self.gridsize = gridsize
 
-        self.construct_grid()
+        self.grid_values_sampl, self.sampl_vals, self.n_grid_points = _build_sampling_grid(
+            self.samp_lb, self.samp_ub, self.gridsize
+        )
         self.model = model
 
         self.k = k
@@ -321,26 +323,6 @@ class InferenceParameters:
         inference_parameter_string = inference_string + "/parameters.pr"
         self.store_inference_parameters(inference_parameter_string)
 
-    def construct_grid(self):
-        """Creates a grid of points over the two-dimensional technical variation parameter domain.
-
-        Sets
-        ----
-        sampl_vals: list of lists of floats
-            list of grid points.
-        grid_values_sampl: list of np.ndarrays
-            grid point values representing sampling parameters for each modality.
-        n_grid_pts: int
-            total number of grid points to evaluate.
-        """
-        linspaces = [np.linspace(self.samp_lb[i], self.samp_ub[i], self.gridsize[i]) for i in range(len(self.gridsize))]
-        grid_values_sampl = np.meshgrid(*linspaces, indexing="ij")
-        
-        grid_values_sampl = [i.flatten() for i in grid_values_sampl]
-        self.grid_values_sampl = grid_values_sampl
-        
-        self.sampl_vals = list(zip(*grid_values_sampl))
-        self.n_grid_points = len(grid_values_sampl[0])    
 
 
     def store_inference_parameters(self, inference_parameter_string):
@@ -406,28 +388,26 @@ class InferenceParameters:
         if self.n_grid_points > 1:
             raise ValueError("Multiple grid points not implemented yet for meK-Means")
         log.info("Starting non-parallelized grid scan.")
-        [
-            self.par_fun(x)
-            for x in zip(
-                range(self.n_grid_points),
-                [[search_data, self.model]] * self.n_grid_points,
-                [self.k] * self.n_grid_points,
-                [self.epochs] * self.n_grid_points,
-                [num_cores] * self.n_grid_points,
-            )
-        ]
+        gp_results = {}
+        for x in zip(
+            range(self.n_grid_points),
+            [[search_data, self.model]] * self.n_grid_points,
+            [self.k] * self.n_grid_points,
+            [self.epochs] * self.n_grid_points,
+            [num_cores] * self.n_grid_points,
+        ):
+            r = self.par_fun(x)
+            if r is not None:
+                gp_results[r.point_index] = r
         log.info("Non-parallelized grid scan complete.")
 
-        #Loop through assignments, and save each k results
         warnings.resetwarnings()
-        full_result_strings = []
         full_results = []
         for i in range(self.k):
             results = SearchResults(self, search_data, i)
-            results.aggregate_grid_points(clean=False)
-            if results.save == True:
-                full_result_string = results.store_on_disk()
-                full_result_strings += [full_result_string]
+            results.aggregate_grid_points(gp_results)
+            if results.save:
+                results.store_on_disk()
                 full_results += [results]
 
         t2 = time.time()
@@ -454,7 +434,7 @@ class InferenceParameters:
         """
         point_index, (search_data, model), k, epochs, num_cores = inputs
         grad_inference = GradientInference(self, model, search_data, point_index, k, epochs)
-        grad_inference.fit_all_genes(model, search_data, num_cores)
+        return grad_inference.fit_all_genes(model, search_data, num_cores)
 
 
 class GradientInference:
@@ -851,11 +831,6 @@ class GradientInference:
             obs x k mixture components for p(z=k|x)
 
         """
-        if search_data.hist_type == "grid":
-            raise ValueError("Mixture model not yet implemented for grid hist type")
-
-        if search_data.hist_type != "unique":
-            raise ValueError(f"Unsupported hist_type: {search_data.hist_type}")
 
         n_cells = search_data.n_cells
         n_genes = search_data.n_genes
@@ -1049,17 +1024,13 @@ class GradientInference:
         err = np.inf
         ERR_THRESH = 0.99
 
-        # print(hist_type)
-        hist_type = get_hist_type(search_data)
-
         for restart in range(self.gradient_params["num_restarts"]):
             res_arr = scipy.optimize.minimize(
                 lambda x: model.eval_model_kld(
-                    p=x,  
+                    p=x,
                     limits=search_data.M[:, gene_index],
                     samp=self.regressor[gene_index],
                     data=search_data.hist[gene_index],
-                    hist_type=hist_type,
                 ),
                 x0=x0[restart],
                 bounds=self.grad_bnd,
@@ -1223,7 +1194,7 @@ class GradientInference:
         aic = lower_bound - (self.n_phys_pars * search_data.n_genes * num_comp + num_comp - 1)/search_data.n_cells
 
 
-        results = GridPointResults(  #****** Update how stored ****** 
+        return GridPointResults(
             *search_out,
             aic,
             assigns,
@@ -1234,7 +1205,6 @@ class GradientInference:
             self.point_index,
             self.inference_string,
         )
-        results.store_grid_point_results()
 
 ########################
 ## Helper functions
@@ -1267,28 +1237,10 @@ def make_histogram(layers, layer_names, hist_type, M):
     n_genes = layers[0].shape[1]  # Assuming all layers have the same number of genes
 
     for gene_index in range(n_genes):
-        
-        if hist_type == "grid":
-            bins = [np.arange(x[gene_index] + 1) - 0.5 for x in M]
-            stacked_data = np.vstack([x[:, gene_index] for x in layers]).T
-            H, edges = np.histogramdd(
-                stacked_data,
-                bins=bins,
-                density=True
-            )
-            xedges = edges[0]  # Assuming only one dimension for each bin
-            yedges = edges[1] 
-        elif hist_type == "unique":
-            unique, unique_counts = np.unique(
-                np.vstack([x[:, gene_index] for x in layers]).T, axis=0, return_counts=True
-            )
-            frequencies = unique_counts / n_cells
-            unique = unique.astype(int)
-            H = (unique, frequencies)
-        elif hist_type == "none":
-            H = [x[:, gene_index] for x in layers]
-
-        hist.append(H)
+        unique, unique_counts = np.unique(
+            np.vstack([x[:, gene_index] for x in layers]).T, axis=0, return_counts=True
+        )
+        hist.append((unique.astype(int), unique_counts / n_cells))
 
     return hist
 
@@ -1353,30 +1305,6 @@ def get_moment_dicts(layers, layer_names, cov_matrix_key='layer_covariances'):
 
     return gene_moments
 
-
-
-def get_hist_type(search_data):
-    """A helper function for backwards compatibility.
-
-    If the histogram type is not specified in the SearchData object, assume it is the legacy
-    type "grid".
-
-    Parameters
-    ----------
-    search_data: monod.extract_data.SearchData
-        SearchData object with the data to fit.
-
-    Returns
-    -------
-    hist_type: str
-        flavor of histogram used to generate search_data, either "unique" or "grid".
-    """
-
-    if hasattr(search_data, "hist_type") and search_data.hist_type == "unique":
-        hist_type = "unique"
-    else:
-        hist_type = "grid"
-    return hist_type
 
 
 ########################
@@ -1598,18 +1526,46 @@ class SearchResults:
         self.all_klds = []
         self.filt = []
 
-    def aggregate_grid_points(self,clean=True):
+    def aggregate_grid_points(self, gp_results=None):
         """This helper method concatenates all of the grid point results.
 
-        The method runs append_grid_point for all grid points, then removes the original grid point files.
+        Parameters
+        ----------
+        gp_results: dict or None, optional
+            If provided, a dict mapping point_index -> GridPointResults for
+            in-memory aggregation. If None or a point is missing, falls back
+            to reading .gp files from disk.
         """
         for point_index in range(self.sp.n_grid_points):
-            self.append_grid_point(point_index)
-        
-        self.clean_up(clean)
+            if gp_results is not None and point_index in gp_results:
+                self._append_from_object(gp_results[point_index])
+            else:
+                self.append_grid_point(point_index)
+        self.clean_up(remove_files=(gp_results is None))
 
-    def append_grid_point(self, point_index): 
-        """This helper method updates the result attributes from a GridPointResult object stored on disk.
+    def _append_from_object(self, gpr):
+        """Update result attributes from an in-memory GridPointResults object.
+
+        Parameters
+        ----------
+        gpr: GridPointResults
+        """
+        if self.assigns in np.unique(gpr.assigns):
+            self.save = True
+            self.param_estimates += [gpr.param_estimates[:, :, self.assigns]]
+            self.klds += [gpr.klds[:, self.assigns]]
+            self.obj_func += [gpr.obj_func[self.assigns]]
+            self.d_time += [gpr.d_time[self.assigns]]
+            self.regressor += [gpr.regressor]
+            self.aic += [gpr.aic]
+            self.weights += [gpr.weights[self.assigns]]
+            self.all_qs += [gpr.all_qs]
+            self.all_klds += [[i[:, self.assigns] for i in gpr.all_klds]]
+            self.filt = gpr.assigns == self.assigns
+            self.n_cells = np.sum(self.filt)
+
+    def append_grid_point(self, point_index):
+        """Update result attributes from a GridPointResults object stored on disk.
 
         Parameters
         ----------
@@ -1620,36 +1576,25 @@ class SearchResults:
             self.inference_string + "/grid_point_" + str(point_index) + ".gp"
         )
         with open(grid_point_result_string, "rb") as ipfs:
-            grid_point_results = pickle.load(ipfs)
-            #Subset results based on assignments
-            if self.assigns in np.unique(grid_point_results.assigns):
-                self.save = True 
+            gpr = pickle.load(ipfs)
+            self._append_from_object(gpr)
 
-                self.param_estimates += [grid_point_results.param_estimates[:,:,self.assigns]]
-                self.klds += [grid_point_results.klds[:,self.assigns]]
-                self.obj_func += [grid_point_results.obj_func[self.assigns]]
-                self.d_time += [grid_point_results.d_time[self.assigns]]
-                self.regressor += [grid_point_results.regressor]
+    def clean_up(self, remove_files=False):
+        """Finalize the SearchResults object.
 
-                self.aic += [grid_point_results.aic]
-                self.weights += [grid_point_results.weights[self.assigns]]
-                self.all_qs += [grid_point_results.all_qs]
-                self.all_klds += [[i[:,self.assigns] for i in grid_point_results.all_klds]]
+        Optionally removes .gp checkpoint files, then converts list attributes
+        to np.ndarrays and creates the analysis figure directory.
 
-                self.filt = grid_point_results.assigns == self.assigns
-
-                self.n_cells = np.sum(self.filt)
-           
-
-    def clean_up(self,clean=True):
-        """This helper method removes temporary files and finalizes the SearchResults object.
-
-        The GridPointResult objects are erased from disk, the attributes are converted to
-        np.ndarrays, and a directory for analysis figures is created.
+        Parameters
+        ----------
+        remove_files: bool, optional
+            If True, delete .gp files from disk. Default False.
         """
-        if clean:
+        if remove_files:
             for point_index in range(self.sp.n_grid_points):
-                os.remove(self.inference_string + "/grid_point_" + str(point_index) + ".gp")
+                gp_path = self.inference_string + "/grid_point_" + str(point_index) + ".gp"
+                if os.path.exists(gp_path):
+                    os.remove(gp_path)
             log.info("All grid point data cleaned from disk.")
 
         self.param_estimates = np.asarray(self.param_estimates)
@@ -2182,7 +2127,6 @@ class SearchResults:
         """
         t1 = time.time()
         #search_data =  self._subset_search_data(search_data) #Already subset
-        hist_type = get_hist_type(search_data)
 
         csqarr = []
         hellinger = []
@@ -2200,19 +2144,16 @@ class SearchResults:
             # expected_freq /= expected_freq.sum()
             # PROPOSAL = search_data.n_cells * expected_freq
 
-            if hist_type == "grid":
-                raise ValueError("Not implemented in current version.")
-            elif hist_type == "unique":
-                counts = np.concatenate(
-                    (search_data.n_cells * search_data.hist[gene_index][1], [0])
-                )
-                expect_freq = expect_freq[
-                    search_data.hist[gene_index][0][:, 0],
-                    search_data.hist[gene_index][0][:, 1],
-                ]
-                expect_freq = np.concatenate(
-                    (expect_freq, [search_data.n_cells - expect_freq.sum()])
-                )
+            counts = np.concatenate(
+                (search_data.n_cells * search_data.hist[gene_index][1], [0])
+            )
+            expect_freq = expect_freq[
+                search_data.hist[gene_index][0][:, 0],
+                search_data.hist[gene_index][0][:, 1],
+            ]
+            expect_freq = np.concatenate(
+                (expect_freq, [search_data.n_cells - expect_freq.sum()])
+            )
 
             hellinger_ = (
                 1
@@ -2332,18 +2273,12 @@ class SearchResults:
 
         gene_index, search_data = inputs
         search_data = self._subset_search_data(search_data)
-        hist_type = get_hist_type(search_data)
-        # if hasattr(search_data, "hist_type") and search_data.hist_type == "unique":
-        #     hist_type = "unique"
-        # else:
-        #     hist_type = "grid"
         Hfun = numdifftools.Hessian(
             lambda x: self.model.eval_model_kld(
                 p=x,
                 limits=search_data.M[:, gene_index],
                 samp=self.regressor_optimum[gene_index],
                 data=search_data.hist[gene_index],
-                hist_type=hist_type,
             )
         )
         hess = Hfun(self.phys_optimum[gene_index])
@@ -2876,7 +2811,6 @@ class SearchResults:
         logL: a vector of size n_genes containing model log-likelihoods.
         """
         search_data = self._subset_search_data(search_data)
-        hist_type = get_hist_type(search_data)
         logL = np.zeros(self.n_genes)
         for gene_index in range(self.n_genes):
             logL[gene_index] = self.model.eval_model_logL(
@@ -2884,8 +2818,7 @@ class SearchResults:
                 limits=search_data.M[:, gene_index] + offs,
                 samp=self.regressor_optimum[gene_index],
                 data=search_data.hist[gene_index],
-                n_cells = search_data.n_cells,
-                hist_type=hist_type,
+                n_cells=search_data.n_cells,
                 EPS=EPS,
             )
             # Pss = self.model.eval_model_pss(self.phys_optimum[gene_index],lm,samp)

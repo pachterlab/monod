@@ -40,7 +40,6 @@ from extract_data import extract_data
 from inference import (
     InferenceParameters,
     searchdata_from_adata,
-    get_hist_type,
 )
 
 # ---------------------------------------------------------------------------
@@ -197,7 +196,6 @@ class TestGabaParameterQuality:
         sd = gaba_fit["sd"]
         model = gaba_fit["model"]
         gene_idx = gaba_fit["gene_idx"]
-        hist_type = get_hist_type(sd)
 
         ref_params = ref_adata.var.loc[GENES, REF_PARAM_COLS]
 
@@ -209,8 +207,8 @@ class TestGabaParameterQuality:
             samp = sr.regressor_optimum[idx]
             fitted_p = sr.param_estimates[REF_SAMP_IND, idx]
             ref_p = ref_params.loc[g].values
-            kld_fit = model.eval_model_kld(fitted_p, sd.M[:, idx], samp, sd.hist[idx], hist_type)
-            kld_ref = model.eval_model_kld(ref_p,    sd.M[:, idx], samp, sd.hist[idx], hist_type)
+            kld_fit = model.eval_model_kld(fitted_p, sd.M[:, idx], samp, sd.hist[idx])
+            kld_ref = model.eval_model_kld(ref_p,    sd.M[:, idx], samp, sd.hist[idx])
             results[g] = (kld_ref, kld_fit)
         return results
 

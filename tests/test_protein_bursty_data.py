@@ -282,21 +282,21 @@ class TestEvalModelKLDRealData:
         p = _fitted_log_params(usp_adata)
         limits = _limits(usp_adata)
         coords, freqs = _unique_histogram(usp_adata)
-        kld = model_usp.eval_model_kld(p, limits, None, (coords, freqs), "unique")
+        kld = model_usp.eval_model_kld(p, limits, None, (coords, freqs))
         assert np.isfinite(kld)
 
     def test_usp_kld_nonnegative(self, usp_adata, model_usp):
         p = _fitted_log_params(usp_adata)
         limits = _limits(usp_adata)
         coords, freqs = _unique_histogram(usp_adata)
-        kld = model_usp.eval_model_kld(p, limits, None, (coords, freqs), "unique")
+        kld = model_usp.eval_model_kld(p, limits, None, (coords, freqs))
         assert kld >= 0.0
 
     def test_usp_kld_snapshot(self, usp_adata, model_usp):
         p = _fitted_log_params(usp_adata)
         limits = _limits(usp_adata)
         coords, freqs = _unique_histogram(usp_adata)
-        kld = model_usp.eval_model_kld(p, limits, None, (coords, freqs), "unique")
+        kld = model_usp.eval_model_kld(p, limits, None, (coords, freqs))
         check_snapshot("kld_usp_fitted_params", np.array([kld]))
 
     def test_sp_kld_finite(self, sp_adata, model_sp):
@@ -305,7 +305,7 @@ class TestEvalModelKLDRealData:
         limits = _limits(sp_adata)
         coords, freqs = _unique_histogram(sp_adata)
         kld = model_sp.eval_model_kld(
-            p, limits, None, (coords, freqs), "unique"
+            p, limits, None, (coords, freqs)
         )
         assert np.isfinite(kld)
 
@@ -314,7 +314,7 @@ class TestEvalModelKLDRealData:
         limits = _limits(sp_adata)
         coords, freqs = _unique_histogram(sp_adata)
         kld = model_sp.eval_model_kld(
-            p, limits, None, (coords, freqs), "unique"
+            p, limits, None, (coords, freqs)
         )
         check_snapshot("kld_sp_fitted_params", np.array([kld]))
 
