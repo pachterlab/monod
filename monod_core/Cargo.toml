@@ -7,6 +7,10 @@ edition = "2021"
 name = "monod_core"
 crate-type = ["cdylib"]
 
+[features]
+default = []
+kmeans = ["dep:rand_xoshiro"]
+
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"] }
 num-complex = "0.4"
@@ -19,6 +23,8 @@ lbfgsb-rs-pure = "0.1.1"
 # ruanndata = { git = "https://github.com/pachterlab/ruanndata", default-features = false, features = ["h5ad"], optional = true }
 ruanndata = { path = "../../ruanndata", default-features = false, features = ["h5ad"] }
 indexmap = "2"
+matrixmultiply    = "0.3"
+rand_xoshiro      = { version = "0.6", optional = true }
 
 [patch.crates-io]
 hdf5-metno-sys = { path = "hdf5_metno_sys_patched" }

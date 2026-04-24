@@ -2147,6 +2147,387 @@ fn searchdata_from_arrays(
     })
 }
 
+// ============================================================================
+// Cell partitioning: subset SearchData by cluster assignment
+// ============================================================================
+
+/// Partition a `SearchData` into per-cluster subsets based on hard cell assignments.
+///
+/// For each cluster `k` in `0..n_clusters`, filters the raw layer counts to
+/// cells where `assigns[c] == k`, recomputes M (max + `padding`), histograms,
+/// and moments, and returns a new `SearchData`.  Clusters with no assigned
+/// cells yield `None`.
+///
+/// Parameters
+/// ----------
+/// sd         : source Rust SearchData (must have ≥ 2 layers)
+/// assigns    : per-cell cluster index, length == sd.n_cells
+/// n_clusters : total number of clusters k (length of returned Vec)
+/// padding    : added to per-gene per-layer max to set M (default 10)
+///
+/// Returns
+/// -------
+/// List of length `n_clusters`; each entry is a `SearchData` or `None`.
+#[pyfunction]
+#[pyo3(signature = (sd, assigns, n_clusters, padding=10))]
+fn partition_searchdata_2d(
+    py: Python<'_>,
+    sd: &Bound<'_, PySearchData>,
+    assigns: Vec<usize>,
+    n_clusters: usize,
+    padding: usize,
+) -> PyResult<Vec<Option<PySearchData>>> {
+    let sd_ref = sd.borrow();
+    let nc    = sd_ref.inner.n_cells;
+    let ng    = sd_ref.inner.n_genes;
+    let nl    = sd_ref.inner.n_layers;
+
+    // Extract raw row-major layers from adata under the GIL.
+    let mut raw_layers: Vec<Vec<i64>> = Vec::with_capacity(nl);
+    for lname in &sd_ref.inner.layer_names {
+        let mat = sd_ref.inner.adata.layers.get(lname)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(
+                format!("layer '{}' not found in adata", lname)))?;
+        let (_, _, flat) = matrix_to_dense_i64(mat)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        raw_layers.push(flat);
+    }
+
+    let gene_log_lengths = sd_ref.inner.extract_gene_log_lengths();
+    let gene_log_lengths_spliced = sd_ref.inner.adata.var.columns
+        .get("gene_log_lengths_spliced")
+        .and_then(|s| if let ruanndata::SeriesData::Float64 { values } = s {
+            Some(values.iter().map(|v| v.unwrap_or(f64::NAN)).collect::<Vec<f64>>())
+        } else { None });
+    let layer_names  = sd_ref.inner.layer_names.clone();
+    let gene_names   = sd_ref.inner.gene_names.clone();
+    let k_opt        = sd_ref.inner.k;
+    let epochs_opt   = sd_ref.inner.epochs;
+    drop(sd_ref);
+
+    // Build per-cluster SearchData in parallel (over clusters) — pure Rust.
+    let cluster_data: Vec<Option<SearchData>> = py.allow_threads(|| {
+        (0..n_clusters).into_par_iter().map(|k| {
+            // Cell indices for this cluster.
+            let cell_idx: Vec<usize> = assigns.iter().enumerate()
+                .filter_map(|(c, &a)| if a == k { Some(c) } else { None })
+                .collect();
+            if cell_idx.is_empty() { return None; }
+            let new_nc = cell_idx.len();
+
+            // Build row-major filtered layers and column-major for moments.
+            let mut rm_layers: Vec<Vec<i64>>  = Vec::with_capacity(nl);
+            let mut cm_layers: Vec<Vec<f64>>  = Vec::with_capacity(nl);
+            for layer in &raw_layers {
+                let mut rm = Vec::with_capacity(new_nc * ng);
+                let mut cm = vec![0f64; ng * new_nc];
+                for (new_c, &old_c) in cell_idx.iter().enumerate() {
+                    for g in 0..ng {
+                        let v = layer[old_c * ng + g];
+                        rm.push(v);
+                        cm[g * new_nc + new_c] = v as f64;
+                    }
+                }
+                rm_layers.push(rm);
+                cm_layers.push(cm);
+            }
+
+            // Limits: max per (gene, layer) + padding.
+            let mut limits_flat = vec![0usize; ng * nl];
+            for (l, layer) in rm_layers.iter().enumerate() {
+                for g in 0..ng {
+                    let max_val = (0..new_nc)
+                        .map(|c| layer[c * ng + g])
+                        .max()
+                        .unwrap_or(0)
+                        .max(0) as usize;
+                    limits_flat[g * nl + l] = max_val.saturating_add(padding);
+                }
+            }
+
+            // Per-gene histograms via shared helper (rayon within each cluster).
+            let hist_pairs: Vec<(Vec<Vec<i64>>, Vec<f64>)> = (0..ng).map(|g| {
+                let cols: Vec<Vec<i64>> = rm_layers.iter()
+                    .map(|layer| (0..new_nc).map(|c| layer[c * ng + g]).collect())
+                    .collect();
+                build_gene_histogram(&cols, new_nc)
+            }).collect();
+            let (coords, freqs): (Vec<Vec<Vec<i64>>>, Vec<Vec<f64>>) =
+                hist_pairs.into_iter().unzip();
+
+            // Moments.
+            let moments = compute_moments_inner(&cm_layers, &layer_names, new_nc, ng);
+
+            // Build minimal adata.
+            let adata = make_minimal_adata(
+                &gene_names, &layer_names, &rm_layers,
+                new_nc, ng,
+                gene_log_lengths.clone(),
+                gene_log_lengths_spliced.clone(),
+            );
+
+            Some(SearchData::new(
+                adata, coords, freqs, limits_flat, moments,
+                nl, new_nc, ng,
+                gene_names.clone(), "unique".to_string(),
+                layer_names.clone(), k_opt, epochs_opt,
+            ))
+        }).collect()
+    });
+
+    Ok(cluster_data.into_iter()
+        .map(|opt| opt.map(|inner| PySearchData { inner }))
+        .collect())
+}
+
+// ============================================================================
+// KMeans initialisation (optional feature "kmeans")
+// ============================================================================
+
+/// KMeans++ initialisation followed by Lloyd iterations using matrixmultiply-accelerated
+/// distance computation.
+///
+/// Distance matrix is computed as:
+///   D[i,k] = ||X[i]||² + ||C[k]||² - 2 · (X @ C^T)[i,k]
+/// where the matrix multiply uses `matrixmultiply::dgemm` (SIMD, cache-blocked).
+///
+/// KMeans++ seeding updates min-distances with rayon so each new centroid's
+/// contribution is computed across cells in parallel.
+///
+/// Parameters
+/// ----------
+/// data     – (n_samples × n_features) C-contiguous f64 array
+/// k        – number of clusters
+/// max_iter – maximum Lloyd iterations
+/// tol      – stop when max centroid shift < tol
+/// seed     – RNG seed for reproducibility
+#[cfg(feature = "kmeans")]
+fn kmeans_fit(
+    data: &ndarray::Array2<f64>,
+    k: usize,
+    max_iter: usize,
+    tol: f64,
+    seed: u64,
+) -> ndarray::Array1<usize> {
+    use rand_xoshiro::rand_core::{RngCore, SeedableRng};
+    use rand_xoshiro::Xoshiro256Plus;
+
+    let n = data.nrows();
+    let d = data.ncols();
+    assert!(k > 0 && n >= k, "k must be > 0 and <= n_samples");
+
+    let mut rng = Xoshiro256Plus::seed_from_u64(seed);
+
+    // ── KMeans++ initialisation ─────────────────────────────────────────────
+    // centroids_flat: row-major (k × d), built incrementally.
+    let mut centroids_flat = vec![0f64; k * d];
+
+    // First centroid: pick uniformly at random.
+    let first = (rng.next_u64() as usize) % n;
+    for (dst, &src) in centroids_flat[..d].iter_mut().zip(data.row(first).iter()) {
+        *dst = src;
+    }
+
+    // min_dists[i] = squared distance from cell i to its nearest centroid so far.
+    let mut min_dists = vec![f64::INFINITY; n];
+
+    for ki in 1..k {
+        // Own the just-added centroid so the rayon closure can capture it without
+        // holding a borrow on centroids_flat while we later write to it.
+        let c_prev: Vec<f64> = centroids_flat[(ki - 1) * d..ki * d].to_vec();
+
+        // Rayon: update min_dists with the distance to c_prev.
+        min_dists.par_iter_mut().enumerate().for_each(|(i, d_min)| {
+            let diff_sq: f64 = data.row(i).iter().zip(c_prev.iter())
+                .map(|(a, b)| (a - b) * (a - b)).sum();
+            if diff_sq < *d_min { *d_min = diff_sq; }
+        });
+
+        // Sample next centroid proportional to min_dists (D² weighting).
+        let total: f64 = min_dists.iter().sum();
+        let mut target = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64 * total;
+        let mut chosen = n - 1;
+        for (i, &dist) in min_dists.iter().enumerate() {
+            target -= dist;
+            if target <= 0.0 { chosen = i; break; }
+        }
+        for (dst, &src) in centroids_flat[ki * d..(ki + 1) * d].iter_mut()
+            .zip(data.row(chosen).iter())
+        {
+            *dst = src;
+        }
+    }
+
+    // ── Lloyd iterations ────────────────────────────────────────────────────
+    // Precompute squared row norms of data (constant across iterations).
+    let x_norms: Vec<f64> = (0..n)
+        .map(|i| data.row(i).iter().map(|v| v * v).sum())
+        .collect();
+
+    let mut assignments = vec![0usize; n];
+    // xct[i * k + j] = dot(X[i], C[j])  — reused every iteration.
+    let mut xct = vec![0f64; n * k];
+
+    for _ in 0..max_iter {
+        // Centroid squared norms.
+        let c_norms: Vec<f64> = (0..k)
+            .map(|j| centroids_flat[j * d..(j + 1) * d].iter().map(|v| v * v).sum())
+            .collect();
+
+        // X @ C^T via dgemm: A=(n×d) row-major, B=C^T via (k×d) with transposed strides.
+        // SAFETY: all three buffers are valid, non-overlapping, and sized correctly.
+        unsafe {
+            matrixmultiply::dgemm(
+                n, d, k,
+                1.0,
+                data.as_ptr(),           d as isize, 1,   // A: (n×d) row-major
+                centroids_flat.as_ptr(), 1, d as isize,   // B = C^T: row-stride=1, col-stride=d
+                0.0,
+                xct.as_mut_ptr(),        k as isize, 1,   // result: (n×k) row-major
+            );
+        }
+
+        // Assign each cell to its nearest centroid.
+        let new_assignments: Vec<usize> = (0..n).into_par_iter().map(|i| {
+            let xi_sq = x_norms[i];
+            let base  = i * k;
+            let mut best_j = 0;
+            let mut best_d = f64::INFINITY;
+            for j in 0..k {
+                let dist = xi_sq + c_norms[j] - 2.0 * xct[base + j];
+                if dist < best_d { best_d = dist; best_j = j; }
+            }
+            best_j
+        }).collect();
+
+        let changed: usize = new_assignments.iter().zip(assignments.iter())
+            .filter(|(a, b)| a != b).count();
+        assignments = new_assignments;
+        if changed == 0 { break; }
+
+        // Update centroids and check convergence.
+        let mut new_centroids = vec![0f64; k * d];
+        let mut counts = vec![0usize; k];
+        for (i, &cl) in assignments.iter().enumerate() {
+            let dst = &mut new_centroids[cl * d..(cl + 1) * d];
+            for (s, &v) in dst.iter_mut().zip(data.row(i).iter()) { *s += v; }
+            counts[cl] += 1;
+        }
+
+        let mut max_shift = 0f64;
+        for j in 0..k {
+            let cnt = counts[j].max(1) as f64;
+            let mut shift_sq = 0f64;
+            for g in 0..d {
+                let new_val = new_centroids[j * d + g] / cnt;
+                let delta   = new_val - centroids_flat[j * d + g];
+                shift_sq += delta * delta;
+                centroids_flat[j * d + g] = new_val;
+            }
+            max_shift = max_shift.max(shift_sq.sqrt());
+        }
+
+        if max_shift < tol { break; }
+    }
+
+    ndarray::Array1::from(assignments)
+}
+
+/// Initialise the EM posterior Q using KMeans on log1p-normalised (U+S) expression.
+///
+/// Replicates the Python `_initialize_Q` preprocessing:
+///   1. Sum layers 0 and 1 → S_total  (n_cells × n_genes)
+///   2. Normalize each cell to 10k counts
+///   3. log1p transform; NaN → 0
+///   4. KMeans++ + Lloyd via matrixmultiply-accelerated distance matrix
+///   5. Biased Q: uniform(0,1) random matrix, then Q[cell, cluster] = 0.9
+///
+/// Parameters
+/// ----------
+/// layers : (n_layers, n_cells, n_genes) int64 numpy array
+/// k      : number of clusters
+/// seed   : RNG seed for reproducibility (default 0)
+///
+/// Returns
+/// -------
+/// (Q, labels) — Q is (n_cells, k) float64; labels is (n_cells,) int64
+#[cfg(feature = "kmeans")]
+#[pyfunction]
+#[pyo3(signature = (layers, k, seed=0))]
+fn initialize_q_kmeans<'py>(
+    py: Python<'py>,
+    layers: numpy::PyReadonlyArray3<'py, i64>,
+    k: usize,
+    seed: u64,
+) -> PyResult<(
+    Bound<'py, numpy::PyArray2<f64>>,
+    Bound<'py, numpy::PyArray1<i64>>,
+)> {
+    use ndarray::{Array1, Array2};
+    use rand_xoshiro::rand_core::{RngCore, SeedableRng};
+    use rand_xoshiro::Xoshiro256Plus;
+
+    let arr = layers.as_array();
+    let shape = arr.shape();
+    if shape.len() != 3 || shape[0] < 2 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "layers must be (n_layers, n_cells, n_genes) with at least 2 layers",
+        ));
+    }
+    let n_cells = shape[1];
+    let n_genes = shape[2];
+
+    // Step 1: S_total = layers[0] + layers[1]  (n_cells × n_genes, f64)
+    let mut s_total = Array2::<f64>::zeros((n_cells, n_genes));
+    for g in 0..n_genes {
+        for c in 0..n_cells {
+            s_total[[c, g]] = arr[[0, c, g]] as f64 + arr[[1, c, g]] as f64;
+        }
+    }
+
+    // Step 2: per-cell normalize to 10k counts (NaN-safe: if tots==0 leave row as-is)
+    for c in 0..n_cells {
+        let tot: f64 = s_total.row(c).sum();
+        if tot > 0.0 {
+            let scale = 1e4 / tot;
+            for g in 0..n_genes { s_total[[c, g]] *= scale; }
+        }
+    }
+
+    // Step 3: log1p; NaN → 0 (row with zero total is already 0)
+    s_total.mapv_inplace(|v| if v.is_nan() { 0.0 } else { v.ln_1p() });
+
+    // Step 4: KMeans++ + Lloyd (custom, matrixmultiply-accelerated, GIL-free)
+    let labels_arr: Array1<usize> = py.allow_threads(|| {
+        kmeans_fit(&s_total, k, 300, 1e-4, seed)
+    });
+
+    // Step 5: build biased Q.
+    let mut rng2 = Xoshiro256Plus::seed_from_u64(seed.wrapping_add(1));
+    let mut q_flat = vec![0f64; n_cells * k];
+    for v in q_flat.iter_mut() {
+        *v = (rng2.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+    }
+    for (c, &lab) in labels_arr.iter().enumerate() {
+        q_flat[c * k + lab] = 0.9;
+    }
+    for c in 0..n_cells {
+        let row_sum: f64 = q_flat[c * k..(c + 1) * k].iter().sum();
+        if row_sum > 0.0 {
+            for v in q_flat[c * k..(c + 1) * k].iter_mut() { *v /= row_sum; }
+        }
+    }
+
+    let q_arr = Array2::from_shape_vec((n_cells, k), q_flat)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
+    let lab_arr = labels_arr.mapv(|v| v as i64);
+
+    Ok((
+        q_arr.into_pyarray_bound(py),
+        lab_arr.into_pyarray_bound(py),
+    ))
+}
+
 /// Run `run` on a rayon thread pool of the requested size, falling back to the
 /// global pool if `num_threads` is `None` or pool creation fails.
 fn run_with_pool<T, F>(num_threads: Option<usize>, run: F) -> Vec<T>
@@ -2161,6 +2542,94 @@ where
             .map(|pool| pool.install(&run))
             .unwrap_or_else(|_| run()),
         None => run(),
+    }
+}
+
+/// Build a unique-microstate histogram for a single gene.
+///
+/// `cols[l]` holds the counts for layer `l` across all cells: `cols[l][c]`.
+/// Returns `(microstates, frequencies)` where each microstate is a `Vec<i64>`
+/// with one entry per layer, and frequencies are `count / n_cells`.
+///
+/// Uses the same dense-counting / sort-based fallback logic as `make_state_dist`.
+fn build_gene_histogram(cols: &[Vec<i64>], n_cells: usize) -> (Vec<Vec<i64>>, Vec<f64>) {
+    let n_layers = cols.len();
+
+    let max_per_layer: Vec<usize> = cols
+        .iter()
+        .map(|col| col.iter().copied().max().unwrap_or(0).max(0) as usize)
+        .collect();
+
+    let total_states: usize = max_per_layer.iter().map(|&m| m + 1).product();
+
+    if total_states <= DENSE_THRESHOLD {
+        let mut strides = vec![1usize; n_layers];
+        for l in (0..n_layers - 1).rev() {
+            strides[l] = strides[l + 1] * (max_per_layer[l + 1] + 1);
+        }
+        DENSE_BUF.with(|db| {
+            let mut table = db.borrow_mut();
+            if table.len() < total_states { table.resize(total_states, 0); }
+            let table = &mut table[..total_states];
+            table.fill(0);
+            for cell in 0..n_cells {
+                let idx: usize = cols.iter().zip(strides.iter())
+                    .map(|(col, &s)| col[cell] as usize * s)
+                    .sum();
+                table[idx] += 1;
+            }
+            let mut unique: Vec<Vec<i64>> = Vec::new();
+            let mut freqs: Vec<f64> = Vec::new();
+            for flat_idx in 0..total_states {
+                if table[flat_idx] == 0 { continue; }
+                let mut ms = vec![0i64; n_layers];
+                let mut rem = flat_idx;
+                for l in 0..n_layers {
+                    ms[l] = (rem / strides[l]) as i64;
+                    rem %= strides[l];
+                }
+                unique.push(ms);
+                freqs.push(table[flat_idx] as f64 / n_cells as f64);
+            }
+            (unique, freqs)
+        })
+    } else {
+        FLAT_BUF.with(|fb| { ORDER_BUF.with(|ob| {
+            let mut flat = fb.borrow_mut();
+            let mut order = ob.borrow_mut();
+            let flat_len = n_cells * n_layers;
+            if flat.len() < flat_len { flat.resize(flat_len, 0); }
+            if order.len() < n_cells { order.resize(n_cells, 0); }
+            let flat = &mut flat[..flat_len];
+            let order = &mut order[..n_cells];
+            for cell in 0..n_cells {
+                for (l, col) in cols.iter().enumerate() {
+                    flat[cell * n_layers + l] = col[cell];
+                }
+            }
+            for (i, v) in order.iter_mut().enumerate() { *v = i; }
+            order.sort_unstable_by(|&a, &b| {
+                flat[a * n_layers..(a + 1) * n_layers]
+                    .cmp(&flat[b * n_layers..(b + 1) * n_layers])
+            });
+            let mut unique: Vec<Vec<i64>> = Vec::new();
+            let mut counts: Vec<usize> = Vec::new();
+            let mut prev_start = usize::MAX;
+            for &idx in order.iter() {
+                let row_start = idx * n_layers;
+                if prev_start != usize::MAX
+                    && flat[prev_start..prev_start + n_layers] == flat[row_start..row_start + n_layers]
+                {
+                    *counts.last_mut().unwrap() += 1;
+                } else {
+                    unique.push(flat[row_start..row_start + n_layers].to_vec());
+                    counts.push(1);
+                    prev_start = row_start;
+                }
+            }
+            let freqs: Vec<f64> = counts.iter().map(|&c| c as f64 / n_cells as f64).collect();
+            (unique, freqs)
+        })})
     }
 }
 
@@ -5055,5 +5524,8 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(searchdata_from_h5ad, m)?)?;
     m.add_function(wrap_pyfunction!(annotate_inference_results, m)?)?;
     m.add_function(wrap_pyfunction!(eval_custom_network_pgf, m)?)?;
+    m.add_function(wrap_pyfunction!(partition_searchdata_2d, m)?)?;
+    #[cfg(feature = "kmeans")]
+    m.add_function(wrap_pyfunction!(initialize_q_kmeans, m)?)?;
     Ok(())
 }

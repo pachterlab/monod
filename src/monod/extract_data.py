@@ -325,9 +325,8 @@ def extract_data(
     
     monod_adata.uns['model'] = _uns_pack(model)
 
-    if not _HAS_RUST:
-        hist = make_histogram(monod_adata, hist_type, M)
-        monod_adata.uns['hist'] = _uns_pack(hist)
+    hist = make_histogram(monod_adata, hist_type, M)
+    monod_adata.uns['hist'] = _uns_pack(hist)
     # Save adata?
     if mek_means_params:
         monod_adata.uns['k'] = k

@@ -6,8 +6,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
-import mminference
-
 from extract_data import make_dir, log, extract_data, make_histogram, _uns_pack, _uns_unpack, _build_sampling_grid
 from cme_toolbox import CMEModel, _HAS_RUST  # may be unnecessary
 try:
@@ -16,6 +14,11 @@ except ImportError:
     _mc = None
 
 _LBFGSB_RUST_MODELS_2D = {"Constitutive", "Bursty", "CIR", "Extrinsic", "Delay", "DelayedSplicing"}
+
+try:
+    from mminference import MEKMeansParameters
+except ImportError:
+    pass
 import multiprocessing
 import os
 
@@ -122,7 +125,8 @@ def perform_inference(h5ad_filepath,
         poisson_average_log_length=poisson_average_log_length)
 
     else:
-        inference_parameters = mminference.InferenceParameters(
+        import mminference
+        inference_parameters = mminference.MEKMeansParameters(
             dataset_string,
             model,
             use_lengths=use_lengths,
@@ -1076,8 +1080,8 @@ class GradientInference:
                 bounds=self.grad_bnd,
                 options={
                     "maxiter": self.gradient_params["max_iterations"],
-                    "ftol": 1e-10,
-                    "gtol": 1e-6,
+                    "ftol": 2.22e-9,
+                    "gtol": 1e-5,
                 },
             )
             if (
@@ -1199,8 +1203,8 @@ class GradientInference:
                 quad_order=int(model.quad_order),
                 fd_eps=1e-6,
                 maxiter=self.gradient_params["max_iterations"],
-                ftol=1e-10,
-                gtol=1e-6,
+                ftol=2.22e-9,
+                gtol=1e-5,
                 eps=1e-15,
                 m_lbfgs=10,
                 num_threads=num_threads,
@@ -1269,8 +1273,8 @@ class GradientInference:
                 max_fudge=float(model.max_fudge),
                 fd_eps=1e-6,
                 maxiter=self.gradient_params["max_iterations"],
-                ftol=1e-10,
-                gtol=1e-6,
+                ftol=2.22e-9,
+                gtol=1e-5,
                 eps=1e-15,
                 m_lbfgs=10,
                 num_threads=num_threads,
@@ -1299,8 +1303,8 @@ class GradientInference:
                 quad_order=int(model.quad_order),
                 fd_eps=1e-6,
                 maxiter=self.gradient_params["max_iterations"],
-                ftol=1e-10,
-                gtol=1e-6,
+                ftol=2.22e-9,
+                gtol=1e-5,
                 samp_list=samp_list,
                 eps=1e-15,
                 m_lbfgs=10,
@@ -1362,8 +1366,8 @@ class GradientInference:
                 max_fudge=float(model.max_fudge),
                 fd_eps=1e-6,
                 maxiter=self.gradient_params["max_iterations"],
-                ftol=1e-10,
-                gtol=1e-6,
+                ftol=2.22e-9,
+                gtol=1e-5,
                 eps=1e-15,
                 m_lbfgs=10,
                 num_threads=num_threads,
@@ -1814,12 +1818,8 @@ class SearchResults:
             self.inference_string + "/grid_point_" + str(point_index) + ".gp"
         )
         with open(grid_point_result_string, "rb") as ipfs:
-            grid_point_results = pickle.load(ipfs)
-            self.param_estimates += [grid_point_results.param_estimates]
-            self.klds += [grid_point_results.klds]
-            self.obj_func += [grid_point_results.obj_func]
-            self.d_time += [grid_point_results.d_time]
-            self.regressor += [grid_point_results.regressor]
+            gp = pickle.load(ipfs)
+            self._append_from_object(gp)
 
     def clean_up(self, remove_files=False):
         """This helper method removes temporary files and finalizes the SearchResults object.
@@ -1849,6 +1849,14 @@ class SearchResults:
         if os.path.isdir(self.inference_string):
             make_dir(analysis_figure_string)
 
+    @property
+    def _result_filename(self):
+        return self.inference_string + "/grid_scan_results.res"
+
+    @property
+    def _upd_result_filename(self):
+        return self.inference_string + "/grid_scan_results_upd.res"
+
     def store_on_disk(self):
         """This helper method attempts to store the SearchResults object to disk.
 
@@ -1858,7 +1866,7 @@ class SearchResults:
             file location.
         """
         try:
-            full_result_string = self.inference_string + "/grid_scan_results.res"
+            full_result_string = self._result_filename
             with open(full_result_string, "wb") as srfs:
                 pickle.dump(self, srfs)
             log.info("Grid scan results stored to {}.".format(full_result_string))
@@ -1882,7 +1890,7 @@ class SearchResults:
             file location.
         """
         try:
-            upd_result_string = self.inference_string + "/grid_scan_results_upd.res"
+            upd_result_string = self._upd_result_filename
             with open(upd_result_string, "wb") as srfs:
                 pickle.dump(self, srfs)
             log.debug("Updated results stored to {}.".format(upd_result_string))
