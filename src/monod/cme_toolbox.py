@@ -42,10 +42,10 @@ except ImportError:
     _HAS_RUST = False
 
 # ---------------------------------------------------------------------------
-# Optional GPU backend (PyTorch).  When a CUDA or MPS GPU is available,
-# eval_model_pss for 2-modality models with seq_model="None" is delegated
-# to a fully-vectorised torch implementation that broadcasts the grid ×
-# quadrature computation onto the GPU.  Results match the Python/Rust
+# Optional GPU backend (PyTorch).  When a CUDA GPU with float64 support is
+# available, eval_model_pss for 2-modality models with seq_model="None" is
+# delegated to a fully-vectorised torch implementation that broadcasts the
+# grid × quadrature computation onto the GPU.  Results match the Python/Rust
 # baseline within rtol=1e-5.
 # ---------------------------------------------------------------------------
 try:
@@ -62,9 +62,6 @@ try:
 
     if _torch.cuda.is_available() and _probe_float64("cuda"):
         _GPU_DEVICE = _torch.device("cuda")
-        _HAS_GPU = True
-    elif hasattr(_torch.backends, "mps") and _torch.backends.mps.is_available() and _probe_float64("mps"):
-        _GPU_DEVICE = _torch.device("mps")
         _HAS_GPU = True
     else:
         _HAS_GPU = False
