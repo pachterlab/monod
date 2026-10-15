@@ -127,8 +127,9 @@ def extract_data(
         if AnnData, an object in memory that contains the count data.
     transcriptome_filepath: str
         location of the transcriptome length reference.
-    dataset_name: str
+    dataset_name: str, optional
         dataset metadata; name assigned to dataset-specific directory.
+        Defaults to "<bio_model>_<seq_model>" when not given.
     dataset_string: str
         dataset-specific directory location.
     dir_string: str
@@ -160,7 +161,9 @@ def extract_data(
     anndata: adata object.
     """
     log.info("Beginning data extraction.")
-    log.info("Dataset: " + dataset_name)
+    if dataset_name is None:
+        dataset_name = f"{model.bio_model}_{model.seq_model}"
+    log.info("Dataset: %s", dataset_name)
 
     if mek_means_params:
         k, epochs = mek_means_params

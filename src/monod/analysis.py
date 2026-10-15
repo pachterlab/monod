@@ -1,5 +1,6 @@
 from cme_toolbox import CMEModel
-from inference import SearchResults, plot_hist_and_fit
+from inference import SearchResults, plot_hist_and_fit, searchdata_from_adata
+from extract_data import _uns_unpack
 # from extract_data import SearchData, normalize_count_matrix
 # from preprocess import make_dir, log
 from plot_aesthetics import aesthetics
@@ -24,12 +25,13 @@ log.setLevel(logging.INFO)
 
 def run_qc(monod_adata, mek_means_params=None,cluster=0, discard_rejected=True, marg='joint',
            gene_dist_size=(5, 5), show_axes=False):
-    sd = monod_adata.uns['search_data']
+    # The SearchData is never stored in the AnnData; rebuild it in memory.
+    sd = searchdata_from_adata(monod_adata)
 
     if not mek_means_params:
-        sr = monod_adata.uns['search_result']
+        sr = _uns_unpack(monod_adata.uns['search_result'])
     else:
-        sr = monod_adata.uns['search_result_list'][cluster]
+        sr = _uns_unpack(monod_adata.uns['search_result_list'])[cluster]
         
     fig1,ax1 = plt.subplots(1,1)
     sr.find_sampling_optimum()
@@ -80,39 +82,6 @@ def load_search_results(full_result_string):
         log.error(
             "Grid scan results could not be loaded from {}.".format(full_result_string)
         )
-        raise ex
-
-
-def load_search_data(search_data_string):
-    """Attempt to load search data from disk.
-
-    If the SearchData object is in the old format, with separate spliced and unspliced count
-    matrix attributes, they are concatenated during the import.
-
-    Parameters
-    ----------
-    search_data_string: str
-        disk location of the SearchData object.
-
-    Returns
-    -------
-    sd: monod.extract_data.SearchData
-        the SearchData object.
-    """
-    try:
-        with open(search_data_string, "rb") as sdfs:
-            sd = pickle.load(sdfs)
-        log.info("Search data loaded from {}.".format(search_data_string))
-
-        if hasattr(sd, "S"):
-            sd.layers = np.asarray([sd.U, sd.S])
-            sd.M = np.asarray([sd.M, sd.N])
-            delattr(sd, "N")
-            delattr(sd, "U")
-            delattr(sd, "S")
-        return sd
-    except Exception as ex:
-        log.error("Search data could not be loaded from {}.".format(search_data_string))
         raise ex
 
 

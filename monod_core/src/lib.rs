@@ -203,9 +203,9 @@ fn build_mesh_2d_poisson_cached(
 }
 
 /// Bernoulli-transformed 2-D mesh cache — keyed by (l0, l1, s0_bits, s1_bits).
-/// The Bernoulli transform is a simple scalar multiply: g_i *= s_i.
-/// s0 and s1 are the raw sampling parameters (log10 capture rates as stored in
-/// regressor_optimum — used directly without 10^ conversion, matching Python).
+/// The Bernoulli transform is a scalar multiply by the capture probability:
+/// g_i *= 10^s_i.  s0 and s1 are log10 capture probabilities (the same
+/// convention as the Poisson model and as the sampling bounds / MoM init).
 static MESH_CACHE_BERNOULLI: OnceLock<Mutex<HashMap<(usize, usize, u64, u64), Arc<(Vec<Complex64>, Vec<Complex64>)>>>> =
     OnceLock::new();
 
@@ -222,8 +222,8 @@ fn build_mesh_2d_bernoulli_cached(
         return Arc::clone(mesh);
     }
     let base = build_mesh_2d_cached(l0, l1);
-    let cs0 = Complex64::new(s0, 0.0);
-    let cs1 = Complex64::new(s1, 0.0);
+    let cs0 = Complex64::new(10f64.powf(s0), 0.0);
+    let cs1 = Complex64::new(10f64.powf(s1), 0.0);
     let g0t: Vec<Complex64> = base.0.iter().map(|&z| z * cs0).collect();
     let g1t: Vec<Complex64> = base.1.iter().map(|&z| z * cs1).collect();
     let mesh = Arc::new((g0t, g1t));
@@ -2045,17 +2045,6 @@ impl PySearchData {
         Ok(())
     }
 
-    fn store_on_disk(&self, py: Python<'_>, inference_string: &str) -> PyResult<String> {
-        let full_path = format!("{inference_string}/search_data.res");
-        let state = self.__getstate__(py)?;
-        let pickle = py.import_bound("pickle")?;
-        let builtins = py.import_bound("builtins")?;
-        let f = builtins.getattr("open")?.call1((&full_path, "wb"))?;
-        pickle.call_method1("dump", (state, &f))?;
-        f.call_method0("close")?;
-        Ok(full_path)
-    }
-
     #[pyo3(signature = (bio_model, seq_model, amb_model, lb, ub, samp_list=None))]
     fn mom_x0_all(
         &self,
@@ -2871,6 +2860,10 @@ fn matrix_to_dense_i64(matrix: &MatrixData) -> Result<(usize, usize, Vec<i64>), 
             }
             Ok((*n_rows, *n_cols, flat))
         }
+        MatrixData::ShiftedClrCsr { .. } => Err(
+            "layer is stored as a shifted-CLR matrix, not integer counts; \
+             monod requires raw count layers".to_string(),
+        ),
     }
 }
 

@@ -739,7 +739,8 @@ class CMEModel:
         if samp is not None and self.seq_model == "Poisson":
             g = np.exp(np.power(10.0, samp)[:, None] * g) - 1
         elif samp is not None and self.seq_model == "Bernoulli":
-            g = g * np.asarray(samp)[:, None]
+            # samp holds log10 capture probabilities (same convention as Poisson).
+            g = g * np.power(10.0, samp)[:, None]
         elif self.seq_model not in ("None", "Poisson", "Bernoulli"):
             return None  # unsupported seq_model
 
@@ -952,7 +953,7 @@ class CMEModel:
             and self.seq_model == "None"
             and self.amb_model == "None"
             and self.quad_method == "fixed_quad"
-            and samp is None
+            and (samp is None or np.all(np.asarray(samp) == 0))
         )
         if _HAS_GPU and _fast_cond:
             pss = _eval_model_pss_gpu(
@@ -1166,7 +1167,8 @@ class CMEModel:
         if self.seq_model == "Poisson":
             g = np.exp((np.power(10, samp))[:, None] * g) - 1
         elif self.seq_model == "Bernoulli":
-            g = g * np.asarray(samp)[:, None]
+            # samp holds log10 capture probabilities (same convention as Poisson).
+            g = g * np.power(10.0, samp)[:, None]
         elif self.seq_model == "None":
             pass
         else:
@@ -1535,8 +1537,14 @@ class CMEModel:
         """
         lb = 10**lb_log
         ub = 10**ub_log
-        if self.seq_model == "Poisson" or "Bernoulli":
-            samp = 10**samp
+        if self.seq_model in ("Poisson", "Bernoulli"):
+            if samp is None:
+                raise ValueError(
+                    "get_MoM requires samp (log10 sampling parameters) for seq_model={!r}.".format(
+                        self.seq_model
+                    )
+                )
+            samp = 10 ** np.asarray(samp, dtype=float)
 
         # These can be defined per model (just happen to be shared by multiple models here).
         U_var, U_mean = moments['MOM_unspliced_var'], moments['MOM_unspliced_mean']
@@ -1714,7 +1722,8 @@ class CMEModel:
             noise = noise_int + noise_ext
             return (noise_int / noise, noise_ext / noise)
         elif self.seq_model == "Bernoulli":
-            noise = noise_int / samp + noise_ext
+            samp_ = 10**samp
+            noise = noise_int / samp_ + noise_ext
             return (
                 noise_int / noise,
                 noise_ext / noise,

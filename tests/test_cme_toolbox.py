@@ -501,11 +501,9 @@ class TestEvalModelNoise:
 # ---------------------------------------------------------------------------
 # get_MoM — output length, bounds adherence, and snapshots
 #
-# Note: get_MoM always calls `samp = 10**samp` regardless of seq_model due to
-# a condition bug (`if self.seq_model == "Poisson" or "Bernoulli":` is always
-# True).  A dummy samp array is passed for all models to avoid a TypeError
-# when samp=None.  For seq_model="None" models the samp value does not affect
-# b/beta/gamma outputs because the samp-scaling branches are gated on seq_model.
+# Note: get_MoM only exponentiates samp for seq_model in ("Poisson", "Bernoulli").
+# A dummy samp array is still passed for seq_model="None" models; it is ignored
+# there because the samp-scaling branches are gated on seq_model.
 # ---------------------------------------------------------------------------
 
 _DUMMY_SAMP = np.array([-6.0, -6.0])  # ignored for seq_model="None"
@@ -629,8 +627,7 @@ class TestRustPythonParity:
 
     seq_model="None" Rust paths: Bursty, CIR (quadrature models only;
     analytical models use Python/scipy which is faster at small grid sizes).
-    seq_model="Poisson" Rust paths: Bursty, CIR.
-    seq_model="Bernoulli": no Rust path (Python only).
+    seq_model="Poisson" and "Bernoulli" Rust paths: all six 2-D models.
     """
 
     LIMITS = [20, 20]
@@ -694,3 +691,49 @@ class TestRustPythonParity:
         py = _eval_pss_python(model, p, self.LIMITS, samp=self._SAMP_POISSON)
         np.testing.assert_allclose(rust, py, rtol=1e-5, atol=1e-10,
                                    err_msg="CIR/Poisson Rust vs Python mismatch")
+
+    # --- Bernoulli: samp is log10 capture probability ---
+    _SAMP_BERNOULLI = np.array([-1.0, -0.5])
+
+    def test_bursty_bernoulli_parity(self, bursty_bernoulli):
+        p = np.array([0.3, 0.0, -0.1])
+        rust = bursty_bernoulli.eval_model_pss(p, self.LIMITS, samp=self._SAMP_BERNOULLI)
+        py = _eval_pss_python(bursty_bernoulli, p, self.LIMITS, samp=self._SAMP_BERNOULLI)
+        np.testing.assert_allclose(rust, py, rtol=1e-5, atol=1e-10,
+                                   err_msg="Bursty/Bernoulli Rust vs Python mismatch")
+
+    def test_bernoulli_unit_capture_matches_none(self, bursty_bernoulli, bursty_none):
+        """log10 capture probability 0 (p=1) must reproduce the noise-free model."""
+        p = np.array([0.3, 0.0, -0.1])
+        unit = np.array([0.0, 0.0])
+        ref = bursty_none.eval_model_pss(p, self.LIMITS)
+        rust = bursty_bernoulli.eval_model_pss(p, self.LIMITS, samp=unit)
+        py = _eval_pss_python(bursty_bernoulli, p, self.LIMITS, samp=unit)
+        np.testing.assert_allclose(rust, ref, rtol=1e-5, atol=1e-10,
+                                   err_msg="Bernoulli p=1 (Rust) != None model")
+        np.testing.assert_allclose(py, ref, rtol=1e-5, atol=1e-10,
+                                   err_msg="Bernoulli p=1 (Python) != None model")
+
+    def test_bernoulli_capture_lowers_mean(self, bursty_bernoulli, bursty_none):
+        """A capture probability of 0.1 must reduce the mean of each species ~10x."""
+        p = np.array([0.3, 0.0, -0.1])
+        limits = [40, 40]
+        ref = bursty_none.eval_model_pss(p, limits)
+        obs = bursty_bernoulli.eval_model_pss(p, limits, samp=np.array([-1.0, -1.0]))
+        idx = np.arange(limits[0])
+        mean_ref = (ref.sum(axis=1) * idx).sum()
+        mean_obs = (obs.sum(axis=1) * idx).sum()
+        np.testing.assert_allclose(mean_obs, 0.1 * mean_ref, rtol=2e-2)
+
+
+class TestGetMoMSamp:
+    def test_poisson_samp_none_raises(self, bursty_poisson):
+        with pytest.raises(ValueError, match="requires samp"):
+            bursty_poisson.get_MoM(_bursty_moments(), np.array([-2.0, -2.0, -2.0]),
+                                   np.array([2.0, 2.0, 2.0]), samp=None)
+
+    def test_none_model_ignores_samp(self, bursty_none):
+        lb, ub = np.array([-2.0, -2.0, -2.0]), np.array([2.0, 2.0, 2.0])
+        a = bursty_none.get_MoM(_bursty_moments(), lb, ub, samp=None)
+        b = bursty_none.get_MoM(_bursty_moments(), lb, ub, samp=_DUMMY_SAMP)
+        np.testing.assert_allclose(a, b)

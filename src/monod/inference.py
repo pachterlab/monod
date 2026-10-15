@@ -52,7 +52,7 @@ def perform_inference(h5ad_filepath,
         "num_gene_cores": 1,
         "n_jac_jobs": 1,
     },
-    use_lengths=True,
+    use_lengths="auto",
     run_meta="",
     phys_lb=None,
     phys_ub=None,
@@ -126,7 +126,10 @@ def perform_inference(h5ad_filepath,
 
     else:
         import mminference
-        inference_parameters = mminference.MEKMeansParameters(
+        # Stage 1: standard inference to find optimal technical parameters.
+        # Technical noise is a batch-level property shared across all clusters,
+        # so eta is estimated once from the full population before clustering.
+        standard_ip = InferenceParameters(
             dataset_string,
             model,
             use_lengths=use_lengths,
@@ -137,8 +140,38 @@ def perform_inference(h5ad_filepath,
             samp_lb=samp_lb,
             samp_ub=samp_ub,
             gridsize=gridsize,
-        poisson_average_log_length=poisson_average_log_length,
-        k=k, epochs=epochs)
+            poisson_average_log_length=poisson_average_log_length)
+
+        if standard_ip.n_grid_points > 1:
+            log.info('Running standard inference to find optimal technical parameters for meK-Means.')
+            standard_result = standard_ip.fit_all_grid_points(
+                search_data, num_cores=num_cores, grid_cores=grid_cores,
+                checkpoint=checkpoint, save=save)
+            standard_result.find_sampling_optimum(discard_rejected=False)
+            optimal_eta = list(standard_result.samp_optimum)
+            log.info('Optimal technical parameters for meK-Means: {}'.format(optimal_eta))
+            fixed_samp_lb = optimal_eta
+            fixed_samp_ub = optimal_eta
+            fixed_gridsize = [1] * len(optimal_eta)
+        else:
+            fixed_samp_lb = samp_lb
+            fixed_samp_ub = samp_ub
+            fixed_gridsize = gridsize
+
+        # Stage 2: meK-Means at the fixed optimal technical parameters.
+        inference_parameters = mminference.MEKMeansParameters(
+            dataset_string,
+            model,
+            use_lengths=use_lengths,
+            gradient_params=gradient_params,
+            run_meta=run_meta,
+            phys_lb=phys_lb,
+            phys_ub=phys_ub,
+            samp_lb=fixed_samp_lb,
+            samp_ub=fixed_samp_ub,
+            gridsize=fixed_gridsize,
+            poisson_average_log_length=poisson_average_log_length,
+            k=k, epochs=epochs)
     
     log.info('Global inference parameters set.')
 
@@ -260,11 +293,16 @@ def perform_inference(h5ad_filepath,
     else:
         monod_adata.uns['search_result_list'] = _uns_pack(search_result_list)
 
-    monod_adata.uns['search_data'] = _uns_pack(search_data)
+    # The SearchData is deliberately not stored: it is rebuilt in memory from
+    # the AnnData (layers + uns['M']) via searchdata_from_adata(), which is fast
+    # and avoids serialising the (Rust-backed) histogram container.
+    log.info('Search data is not stored; rebuild it with searchdata_from_adata(monod_adata).')
 
     if save:
-        inference_string = search_result.inference_string
-        sd = search_data.store_on_disk(inference_string)
+        if mek_means_params:
+            inference_string = search_result_list[0].inference_string
+        else:
+            inference_string = search_result.inference_string
 
         adata_file_path = inference_string + '/monod_adata.pkl'
         with open(adata_file_path, 'wb') as adfs:
@@ -419,28 +457,6 @@ class SearchData:
         for j in range(len(input_data)):
             setattr(self, attr_names[j], input_data[j])
 
-    def store_on_disk(self, inference_string):
-        """This helper method attempts to store the SearchData object to disk.
-
-        Returns
-        -------
-        full_result_string: str
-            file location.
-        """
-        try:
-            full_result_string = inference_string + "/search_data.res"
-            with open(full_result_string, "wb") as sdfs:
-                pickle.dump(self, sdfs)
-            log.info("Search data stored to {}.".format(full_result_string))
-        except:
-            log.error(
-                "Search data could not be stored to {}.".format(
-                    full_result_string
-                )
-            )
-        self.full_result_string = full_result_string
-        return full_result_string
-
             
 
 def AIC_per_gene(search_result, monod_adata):
@@ -474,6 +490,42 @@ def AIC_per_gene(search_result, monod_adata):
     
     return AIC
 
+
+
+_USE_LENGTHS_MODES = (None, "unspliced", "spliced", "both")
+
+
+def _normalize_use_lengths(use_lengths, model):
+    """Resolve the ``use_lengths`` option against the model's sequencing model.
+
+    Returns a tuple ``(mode, explicit)`` where ``mode`` is one of None,
+    "unspliced", "spliced", "both" and ``explicit`` is False when the caller
+    left the default ("auto"), so downstream code may silently fall back to
+    no length correction when gene lengths are unavailable.
+
+    "auto" (the default) means "unspliced" for the Poisson sequencing model
+    and None otherwise, since only the Poisson model has a length effect.
+    Legacy bools are accepted: True -> "unspliced", False -> None.
+    """
+    if use_lengths == "auto":
+        mode = "unspliced" if model.seq_model == "Poisson" else None
+        return mode, False
+    if use_lengths is True:
+        use_lengths = "unspliced"
+    elif use_lengths is False:
+        use_lengths = None
+    if use_lengths not in _USE_LENGTHS_MODES:
+        raise ValueError(
+            "use_lengths must be 'auto', None, 'unspliced', 'spliced', or 'both'; "
+            f"got {use_lengths!r}"
+        )
+    if use_lengths is not None and model.seq_model != "Poisson":
+        raise ValueError(
+            f"use_lengths={use_lengths!r} requires seq_model='Poisson'; the "
+            f"{model.seq_model!r} sequencing model has no gene-length effect. "
+            "Pass use_lengths=None (or leave the default)."
+        )
+    return use_lengths, True
 
 
 class InferenceParameters:
@@ -530,7 +582,7 @@ class InferenceParameters:
         self,
         dataset_string,
         model,
-        use_lengths=True,
+        use_lengths="auto",
         gradient_params={
             "max_iterations": 10,
             "init_pattern": "moments",
@@ -565,10 +617,13 @@ class InferenceParameters:
             dataset-specific directory location.
         model: monod.cme_toolbox.CMEModel
             CME model used for inference.
-        use_lengths: None | "unspliced" | "spliced" | "both", optional
+        use_lengths: "auto" | None | "unspliced" | "spliced" | "both", optional
             Which Poisson sampling channels receive a per-gene log-length offset.
+            "auto" (default): "unspliced" for the Poisson sequencing model, None
+            otherwise; falls back to None if the search data carries no lengths.
             None: no correction. "unspliced": unspliced channel only.
             "spliced": spliced channel only. "both": both channels.
+            Any non-None value with a non-Poisson sequencing model raises.
             Legacy bool values are accepted: True → "unspliced", False → None.
         gradient_params: dict, optional
             settings for gradient descent.
@@ -607,18 +662,7 @@ class InferenceParameters:
         self.phys_ub = np.array(phys_ub)
         self.grad_bnd = scipy.optimize.Bounds(phys_lb, phys_ub)
 
-        # Normalise use_lengths to one of: None, "unspliced", "spliced", "both".
-        # Accept legacy bool for backward compatibility.
-        if use_lengths is True:
-            use_lengths = "unspliced"
-        elif use_lengths is False:
-            use_lengths = None
-        if use_lengths not in (None, "unspliced", "spliced", "both"):
-            raise ValueError(
-                "use_lengths must be None, 'unspliced', 'spliced', or 'both'; "
-                f"got {use_lengths!r}"
-            )
-        self.use_lengths = use_lengths
+        self.use_lengths, self.use_lengths_explicit = _normalize_use_lengths(use_lengths, model)
         self.poisson_average_log_length = poisson_average_log_length
 
         if model.seq_model == "None":
@@ -759,7 +803,9 @@ class InferenceParameters:
             """
             if grid_cores > 1:
                 log.info("Starting parallelized grid scan (%d points).", len(point_indices))
-                returned = Parallel(n_jobs=grid_cores)(
+                # Thread backend: the SearchData is shared in memory rather than
+                # pickled to worker processes; the Rust kernels release the GIL.
+                returned = Parallel(n_jobs=grid_cores, prefer="threads")(
                     jdelayed(self.par_fun)(idx, search_data, self.model)
                     for idx in tqdm(point_indices, desc="Grid scan")
                 )
@@ -935,6 +981,15 @@ class GradientInference:
         )
 
         use_lengths_mode = global_parameters.use_lengths
+        if use_lengths_mode is not None and getattr(search_data, "gene_log_lengths", None) is None:
+            if getattr(global_parameters, "use_lengths_explicit", True):
+                raise ValueError(
+                    f"use_lengths={use_lengths_mode!r} was requested but the search data has "
+                    "no gene lengths. Provide a transcriptome_filepath / adata.var['log_lengths'], "
+                    "or pass use_lengths=None."
+                )
+            log.info("No gene lengths in search data; use_lengths='auto' resolved to None.")
+            use_lengths_mode = None
         if use_lengths_mode is not None:
             if model.seq_model == "Bernoulli":
                 raise ValueError(
@@ -3179,7 +3234,9 @@ def parallelize(
     x = []
     try:
         items = list(tqdm(iterable, total=num_entries) if use_tqdm else iterable)
-        x = Parallel(n_jobs=num_cores)(delayed(function)(item) for item in items)
+        # Thread backend: items may contain a SearchData, which is shared in
+        # memory rather than pickled to worker processes.
+        x = Parallel(n_jobs=num_cores, prefer="threads")(delayed(function)(item) for item in items)
         log.info(completion_message)
     except KeyboardInterrupt:
         log.warning(termination_message)

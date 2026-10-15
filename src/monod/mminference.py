@@ -8,12 +8,14 @@ from scipy.special import logsumexp, softmax
 from extract_data import make_dir, log, _build_sampling_grid
 from cme_toolbox import CMEModel  # may be unnecessary
 from inference import (
+    _normalize_use_lengths,
     GradientInference as _BaseGradientInference,
     InferenceParameters as _BaseInferenceParameters,
     GridPointResults as _BaseGridPointResults,
     SearchResults as _BaseSearchResults,
 )
 import multiprocessing
+import multiprocessing.pool
 import os
 import itertools
 from sklearn.cluster import KMeans, SpectralClustering
@@ -59,7 +61,7 @@ class MEKMeansParameters(_BaseInferenceParameters):
         log10 upper bounds on biological parameters.
     grad_bnd: scipy.optimize.Bounds
         log10 lower and upper bounds on biological parameters.
-    use_lengths: bool
+    use_lengths: None | "unspliced" | "spliced" | "both"
         if True, the nascent Poisson model technical variation parameter is a
         coefficient multiplied by gene length.
         if False, the parameter is the genome-wide nascent sampling rate.
@@ -98,7 +100,7 @@ class MEKMeansParameters(_BaseInferenceParameters):
         self,
         dataset_string,
         model,
-        use_lengths=True,
+        use_lengths="auto",
         gradient_params={
             "max_iterations": 10,
             "init_pattern": "moments",
@@ -133,7 +135,8 @@ class MEKMeansParameters(_BaseInferenceParameters):
             dataset-specific directory location.
         model: monod.cme_toolbox.CMEModel
             CME model used for inference.
-        use_lengths: bool, optional
+        use_lengths: "auto" | None | "unspliced" | "spliced" | "both", optional
+            "auto" (default) resolves to "unspliced" for Poisson and None otherwise.
             if True, the nascent Poisson model technical variation parameter is a
             coefficient multiplied by gene length.
             if False, the parameter is the genome-wide nascent sampling rate.
@@ -164,7 +167,7 @@ class MEKMeansParameters(_BaseInferenceParameters):
         self.phys_ub = np.array(phys_ub)
         self.grad_bnd = scipy.optimize.Bounds(phys_lb, phys_ub)
 
-        self.use_lengths = use_lengths
+        self.use_lengths, self.use_lengths_explicit = _normalize_use_lengths(use_lengths, model)
         self.poisson_average_log_length = poisson_average_log_length
 
         if model.seq_model == "None":
@@ -274,7 +277,14 @@ class MEKMeansParameters(_BaseInferenceParameters):
         log.info("Runtime: {:.1f} seconds.".format(t2 - t1))
         return full_results
 
- 
+    def fit_all_grid_points(self, search_data, num_cores=1, grid_cores=1,
+                            coarse_to_fine=False, checkpoint=False, save=False):
+        """Run meK-Means EM and return a list of SearchResults (one per cluster).
+
+        Overrides the base class to delegate to run_mek_means, which handles
+        the MEK-Means-specific par_fun signature and returns a per-cluster list.
+        """
+        return self.run_mek_means(search_data, num_cores=num_cores)
 
     def par_fun(self, inputs):
         """Helper method for the grid point parallelization procedure.
@@ -390,10 +400,6 @@ class GradientInference(_BaseGradientInference):
             method of moments estimates for all genes under the current technical variation parameters.
 
         """
-        # mminference.InferenceParameters.use_lengths is a bool; the base class
-        # expects None or a string ("unspliced"/"spliced"/"both"). Normalise here.
-        if isinstance(global_parameters.use_lengths, bool):
-            global_parameters.use_lengths = "unspliced" if global_parameters.use_lengths else None
         # Delegate regressor setup, param_MoM, restart bounds, and warm_start
         # to the base class, then add MEK-Means-specific attributes.
         super().__init__(global_parameters, model, search_data, point_index)
@@ -1618,7 +1624,9 @@ def parallelize(
 
     """
     try:
-        pool = multiprocessing.Pool(processes=num_cores)
+        # Thread pool: per-cluster SearchData subsets are shared in memory
+        # rather than pickled to worker processes; Rust kernels release the GIL.
+        pool = multiprocessing.pool.ThreadPool(processes=num_cores)
         if use_tqdm:
             x = list(tqdm(pool.imap(function, iterable), total=num_entries))  # hacky
         else:

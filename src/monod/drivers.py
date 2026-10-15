@@ -9,7 +9,6 @@ samples in a parallelized fashion.
 from .extract_data import extract_data
 from .cme_toolbox import CMEModel
 from .inference import InferenceParameters, GradientInference
-from .analysis import load_search_data
 
 
 def parfun_noisefree(x):
