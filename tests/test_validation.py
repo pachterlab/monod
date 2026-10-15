@@ -187,3 +187,27 @@ class TestRustEntryPoints:
     def test_h5ad_padding_zero(self, tmp_path):
         with pytest.raises(ValueError, match="padding must be >= 1"):
             _mc.searchdata_from_h5ad(str(tmp_path / "x.h5ad"), ["unspliced", "spliced"], padding=0)
+
+
+class TestReviewRegressions:
+    """Regressions caught by the post-fix code review (2026-10-15)."""
+
+    def test_ambient_param_count_is_total(self):
+        m = CMEModel("Bursty", "None", amb_model="Equal")
+        assert m.get_num_params() == 4
+        p, lim = m._check_pss_args(np.zeros(4), [8, 8, 4])
+        assert p.shape == (4,) and lim == [8, 8, 4]
+        with pytest.raises(ValueError, match="expected 4 log10 parameters \\(3 biological \\+ 1 ambient\\)"):
+            m._check_pss_args(np.zeros(5), [8, 8, 4])
+        with pytest.raises(ValueError, match="expected 4"):
+            m._check_pss_args(np.zeros(3), [8, 8, 4])
+
+    def test_bounds_validated_before_scipy(self):
+        with pytest.raises(ValueError, match="must be 1-D with equal length"):
+            InferenceParameters("ds", CMEModel("Bursty", "None"), phys_lb=[-1, -1, -1], phys_ub=[2, 2])
+
+    def test_mek_means_bounds_validated_before_scipy(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(ValueError, match="must be 1-D with equal length"):
+            mminference.MEKMeansParameters("ds", CMEModel("Bursty", "None"), k=2, epochs=1,
+                                           phys_lb=[-1, -1, -1], phys_ub=[2, 2])

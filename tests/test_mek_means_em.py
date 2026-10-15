@@ -342,3 +342,38 @@ class TestRustPythonBackendConsistency:
         np.testing.assert_allclose(Qr, Qp, rtol=1e-6, atol=1e-9)
         assert lbr == pytest.approx(lbp, rel=1e-6)
         assert qr == pytest.approx(qp, rel=1e-6)
+
+
+@needs_rust
+class TestReviewRegressions:
+    def test_cluster_that_empties_is_dropped_from_theta(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        warnings.filterwarnings("ignore")
+        sd, _ = _two_population_sd()
+        model = CMEModel("Bursty", "None")
+        p = mm.MEKMeansParameters("ds", model, k=2, epochs=1, random_state=0, gradient_params=GP)
+        gi = mm.GradientInference(p, model, sd, 0, 2, 1)
+        Q0 = gi._initialize_Q(sd)
+        k_dict = gi._part_search_data(sd, Q0)
+        gi._m_step(model, k_dict, Q0)
+        assert sorted(gi.theta) == [0, 1]
+        gi._m_step(model, {0: k_dict[0]}, Q0)       # cluster 1 received no cells this epoch
+        assert sorted(gi.theta) == [0]
+        Q, lb, q = gi._e_step(model, sd)
+        assert np.all(Q[:, 1] == 0.0)
+
+    def test_mek_means_plot_gene_distributions_1x1_and_unsaved(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        warnings.filterwarnings("ignore")
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        sd, _ = _two_population_sd()
+        model = CMEModel("Bursty", "None")
+        p = mm.MEKMeansParameters("ds", model, k=2, epochs=2, random_state=0, gradient_params=GP)
+        results = p.run_mek_means(sd)
+        sr = results[0]
+        sr.find_sampling_optimum()
+        sr.plot_gene_distributions(sd, sz=(1, 1), marg="joint", savefig=False)
+        sr.plot_gene_distributions(sd, sz=(1, 2), marg="spliced", savefig=True)
+        plt.close("all")

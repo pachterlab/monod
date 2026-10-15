@@ -1,6 +1,6 @@
 from .cme_toolbox import CMEModel
-from .inference import SearchResults, plot_hist_and_fit, _resolve_marg, searchdata_from_adata
-from .extract_data import _uns_unpack, make_dir, knee_plot, log
+from .inference import SearchResults, plot_hist_and_fit, _resolve_marg, searchdata_from_adata, _read_h5, search_result_from_uns, search_result_list_from_uns
+from .extract_data import make_dir, knee_plot, log
 from .plot_aesthetics import aesthetics
 import pickle
 import scipy
@@ -20,9 +20,9 @@ def run_qc(monod_adata, mek_means_params=None,cluster=0, discard_rejected=True, 
     sd = searchdata_from_adata(monod_adata)
 
     if not mek_means_params:
-        sr = _uns_unpack(monod_adata.uns['search_result'])
+        sr = search_result_from_uns(monod_adata.uns['search_result'])
     else:
-        sr = _uns_unpack(monod_adata.uns['search_result_list'])[cluster]
+        sr = search_result_list_from_uns(monod_adata.uns['search_result_list'])[cluster]
         
     fig1,ax1 = plt.subplots(1,1)
     sr.find_sampling_optimum()
@@ -49,25 +49,44 @@ def run_qc(monod_adata, mek_means_params=None,cluster=0, discard_rejected=True, 
 
 
 def load_search_results(full_result_string):
-    """Attempt to load search results from disk.
+    """Load search results from disk.
+
+    Accepts the ``monod_adata.h5ad`` written by ``perform_inference(save=True)``
+    (returns the SearchResults, or the per-cluster list for a meK-Means run), a
+    ``grid_scan_results.h5`` written by ``SearchResults.store_on_disk`` or
+    ``run_mek_means(save=True)``, or a legacy pickled ``.res`` file.
 
     Parameters
     ----------
     full_result_string: str
-        disk location of the SearchResults object.
+        file location.
 
     Returns
     -------
-    search_results: monod.inference.SearchResults
-        the SearchResults object.
+    search_results: SearchResults or list of SearchResults
     """
     try:
-        with open(full_result_string, "rb") as srfs:
-            search_results = pickle.load(srfs)
+        try:
+            if full_result_string.endswith(".h5ad"):
+                import h5py
+                from anndata.io import read_elem
+                with h5py.File(full_result_string, "r") as f:
+                    uns = read_elem(f["uns"])
+                if "search_result_list" in uns:
+                    return search_result_list_from_uns(uns["search_result_list"])
+                return search_result_from_uns(uns["search_result"])
+            d = _read_h5(full_result_string)
+            if str(d.get("kind", "")) == "SearchResultsList":
+                return search_result_list_from_uns(d)
+            search_results = SearchResults.from_dict(d)
+        except OSError:
+            # Legacy pickled .res file written by older monod versions.
+            log.warning("%s is not an HDF5 results file; falling back to the legacy pickle loader.", full_result_string)
+            with open(full_result_string, "rb") as srfs:
+                search_results = pickle.load(srfs)
+            if not hasattr(search_results.model, "amb_model"):  # bck
+                search_results.model.amb_model = "None"
         log.info("Grid scan results loaded from {}.".format(full_result_string))
-        if not hasattr(search_results.model, "amb_model"):  # bck
-            search_results.model.amb_model = "None"
-
         return search_results
     except Exception as ex:
         log.error(
@@ -468,8 +487,8 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
             raise KeyError('Genes are not the same between datasets')
             # log.error('Genes are not the same between datasets')
     
-        sr1 = _uns_unpack(adata1.uns['search_result'])
-        sr2 = _uns_unpack(adata2.uns['search_result'])
+        sr1 = search_result_from_uns(adata1.uns['search_result'])
+        sr2 = search_result_from_uns(adata2.uns['search_result'])
             
         gn, gf, offs, resid = diffexp_pars(sr1, sr2, modeltype=modeltype,
         gene_filter_=gene_filter_,
@@ -509,7 +528,7 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
     else:
         
         mek_means = True
-        sr_list = _uns_unpack(adata1.uns['search_result_list'])
+        sr_list = search_result_list_from_uns(adata1.uns['search_result_list'])
     
         gn, gf, offs, resid = {}, {}, {}, {}
     
@@ -821,7 +840,10 @@ def diffexp_fpi(
             # RealData takes standard deviations (sx, sy) and converts them to
             # inverse-variance weights; odr.Data's positional arguments are
             # weights, which would have *up*-weighted uncertain points.
-            d = odr.RealData(m1[gf], m2[gf], sx=s1[gf], sy=s2[gf])
+            # A zero standard error (parameter pinned at a bound) would become an
+            # infinite weight; floor it at a tiny positive value.
+            tiny = 1e-12
+            d = odr.RealData(m1[gf], m2[gf], sx=np.maximum(s1[gf], tiny), sy=np.maximum(s2[gf], tiny))
 
         md = lambda B, x: linoffset(B, x, modeltype=modeltype)
         odrmodel = scipy.odr.Model(md)

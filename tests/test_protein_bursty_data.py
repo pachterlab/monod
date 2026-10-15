@@ -30,7 +30,7 @@ import anndata as ad
 
 from conftest import check_snapshot
 from monod.cme_toolbox import CMEModel
-from monod.extract_data import extract_data, _uns_unpack
+from monod.extract_data import extract_data, make_histogram, model_from_uns
 
 try:
     import monod_core as _mc
@@ -42,13 +42,13 @@ def _hist_from_adata(adata):
     """Return (coords, freqs) for gene 0, computing from layers when Rust is available."""
     if _mc is not None:
         modality_name_dict = adata.uns['modality_name_dict']
-        model = _uns_unpack(adata.uns['model'])
+        model = model_from_uns(adata.uns['model'])
         ordered_layer_names = [modality_name_dict[m] for m in model.model_modalities]
         layers = [np.ascontiguousarray(adata.layers[ln], dtype=np.int64)
                   for ln in ordered_layer_names]
         coords_list, freqs_list = _mc.make_state_dist(layers)
         return (np.array(coords_list[0], dtype=np.int64), np.array(freqs_list[0]))
-    return _uns_unpack(adata.uns["hist"])[0]
+    return make_histogram(adata, "unique", adata.uns["M"])[0]
 
 # ---------------------------------------------------------------------------
 # Paths

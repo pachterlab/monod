@@ -344,8 +344,11 @@ class CMEModel:
             else:
                 log.error("Modalities unknown for model: {}".format(self.bio_model))
 
-        print('The expected modalities for this model are:', self.model_modalities)
-        print('If your anndata layers have different names, please give a modality dictionary of the form: modality_name_dict  = {\'spliced\':your_spliced_layer_name, \'unspliced\':your_unspliced_layer_name} ')
+        log.info(
+            "Expected modalities for %s: %s. If your AnnData layers use other names, pass "
+            "modality_name_dict={'spliced': <layer>, 'unspliced': <layer>}.",
+            self.bio_model, self.model_modalities,
+        )
 
         # TODO: make nascent and mature also detected automatically
 
@@ -383,6 +386,13 @@ class CMEModel:
         except KeyError:
             log.info("Biophysical bounds unknown for model: {}".format(self.bio_model))
 
+        if amb_model in ["None", None, "Null"]:
+            amb_model = "None"
+        CMEModel.available_amb_models = ("None", "Equal", "Unequal")
+        if amb_model not in CMEModel.available_amb_models:
+            raise ValueError(
+                f"amb_model must be one of {CMEModel.available_amb_models}; got {amb_model!r}"
+            )
         self.amb_model = amb_model
         if seq_model in ["None", None, "Null"]:
             self.seq_model = "None"
@@ -490,6 +500,52 @@ class CMEModel:
         elif self.amb_model == "Unequal":
             param_str += [r"$\log_{10} p_N$", r"$\log_{10} p_M$"]
         return param_str
+
+    # ------------------------------------------------------------------
+    # Structured (pickle-free) serialisation
+    # ------------------------------------------------------------------
+    _CTOR_KEYS = (
+        "bio_model", "seq_model", "amb_model", "quad_method", "fixed_quad_T", "quad_order",
+        "quad_vec_T", "protein_limit", "fit_unspliced", "min_fudge", "max_fudge",
+        "network", "normalize_production_rate",
+    )
+
+    def to_dict(self):
+        """Constructor arguments as a flat dict of scalars and strings.
+
+        Round-trips through ``adata.uns`` and h5ad; see :meth:`from_dict`.
+        """
+        d = {
+            "format_version": 1,
+            "kind": "CMEModel",
+            "bio_model": self.bio_model,
+            "seq_model": self.seq_model,
+            "amb_model": self.amb_model,
+            "quad_method": self.quad_method,
+            "fixed_quad_T": float(self.fixed_quad_T),
+            "quad_order": int(self.quad_order),
+            "quad_vec_T": float(self.quad_vec_T),
+        }
+        for k in ("protein_limit", "fit_unspliced", "min_fudge", "max_fudge"):
+            if hasattr(self, k):
+                v = getattr(self, k)
+                d[k] = bool(v) if isinstance(v, (bool, np.bool_)) else float(v)
+        if getattr(self, "network", None) is not None:
+            d["network"] = self.network.network_str
+            d["normalize_production_rate"] = bool(self.network.normalize_production_rate)
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        """Rebuild a CMEModel from :meth:`to_dict` output (or an h5ad-loaded copy of it)."""
+        kwargs = {}
+        for k in cls._CTOR_KEYS:
+            if k in d:
+                v = d[k]
+                kwargs[k] = v.item() if isinstance(v, np.generic) else v
+        if kwargs.get("network", None) == "":
+            kwargs["network"] = None
+        return cls(**kwargs)
 
     def get_num_params(self):
         """Return the number of parameters for the model instance.
@@ -938,12 +994,13 @@ class CMEModel:
         Rust error.
         """
         p = np.asarray(p, dtype=float)
-        n_bio = self.get_num_params()
+        n_total = self.get_num_params()          # biological + ambient parameters
         n_amb = {"None": 0, "Equal": 1, "Unequal": 2}.get(self.amb_model, 0)
-        if p.ndim != 1 or p.shape[0] not in (n_bio, n_bio + n_amb):
+        if p.ndim != 1 or p.shape[0] != n_total:
             raise ValueError(
-                f"{self.bio_model}/{self.seq_model}/{self.amb_model}: expected {n_bio} log10 "
-                f"parameters{' (+' + str(n_amb) + ' ambient)' if n_amb else ''}, got shape {p.shape}"
+                f"{self.bio_model}/{self.seq_model}/{self.amb_model}: expected {n_total} log10 "
+                f"parameters ({n_total - n_amb} biological"
+                f"{' + ' + str(n_amb) + ' ambient' if n_amb else ''}), got shape {p.shape}"
             )
         if not np.all(np.isfinite(p)):
             raise ValueError("parameters must be finite log10 values; got {}".format(p))
@@ -1216,16 +1273,23 @@ class CMEModel:
             g = g_
             p = np.copy(p[:-1])
 
-        # For now add zero for protein sampling parameter.
-        if samp is not None:
-            num_excess = np.shape(g)[0] - len(samp)
-            samp_use = np.pad(samp, (0, num_excess))
-        
-        if self.seq_model == "Poisson":
-            g = np.exp((np.power(10, samp))[:, None] * g) - 1
-        elif self.seq_model == "Bernoulli":
-            # samp holds log10 capture probabilities (same convention as Poisson).
-            g = g * np.power(10.0, samp)[:, None]
+        # Technical-noise transform.  samp holds one log10 sampling parameter per
+        # sequenced modality; modalities beyond len(samp) (e.g. protein in
+        # ProteinBursty) are left untouched.  The mesh is cached, so transform a copy.
+        if self.seq_model in ("Poisson", "Bernoulli"):
+            if samp is None:
+                raise ValueError(
+                    f"seq_model={self.seq_model!r} requires samp (log10 sampling parameters, "
+                    "one per sequenced modality); got None."
+                )
+            samp = np.asarray(samp, dtype=float).ravel()
+            n_s = min(len(samp), g.shape[0])
+            lam = np.power(10.0, samp[:n_s])[:, None]
+            g = np.array(g, copy=True)
+            if self.seq_model == "Poisson":
+                g[:n_s] = np.exp(lam * g[:n_s]) - 1
+            else:
+                g[:n_s] = g[:n_s] * lam
         elif self.seq_model == "None":
             pass
         else:

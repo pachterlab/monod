@@ -1,4 +1,3 @@
-import pickle
 import time
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,6 +9,8 @@ from .cme_toolbox import CMEModel  # may be unnecessary
 from .inference import (
     _normalize_use_lengths,
     _validate_bounds,
+    _write_h5,
+    search_result_list_to_uns,
     plot_hist_and_fit,
     GradientInference as _BaseGradientInference,
     InferenceParameters as _BaseInferenceParameters,
@@ -122,6 +123,7 @@ class MEKMeansParameters(_BaseInferenceParameters):
         em_patience=2,
         random_state=0,
         init_modality="sum",
+        save=False,
     ):
         """Initialize the InferenceParameters instance.
 
@@ -172,6 +174,10 @@ class MEKMeansParameters(_BaseInferenceParameters):
             1e4 and log1p. "sum" (default) uses the sum of the first two
             modalities (U + S); a modality name such as "spliced" uses that layer
             alone, which is the setting described in the meK-Means paper.
+        save: bool, optional
+            create the run directory and write parameters.h5 at construction.
+            Default False: nothing is written to disk unless you ask for it
+            (see ``run_mek_means(save=True)``).
 
         Notes
         -----
@@ -195,11 +201,14 @@ class MEKMeansParameters(_BaseInferenceParameters):
             gridsize = model.seq_bounds['gridsize']
         
         self.gradient_params = gradient_params
+        self.use_lengths, self.use_lengths_explicit = _normalize_use_lengths(use_lengths, model)
+        if model.seq_model == "None":
+            samp_lb, samp_ub, gridsize = [0, 0], [0, 0], [1, 1]
+        _validate_bounds(model, phys_lb, phys_ub, samp_lb, samp_ub, gridsize)
         self.phys_lb = np.array(phys_lb)
         self.phys_ub = np.array(phys_ub)
         self.grad_bnd = scipy.optimize.Bounds(phys_lb, phys_ub)
 
-        self.use_lengths, self.use_lengths_explicit = _normalize_use_lengths(use_lengths, model)
         self.poisson_average_log_length = poisson_average_log_length
 
         if model.seq_model == "None":
@@ -210,7 +219,6 @@ class MEKMeansParameters(_BaseInferenceParameters):
             samp_ub = [0, 0]
             gridsize = [1, 1]
 
-        _validate_bounds(model, phys_lb, phys_ub, samp_lb, samp_ub, gridsize)
         self.samp_lb = np.array(samp_lb)
         self.samp_ub = np.array(samp_ub)
         self.gridsize = gridsize
@@ -245,14 +253,44 @@ class MEKMeansParameters(_BaseInferenceParameters):
         inference_string = inference_string[:-1]
         inference_string += f"{run_meta}"
         
-        make_dir(inference_string)
         self.inference_string = inference_string
-        inference_parameter_string = inference_string + "/parameters.pr"
-        self.store_inference_parameters(inference_parameter_string)
+        if save:
+            make_dir(inference_string)
+            self.store_inference_parameters(inference_string + "/parameters.h5")
+
+    # ------------------------------------------------------------------
+    # Structured (pickle-free) serialisation
+    # ------------------------------------------------------------------
+    _SERIAL_KIND = "MEKMeansParameters"
+
+    def to_dict(self):
+        d = super().to_dict()
+        d.update({
+            "k": int(self.k),
+            "epochs": int(self.epochs),
+            "em_tol": float(self.em_tol),
+            "em_patience": int(self.em_patience),
+            "init_modality": str(self.init_modality),
+        })
+        if self.random_state is not None:
+            d["random_state"] = int(self.random_state)
+        return d
+
+    @classmethod
+    def _from_dict_impl(cls, d):
+        kw = cls._ctor_kwargs_from_dict(d)
+        return cls(
+            str(d["dataset_string"]),
+            k=int(d["k"]), epochs=int(d["epochs"]),
+            em_tol=float(d.get("em_tol", 1e-4)), em_patience=int(d.get("em_patience", 2)),
+            random_state=(int(d["random_state"]) if "random_state" in d else None),
+            init_modality=str(d.get("init_modality", "sum")),
+            save=False, **kw,
+        )
 
 
 
-    def run_mek_means(self, search_data, num_cores=1):
+    def run_mek_means(self, search_data, num_cores=1, save=False):
         """Fits the search data for all genes over all grid points.
 
         Parameters
@@ -262,15 +300,18 @@ class MEKMeansParameters(_BaseInferenceParameters):
         search_data: monod.extract_data.SearchData
             SearchData object with the data to fit.
 
+        save: bool, optional
+            write all per-cluster results to a single
+            ``<inference_string>/grid_scan_results.h5`` (default False).
+
         Returns
         -------
-        full_result_string: str
-            disk location of the SearchResults object.
+        full_results: list of SearchResults
+            one entry per cluster that received cells, ordered by cluster id.
 
         """
 
         t1 = time.time()
-        warnings.filterwarnings("ignore", category=DeprecationWarning)
         # ***** Assuming no parallelized grid search for now ***** 
         # if num_cores > 1: 
         #     log.info("Starting parallelized grid scan.") 
@@ -304,15 +345,18 @@ class MEKMeansParameters(_BaseInferenceParameters):
             if r is not None:
                 gp_results[r.point_index] = r
         log.info("Non-parallelized grid scan complete.")
-
-        warnings.resetwarnings()
         full_results = []
         for i in range(self.k):
             results = SearchResults(self, search_data, i)
             results.aggregate_grid_points(gp_results)
             if results.save:
-                results.store_on_disk()
                 full_results += [results]
+
+        if save:
+            make_dir(self.inference_string)
+            path = self.inference_string + "/grid_scan_results.h5"
+            _write_h5(path, search_result_list_to_uns(full_results))
+            log.info("meK-Means results (%d clusters) stored to %s.", len(full_results), path)
 
         t2 = time.time()
         log.info("Runtime: {:.1f} seconds.".format(t2 - t1))
@@ -325,7 +369,7 @@ class MEKMeansParameters(_BaseInferenceParameters):
         Overrides the base class to delegate to run_mek_means, which handles
         the MEK-Means-specific par_fun signature and returns a per-cluster list.
         """
-        return self.run_mek_means(search_data, num_cores=num_cores)
+        return self.run_mek_means(search_data, num_cores=num_cores, save=save)
 
     def par_fun(self, inputs):
         """Helper method for the grid point parallelization procedure.
@@ -675,6 +719,12 @@ class GradientInference(_BaseGradientInference):
         #Update weights
         self.weights = EPS+np.sum(Q,axis=0)
         self.weights /= self.weights.sum()
+
+        # A cluster that received no cells this epoch has no M-step update:
+        # drop its stale parameters so the E-step treats it as unfitted
+        # (zero posterior) instead of scoring cells against old theta.
+        for k_stale in [k for k in self.theta if k not in k_dict]:
+            del self.theta[k_stale]
 
         #Get optimal parameters
         if num_cores > 1: # ****** PARALLELIZE *****
@@ -1138,6 +1188,9 @@ class GridPointResults(_BaseGridPointResults):
         self.all_qs = all_qs
         self.all_klds = all_klds
 
+    _SERIAL_KIND = "MEKMeansGridPointResults"
+    _SERIAL_ATTRS = _BaseGridPointResults._SERIAL_ATTRS + ("weights", "aic", "assigns", "all_qs", "all_klds")
+
 
 class SearchResults(_BaseSearchResults):
     """Stores and analyzes the results of a single inference run.
@@ -1245,6 +1298,9 @@ class SearchResults(_BaseSearchResults):
         self.all_klds = []
         self.filt = []
 
+    _SERIAL_KIND = "MEKMeansSearchResults"
+    _SERIAL_ATTRS = _BaseSearchResults._SERIAL_ATTRS + ("assigns", "save", "weights", "aic", "all_qs", "all_klds", "filt")
+
     def _append_from_object(self, gpr):
         """Update result attributes from an in-memory GridPointResults object.
 
@@ -1296,9 +1352,8 @@ class SearchResults(_BaseSearchResults):
         self.all_klds = np.asarray(self.all_klds)
 
         if self.save:
-            analysis_figure_string = self.inference_string + "/analysis_figures_"+str(self.assigns)
-            self.analysis_figure_string = analysis_figure_string
-            make_dir(analysis_figure_string)
+            # Created lazily by _savefig the first time a figure is actually saved.
+            self.analysis_figure_string = self.inference_string + "/analysis_figures_" + str(self.assigns)
 
     @property
     def _result_filename(self):
@@ -1560,9 +1615,7 @@ class SearchResults(_BaseSearchResults):
                 )
                 self.plot_landscape(ax1[axloc], discard_rejected=True, hideticks=True)
         if viz:
-            fig_string = self.analysis_figure_string + "/chisquare_stability.png"
-            plt.savefig(fig_string, dpi=450)
-            log.info("Figure stored to {}.".format(fig_string))
+            self._savefig("chisquare_stability.png")
 
         if overwrite:
             self.chisquare_testing(search_data, threshold=threshold)
@@ -1629,6 +1682,7 @@ class SearchResults(_BaseSearchResults):
 
         (nrows, ncols) = sz
         fig1, ax1 = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize)
+        axes = np.atleast_1d(ax1).ravel()
 
         nax = np.prod(sz)
         if genes_to_plot is None:
@@ -1654,7 +1708,7 @@ class SearchResults(_BaseSearchResults):
                 lm[0] = 1
             if marg == "nascent":
                 lm[1] = 1
-            axloc = np.unravel_index(j_, sz) if (sz[0] > 1 and sz[1] > 1) else j_
+            ax = axes[j_]
 
             samp = self.regressor_optimum[i_]
             Pa = np.squeeze(self.model.eval_model_pss(self.phys_optimum[i_], lm, samp))
@@ -1664,37 +1718,33 @@ class SearchResults(_BaseSearchResults):
                     Pa[Pa < 1e-10] = 1e-10
                     Pa = np.log10(Pa)
 
-                ax1[axloc].imshow(Pa.T, aspect="auto", cmap="summer")
-                ax1[axloc].invert_yaxis()
+                ax.imshow(Pa.T, aspect="auto", cmap="summer")
+                ax.invert_yaxis()
 
                 jitter_magn = 0.1
                 jitter = np.random.randn(2, self.n_cells) * jitter_magn
-                ax1[axloc].scatter(
+                ax.scatter(
                     *search_data.layers[:2, :,i_] + jitter, c="k", s=1, alpha=0.1
                 )
 
-                ax1[axloc].set_xlim([-0.5, search_data.M[0, i_] - 1.5])
-                ax1[axloc].set_ylim([-0.5, search_data.M[1, i_] - 1.5])
+                ax.set_xlim([-0.5, search_data.M[0, i_] - 1.5])
+                ax.set_ylim([-0.5, search_data.M[1, i_] - 1.5])
             else:
-                plot_hist_and_fit(ax1[axloc], search_data, i_, Pa, marg, modalities=self.model.model_modalities)
+                plot_hist_and_fit(ax, search_data, i_, Pa, marg, modalities=self.model.model_modalities)
                 if logscale:
-                    ax1[axloc].set_yscale("log")
+                    ax.set_yscale("log")
             if title:
                 titlestr = self.gene_names[i_]
                 if hasattr(self, "rejected_genes") and self.rejected_genes[i_]:
                     titlestr += " (rej.)"
-                ax1[axloc].set_title(titlestr, fontdict={"fontsize": 9})
-            ax1[axloc].set_xticks([])
-            ax1[axloc].set_yticks([])
+                ax.set_title(titlestr, fontdict={"fontsize": 9})
+            ax.set_xticks([])
+            ax.set_yticks([])
             j_ += 1
         fig1.tight_layout(pad=0.02)
 
         if savefig:
-            fig_string = (
-                self.analysis_figure_string + "/gene_distributions_{}.png".format(marg)
-            )
-            plt.savefig(fig_string, dpi=450)
-            log.info("Figure stored to {}.".format(fig_string))
+            self._savefig("gene_distributions_{}.png".format(marg))
 
     # the next two functions are useful for model selection, but are not currently in use.
     def get_logL(self, search_data, EPS=1e-20, offs=0):

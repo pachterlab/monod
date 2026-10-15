@@ -440,7 +440,7 @@ class TestBurstyEquivalenceTight:
         ref = self._ref()
         cus = self._custom(use_rust)
         kld = self._kld(ref, cus)
-        assert kld < 1e-4, f"KLD {kld:.2e} (was ~6e-5 with the double-counted half-steps)"
+        assert kld < 1e-5, f"KLD {kld:.2e} (was ~6e-5 with the double-counted half-steps)"
         assert np.max(np.abs(ref - cus)) < 1e-4, f"max |dPMF| {np.max(np.abs(ref - cus)):.2e}"
 
     def test_rust_and_python_custom_agree(self):

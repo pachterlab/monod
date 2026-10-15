@@ -1,12 +1,11 @@
 import itertools
 import logging
-import pickle
 import time
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
-from .extract_data import make_dir, log, extract_data, make_histogram, _uns_pack, _uns_unpack, _build_sampling_grid
+from .extract_data import make_dir, log, extract_data, make_histogram, _uns_unpack, _build_sampling_grid, model_from_uns
 from .cme_toolbox import CMEModel, _HAS_RUST  # may be unnecessary
 try:
     import monod_core as _mc
@@ -40,14 +39,8 @@ def perform_inference(h5ad_filepath,
     code_ver=code_ver_global,
     filt_param=None,
     exp_filter_threshold=1,
-    genes_to_fit=[],
-    gradient_params={
-        "max_iterations": 10,
-        "init_pattern": "moments",
-        "num_restarts": 3,
-        "num_gene_cores": 1,
-        "n_jac_jobs": 1,
-    },
+    genes_to_fit=None,
+    gradient_params=None,
     use_lengths="auto",
     run_meta="",
     phys_lb=None,
@@ -66,6 +59,16 @@ def perform_inference(h5ad_filepath,
     Run inference procedure for the desired model, save parameters, uncertainty from Hessian and AIC values automatically.
     '''
     
+    if gradient_params is None:
+        gradient_params = {
+            "max_iterations": 10,
+            "init_pattern": "moments",
+            "num_restarts": 3,
+            "num_gene_cores": 1,
+            "n_jac_jobs": 1,
+        }
+    if genes_to_fit is None:
+        genes_to_fit = []
     if mek_means_params:
         k, epochs = mek_means_params
     
@@ -118,7 +121,7 @@ def perform_inference(h5ad_filepath,
             samp_lb=samp_lb,
             samp_ub=samp_ub,
             gridsize=gridsize,
-        poisson_average_log_length=poisson_average_log_length)
+            poisson_average_log_length=poisson_average_log_length)
 
     else:
         from . import mminference
@@ -142,7 +145,7 @@ def perform_inference(h5ad_filepath,
             log.info('Running standard inference to find optimal technical parameters for meK-Means.')
             standard_result = standard_ip.fit_all_grid_points(
                 search_data, num_cores=num_cores, grid_cores=grid_cores,
-                checkpoint=checkpoint, save=save)
+                checkpoint=checkpoint, save=False)
             standard_result.find_sampling_optimum(discard_rejected=False)
             optimal_eta = list(standard_result.samp_optimum)
             log.info('Optimal technical parameters for meK-Means: {}'.format(optimal_eta))
@@ -173,7 +176,9 @@ def perform_inference(h5ad_filepath,
 
     if not mek_means_params:
         # Fit the model at all values of technical parameters, and save the location of the results.
-        search_result = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, grid_cores=grid_cores, checkpoint=checkpoint, save=save)
+        # save=False here: with save=True the whole run (model, parameters, results)
+        # is written once, as monod_adata.h5ad, at the end.
+        search_result = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, grid_cores=grid_cores, checkpoint=checkpoint, save=False)
         log.info('Grid points fit.')
         search_result.find_sampling_optimum(discard_rejected=False)
         parameters_per_gene = search_result.phys_optimum
@@ -182,7 +187,7 @@ def perform_inference(h5ad_filepath,
 
     else:
         # Fit the model at all values of technical parameters, and save the location of the results.
-        search_result_list = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, grid_cores=grid_cores, checkpoint=checkpoint, save=save)
+        search_result_list = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, grid_cores=grid_cores, checkpoint=checkpoint, save=False)
         log.info('Grid points fit.')
 
         cluster_params = {}
@@ -251,7 +256,7 @@ def perform_inference(h5ad_filepath,
             # Save uncertainties from Hessian.
             for j, sr in enumerate(search_result_list):
                 
-                sd =  sr._subset_search_data(search_data)
+                # compute_sigma subsets the search data to this cluster's cells itself.
                 sr.compute_sigma(search_data, num_cores=1)
                 all_sigmas = sr.sigma
                 
@@ -282,12 +287,9 @@ def perform_inference(h5ad_filepath,
     # Also save entire objects to adata.
 
     if not mek_means_params:
-        monod_adata.uns['search_result'] = _uns_pack(search_result)
-        if save:
-            sr = search_result.store_on_disk()
-            log.info('Search Result stored to %s', sr)
+        monod_adata.uns['search_result'] = search_result.to_dict()
     else:
-        monod_adata.uns['search_result_list'] = _uns_pack(search_result_list)
+        monod_adata.uns['search_result_list'] = search_result_list_to_uns(search_result_list)
 
     # The SearchData is deliberately not stored: it is rebuilt in memory from
     # the AnnData (layers + uns['M']) via searchdata_from_adata(), which is fast
@@ -295,15 +297,16 @@ def perform_inference(h5ad_filepath,
     log.info('Search data is not stored; rebuild it with searchdata_from_adata(monod_adata).')
 
     if save:
+        # Everything (data, model, parameters, results, cluster labels) lives in
+        # the AnnData, so one h5ad is the whole run on disk.
         if mek_means_params:
             inference_string = search_result_list[0].inference_string
         else:
             inference_string = search_result.inference_string
-
-        adata_file_path = inference_string + '/monod_adata.pkl'
-        with open(adata_file_path, 'wb') as adfs:
-            pickle.dump(monod_adata, adfs)
-        log.info('Anndata object stored to %s', adata_file_path)
+        make_dir(inference_string)
+        adata_file_path = inference_string + '/monod_adata.h5ad'
+        monod_adata.write_h5ad(adata_file_path)
+        log.info('Run stored to %s (load results with analysis.load_search_results).', adata_file_path)
 
     return monod_adata
 
@@ -314,7 +317,7 @@ def searchdata_from_adata(adata):
     # NB the order of the layers here will be enforced to be the same as the order of the model
     # modalities defined in cme_toolbox.
     modality_name_dict = adata.uns['modality_name_dict']
-    model = _uns_unpack(adata.uns['model'])
+    model = model_from_uns(adata.uns['model'])
 
     ordered_modalities = model.model_modalities
     ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
@@ -486,6 +489,78 @@ def AIC_per_gene(search_result, monod_adata):
     
     return AIC
 
+
+
+# ---------------------------------------------------------------------------
+# Structured (pickle-free) serialisation.
+#
+# Every persistent object (CMEModel, InferenceParameters, GridPointResults,
+# SearchResults and their meK-Means subclasses) implements to_dict()/from_dict()
+# producing nested dicts of numpy arrays, scalars and strings.  Those dicts go
+# straight into adata.uns (so the AnnData writes to h5ad) and into standalone
+# HDF5 files via anndata's write_elem.  No pickle is involved, so loading does
+# not execute code and does not depend on the Python class layout at write time.
+# ---------------------------------------------------------------------------
+
+def _to_plain(v):
+    """Coerce an attribute value into something h5ad/HDF5 can store."""
+    if isinstance(v, np.generic):
+        return v.item()
+    if isinstance(v, (list, tuple)):
+        if len(v) == 0:
+            return np.zeros(0)
+        a = np.asarray(v)
+        if a.dtype == object:
+            raise TypeError("cannot serialise a ragged or object-typed attribute")
+        return a
+    return v
+
+
+def _attr_dict(obj, names):
+    d = {}
+    for n in names:
+        v = getattr(obj, n, None)
+        if v is None:
+            continue
+        d[n] = _to_plain(v)
+    return d
+
+
+def _write_h5(path, d):
+    """Write a structured dict to an HDF5 file (anndata element encoding)."""
+    import h5py
+    from anndata.io import write_elem
+    with h5py.File(path, "w") as f:
+        write_elem(f, "monod", d)
+
+
+def _read_h5(path):
+    import h5py
+    from anndata.io import read_elem
+    with h5py.File(path, "r") as f:
+        return read_elem(f["monod"])
+
+
+def search_result_from_uns(v):
+    """Return the SearchResults stored in ``adata.uns['search_result']``."""
+    if hasattr(v, "keys"):
+        return SearchResults.from_dict(v)
+    return _uns_unpack(v)  # legacy pickle
+
+
+def search_result_list_from_uns(v):
+    """Return the per-cluster SearchResults list stored in ``adata.uns['search_result_list']``."""
+    if hasattr(v, "keys"):
+        n = int(v["n_clusters"])
+        return [SearchResults.from_dict(v[f"cluster_{i}"]) for i in range(n)]
+    return _uns_unpack(v)  # legacy pickle
+
+
+def search_result_list_to_uns(srs):
+    d = {"format_version": 1, "kind": "SearchResultsList", "n_clusters": len(srs)}
+    for i, sr in enumerate(srs):
+        d[f"cluster_{i}"] = sr.to_dict()
+    return d
 
 
 _USE_LENGTHS_MODES = (None, "unspliced", "spliced", "both")
@@ -709,11 +784,14 @@ class InferenceParameters:
             "n_jac_jobs": 1,
         }
         self.gradient_params = {**_gp_defaults, **gradient_params}
+        self.use_lengths, self.use_lengths_explicit = _normalize_use_lengths(use_lengths, model)
+        if model.seq_model == "None":
+            samp_lb, samp_ub, gridsize = [0, 0], [0, 0], [1, 1]
+        _validate_bounds(model, phys_lb, phys_ub, samp_lb, samp_ub, gridsize)
         self.phys_lb = np.array(phys_lb)
         self.phys_ub = np.array(phys_ub)
         self.grad_bnd = scipy.optimize.Bounds(phys_lb, phys_ub)
 
-        self.use_lengths, self.use_lengths_explicit = _normalize_use_lengths(use_lengths, model)
         self.poisson_average_log_length = poisson_average_log_length
 
         if model.seq_model == "None":
@@ -724,7 +802,6 @@ class InferenceParameters:
             samp_ub = [0, 0]
             gridsize = [1, 1]
 
-        _validate_bounds(model, phys_lb, phys_ub, samp_lb, samp_ub, gridsize)
         self.samp_lb = np.array(samp_lb)
         self.samp_ub = np.array(samp_ub)
         self.gridsize = gridsize
@@ -748,9 +825,67 @@ class InferenceParameters:
 
         if save:
             make_dir(inference_string)
-            inference_parameter_string = inference_string + "/parameters.pr"
+            inference_parameter_string = inference_string + "/parameters.h5"
             self.store_inference_parameters(inference_parameter_string)
         self.inference_string = inference_string
+
+    # ------------------------------------------------------------------
+    # Structured (pickle-free) serialisation
+    # ------------------------------------------------------------------
+    _SERIAL_KIND = "InferenceParameters"
+
+    def to_dict(self):
+        gp = {}
+        for k, v in self.gradient_params.items():
+            if v is None:
+                continue
+            gp[k] = v.item() if isinstance(v, np.generic) else v
+        d = {
+            "format_version": 1,
+            "kind": self._SERIAL_KIND,
+            "dataset_string": self.dataset_string,
+            "inference_string": self.inference_string,
+            "model": self.model.to_dict(),
+            "use_lengths": self.use_lengths or "",
+            "use_lengths_explicit": bool(getattr(self, "use_lengths_explicit", True)),
+            "gradient_params": gp,
+            "phys_lb": np.asarray(self.phys_lb, dtype=float),
+            "phys_ub": np.asarray(self.phys_ub, dtype=float),
+            "samp_lb": np.asarray(self.samp_lb, dtype=float),
+            "samp_ub": np.asarray(self.samp_ub, dtype=float),
+            "gridsize": np.asarray(self.gridsize, dtype=int),
+            "poisson_average_log_length": float(self.poisson_average_log_length),
+        }
+        return d
+
+    @staticmethod
+    def _ctor_kwargs_from_dict(d):
+        from .cme_toolbox import CMEModel
+        ul = d.get("use_lengths", "")
+        return dict(
+            model=CMEModel.from_dict(d["model"]),
+            use_lengths=(None if ul == "" else str(ul)),
+            gradient_params={k: (v.item() if isinstance(v, np.generic) else v) for k, v in dict(d.get("gradient_params", {})).items()},
+            phys_lb=np.asarray(d["phys_lb"], dtype=float),
+            phys_ub=np.asarray(d["phys_ub"], dtype=float),
+            samp_lb=np.asarray(d["samp_lb"], dtype=float),
+            samp_ub=np.asarray(d["samp_ub"], dtype=float),
+            gridsize=[int(g) for g in np.asarray(d["gridsize"]).ravel()],
+            poisson_average_log_length=float(d.get("poisson_average_log_length", 5)),
+        )
+
+    @classmethod
+    def from_dict(cls, d):
+        kind = str(d.get("kind", "InferenceParameters"))
+        if kind == "MEKMeansParameters":
+            from .mminference import MEKMeansParameters
+            obj = MEKMeansParameters._from_dict_impl(d)
+        else:
+            kw = cls._ctor_kwargs_from_dict(d)
+            obj = InferenceParameters(str(d["dataset_string"]), save=False, **kw)
+        obj.inference_string = str(d["inference_string"])
+        obj.use_lengths_explicit = bool(d.get("use_lengths_explicit", True))
+        return obj
 
     def construct_grid(self):
         """Creates a grid of points over the two-dimensional technical variation parameter domain.
@@ -777,18 +912,18 @@ class InferenceParameters:
             file location.
         """
         try:
-            with open(inference_parameter_string, "wb") as ipfs:
-                pickle.dump(self, ipfs)
+            _write_h5(inference_parameter_string, self.to_dict())
             log.info(
                 "Global inference parameters stored to {}.".format(
                     inference_parameter_string
                 )
             )
-        except:
+        except Exception:
             log.error(
                 "Global inference parameters could not be stored to {}.".format(
                     inference_parameter_string
-                )
+                ),
+                exc_info=True,
             )
 
     def fit_all_grid_points(self, search_data, num_cores=1, grid_cores=1, coarse_to_fine=False, checkpoint=False, save=False):
@@ -825,7 +960,6 @@ class InferenceParameters:
             Saves search_result to disk and returns it.
         """
         t1 = time.time()
-        warnings.filterwarnings("ignore", category=DeprecationWarning)
         self._checkpoint = checkpoint
         if checkpoint:
             make_dir(self.inference_string)
@@ -898,9 +1032,8 @@ class InferenceParameters:
                 if i in gp_results:
                     coarse_klds.append(gp_results[i].obj_func)
                 else:
-                    gp_path = self.inference_string + "/grid_point_" + str(i) + ".gp"
-                    with open(gp_path, "rb") as fh:
-                        gp = pickle.load(fh)
+                    gp_path = self.inference_string + "/grid_point_" + str(i) + ".h5"
+                    gp = GridPointResults.from_dict(_read_h5(gp_path))
                     coarse_klds.append(gp.obj_func)
 
             # ── Phase 2: refine top-k grid points using coarse results as warm-start
@@ -1109,6 +1242,7 @@ class GradientInference:
                     )
                 )
             else:
+                _saved_filters = warnings.filters[:]
                 warnings.filterwarnings("ignore", category=RuntimeWarning)
                 self.param_MoM = np.asarray(
                     [
@@ -1121,7 +1255,7 @@ class GradientInference:
                         for i in range(search_data.n_genes)
                     ]
                 )
-                warnings.resetwarnings()
+                warnings.filters[:] = _saved_filters   # restore the caller's filters
 
     def optimize_gene(self, gene_index, model, search_data, x0=None):
         """Fit the data for a single gene using KL divergence gradient descent.
@@ -1767,14 +1901,36 @@ class GridPointResults:
         self.point_index = point_index
         self.inference_string = inference_string
 
+    _SERIAL_KIND = "GridPointResults"
+    _SERIAL_ATTRS = ("param_estimates", "klds", "obj_func", "d_time", "regressor",
+                     "grid_point", "point_index", "inference_string")
+
+    def to_dict(self):
+        d = {"format_version": 1, "kind": self._SERIAL_KIND}
+        d.update(_attr_dict(self, self._SERIAL_ATTRS))
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        kind = str(d.get("kind", "GridPointResults"))
+        if kind == "MEKMeansGridPointResults":
+            from .mminference import GridPointResults as target
+        else:
+            target = GridPointResults
+        obj = target.__new__(target)
+        for n in target._SERIAL_ATTRS:
+            if n in d:
+                v = d[n]
+                setattr(obj, n, v.item() if isinstance(v, np.generic) else v)
+        return obj
+
     def store_grid_point_results(self):
-        """This helper method attempts to store the grid point results to disk as a grid_point_X.gp object."""
+        """Store the grid point results to disk as grid_point_X.h5 (structured HDF5, no pickle)."""
         try:
             grid_point_result_string = (
-                self.inference_string + "/grid_point_" + str(self.point_index) + ".gp"
+                self.inference_string + "/grid_point_" + str(self.point_index) + ".h5"
             )
-            with open(grid_point_result_string, "wb") as gpfs:
-                pickle.dump(self, gpfs)
+            _write_h5(grid_point_result_string, self.to_dict())
             log.debug(
                 "Grid point {:.0f} results stored to {}.".format(
                     self.point_index, grid_point_result_string
@@ -1930,11 +2086,10 @@ class SearchResults:
             index of the grid point results to load from disk.
         """
         grid_point_result_string = (
-            self.inference_string + "/grid_point_" + str(point_index) + ".gp"
+            self.inference_string + "/grid_point_" + str(point_index) + ".h5"
         )
-        with open(grid_point_result_string, "rb") as ipfs:
-            gp = pickle.load(ipfs)
-            self._append_from_object(gp)
+        gp = GridPointResults.from_dict(_read_h5(grid_point_result_string))
+        self._append_from_object(gp)
 
     def clean_up(self, remove_files=False):
         """This helper method removes temporary files and finalizes the SearchResults object.
@@ -1949,7 +2104,7 @@ class SearchResults:
         """
         if remove_files:
             for point_index in range(self.sp.n_grid_points):
-                gp_path = self.inference_string + "/grid_point_" + str(point_index) + ".gp"
+                gp_path = self.inference_string + "/grid_point_" + str(point_index) + ".h5"
                 if os.path.exists(gp_path):
                     os.remove(gp_path)
             log.info("All grid point data cleaned from disk.")
@@ -1959,18 +2114,55 @@ class SearchResults:
         self.d_time = np.asarray(self.d_time)
         self.regressor = np.asarray(self.regressor)
 
-        analysis_figure_string = self.inference_string + "/analysis_figures"
-        self.analysis_figure_string = analysis_figure_string
-        if os.path.isdir(self.inference_string):
-            make_dir(analysis_figure_string)
+        # Created lazily by _savefig the first time a figure is actually saved.
+        self.analysis_figure_string = self.inference_string + "/analysis_figures"
 
     @property
     def _result_filename(self):
-        return self.inference_string + "/grid_scan_results.res"
+        return self.inference_string + "/grid_scan_results.h5"
 
     @property
     def _upd_result_filename(self):
-        return self.inference_string + "/grid_scan_results_upd.res"
+        return self.inference_string + "/grid_scan_results_upd.h5"
+
+    # ------------------------------------------------------------------
+    # Structured (pickle-free) serialisation
+    # ------------------------------------------------------------------
+    _SERIAL_KIND = "SearchResults"
+    _SERIAL_ATTRS = (
+        "inference_string", "n_genes", "n_cells", "gene_names", "gene_log_lengths",
+        "param_estimates", "klds", "obj_func", "d_time", "regressor",
+        "samp_optimum_ind", "samp_optimum", "phys_optimum", "regressor_optimum",
+        "rejected_genes", "pval", "csq", "hellinger", "sigma",
+        "analysis_figure_string", "full_result_string",
+    )
+
+    def to_dict(self):
+        """Nested dict of arrays/scalars describing this result (h5ad/HDF5 friendly)."""
+        d = {"format_version": 1, "kind": self._SERIAL_KIND, "sp": self.sp.to_dict()}
+        d.update(_attr_dict(self, self._SERIAL_ATTRS))
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        """Rebuild a SearchResults (or meK-Means subclass) from :meth:`to_dict` output."""
+        kind = str(d.get("kind", "SearchResults"))
+        if kind == "MEKMeansSearchResults":
+            from .mminference import SearchResults as target
+        else:
+            target = SearchResults
+        obj = target.__new__(target)
+        obj.sp = InferenceParameters.from_dict(d["sp"])
+        obj.model = obj.sp.model
+        for n in ("param_estimates", "klds", "obj_func", "d_time", "regressor"):
+            setattr(obj, n, np.zeros(0))
+        for n in target._SERIAL_ATTRS:
+            if n in d:
+                v = d[n]
+                setattr(obj, n, v.item() if isinstance(v, np.generic) else v)
+        if hasattr(obj, "gene_names"):
+            obj.gene_names = np.asarray(obj.gene_names).astype(str)
+        return obj
 
     def store_on_disk(self):
         """This helper method attempts to store the SearchResults object to disk.
@@ -1982,14 +2174,14 @@ class SearchResults:
         """
         try:
             full_result_string = self._result_filename
-            with open(full_result_string, "wb") as srfs:
-                pickle.dump(self, srfs)
+            _write_h5(full_result_string, self.to_dict())
             log.info("Grid scan results stored to {}.".format(full_result_string))
-        except:
+        except Exception:
             log.error(
                 "Grid scan results could not be stored to {}.".format(
                     full_result_string
-                )
+                ),
+                exc_info=True,
             )
         self.full_result_string = full_result_string
         return full_result_string
@@ -2006,8 +2198,7 @@ class SearchResults:
         """
         try:
             upd_result_string = self._upd_result_filename
-            with open(upd_result_string, "wb") as srfs:
-                pickle.dump(self, srfs)
+            _write_h5(upd_result_string, self.to_dict())
             log.debug("Updated results stored to {}.".format(upd_result_string))
         except:
             log.error(
@@ -2067,6 +2258,23 @@ class SearchResults:
         self.regressor_optimum = self.regressor[samp_optimum_ind]
         return self.samp_optimum
 
+    def _savefig(self, filename, dpi=450):
+        """Save the current figure into the analysis figure directory if it exists.
+
+        The directory is created only when the search was run with save=True or
+        checkpoint=True; otherwise the figure is left on screen and a message is
+        logged instead of raising FileNotFoundError.
+        """
+        figdir = getattr(self, "analysis_figure_string", None)
+        run_dir = os.path.dirname(figdir) if figdir else None
+        if run_dir and os.path.isdir(run_dir):
+            os.makedirs(figdir, exist_ok=True)
+            fig_string = figdir + "/" + filename
+            plt.savefig(fig_string, dpi=dpi)
+            log.info("Figure stored to {}.".format(fig_string))
+        else:
+            log.info("Run directory %s does not exist (run with save=True to create it); %s not saved.", run_dir, filename)
+
     def plot_landscape(
         self,
         ax,
@@ -2114,10 +2322,13 @@ class SearchResults:
         if logscale:
             total_divergence = np.log10(total_divergence)
 
-        dx = (np.asarray(self.sp.samp_ub) - np.asarray(self.sp.samp_lb)) / (
-            np.asarray(self.sp.gridsize) - 1
-        )
-        dx[dx < 1e-10] = 0.1
+        # Cell width per axis; a one-point axis (gridsize 1) gets a nominal width
+        # instead of the 0/0 that would make the extent NaN.
+        span = np.asarray(self.sp.samp_ub, dtype=float) - np.asarray(self.sp.samp_lb, dtype=float)
+        steps = np.asarray(self.sp.gridsize, dtype=float) - 1
+        with np.errstate(divide="ignore", invalid="ignore"):
+            dx = np.where(steps > 0, span / np.maximum(steps, 1), np.nan)
+        dx[~np.isfinite(dx) | (dx < 1e-10)] = 0.1
         extent = [
             self.sp.samp_lb[0] - dx[0] / 2,
             self.sp.samp_ub[0] + dx[0] / 2,
@@ -2136,9 +2347,7 @@ class SearchResults:
             ax.set_xticks([])
             ax.set_yticks([])
         if savefig:
-            fig_string = self.analysis_figure_string + "/landscape.png"
-            plt.savefig(fig_string, dpi=450)
-            log.info("Figure stored to {}.".format(fig_string))
+            self._savefig("landscape.png")
 
     def get_bool_filt(self, gene_filter, discard_rejected):
         """This helper method constructs gene filters.
@@ -2238,9 +2447,7 @@ class SearchResults:
             ax1[i].set_title(self.model.get_log_name_str()[i])
             ax1[i].set_xlabel(r"$log_{10}$ value")
         fig1.tight_layout()
-        fig_string = self.analysis_figure_string + "/parameter_marginals.png"
-        plt.savefig(fig_string, dpi=450)
-        log.info("Figure stored to {}.".format(fig_string))
+        self._savefig("parameter_marginals.png")
 
     def plot_KL(self, ax, gene_filter=None, discard_rejected=True, nbin=15):
         """Plot the distribution of KL divergences at the sampling parameter optimum.
@@ -2263,9 +2470,7 @@ class SearchResults:
         ax.hist(kld_data, nbin, color=aesthetics["hist_face_color"])
         ax.set_xlabel("KL divergence")
         ax.set_ylabel("# genes")
-        fig_string = self.analysis_figure_string + "/kldiv.png"
-        plt.savefig(fig_string, dpi=450)
-        log.info("Figure stored to {}.".format(fig_string))
+        self._savefig("kldiv.png")
 
     def chisquare_testing(
         self,
@@ -2544,9 +2749,7 @@ class SearchResults:
             plt.hist(csq)
             plt.xlabel("Chi-square statistic")
             plt.ylabel("# genes")
-            fig_string = self.analysis_figure_string + "/chisquare.png"
-            plt.savefig(fig_string, dpi=450)
-            log.info("Figure stored to {}.".format(fig_string))
+            self._savefig("chisquare.png")
 
         t2 = time.time()
         log.info(
@@ -2621,7 +2824,6 @@ class SearchResults:
         """
         log.info("Computing local Hessian.")
         t1 = time.time()
-        warnings.filterwarnings("ignore", category=DeprecationWarning)
         if num_cores > 1:
             log.info("Starting parallelized Hessian computation.")
             hess = parallelize(
@@ -2641,7 +2843,6 @@ class SearchResults:
                 for x in zip(range(self.n_genes), itertools.repeat(search_data, self.n_genes))
             ]
             log.info("Non-parallelized Hessian computation complete.")
-        warnings.resetwarnings()
         hess = np.asarray(hess)
 
         fail = np.zeros(self.n_genes, dtype=bool)
@@ -2715,9 +2916,7 @@ class SearchResults:
                 if i_ == 0:
                     ax1[axloc].set_ylabel("n_genes = " + str(resamp_vec[samp_num]))
 
-        fig_string = self.analysis_figure_string + "/subsampling.png"
-        plt.savefig(fig_string, dpi=450)
-        log.info("Figure stored to {}.".format(fig_string))
+        self._savefig("subsampling.png")
         self.find_sampling_optimum()  # reset sampling optimum here
 
     def resample_opt_mc_viz(
@@ -2768,9 +2967,7 @@ class SearchResults:
             )
             ax1[axloc].set_title("n_genes = " + str(resamp_vec[samp_num]))
 
-        fig_string = self.analysis_figure_string + "/subsampling_stability.png"
-        plt.savefig(fig_string, dpi=450)
-        log.info("Figure stored to {}.".format(fig_string))
+        self._savefig("subsampling_stability.png")
 
         self.find_sampling_optimum()  # reset sampling optimum.
 
@@ -2839,9 +3036,7 @@ class SearchResults:
                 )
                 self.plot_landscape(ax1[axloc], discard_rejected=True, hideticks=True)
         if viz:
-            fig_string = self.analysis_figure_string + "/chisquare_stability.png"
-            plt.savefig(fig_string, dpi=450)
-            log.info("Figure stored to {}.".format(fig_string))
+            self._savefig("chisquare_stability.png")
 
         if overwrite:
             self.chisquare_testing(search_data, threshold=threshold)
@@ -3000,9 +3195,7 @@ class SearchResults:
                 ax1[i].set_ylim([self.sp.phys_lb[i], self.sp.phys_ub[i]])
         
         fig1.tight_layout()
-        fig_string = self.analysis_figure_string + "/length_dependence.png"
-        plt.savefig(fig_string, dpi=450)
-        log.info("Figure stored to {}.".format(fig_string))
+        self._savefig("length_dependence.png")
 
     def plot_gene_distributions(
         self,
@@ -3144,13 +3337,7 @@ class SearchResults:
         fig1.tight_layout(pad=0.02, rect=[0.05, 0.05, 0.98, 0.98])
 
         if savefig:
-            figdir = getattr(self, "analysis_figure_string", None)
-            if figdir and os.path.isdir(figdir):
-                fig_string = figdir + "/gene_distributions_{}.png".format(marg)
-                plt.savefig(fig_string, dpi=450)
-                log.info("Figure stored to {}.".format(fig_string))
-            else:
-                log.info("No analysis figure directory (run with save=True to create one); figure not saved.")
+            self._savefig("gene_distributions_{}.png".format(marg))
 
     # the next two functions are useful for model selection, but are not currently in use.
     def get_logL(self, search_data, n_cells=None, EPS=1e-20, offs=0):

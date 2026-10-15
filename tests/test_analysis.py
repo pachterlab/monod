@@ -164,3 +164,12 @@ def test_drivers_module_removed():
     import importlib
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module("monod.drivers")
+
+
+def test_diffexp_fpi_tolerates_zero_sigma():
+    rng = np.random.default_rng(1)
+    m1 = rng.normal(size=100)
+    m2 = m1 + 0.2 + rng.normal(scale=0.05, size=100)
+    s = np.full(100, 0.05); s[:10] = 0.0            # pinned-at-bound genes report sigma 0
+    gf, beta, resid, pval = analysis.diffexp_fpi(m1, m2, s1=s, s2=s, nit=3, viz=False)
+    assert np.isfinite(beta).all() and np.isfinite(resid).all()

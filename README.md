@@ -64,6 +64,26 @@ adata.var[["$b$", r"$\beta$", r"$\gamma$", "AIC"]].head()
 
 Input expectations: an AnnData whose `layers` hold integer counts for the model's modalities (`unspliced` and `spliced` by default; map other names with `modality_name_dict`). Gene lengths, if used, come from a transcriptome file or `adata.var['log_lengths']`.
 
+### Logging and stored objects
+
+monod logs through the `"monod"` logger and never reconfigures Python logging itself. To see progress messages, configure logging in your application, for example `logging.basicConfig(); logging.getLogger("monod").setLevel(logging.INFO)`.
+
+### Files on disk
+
+By default monod writes nothing. Results live in memory and in the returned AnnData: `adata.uns['model']` and `adata.uns['search_result']` (or `search_result_list` for meK-Means) are nested dicts of arrays and scalars, not pickles, so the AnnData writes to a plain h5ad with `adata.write_h5ad()` and reads back anywhere. Rebuild the Python objects with `CMEModel.from_dict`, `monod.inference.search_result_from_uns`, or `search_result_list_from_uns`.
+
+When you do ask for files:
+
+| Call | What is written |
+|---|---|
+| `perform_inference(..., save=True)` | one file, `<dataset>/<model>_<grid>/monod_adata.h5ad`, holding data, model, parameters, results and cluster labels |
+| `SearchResults.store_on_disk()` or `run_mek_means(save=True)` | one `grid_scan_results.h5` in the run directory |
+| `InferenceParameters(..., save=True)` | `parameters.h5` in the run directory |
+| `fit_all_grid_points(..., checkpoint=True)` | one `grid_point_<i>.h5` per grid point, for crash recovery |
+| any plot method with `savefig=True` | `analysis_figures/<name>.png`, created on first use, only if the run directory exists |
+
+`monod.analysis.load_search_results(path)` reads any of the h5ad or h5 files above (and, with a warning, legacy pickled `.res` files). Run directories are relative to the working directory at the time of the run.
+
 ## Development
 
 ```bash

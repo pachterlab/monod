@@ -5040,8 +5040,8 @@ fn optimize_genes_protein_bursty_sd(
         }
         sd_ref.extract_for_parallel()
     };
-    validate_bounds(&lb, &ub, None, "optimize_genes_sd")?;
-    validate_x0_list(&x0_list, n_genes, lb.len(), "optimize_genes_sd")?;
+    validate_bounds(&lb, &ub, Some(5), "optimize_genes_protein_bursty_sd")?;
+    validate_x0_list(&x0_list, n_genes, lb.len(), "optimize_genes_protein_bursty_sd")?;
 
 
     let results: Vec<(Vec<f64>, f64, u8)> = py.allow_threads(|| {
@@ -5292,8 +5292,8 @@ fn optimize_genes_2d_amb_sd(
         }
         sd_ref.extract_for_parallel()
     };
-    validate_bounds(&lb, &ub, None, "optimize_genes_sd")?;
-    validate_x0_list(&x0_list, n_genes, lb.len(), "optimize_genes_sd")?;
+    validate_bounds(&lb, &ub, None, "optimize_genes_2d_amb_sd")?;
+    validate_x0_list(&x0_list, n_genes, lb.len(), "optimize_genes_2d_amb_sd")?;
 
 
     let results: Vec<(Vec<f64>, f64, u8)> = py.allow_threads(|| {

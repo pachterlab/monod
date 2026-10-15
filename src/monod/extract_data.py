@@ -33,19 +33,40 @@ except ImportError:
 # as pickle bytes keeps them round-trip-safe while allowing adata.write_h5ad().
 
 def _uns_pack(obj):
-    """Pickle *obj* to bytes for storage in adata.uns."""
+    """Deprecated: pickle *obj* to bytes for storage in adata.uns.
+
+    monod no longer writes pickled objects into ``uns``; models and results are
+    stored as nested dicts (see ``CMEModel.to_dict`` and
+    ``SearchResults.to_dict``). Kept so old code paths keep working.
+    """
+    warnings.warn("_uns_pack is deprecated; use the object's to_dict()", DeprecationWarning, stacklevel=2)
     return np.frombuffer(pickle.dumps(obj), dtype=np.uint8)
 
 def _uns_unpack(v):
-    """Restore an object previously packed with _uns_pack (no-op otherwise)."""
+    """Restore an object previously packed with the (legacy) pickle format.
+
+    Returns *v* unchanged unless it is a bytes / uint8 blob.  This unpickles,
+    so it executes code embedded in the bytes: only call it on ``uns`` entries
+    from h5ad files you trust.  Files written by current monod versions store
+    structured dicts instead and never hit this path.
+    """
     if isinstance(v, (bytes, np.ndarray)) and (
         isinstance(v, bytes) or v.dtype == np.uint8
     ):
         try:
+            log.warning("Loading a legacy pickled object from adata.uns; re-run extract_data/perform_inference to store it in the structured format.")
             return pickle.loads(bytes(v))
         except Exception:
             pass
     return v
+
+
+def model_from_uns(v):
+    """Return the CMEModel stored in ``adata.uns['model']`` (structured dict or legacy pickle)."""
+    from .cme_toolbox import CMEModel
+    if hasattr(v, "keys"):
+        return CMEModel.from_dict(v)
+    return _uns_unpack(v)
 
 def _build_sampling_grid(samp_lb, samp_ub, gridsize):
     """Build a flat meshgrid over the sampling-parameter space.
@@ -60,44 +81,41 @@ def _build_sampling_grid(samp_lb, samp_ub, gridsize):
     sampl_vals = list(zip(*grid_values))
     return grid_values, sampl_vals, len(grid_values[0])
 
-import logging, sys
+import logging
 from scipy.sparse import csr_matrix
 from scipy.sparse import issparse
 
-logging.basicConfig(stream=sys.stdout)
-log = logging.getLogger()
-log.setLevel(logging.WARNING)
+# Library logger.  monod does not configure handlers or touch the root logger;
+# messages propagate to whatever logging setup the application has.  To see
+# progress messages: ``logging.getLogger("monod").setLevel(logging.INFO)`` after
+# ``logging.basicConfig()``.
+log = logging.getLogger("monod")
 
-import logging.config
+def _plain_string_index(adata):
+    """Make obs/var names and string columns plain object dtype so the AnnData writes to h5ad.
 
-logging.config.dictConfig(
-    {
-        "version": 1,
-        "disable_existing_loggers": True,
-    }
-)
+    pandas may give h5ad-loaded indices and text columns the nullable
+    ``string`` dtype, which anndata refuses to write unless
+    ``allow_write_nullable_strings`` is set.  Converting to object dtype keeps
+    the AnnData writable with default settings.
+    """
+    adata.obs_names = pd.Index(np.asarray(adata.obs_names, dtype=object).astype(str), dtype=object)
+    adata.var_names = pd.Index(np.asarray(adata.var_names, dtype=object).astype(str), dtype=object)
+    for df in (adata.obs, adata.var):
+        for col in df.columns:
+            if isinstance(df[col].dtype, pd.StringDtype):
+                df[col] = df[col].astype(object)
+    return adata
+
 
 def make_dir(dir_string):
-    """Convenience function to create a directory.
-
-    Parameters
-    ----------
-    dir_string: str
-        directory location to create.
-    """
+    """Create *dir_string* (and any missing parents); a no-op if it already exists."""
     try:
-        os.mkdir(dir_string)
-        log.info("Directory " + dir_string + " created.")
-    except OSError as error:
-        log.info(
-            "Directory " + dir_string + " already exists."
-        )  # used to be warning, but should be ok for now
-
-
-
-########################
-## Main code
-########################
+        os.makedirs(dir_string, exist_ok=True)
+        log.debug("Directory %s ready.", dir_string)
+    except OSError as e:
+        log.error("Directory %s could not be created: %s", dir_string, e)
+        raise
 
 def extract_data(
     h5ad_filepath,
@@ -112,7 +130,7 @@ def extract_data(
     cf=None,
     code_ver=code_ver_global,
     exp_filter_threshold=1,
-    genes_to_fit=[],
+    genes_to_fit=None,
     hist_type = 'unique',
     padding=None,
     mek_means_params=None,
@@ -169,6 +187,8 @@ def extract_data(
 
     if not filt_param:
         filt_param = model.filter_bounds
+    if genes_to_fit is None:
+        genes_to_fit = []
         log.info('Using default gene filtering parameters')
 
     # If no mapping given, assume that the layers are named according to the conventional modalities for the model
@@ -195,6 +215,7 @@ def extract_data(
     if monod_adata.isbacked:
         monod_adata = monod_adata.to_memory()
     # Store the raw data.
+    monod_adata = _plain_string_index(monod_adata)
     raw_adata = monod_adata.copy()
 
     # Check whether the given data is in sparse or numpy format.
@@ -214,12 +235,12 @@ def extract_data(
 
     if layer_type == 'sparse':
         monod_adata = CSRDataset_to_arrays(monod_adata)
-        print('is sparse')
+        log.debug('layers are sparse; converting to dense arrays')
     elif layer_type == 'numpy_array':
         pass
     else:
         monod_adata = CSRDataset_to_arrays(monod_adata)
-        print('CSRDataset')
+        log.debug('layers are backed CSRDataset; converting to dense arrays')
 
     # # Save entire raw data object to monod_adata
     # mono
@@ -248,7 +269,7 @@ def extract_data(
 
 
     monod_adata.uns['modality_name_dict'] = modality_name_dict
-    monod_adata.uns['model'] = _uns_pack(model)
+    monod_adata.uns['model'] = model.to_dict()
 
     if padding is None:
         padding = np.asarray([10] * len(ordered_layer_names))
@@ -320,21 +341,28 @@ def extract_data(
     if monod_adata.isbacked:
         monod_adata = monod_adata.to_memory()
 
+    if hist_type != "unique":
+        raise ValueError(
+            f"hist_type={hist_type!r} is not implemented; only 'unique' (per-gene unique "
+            "microstate counts) is supported in this version."
+        )
     monod_adata.uns['hist_type'] = hist_type
 
     monod_adata = add_moments(monod_adata)
     log.debug('Moments were added')
     
-    monod_adata.uns['model'] = _uns_pack(model)
+    monod_adata.uns['model'] = model.to_dict()
 
-    hist = make_histogram(monod_adata, hist_type, M)
-    monod_adata.uns['hist'] = _uns_pack(hist)
+    # Histograms are not stored in uns: searchdata_from_adata rebuilds them from
+    # the layers (in Rust when available), which is faster than unpickling and
+    # keeps the AnnData writable as a plain h5ad.
     # Save adata?
     if mek_means_params:
         monod_adata.uns['k'] = k
         monod_adata.uns['epochs'] = epochs
 
     # Save the raw data as an attribute.
+    monod_adata = _plain_string_index(monod_adata)
     monod_adata.raw = raw_adata
     
     return monod_adata
@@ -523,7 +551,7 @@ def make_histogram(monod_adata, hist_type, M, n_jobs=1):
     # modalities defined in cme_toolbox.
 
     modality_name_dict = monod_adata.uns['modality_name_dict']
-    model = _uns_unpack(monod_adata.uns['model'])
+    model = model_from_uns(monod_adata.uns['model'])
 
     ordered_modalities = model.model_modalities
     ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
@@ -737,8 +765,7 @@ def add_gene_lengths(adata, length_dict, attribute_name='length_given', lengths_
     log.info('Added lengths')
     return adata
 
-def threshold_by_expression(adata, filt_param={'min_means': [0.01, 0.01], 
-                                               'max_maxes': [350, 350], 'min_maxes': [4, 4]}):
+def threshold_by_expression(adata, filt_param=None):
     """
     Filters genes in an AnnData object based on expression thresholds for each layer.
 
@@ -757,7 +784,9 @@ def threshold_by_expression(adata, filt_param={'min_means': [0.01, 0.01],
     adata: anndata.AnnData
         Filtered AnnData object with genes that meet the expression thresholds.
     """
-    model = _uns_unpack(adata.uns['model'])
+    if filt_param is None:
+        filt_param = {'min_means': [0.01, 0.01], 'max_maxes': [350, 350], 'min_maxes': [4, 4]}
+    model = model_from_uns(adata.uns['model'])
     ordered_modalities = model.model_modalities
     modality_name_dict = adata.uns['modality_name_dict']
     ordered_layer_names = [modality_name_dict[mod] for mod in ordered_modalities]
@@ -797,7 +826,7 @@ def threshold_by_expression(adata, filt_param={'min_means': [0.01, 0.01],
     adata.var['gene_exp_filter'] = gene_exp_filter
 
     # Log the number of genes retained
-    print(f"{np.sum(gene_exp_filter)} genes retained after expression filter.")
+    log.info("%d genes retained after expression filter.", int(np.sum(gene_exp_filter)))
     
     return adata
     
@@ -858,7 +887,7 @@ def visualize_gene_filtering_lengths(monod_adata):
         len_arr = monod_adata.var['log_lengths']
     except AttributeError:
         log.error('No gene lengths given')
-    modality_names = _uns_unpack(monod_adata.uns['model']).model_modalities
+    modality_names = model_from_uns(monod_adata.uns['model']).model_modalities
     
     # len_arr = np.array([transcriptome_dict[k] for k in gene_names])
     var_name = tuple([name[0].upper() for name in modality_names[::-1]])
@@ -894,7 +923,7 @@ def visualize_gene_filtering(monod_adata):
     """
     gene_names = monod_adata.var_names
 
-    modality_names = _uns_unpack(monod_adata.uns['model']).model_modalities
+    modality_names = model_from_uns(monod_adata.uns['model']).model_modalities
     
     # len_arr = np.array([transcriptome_dict[k] for k in gene_names])
     var_name = tuple([name[0].upper() for name in modality_names[::-1]])
