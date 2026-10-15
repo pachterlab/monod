@@ -9,11 +9,8 @@ import numpy as np
 import pytest
 import sys
 import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src', 'monod'))
-
-from reaction_network import ReactionNetwork
-from cme_toolbox import CMEModel
+from monod.reaction_network import ReactionNetwork
+from monod.cme_toolbox import CMEModel
 
 
 # ---------------------------------------------------------------------------
@@ -382,3 +379,73 @@ class TestDelayedReaction:
         # Both should be valid distributions
         assert pss_instant.sum() == pytest.approx(1.0, abs=1e-3)
         assert pss_delayed.sum() == pytest.approx(1.0, abs=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Unsupported reactions are rejected at parse time (audit fix 4, 2026-10-15)
+# ---------------------------------------------------------------------------
+
+class TestUnsupportedReactionsRejected:
+    @pytest.mark.parametrize("net", [
+        "A + A -> B",          # reactant stoichiometry 2 via repetition
+        "2 x A -> B",          # reactant stoichiometry 2 via prefix
+        "A + B -> C",          # bimolecular
+        "0 -> B x U -> S -> 0; U + S -> 0",  # bimolecular in a second chain
+    ])
+    def test_raises_value_error(self, net):
+        with pytest.raises(ValueError, match="zero- and first-order|stoichiometry > 1"):
+            ReactionNetwork(net)
+
+    def test_burst_prefix_on_reactant_raises(self):
+        with pytest.raises(ValueError, match="only allowed on products"):
+            ReactionNetwork("0 -> B x U; B x U -> S")
+
+    def test_cme_model_custom_rejects_too(self):
+        with pytest.raises(ValueError):
+            CMEModel("Custom", "None", network="A + B -> C")
+
+
+# ---------------------------------------------------------------------------
+# Tight equivalence after removing the trapezoid double count (fix 4)
+# ---------------------------------------------------------------------------
+
+class TestBurstyEquivalenceTight:
+    LIMITS = [30, 30]
+    B, BETA, GAMMA = 2.0, 0.8, 0.5
+
+    def _ref(self):
+        model = CMEModel("Bursty", "None", quad_method="fixed_quad", fixed_quad_T=10)
+        return model.eval_model_pss(np.log10([self.B, self.BETA, self.GAMMA]), limits=self.LIMITS)
+
+    def _custom(self, use_rust):
+        import unittest.mock
+        import monod.cme_toolbox as ct
+        model = CMEModel("Custom", "None", network="0 -> B x U -> S -> 0",
+                         normalize_production_rate=True, min_fudge=0.05, max_fudge=15)
+        p = np.log10([self.B, self.BETA, self.GAMMA])
+        if use_rust:
+            if not ct._HAS_RUST:
+                pytest.skip("monod_core not installed")
+            return model.eval_model_pss(p, limits=self.LIMITS)
+        with unittest.mock.patch.object(ct, "_HAS_RUST", False):
+            return model.eval_model_pss(p, limits=self.LIMITS)
+
+    @staticmethod
+    def _kld(p, q):
+        m = p > 0
+        return float(np.sum(p[m] * np.log(p[m] / np.clip(q[m], 1e-15, None))))
+
+    @pytest.mark.parametrize("use_rust", [True, False], ids=["rust", "python"])
+    def test_custom_matches_builtin_tightly(self, use_rust):
+        ref = self._ref()
+        cus = self._custom(use_rust)
+        kld = self._kld(ref, cus)
+        assert kld < 1e-4, f"KLD {kld:.2e} (was ~6e-5 with the double-counted half-steps)"
+        assert np.max(np.abs(ref - cus)) < 1e-4, f"max |dPMF| {np.max(np.abs(ref - cus)):.2e}"
+
+    def test_rust_and_python_custom_agree(self):
+        import monod.cme_toolbox as ct
+        if not ct._HAS_RUST:
+            pytest.skip("monod_core not installed")
+        r, p = self._custom(True), self._custom(False)
+        np.testing.assert_allclose(r, p, rtol=0, atol=2e-4)

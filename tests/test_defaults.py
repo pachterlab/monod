@@ -10,16 +10,15 @@ import anndata as ad
 import numpy as np
 import pytest
 
-from cme_toolbox import CMEModel
-from extract_data import extract_data
-from inference import (
+from monod.cme_toolbox import CMEModel
+from monod.extract_data import extract_data
+from monod.inference import (
     GradientInference,
     InferenceParameters,
     _normalize_use_lengths,
     searchdata_from_adata,
 )
-import mminference
-
+import monod.mminference as mminference
 _HERE = os.path.dirname(__file__)
 EXAMPLE = os.path.join(_HERE, "..", "example_h5ad", "example_adata.h5ad")
 

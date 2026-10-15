@@ -17,13 +17,13 @@ import numpy as np
 warnings.filterwarnings('ignore')
 os.makedirs('figures', exist_ok=True)
 
-sys.path.insert(0, os.path.join(os.path.abspath('.'), 'src', 'monod'))
+sys.path.insert(0, os.path.join(os.path.abspath('.'), 'src'))
 
-import cme_toolbox
-import extract_data as _ed_bare
-from cme_toolbox import CMEModel, _HAS_RUST
-from extract_data import extract_data
-from inference import InferenceParameters, searchdata_from_adata
+import monod.cme_toolbox as cme_toolbox
+import monod.extract_data as _ed_bare
+from monod.cme_toolbox import CMEModel, _HAS_RUST
+from monod.extract_data import extract_data
+from monod.inference import InferenceParameters, searchdata_from_adata
 import monod_core as _mc
 import anndata as ad
 import scipy.sparse as _ssp

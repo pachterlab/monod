@@ -36,6 +36,8 @@ use rustfft::FftPlanner;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::hash::Hash;
 
 // ============================================================================
 // Thread-local FFT planner, scratch buffer, and row buffer
@@ -142,23 +144,93 @@ fn gauss_legendre_cached(n: usize) -> Arc<(Vec<f64>, Vec<f64>)> {
 }
 
 /// 2-D base mesh cache — Arc-wrapped, keyed by (l0, l1).
-static MESH_CACHE_2D: OnceLock<Mutex<HashMap<(usize, usize), Arc<(Vec<Complex64>, Vec<Complex64>)>>>> =
+// ----------------------------------------------------------------------------
+// Bounded mesh caches.
+//
+// Meshes are keyed by grid shape (and, for the Poisson/Bernoulli transforms, by
+// the sampling parameters).  With per-gene limits and per-gene length offsets
+// every (gene, grid point) pair is a distinct key, so an unbounded map grows
+// without limit over a run.  `BoundedCache` tracks the total number of stored
+// complex entries and clears itself when the next insert would exceed the cap
+// (default 8M entries = 128 MB per cache).  Arc handles already handed out stay
+// valid, so a clear never invalidates an in-flight computation; the hot
+// working set (one transformed mesh per optimising gene) is rebuilt cheaply.
+// ----------------------------------------------------------------------------
+
+static MESH_CACHE_CAP_ENTRIES: AtomicUsize = AtomicUsize::new(8 << 20);
+
+struct BoundedCache<K, V> {
+    map: HashMap<K, Arc<V>>,
+    total_entries: usize,
+}
+
+impl<K: Eq + Hash + Clone, V> BoundedCache<K, V> {
+    fn new() -> Self {
+        BoundedCache { map: HashMap::new(), total_entries: 0 }
+    }
+    fn get(&self, key: &K) -> Option<Arc<V>> {
+        self.map.get(key).map(Arc::clone)
+    }
+    fn insert(&mut self, key: K, value: V, n_entries: usize) -> Arc<V> {
+        if let Some(existing) = self.map.get(&key) {
+            return Arc::clone(existing); // another thread built it meanwhile
+        }
+        let cap = MESH_CACHE_CAP_ENTRIES.load(Ordering::Relaxed);
+        if !self.map.is_empty() && self.total_entries + n_entries > cap {
+            self.map.clear();
+            self.total_entries = 0;
+        }
+        let a = Arc::new(value);
+        self.map.insert(key, Arc::clone(&a));
+        self.total_entries += n_entries;
+        a
+    }
+    fn clear(&mut self) {
+        self.map.clear();
+        self.total_entries = 0;
+    }
+}
+
+/// Look up `key`; on a miss, build OUTSIDE the lock (so concurrent first-time
+/// builds do not serialise) and insert.
+fn cached<K: Eq + Hash + Clone, V>(
+    cell: &OnceLock<Mutex<BoundedCache<K, V>>>,
+    key: K,
+    build: impl FnOnce() -> (V, usize),
+) -> Arc<V> {
+    let cache = cell.get_or_init(|| Mutex::new(BoundedCache::new()));
+    if let Some(v) = cache.lock().unwrap().get(&key) {
+        return v;
+    }
+    let (v, n) = build();
+    cache.lock().unwrap().insert(key, v, n)
+}
+
+fn cache_stats<K: Eq + Hash + Clone, V>(cell: &OnceLock<Mutex<BoundedCache<K, V>>>) -> (usize, usize) {
+    match cell.get() {
+        Some(m) => { let g = m.lock().unwrap(); (g.map.len(), g.total_entries) }
+        None => (0, 0),
+    }
+}
+
+fn cache_clear<K: Eq + Hash + Clone, V>(cell: &OnceLock<Mutex<BoundedCache<K, V>>>) {
+    if let Some(m) = cell.get() { m.lock().unwrap().clear(); }
+}
+
+static MESH_CACHE_2D: OnceLock<Mutex<BoundedCache<(usize, usize), (Vec<Complex64>, Vec<Complex64>)>>> =
     OnceLock::new();
 
 /// 3-D ambient mesh cache — Arc-wrapped, keyed by (l0, l1, l2).
 /// Stores (g0, g1, g_amb) each of length l0 * l1 * (l2/2+1).
-static MESH_CACHE_3D: OnceLock<Mutex<HashMap<(usize, usize, usize), Arc<(Vec<Complex64>, Vec<Complex64>, Vec<Complex64>)>>>> =
+static MESH_CACHE_3D: OnceLock<Mutex<BoundedCache<(usize, usize, usize), (Vec<Complex64>, Vec<Complex64>, Vec<Complex64>)>>> =
     OnceLock::new();
 
 fn build_mesh_2d_cached(l0: usize, l1: usize) -> Arc<(Vec<Complex64>, Vec<Complex64>)> {
-    let cache = MESH_CACHE_2D.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = cache.lock().unwrap();
-    if let Some(mesh) = map.get(&(l0, l1)) {
-        return Arc::clone(mesh);
-    }
-    let mesh = Arc::new(build_mesh_2d(l0, l1));
-    map.insert((l0, l1), Arc::clone(&mesh));
-    mesh
+    cached(&MESH_CACHE_2D, (l0, l1), || {
+        let m = build_mesh_2d(l0, l1);
+        let n = m.0.len() + m.1.len();
+        (m, n)
+    })
 }
 
 fn build_mesh_3d_cached(
@@ -166,19 +238,16 @@ fn build_mesh_3d_cached(
     l1: usize,
     l2: usize,
 ) -> Arc<(Vec<Complex64>, Vec<Complex64>, Vec<Complex64>)> {
-    let cache = MESH_CACHE_3D.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = cache.lock().unwrap();
-    if let Some(mesh) = map.get(&(l0, l1, l2)) {
-        return Arc::clone(mesh);
-    }
-    let mx2 = l2 / 2 + 1;
-    let mesh = Arc::new(build_mesh_3d(&[l0, l1, mx2], &[l0, l1, l2]));
-    map.insert((l0, l1, l2), Arc::clone(&mesh));
-    mesh
+    cached(&MESH_CACHE_3D, (l0, l1, l2), || {
+        let mx2 = l2 / 2 + 1;
+        let m = build_mesh_3d(&[l0, l1, mx2], &[l0, l1, l2]);
+        let n = m.0.len() + m.1.len() + m.2.len();
+        (m, n)
+    })
 }
 
 /// Poisson-transformed 2-D mesh cache — Arc-wrapped, keyed by (l0, l1, lam0_bits, lam1_bits).
-static MESH_CACHE_POISSON: OnceLock<Mutex<HashMap<(usize, usize, u64, u64), Arc<(Vec<Complex64>, Vec<Complex64>)>>>> =
+static MESH_CACHE_POISSON: OnceLock<Mutex<BoundedCache<(usize, usize, u64, u64), (Vec<Complex64>, Vec<Complex64>)>>> =
     OnceLock::new();
 
 fn build_mesh_2d_poisson_cached(
@@ -188,25 +257,21 @@ fn build_mesh_2d_poisson_cached(
     lam1: f64,
 ) -> Arc<(Vec<Complex64>, Vec<Complex64>)> {
     let key = (l0, l1, lam0.to_bits(), lam1.to_bits());
-    let cache = MESH_CACHE_POISSON.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = cache.lock().unwrap();
-    if let Some(mesh) = map.get(&key) {
-        return Arc::clone(mesh);
-    }
-    let base = build_mesh_2d_cached(l0, l1);
-    let one = Complex64::new(1.0, 0.0);
-    let g0t: Vec<Complex64> = base.0.iter().map(|&z| (lam0 * z).exp() - one).collect();
-    let g1t: Vec<Complex64> = base.1.iter().map(|&z| (lam1 * z).exp() - one).collect();
-    let mesh = Arc::new((g0t, g1t));
-    map.insert(key, Arc::clone(&mesh));
-    mesh
+    cached(&MESH_CACHE_POISSON, key, || {
+        let base = build_mesh_2d_cached(l0, l1);
+        let one = Complex64::new(1.0, 0.0);
+        let g0t: Vec<Complex64> = base.0.iter().map(|&z| (lam0 * z).exp() - one).collect();
+        let g1t: Vec<Complex64> = base.1.iter().map(|&z| (lam1 * z).exp() - one).collect();
+        let n = g0t.len() + g1t.len();
+        ((g0t, g1t), n)
+    })
 }
 
 /// Bernoulli-transformed 2-D mesh cache — keyed by (l0, l1, s0_bits, s1_bits).
 /// The Bernoulli transform is a scalar multiply by the capture probability:
 /// g_i *= 10^s_i.  s0 and s1 are log10 capture probabilities (the same
 /// convention as the Poisson model and as the sampling bounds / MoM init).
-static MESH_CACHE_BERNOULLI: OnceLock<Mutex<HashMap<(usize, usize, u64, u64), Arc<(Vec<Complex64>, Vec<Complex64>)>>>> =
+static MESH_CACHE_BERNOULLI: OnceLock<Mutex<BoundedCache<(usize, usize, u64, u64), (Vec<Complex64>, Vec<Complex64>)>>> =
     OnceLock::new();
 
 fn build_mesh_2d_bernoulli_cached(
@@ -216,19 +281,42 @@ fn build_mesh_2d_bernoulli_cached(
     s1: f64,
 ) -> Arc<(Vec<Complex64>, Vec<Complex64>)> {
     let key = (l0, l1, s0.to_bits(), s1.to_bits());
-    let cache = MESH_CACHE_BERNOULLI.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = cache.lock().unwrap();
-    if let Some(mesh) = map.get(&key) {
-        return Arc::clone(mesh);
-    }
-    let base = build_mesh_2d_cached(l0, l1);
-    let cs0 = Complex64::new(10f64.powf(s0), 0.0);
-    let cs1 = Complex64::new(10f64.powf(s1), 0.0);
-    let g0t: Vec<Complex64> = base.0.iter().map(|&z| z * cs0).collect();
-    let g1t: Vec<Complex64> = base.1.iter().map(|&z| z * cs1).collect();
-    let mesh = Arc::new((g0t, g1t));
-    map.insert(key, Arc::clone(&mesh));
-    mesh
+    cached(&MESH_CACHE_BERNOULLI, key, || {
+        let base = build_mesh_2d_cached(l0, l1);
+        let cs0 = Complex64::new(10f64.powf(s0), 0.0);
+        let cs1 = Complex64::new(10f64.powf(s1), 0.0);
+        let g0t: Vec<Complex64> = base.0.iter().map(|&z| z * cs0).collect();
+        let g1t: Vec<Complex64> = base.1.iter().map(|&z| z * cs1).collect();
+        let n = g0t.len() + g1t.len();
+        ((g0t, g1t), n)
+    })
+}
+
+/// Clear every mesh cache (2-D base, 3-D base, Poisson, Bernoulli).
+#[pyfunction]
+fn mesh_cache_clear() {
+    cache_clear(&MESH_CACHE_2D);
+    cache_clear(&MESH_CACHE_3D);
+    cache_clear(&MESH_CACHE_POISSON);
+    cache_clear(&MESH_CACHE_BERNOULLI);
+}
+
+/// Per-cache (number of meshes, total complex entries) plus the active cap.
+#[pyfunction]
+fn mesh_cache_stats() -> HashMap<String, (usize, usize)> {
+    let mut m = HashMap::new();
+    m.insert("mesh_2d".to_string(), cache_stats(&MESH_CACHE_2D));
+    m.insert("mesh_3d".to_string(), cache_stats(&MESH_CACHE_3D));
+    m.insert("poisson".to_string(), cache_stats(&MESH_CACHE_POISSON));
+    m.insert("bernoulli".to_string(), cache_stats(&MESH_CACHE_BERNOULLI));
+    m.insert("cap_entries".to_string(), (MESH_CACHE_CAP_ENTRIES.load(Ordering::Relaxed), 0));
+    m
+}
+
+/// Set the per-cache cap in complex entries (16 bytes each). Default 8M (128 MB).
+#[pyfunction]
+fn mesh_cache_set_cap(entries: usize) {
+    MESH_CACHE_CAP_ENTRIES.store(entries.max(1), Ordering::Relaxed);
 }
 
 // ============================================================================
@@ -1069,6 +1157,27 @@ fn eval_model_pss_2d(
     amb_log: Option<Vec<f64>>,
     seq_model: &str,
 ) -> PyResult<Vec<f64>> {
+    validate_bio_model_2d(bio_model, "eval_model_pss_2d")?;
+    let n_amb = match amb_model {
+        "None" => 0usize,
+        "Equal" => 1,
+        "Unequal" => 2,
+        other => return verr(format!("eval_model_pss_2d: unknown amb_model {other:?} (use None, Equal, Unequal)")),
+    };
+    validate_limits(&limits, if n_amb == 0 { 2 } else { 3 }, "eval_model_pss_2d")?;
+    if let Some(n) = n_bio_params(bio_model) {
+        if p_log.len() < n {
+            return verr(format!("eval_model_pss_2d: {bio_model} takes {n} parameters, got {}", p_log.len()));
+        }
+    }
+    if let Some(sl) = samp_log.as_ref() {
+        if sl.len() < 2 {
+            return verr(format!("eval_model_pss_2d: samp_log needs 2 entries, got {}", sl.len()));
+        }
+    }
+    if n_amb > 0 && amb_log.as_ref().map_or(true, |a| a.len() < n_amb) {
+        return verr(format!("eval_model_pss_2d: amb_model={amb_model} needs {n_amb} amb_log entries"));
+    }
     let p: Vec<f64> = p_log.iter().map(|&x| 10.0_f64.powf(x)).collect();
 
     if amb_model == "None" {
@@ -1317,6 +1426,17 @@ fn eval_model_pss_protein_bursty(
     min_fudge: f64,
     max_fudge: f64,
 ) -> PyResult<Vec<f64>> {
+    validate_limits(&limits, 3, "eval_model_pss_protein_bursty")?;
+    if p_log.len() != 5 {
+        return verr(format!("eval_model_pss_protein_bursty: expected 5 parameters, got {}", p_log.len()));
+    }
+    if protein_limit.is_nan() || protein_limit <= 0.0 {
+        // +inf is allowed: it disables coarse-graining of the protein axis.
+        return verr(format!("eval_model_pss_protein_bursty: protein_limit must be > 0, got {protein_limit}"));
+    }
+    if !(min_fudge > 0.0) || !(max_fudge > 0.0) {
+        return verr(format!("eval_model_pss_protein_bursty: min_fudge/max_fudge must be > 0"));
+    }
     let (gf, mx, lims) =
         protein_bursty_core(&p_log, &limits, fit_unspliced, protein_limit, min_fudge, max_fudge);
     let pss_raw = irfftn_3d(&gf, mx[0], mx[2], lims[0], lims[1], lims[2]);
@@ -1379,6 +1499,124 @@ fn validate_bio_model_2d(bio_model: &str, caller: &str) -> pyo3::PyResult<()> {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Input validation helpers — turn would-be panics (index out of bounds, clamp
+// with min > max, chunks of size 0) into Python ValueErrors with a message.
+// ----------------------------------------------------------------------------
+
+/// Number of gene-specific (biological) parameters per built-in model.
+fn n_bio_params(bio_model: &str) -> Option<usize> {
+    match bio_model {
+        "Constitutive" => Some(2),
+        "Bursty" | "CIR" | "Extrinsic" | "Delay" | "DelayedSplicing" => Some(3),
+        "ProteinBursty" => Some(5),
+        _ => None,
+    }
+}
+
+fn verr<T>(msg: String) -> pyo3::PyResult<T> {
+    Err(pyo3::exceptions::PyValueError::new_err(msg))
+}
+
+/// lb/ub must have equal length (== n_params when known), be finite, and lb <= ub.
+fn validate_bounds(lb: &[f64], ub: &[f64], n_params: Option<usize>, caller: &str) -> pyo3::PyResult<()> {
+    if lb.len() != ub.len() {
+        return verr(format!("{caller}: lb and ub must have the same length (got {} and {})", lb.len(), ub.len()));
+    }
+    if let Some(n) = n_params {
+        if lb.len() < n {
+            return verr(format!("{caller}: expected at least {n} parameter bounds, got {}", lb.len()));
+        }
+    }
+    for i in 0..lb.len() {
+        if !lb[i].is_finite() || !ub[i].is_finite() {
+            return verr(format!("{caller}: bounds must be finite (index {i}: lb={}, ub={})", lb[i], ub[i]));
+        }
+        if lb[i] > ub[i] {
+            return verr(format!("{caller}: lb[{i}]={} exceeds ub[{i}]={}", lb[i], ub[i]));
+        }
+    }
+    Ok(())
+}
+
+/// limits must have exactly `n_expected` entries, all >= 1.
+fn validate_limits(limits: &[usize], n_expected: usize, caller: &str) -> pyo3::PyResult<()> {
+    if limits.len() != n_expected {
+        return verr(format!("{caller}: expected {n_expected} grid limits, got {}", limits.len()));
+    }
+    if let Some(i) = limits.iter().position(|&l| l == 0) {
+        return verr(format!("{caller}: grid limit at index {i} is 0; every limit must be >= 1"));
+    }
+    Ok(())
+}
+
+/// Every observed count must lie strictly inside the PMF grid.
+fn validate_coords_2d(u_idx: &[u64], s_idx: &[u64], l0: usize, l1: usize, caller: &str) -> pyo3::PyResult<()> {
+    if u_idx.len() != s_idx.len() {
+        return verr(format!("{caller}: u_idx and s_idx must have the same length"));
+    }
+    if let Some(&m) = u_idx.iter().max() {
+        if m as usize >= l0 {
+            return verr(format!("{caller}: observed unspliced count {m} >= grid limit {l0}; increase padding"));
+        }
+    }
+    if let Some(&m) = s_idx.iter().max() {
+        if m as usize >= l1 {
+            return verr(format!("{caller}: observed spliced count {m} >= grid limit {l1}; increase padding"));
+        }
+    }
+    Ok(())
+}
+
+/// x0_list must be n_genes x (>=1 restarts) x n_params.
+fn validate_x0_list(x0_list: &[Vec<Vec<f64>>], n_genes: usize, n_params: usize, caller: &str) -> pyo3::PyResult<()> {
+    if x0_list.len() != n_genes {
+        return verr(format!("{caller}: x0_list has {} genes, search data has {n_genes}", x0_list.len()));
+    }
+    for (g, restarts) in x0_list.iter().enumerate() {
+        if restarts.is_empty() {
+            return verr(format!("{caller}: gene {g} has no restart initial points"));
+        }
+        if let Some(bad) = restarts.iter().find(|x| x.len() != n_params) {
+            return verr(format!("{caller}: gene {g} initial point has {} entries, expected {n_params}", bad.len()));
+        }
+    }
+    Ok(())
+}
+
+/// Optimizer termination codes surfaced to Python via `return_status=True`.
+const OPT_STATUS_CONVERGED: u8 = 0;
+const OPT_STATUS_MAXITER: u8 = 1;
+const OPT_STATUS_LINESEARCH: u8 = 2;
+const OPT_STATUS_ERROR: u8 = 3;
+
+fn solver_status_code(status: &lbfgsb_rs_pure::Status) -> u8 {
+    match status {
+        lbfgsb_rs_pure::Status::Converged => OPT_STATUS_CONVERGED,
+        lbfgsb_rs_pure::Status::MaxIter => OPT_STATUS_MAXITER,
+        lbfgsb_rs_pure::Status::LineSearchFailure => OPT_STATUS_LINESEARCH,
+        #[allow(unreachable_patterns)]
+        _ => OPT_STATUS_ERROR,
+    }
+}
+
+fn split_results(results: Vec<(Vec<f64>, f64, u8)>) -> (Vec<Vec<f64>>, Vec<f64>, Vec<u8>) {
+    let n = results.len();
+    let (mut p, mut k, mut st) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+    for (x, kld, s) in results {
+        p.push(x); k.push(kld); st.push(s);
+    }
+    (p, k, st)
+}
+
+fn pack_results(py: Python<'_>, params: Vec<Vec<f64>>, klds: Vec<f64>, status: Vec<u8>, return_status: bool) -> PyObject {
+    if return_status {
+        (params, klds, status).into_py(py)
+    } else {
+        (params, klds).into_py(py)
+    }
+}
+
 // Per-thread scratch buffers reused across genes — avoids one allocation per
 // gene for the sort-based fallback path.
 thread_local! {
@@ -1417,6 +1655,14 @@ fn compute_moments(
     let n_layers = layers.len();
     let n_cells = layers[0].shape()[0];
     let n_genes = layers[0].shape()[1];
+    for (l, arr) in layers.iter().enumerate() {
+        if !arr.is_c_contiguous() {
+            return verr(format!("compute_moments: layer {l} must be C-contiguous (use np.ascontiguousarray)"));
+        }
+        if arr.shape() != [n_cells, n_genes] {
+            return verr(format!("compute_moments: layer {l} has shape {:?}, expected ({n_cells}, {n_genes})", arr.shape()));
+        }
+    }
 
     // Transpose each (n_cells, n_genes) row-major numpy array to column-major [g * n_cells + c].
     let flat_layers: Vec<Vec<f64>> = layers
@@ -2054,12 +2300,18 @@ impl PySearchData {
         lb:        Vec<f64>,
         ub:        Vec<f64>,
         samp_list: Option<Vec<Option<Vec<f64>>>>,
-    ) -> Vec<Vec<f64>> {
-        self.inner.mom_x0_all_inner(
+    ) -> PyResult<Vec<Vec<f64>>> {
+        validate_bounds(&lb, &ub, None, "mom_x0_all")?;
+        if let Some(n) = n_bio_params(&bio_model) {
+            if lb.len() < n {
+                return verr(format!("mom_x0_all: {bio_model} needs at least {n} bounds, got {}", lb.len()));
+            }
+        }
+        Ok(self.inner.mom_x0_all_inner(
             &bio_model, &seq_model, &amb_model,
             &lb, &ub,
             samp_list.as_deref(),
-        )
+        ))
     }
 }
 
@@ -2091,6 +2343,48 @@ fn searchdata_from_arrays(
 ) -> PyResult<PySearchData> {
     let n_layers = layers.len();
     let n_genes = if n_layers > 0 { layers[0].shape()[1] } else { 0 };
+    if n_layers == 0 {
+        return verr("searchdata_from_arrays: at least one layer is required".to_string());
+    }
+    for (l, arr) in layers.iter().enumerate() {
+        let sh = arr.shape();
+        if !arr.is_c_contiguous() {
+            return verr(format!("searchdata_from_arrays: layer {l} must be C-contiguous (use np.ascontiguousarray)"));
+        }
+        if sh[0] != n_cells || sh[1] != n_genes {
+            return verr(format!("searchdata_from_arrays: layer {l} has shape {sh:?}, expected ({n_cells}, {n_genes})"));
+        }
+    }
+    {
+        let lsh = limits.shape();
+        if lsh[0] < n_layers || lsh[1] < n_genes {
+            return verr(format!("searchdata_from_arrays: limits has shape {lsh:?}, need at least ({n_layers}, {n_genes})"));
+        }
+    }
+    if coords.len() != n_genes || freqs.len() != n_genes || gene_names.len() != n_genes {
+        return verr(format!("searchdata_from_arrays: coords ({}), freqs ({}) and gene_names ({}) must all have n_genes={n_genes} entries",
+            coords.len(), freqs.len(), gene_names.len()));
+    }
+    {
+        let lsl = limits.as_slice().map_err(|_| pyo3::exceptions::PyValueError::new_err("limits array must be C-contiguous"))?;
+        let ncol = limits.shape()[1];
+        for g in 0..n_genes {
+            if coords[g].len() != freqs[g].len() {
+                return verr(format!("searchdata_from_arrays: gene {g} has {} microstates but {} frequencies", coords[g].len(), freqs[g].len()));
+            }
+            for ms in &coords[g] {
+                if ms.len() != n_layers {
+                    return verr(format!("searchdata_from_arrays: gene {g} microstate has {} entries, expected n_layers={n_layers}", ms.len()));
+                }
+                for l in 0..n_layers {
+                    let lim = lsl[l * ncol + g];
+                    if ms[l] < 0 || ms[l] >= lim {
+                        return verr(format!("searchdata_from_arrays: gene {g} layer {l}: observed count {} outside grid [0, {lim}); increase padding", ms[l]));
+                    }
+                }
+            }
+        }
+    }
 
     // Borrow row-major slices from numpy (for adata storage) and build column-major
     // copies (for moments computation).
@@ -2170,6 +2464,15 @@ fn partition_searchdata_2d(
     let nc    = sd_ref.inner.n_cells;
     let ng    = sd_ref.inner.n_genes;
     let nl    = sd_ref.inner.n_layers;
+    if assigns.len() != nc {
+        return verr(format!("partition_searchdata_2d: assigns has {} entries, search data has {nc} cells", assigns.len()));
+    }
+    if n_clusters == 0 {
+        return verr("partition_searchdata_2d: n_clusters must be >= 1".to_string());
+    }
+    if let Some(&bad) = assigns.iter().find(|&&a| a >= n_clusters) {
+        return verr(format!("partition_searchdata_2d: cluster label {bad} >= n_clusters={n_clusters}"));
+    }
 
     // Extract raw row-major layers from adata under the GIL.
     let mut raw_layers: Vec<Vec<i64>> = Vec::with_capacity(nl);
@@ -2658,6 +2961,17 @@ fn make_state_dist(
             })
         })
         .collect::<PyResult<_>>()?;
+    for (l, arr) in layers.iter().enumerate() {
+        if !arr.is_c_contiguous() {
+            return verr(format!("make_state_dist: layer {l} must be C-contiguous (use np.ascontiguousarray)"));
+        }
+        if arr.shape() != [n_cells, n_genes] {
+            return verr(format!("make_state_dist: layer {l} has shape {:?}, expected ({n_cells}, {n_genes})", arr.shape()));
+        }
+        if let Some(v) = raw[l].iter().find(|&&v| v < 0) {
+            return verr(format!("make_state_dist: layer {l} contains a negative count ({v}); layers must be non-negative integer counts"));
+        }
+    }
 
     // Release the GIL during the parallel computation.
     let results: Vec<(Vec<Vec<i64>>, Vec<f64>)> = py.allow_threads(|| {
@@ -3232,6 +3546,11 @@ fn load_histograms_h5ad(
     if n_layers == 0 {
         return Err(pyo3::exceptions::PyValueError::new_err("layer_names must not be empty"));
     }
+    if padding == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "padding must be >= 1 so that the largest observed count lies inside the PMF grid",
+        ));
+    }
     let min_means  = min_means .unwrap_or_else(|| vec![0.01;  n_layers]);
     let max_maxes  = max_maxes .unwrap_or_else(|| vec![350.0; n_layers]);
     let min_maxes  = min_maxes .unwrap_or_else(|| vec![4.0;   n_layers]);
@@ -3290,6 +3609,11 @@ fn searchdata_from_h5ad(
     let n_layers = layer_names.len();
     if n_layers == 0 {
         return Err(pyo3::exceptions::PyValueError::new_err("layer_names must not be empty"));
+    }
+    if padding == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "padding must be >= 1 so that the largest observed count lies inside the PMF grid",
+        ));
     }
     let min_means  = min_means .unwrap_or_else(|| vec![0.01;  n_layers]);
     let max_maxes  = max_maxes .unwrap_or_else(|| vec![350.0; n_layers]);
@@ -3530,9 +3854,9 @@ fn custom_pgf_parallel(
                     g[s][k].im as f32 as f64,
                 ))
                 .collect();
-            // Leading trapezoidal half-step.
-            let (_, dp0) = custom_rhs_point(&u, params, rxns, prod_sp, prod_st);
-            let mut phi = dp0 * (dt / 2.0);
+            // phi starts at 0 and is integrated inside each RK4 step; the
+            // former leading/trailing half-steps double counted the end points.
+            let mut phi = Complex64::new(0.0, 0.0);
             for _ in 0..n_steps {
                 custom_rk4_point(&mut u, &mut phi, params, rxns, prod_sp, prod_st, dt);
             }
@@ -3553,12 +3877,8 @@ fn custom_pgf_parallel(
         while_steps += 1;
     }
 
-    // Phase 3: trailing trapezoidal half-step, then exp(φ).
-    states.into_par_iter().map(|(u, mut phi)| {
-        let (_, dpf) = custom_rhs_point(&u, params, rxns, prod_sp, prod_st);
-        phi += dpf * (dt / 2.0);
-        phi.exp()
-    }).collect()
+    // Phase 3: exp(φ).
+    states.into_par_iter().map(|(_u, phi)| phi.exp()).collect()
 }
 
 /// Evaluate the custom reaction-network log-PGF over all grid points in
@@ -3682,6 +4002,14 @@ fn eval_kld_2d(
     eps: f64,
     seq_model: &str,
 ) -> PyResult<f64> {
+    validate_bio_model_2d(bio_model, "eval_kld_2d/eval_logl_2d")?;
+    validate_limits(&limits, 2, "eval_kld_2d/eval_logl_2d")?;
+    validate_coords_2d(&u_idx, &s_idx, limits[0], limits[1], "eval_kld_2d/eval_logl_2d")?;
+    if let Some(n) = n_bio_params(bio_model) {
+        if p_log.len() < n {
+            return verr(format!("eval_kld_2d/eval_logl_2d: {bio_model} takes {n} parameters, got {}", p_log.len()));
+        }
+    }
     let pss = eval_model_pss_2d_seq(
         bio_model,
         &p_log,
@@ -4008,6 +4336,14 @@ fn eval_logl_2d(
     eps: f64,
     seq_model: &str,
 ) -> PyResult<f64> {
+    validate_bio_model_2d(bio_model, "eval_kld_2d/eval_logl_2d")?;
+    validate_limits(&limits, 2, "eval_kld_2d/eval_logl_2d")?;
+    validate_coords_2d(&u_idx, &s_idx, limits[0], limits[1], "eval_kld_2d/eval_logl_2d")?;
+    if let Some(n) = n_bio_params(bio_model) {
+        if p_log.len() < n {
+            return verr(format!("eval_kld_2d/eval_logl_2d: {bio_model} takes {n} parameters, got {}", p_log.len()));
+        }
+    }
     let pss = eval_model_pss_2d_seq(
         bio_model,
         &p_log,
@@ -4231,7 +4567,7 @@ fn lbfgsb_minimize(
     eps: f64,
     m_mem: usize,
     seq_model: &str,
-) -> (Vec<f64>, f64) {
+) -> (Vec<f64>, f64, u8) {
     let n = x0.len();
     let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
 
@@ -4254,11 +4590,12 @@ fn lbfgsb_minimize(
     };
 
     match solver.minimize_with_callback(&mut x, lb, ub, &mut f_and_grad, &mut callback) {
-        Ok(sol) => (sol.x, sol.f),
+        Ok(sol) => (sol.x, sol.f, solver_status_code(&sol.status)),
         Err(_) => {
-            // Line-search or numerical failure: return the projected x0 with its f value.
+            // Solver-level error (bounds are validated up front, so this is a
+            // numerical failure): return the projected x0, flagged as an error.
             let (f0, _) = f_and_grad(&x);
-            (x, f0)
+            (x, f0, OPT_STATUS_ERROR)
         }
     }
 }
@@ -4296,6 +4633,10 @@ fn optimize_gene_2d(
     seq_model: &str,
 ) -> PyResult<(Vec<f64>, f64)> {
     validate_bio_model_2d(&bio_model, "optimize_gene_2d")?;
+    validate_bounds(&lb, &ub, n_bio_params(&bio_model), "optimize_gene_2d")?;
+    validate_limits(&limits, 2, "optimize_gene_2d")?;
+    validate_coords_2d(&u_idx, &s_idx, limits[0], limits[1], "optimize_gene_2d")?;
+    validate_x0_list(std::slice::from_ref(&x0_list), 1, lb.len(), "optimize_gene_2d")?;
     let seq_model = seq_model.to_owned();
 
     let result = py.allow_threads(|| {
@@ -4303,8 +4644,9 @@ fn optimize_gene_2d(
             .map(|i| x0_list[0][i].max(lb[i]).min(ub[i]))
             .collect();
         let mut best_kld = f64::INFINITY;
+        let mut best_status: u8 = OPT_STATUS_ERROR;
         for x0 in &x0_list {
-            let (x_opt, kld) = lbfgsb_minimize(
+            let (x_opt, kld, st) = lbfgsb_minimize(
                 &bio_model, x0, &lb, &ub, &limits,
                 &u_idx, &s_idx, &f,
                 fixed_quad_t, quad_order, fd_eps,
@@ -4314,11 +4656,13 @@ fn optimize_gene_2d(
             if kld < best_kld * ERR_THRESH {
                 best_x = x_opt;
                 best_kld = kld;
+                best_status = st;
             }
         }
-        (best_x, best_kld)
+        (best_x, best_kld, best_status)
     });
-    Ok(result)
+    let (best_x, best_kld, _status) = result;
+    Ok((best_x, best_kld))
 }
 
 /// Optimize all genes in parallel using L-BFGS-B + rayon.
@@ -4329,7 +4673,7 @@ fn optimize_gene_2d(
 #[pyo3(signature = (bio_model, x0_list, lb, ub, limits_list, u_idx_list, s_idx_list, f_list,
                     fixed_quad_t, quad_order, fd_eps=1e-6, maxiter=1000,
                     ftol=1e-10, gtol=1e-6, samp_list=None, eps=1e-15,
-                    m_lbfgs=10, num_threads=None, seq_model="Poisson"))]
+                    m_lbfgs=10, num_threads=None, seq_model="Poisson", return_status=false))]
 #[allow(clippy::too_many_arguments)]
 fn optimize_genes_2d(
     py: Python<'_>,
@@ -4352,12 +4696,22 @@ fn optimize_genes_2d(
     m_lbfgs: usize,
     num_threads: Option<usize>,
     seq_model: &str,
-) -> PyResult<(Vec<Vec<f64>>, Vec<f64>)> {
+    return_status: bool,
+) -> PyResult<PyObject> {
     validate_bio_model_2d(&bio_model, "optimize_genes_2d")?;
+    validate_bounds(&lb, &ub, n_bio_params(&bio_model), "optimize_genes_2d")?;
     let seq_model = seq_model.to_owned();
     let n_genes = x0_list.len();
+    if limits_list.len() != n_genes || u_idx_list.len() != n_genes || s_idx_list.len() != n_genes || f_list.len() != n_genes {
+        return verr(format!("optimize_genes_2d: x0_list, limits_list, u_idx_list, s_idx_list, f_list must all have n_genes={n_genes} entries"));
+    }
+    validate_x0_list(&x0_list, n_genes, lb.len(), "optimize_genes_2d")?;
+    for gi in 0..n_genes {
+        validate_limits(&limits_list[gi], 2, "optimize_genes_2d")?;
+        validate_coords_2d(&u_idx_list[gi], &s_idx_list[gi], limits_list[gi][0], limits_list[gi][1], "optimize_genes_2d")?;
+    }
 
-    let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
+    let results: Vec<(Vec<f64>, f64, u8)> = py.allow_threads(|| {
         run_with_pool(num_threads, || {
             (0..n_genes)
                 .into_par_iter()
@@ -4367,8 +4721,9 @@ fn optimize_genes_2d(
                         .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
                         .collect();
                     let mut best_kld = f64::INFINITY;
+                    let mut best_status: u8 = OPT_STATUS_ERROR;
                     for x0 in &x0_list[gi] {
-                        let (x_opt, kld) = lbfgsb_minimize(
+                        let (x_opt, kld, st) = lbfgsb_minimize(
                             &bio_model, x0, &lb, &ub, &limits_list[gi],
                             &u_idx_list[gi], &s_idx_list[gi], &f_list[gi],
                             fixed_quad_t, quad_order, fd_eps,
@@ -4378,16 +4733,17 @@ fn optimize_genes_2d(
                         if kld < best_kld * ERR_THRESH {
                             best_x = x_opt;
                             best_kld = kld;
+                            best_status = st;
                         }
                     }
-                    (best_x, best_kld)
+                    (best_x, best_kld, best_status)
                 })
                 .collect()
         })
     });
 
-    let (params, klds): (Vec<Vec<f64>>, Vec<f64>) = results.into_iter().unzip();
-    Ok((params, klds))
+    let (params, klds, status) = split_results(results);
+    Ok(pack_results(py, params, klds, status, return_status))
 }
 
 /// Optimize all genes in parallel using L-BFGS-B, reading histogram data directly
@@ -4402,7 +4758,7 @@ fn optimize_genes_2d(
 #[pyo3(signature = (sd, bio_model, x0_list, lb, ub, fixed_quad_t, quad_order,
                     fd_eps=1e-6, maxiter=1000, ftol=1e-10, gtol=1e-6,
                     base_samp=None, use_lengths_unspliced=false, use_lengths_spliced=false,
-                    eps=1e-15, m_lbfgs=10, num_threads=None, seq_model="Poisson"))]
+                    eps=1e-15, m_lbfgs=10, num_threads=None, seq_model="Poisson", return_status=false))]
 #[allow(clippy::too_many_arguments)]
 fn optimize_genes_2d_sd(
     py: Python<'_>,
@@ -4424,8 +4780,10 @@ fn optimize_genes_2d_sd(
     m_lbfgs: usize,
     num_threads: Option<usize>,
     seq_model: &str,
-) -> PyResult<(Vec<Vec<f64>>, Vec<f64>)> {
+    return_status: bool,
+) -> PyResult<PyObject> {
     validate_bio_model_2d(&bio_model, "optimize_genes_2d_sd")?;
+    validate_bounds(&lb, &ub, n_bio_params(&bio_model), "optimize_genes_2d_sd")?;
     let seq_model = seq_model.to_owned();
 
     // Extract all needed data from the Rust struct while holding the GIL borrow.
@@ -4448,8 +4806,9 @@ fn optimize_genes_2d_sd(
         let gll_s = sd_ref.extract_gene_log_lengths_spliced();
         (u, s, f, lim, n_lm, n, gll, gll_s)
     }; // sd_ref dropped — GIL borrow released before allow_threads
+    validate_x0_list(&x0_list, n_genes, lb.len(), "optimize_genes_2d_sd")?;
 
-    let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
+    let results: Vec<(Vec<f64>, f64, u8)> = py.allow_threads(|| {
         run_with_pool(num_threads, || {
             (0..n_genes)
                 .into_par_iter()
@@ -4473,8 +4832,9 @@ fn optimize_genes_2d_sd(
                         .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
                         .collect();
                     let mut best_kld = f64::INFINITY;
+                    let mut best_status: u8 = OPT_STATUS_ERROR;
                     for x0 in &x0_list[gi] {
-                        let (x_opt, kld) = lbfgsb_minimize(
+                        let (x_opt, kld, st) = lbfgsb_minimize(
                             &bio_model, x0, &lb, &ub,
                             &limits_flat[gi * n_lim .. (gi + 1) * n_lim],
                             &u_idx_list[gi], &s_idx_list[gi], &f_list[gi],
@@ -4485,16 +4845,17 @@ fn optimize_genes_2d_sd(
                         if kld < best_kld * ERR_THRESH {
                             best_x = x_opt;
                             best_kld = kld;
+                            best_status = st;
                         }
                     }
-                    (best_x, best_kld)
+                    (best_x, best_kld, best_status)
                 })
                 .collect()
         })
     });
 
-    let (params, klds): (Vec<Vec<f64>>, Vec<f64>) = results.into_iter().unzip();
-    Ok((params, klds))
+    let (params, klds, status) = split_results(results);
+    Ok(pack_results(py, params, klds, status, return_status))
 }
 
 // ============================================================================
@@ -4615,7 +4976,7 @@ fn lbfgsb_minimize_protein_bursty(
     gtol:          f64,
     eps:           f64,
     m_mem:         usize,
-) -> (Vec<f64>, f64) {
+) -> (Vec<f64>, f64, u8) {
     let n = x0.len();
     let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
     let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol).with_ftol(ftol);
@@ -4636,10 +4997,10 @@ fn lbfgsb_minimize_protein_bursty(
         }
     };
     match solver.minimize_with_callback(&mut x, lb, ub, &mut f_and_grad, &mut callback) {
-        Ok(sol) => (sol.x, sol.f),
+        Ok(sol) => (sol.x, sol.f, solver_status_code(&sol.status)),
         Err(_) => {
             let (f0, _) = f_and_grad(&x);
-            (x, f0)
+            (x, f0, OPT_STATUS_ERROR)
         }
     }
 }
@@ -4649,7 +5010,7 @@ fn lbfgsb_minimize_protein_bursty(
 #[pyfunction]
 #[pyo3(signature = (sd, x0_list, lb, ub, fit_unspliced, protein_limit, min_fudge, max_fudge,
                     fd_eps=1e-6, maxiter=1000, ftol=1e-10, gtol=1e-6,
-                    eps=1e-15, m_lbfgs=10, num_threads=None))]
+                    eps=1e-15, m_lbfgs=10, num_threads=None, return_status=false))]
 #[allow(clippy::too_many_arguments)]
 fn optimize_genes_protein_bursty_sd(
     py: Python<'_>,
@@ -4668,7 +5029,8 @@ fn optimize_genes_protein_bursty_sd(
     eps: f64,
     m_lbfgs: usize,
     num_threads: Option<usize>,
-) -> PyResult<(Vec<Vec<f64>>, Vec<f64>)> {
+    return_status: bool,
+) -> PyResult<PyObject> {
     let (coords_list, f_list, limits_flat, n_genes, n_lim) = {
         let sd_ref = sd.borrow();
         if sd_ref.n_layers < 3 {
@@ -4678,9 +5040,11 @@ fn optimize_genes_protein_bursty_sd(
         }
         sd_ref.extract_for_parallel()
     };
+    validate_bounds(&lb, &ub, None, "optimize_genes_sd")?;
+    validate_x0_list(&x0_list, n_genes, lb.len(), "optimize_genes_sd")?;
 
 
-    let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
+    let results: Vec<(Vec<f64>, f64, u8)> = py.allow_threads(|| {
         run_with_pool(num_threads, || {
             (0..n_genes)
                 .into_par_iter()
@@ -4691,8 +5055,9 @@ fn optimize_genes_protein_bursty_sd(
                         .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
                         .collect();
                     let mut best_kld = f64::INFINITY;
+                    let mut best_status: u8 = OPT_STATUS_ERROR;
                     for x0 in &x0_list[gi] {
-                        let (x_opt, kld) = lbfgsb_minimize_protein_bursty(
+                        let (x_opt, kld, st) = lbfgsb_minimize_protein_bursty(
                             x0, &lb, &ub, lims, &strides,
                             &coords_list[gi], &f_list[gi],
                             fit_unspliced, protein_limit, min_fudge, max_fudge,
@@ -4701,16 +5066,17 @@ fn optimize_genes_protein_bursty_sd(
                         if kld < best_kld * ERR_THRESH {
                             best_x = x_opt;
                             best_kld = kld;
+                            best_status = st;
                         }
                     }
-                    (best_x, best_kld)
+                    (best_x, best_kld, best_status)
                 })
                 .collect()
         })
     });
 
-    let (params, klds): (Vec<Vec<f64>>, Vec<f64>) = results.into_iter().unzip();
-    Ok((params, klds))
+    let (params, klds, status) = split_results(results);
+    Ok(pack_results(py, params, klds, status, return_status))
 }
 
 // ============================================================================
@@ -4850,7 +5216,7 @@ fn lbfgsb_minimize_amb(
     gtol:         f64,
     eps:          f64,
     m_mem:        usize,
-) -> (Vec<f64>, f64) {
+) -> (Vec<f64>, f64, u8) {
     let n = x0.len();
     let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
     let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol).with_ftol(ftol);
@@ -4871,10 +5237,10 @@ fn lbfgsb_minimize_amb(
         }
     };
     match solver.minimize_with_callback(&mut x, lb, ub, &mut f_and_grad, &mut callback) {
-        Ok(sol) => (sol.x, sol.f),
+        Ok(sol) => (sol.x, sol.f, solver_status_code(&sol.status)),
         Err(_) => {
             let (f0, _) = f_and_grad(&x);
-            (x, f0)
+            (x, f0, OPT_STATUS_ERROR)
         }
     }
 }
@@ -4887,7 +5253,7 @@ fn lbfgsb_minimize_amb(
 #[pyfunction]
 #[pyo3(signature = (sd, bio_model, amb_model, x0_list, lb, ub, fixed_quad_t, quad_order,
                     fd_eps=1e-6, maxiter=1000, ftol=1e-10, gtol=1e-6,
-                    samp_list=None, eps=1e-15, m_lbfgs=10, num_threads=None))]
+                    samp_list=None, eps=1e-15, m_lbfgs=10, num_threads=None, return_status=false))]
 #[allow(clippy::too_many_arguments)]
 fn optimize_genes_2d_amb_sd(
     py: Python<'_>,
@@ -4907,7 +5273,8 @@ fn optimize_genes_2d_amb_sd(
     eps: f64,
     m_lbfgs: usize,
     num_threads: Option<usize>,
-) -> PyResult<(Vec<Vec<f64>>, Vec<f64>)> {
+    return_status: bool,
+) -> PyResult<PyObject> {
     validate_bio_model_2d(&bio_model, "optimize_genes_2d_amb_sd")?;
     match amb_model.as_str() {
         "Equal" | "Unequal" => {}
@@ -4925,9 +5292,11 @@ fn optimize_genes_2d_amb_sd(
         }
         sd_ref.extract_for_parallel()
     };
+    validate_bounds(&lb, &ub, None, "optimize_genes_sd")?;
+    validate_x0_list(&x0_list, n_genes, lb.len(), "optimize_genes_sd")?;
 
 
-    let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
+    let results: Vec<(Vec<f64>, f64, u8)> = py.allow_threads(|| {
         run_with_pool(num_threads, || {
             (0..n_genes)
                 .into_par_iter()
@@ -4939,8 +5308,9 @@ fn optimize_genes_2d_amb_sd(
                         .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
                         .collect();
                     let mut best_kld = f64::INFINITY;
+                    let mut best_status: u8 = OPT_STATUS_ERROR;
                     for x0 in &x0_list[gi] {
-                        let (x_opt, kld) = lbfgsb_minimize_amb(
+                        let (x_opt, kld, st) = lbfgsb_minimize_amb(
                             &bio_model, &amb_model, x0, &lb, &ub,
                             lims, &strides, &coords_list[gi], &f_list[gi],
                             fixed_quad_t, quad_order, samp,
@@ -4949,16 +5319,17 @@ fn optimize_genes_2d_amb_sd(
                         if kld < best_kld * ERR_THRESH {
                             best_x = x_opt;
                             best_kld = kld;
+                            best_status = st;
                         }
                     }
-                    (best_x, best_kld)
+                    (best_x, best_kld, best_status)
                 })
                 .collect()
         })
     });
 
-    let (params, klds): (Vec<Vec<f64>>, Vec<f64>) = results.into_iter().unzip();
-    Ok((params, klds))
+    let (params, klds, status) = split_results(results);
+    Ok(pack_results(py, params, klds, status, return_status))
 }
 
 // ============================================================================
@@ -5099,7 +5470,7 @@ fn lbfgsb_minimize_custom(
     gtol:          f64,
     eps:           f64,
     m_mem:         usize,
-) -> (Vec<f64>, f64) {
+) -> (Vec<f64>, f64, u8) {
     let n = x0.len();
     let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
     let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol).with_ftol(ftol);
@@ -5120,10 +5491,10 @@ fn lbfgsb_minimize_custom(
         }
     };
     match solver.minimize_with_callback(&mut x, lb, ub, &mut f_and_grad, &mut callback) {
-        Ok(sol) => (sol.x, sol.f),
+        Ok(sol) => (sol.x, sol.f, solver_status_code(&sol.status)),
         Err(_) => {
             let (f0, _) = f_and_grad(&x);
-            (x, f0)
+            (x, f0, OPT_STATUS_ERROR)
         }
     }
 }
@@ -5139,7 +5510,7 @@ fn lbfgsb_minimize_custom(
                     prod_sp, prod_st, prod_off,
                     has_norm_rate, min_fudge, max_fudge,
                     fd_eps=1e-6, maxiter=1000, ftol=1e-10, gtol=1e-6,
-                    eps=1e-15, m_lbfgs=10, num_threads=None))]
+                    eps=1e-15, m_lbfgs=10, num_threads=None, return_status=false))]
 #[allow(clippy::too_many_arguments)]
 fn optimize_genes_custom_sd(
     py: Python<'_>,
@@ -5165,7 +5536,8 @@ fn optimize_genes_custom_sd(
     eps:           f64,
     m_lbfgs:       usize,
     num_threads:   Option<usize>,
-) -> PyResult<(Vec<Vec<f64>>, Vec<f64>)> {
+    return_status: bool,
+) -> PyResult<PyObject> {
     if n_species != 2 && n_species != 3 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "optimize_genes_custom_sd only supports 2- and 3-species custom networks",
@@ -5173,11 +5545,13 @@ fn optimize_genes_custom_sd(
     }
 
     let (coords_list, f_list, limits_flat, n_genes, n_lim) = sd.borrow().extract_for_parallel();
+    validate_bounds(&lb, &ub, None, "optimize_genes_custom_sd")?;
+    validate_x0_list(&x0_list, n_genes, lb.len(), "optimize_genes_custom_sd")?;
 
     let rxns = build_rxns(&rxn_kinds, &rxn_rate_idxs, &rxn_extra1, &rxn_extra2, &prod_off);
 
 
-    let results: Vec<(Vec<f64>, f64)> = py.allow_threads(|| {
+    let results: Vec<(Vec<f64>, f64, u8)> = py.allow_threads(|| {
         run_with_pool(num_threads, || {
             (0..n_genes)
                 .into_par_iter()
@@ -5188,8 +5562,9 @@ fn optimize_genes_custom_sd(
                         .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
                         .collect();
                     let mut best_kld = f64::INFINITY;
+                    let mut best_status: u8 = OPT_STATUS_ERROR;
                     for x0 in &x0_list[gi] {
-                        let (x_opt, kld) = lbfgsb_minimize_custom(
+                        let (x_opt, kld, st) = lbfgsb_minimize_custom(
                             x0, &lb, &ub, n_species, lims, &strides,
                             &rxns, &prod_sp, &prod_st,
                             &coords_list[gi], &f_list[gi],
@@ -5199,16 +5574,17 @@ fn optimize_genes_custom_sd(
                         if kld < best_kld * ERR_THRESH {
                             best_x = x_opt;
                             best_kld = kld;
+                            best_status = st;
                         }
                     }
-                    (best_x, best_kld)
+                    (best_x, best_kld, best_status)
                 })
                 .collect()
         })
     });
 
-    let (params, klds): (Vec<Vec<f64>>, Vec<f64>) = results.into_iter().unzip();
-    Ok((params, klds))
+    let (params, klds, status) = split_results(results);
+    Ok(pack_results(py, params, klds, status, return_status))
 }
 
 // ============================================================================
@@ -5520,5 +5896,8 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(partition_searchdata_2d, m)?)?;
     #[cfg(feature = "kmeans")]
     m.add_function(wrap_pyfunction!(initialize_q_kmeans, m)?)?;
+    m.add_function(wrap_pyfunction!(mesh_cache_clear, m)?)?;
+    m.add_function(wrap_pyfunction!(mesh_cache_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(mesh_cache_set_cap, m)?)?;
     Ok(())
 }

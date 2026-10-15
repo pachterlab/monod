@@ -11,7 +11,8 @@ becomes one elementary reaction.  Nodes can be:
   ``N x A``           N molecules of A
                         N integer  → deterministic stoichiometry
                         N name     → geometric-burst parameter
-  ``A + B``           sum of terms (multi-product or multi-reactant)
+  ``A + B``           sum of terms (products only; a reactant node must be
+                      ``0`` or a single species, see below)
 
 Arrow types
 -----------
@@ -36,8 +37,10 @@ The ``N x A`` notation for the *target* of a production reaction (source
 * **Integer literal** (e.g. ``2``): deterministic burst of that size.
   ``dφ/dt += k · ((1 + u_A)^N − 1)``
 
-For all other (non-production) reactions a single reactant species is
-consumed and any number of product species are created.  The characteristic
+For all other (non-production) reactions exactly one reactant molecule is
+consumed and any number of product species are created.  Reactant
+stoichiometry > 1 (``2 x A``, ``A + A``) and bimolecular reactions
+(``A + B``) are not supported and are rejected when the network is parsed.  The characteristic
 ODE/DDE contribution for reactant A is:
 
   ``du_A/dt += k · (∏_j (1 + u_j)^{n_j} − (1 + u_A))``
@@ -137,18 +140,42 @@ def _parse_node(node_str: str) -> List[_Term]:
     return [_parse_term(part) for part in re.split(r'\s*\+\s*', s)]
 
 
-def _terms_to_stoich(terms: List[_Term], is_source: bool = False) -> Dict[str, int]:
+def _terms_to_stoich(
+    terms: List[_Term], is_source: bool = False, is_chain_head: bool = True
+) -> Dict[str, int]:
     """Aggregate terms into a stoichiometry dict.
 
-    For *source* nodes the ``N x SPECIES`` multiplier is always treated as 1:
-    the ``N`` prefix is a production modifier (burst size) and does not imply
-    that N molecules are consumed.  Write ``A + A -> B`` explicitly if you want
-    to consume 2 copies of A in a single reaction.
+    Source (reactant) nodes must be empty (``0``) or a single species with
+    stoichiometry 1: the characteristic-ODE solver only supports zero- and
+    first-order propensities.  ``2 x A -> B``, ``A + A -> B`` and
+    ``A + B -> C`` are rejected here, at parse time, so that every backend
+    (Python and Rust) sees the same network.
+
+    Inside a chain (``0 -> B x U -> S``) an interior node is both the product
+    of one arrow and the reactant of the next; its ``N x`` prefix belongs to
+    the production step and is ignored on the reactant side
+    (``is_chain_head=False``).  On the head node of a chain a prefix has no
+    production to attach to and is an error.
     """
     d: Dict[str, int] = {}
     for t in terms:
+        if is_source and is_chain_head and t.burst_param is not None:
+            raise ValueError(
+                f"A geometric-burst prefix ({t.burst_param!r}) is only allowed on "
+                f"products, not on the reactant {t.species!r}."
+            )
+        if is_source and is_chain_head and t.stoich != 1:
+            raise ValueError(
+                f"Reactant stoichiometry > 1 is not supported ({t.stoich} x {t.species}); "
+                "only zero- and first-order reactions are available."
+            )
         stoich = 1 if is_source else t.stoich
         d[t.species] = d.get(t.species, 0) + stoich
+    if is_source and (len(d) > 1 or any(v != 1 for v in d.values())):
+        raise ValueError(
+            "Only zero- and first-order reactions are supported: a reactant node must "
+            f"be '0' or a single species, got {' + '.join(f'{v} x {k}' if v > 1 else k for k, v in d.items())!r}."
+        )
     return d
 
 
@@ -185,7 +212,7 @@ def _parse_chain(
             tau_name = f"tauinv{tau_counter[0]}"
             tau_counter[0] += 1
 
-        reactants = _terms_to_stoich(src_terms, is_source=True)
+        reactants = _terms_to_stoich(src_terms, is_source=True, is_chain_head=(i == 0))
         products  = _terms_to_stoich(tgt_terms, is_source=False)
 
         # Identify geometric-burst parameter (only valid for production reactions)
@@ -633,9 +660,8 @@ class ReactionNetwork:
         h_max = 10.0 * h
         h_min = h * 1e-8
 
-        # Leading trapezoidal half-step with initial h.
-        _, dphi0 = self._rhs(u, params, sp_idx)
-        phi += dphi0 * (h / 2.0)
+        # phi starts at 0 and is integrated inside each RK stage; no extra
+        # end-point corrections are needed (they would double count).
 
         # Adaptive integration until |u[0]| < 1e-3.
         max_steps = 50 * n_steps + 50_000
@@ -648,10 +674,6 @@ class ReactionNetwork:
                 u, phi = u_new, phi_new
                 step_count += 1
             h = float(np.clip(h * factor, h_min, h_max))
-
-        # Trailing trapezoidal half-step.
-        _, dphi_f = self._rhs(u, params, sp_idx)
-        phi += dphi_f * (h / 2.0)
 
         return phi
 
@@ -677,9 +699,6 @@ class ReactionNetwork:
 
         u_hist, tau_d_steps = self._build_history(u, params, dt)
 
-        _, dphi0 = self._rhs(u, params, sp_idx)
-        phi += dphi0 * (dt / 2.0)
-
         def _step(u, phi):
             u_del = self._delayed_state(u_hist, tau_d_steps)
             u_new, phi_new = self._rk4_step(u, phi, params, sp_idx, dt, u_del)
@@ -694,9 +713,6 @@ class ReactionNetwork:
         while np.max(np.abs(u[0])) > 1e-3 and while_steps < max_while_steps:
             u, phi = _step(u, phi)
             while_steps += 1
-
-        _, dphi_f = self._rhs(u, params, sp_idx)
-        phi += dphi_f * (dt / 2.0)
 
         return phi
 

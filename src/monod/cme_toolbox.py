@@ -11,24 +11,42 @@ from scipy import integrate
 from scipy.fft import irfftn
 
 # from .nn_toolbox import basic_ml_bivariate, ml_microstate_logP
-from extract_data import log
-from reaction_network import ReactionNetwork
+from .extract_data import log
+from .reaction_network import ReactionNetwork
 
 _MESH_CACHE: dict = {}
+_MESH_CACHE_ENTRIES = [0]          # total complex128 entries currently cached
+_MESH_CACHE_CAP_ENTRIES = 8 << 20  # 8M entries = 128 MB; cleared wholesale when exceeded
+
+
+def clear_mesh_cache():
+    """Drop every cached evaluation mesh (Python path)."""
+    _MESH_CACHE.clear()
+    _MESH_CACHE_ENTRIES[0] = 0
 
 
 def _build_mesh(limits_tuple, mx_tuple):
-    """Build and cache the complex evaluation mesh for eval_model_pss."""
+    """Build and cache the complex evaluation mesh for eval_model_pss.
+
+    Keyed by (limits, reduced shape).  With per-gene limits each distinct grid
+    adds an entry, so the cache is bounded: when adding a mesh would push the
+    total above ``_MESH_CACHE_CAP_ENTRIES`` the cache is cleared first.
+    """
     key = (limits_tuple, mx_tuple)
-    if key not in _MESH_CACHE:
+    mesh = _MESH_CACHE.get(key)
+    if mesh is None:
         u = []
         for i, m in enumerate(mx_tuple):
             l = np.arange(m)
             u_ = np.exp(-2j * np.pi * l / limits_tuple[i]) - 1
             u.append(u_)
         g = np.meshgrid(*u, indexing="ij")
-        _MESH_CACHE[key] = np.array([arr.flatten() for arr in g])
-    return _MESH_CACHE[key]
+        mesh = np.array([arr.flatten() for arr in g])
+        if _MESH_CACHE and _MESH_CACHE_ENTRIES[0] + mesh.size > _MESH_CACHE_CAP_ENTRIES:
+            clear_mesh_cache()
+        _MESH_CACHE[key] = mesh
+        _MESH_CACHE_ENTRIES[0] += mesh.size
+    return mesh
 
 # ---------------------------------------------------------------------------
 # Optional Rust backend (monod_core).  When available, eval_model_pss for
@@ -911,6 +929,36 @@ class CMEModel:
             )
         return kld, grad
 
+    def _check_pss_args(self, p, limits):
+        """Validate and normalise the (p, limits) arguments of eval_model_pss.
+
+        Returns ``(p, limits)`` with ``p`` a 1-D float ndarray and ``limits``
+        a list of Python ints, raising ``ValueError`` with a clear message
+        instead of letting a shape mismatch surface as an opaque numpy or
+        Rust error.
+        """
+        p = np.asarray(p, dtype=float)
+        n_bio = self.get_num_params()
+        n_amb = {"None": 0, "Equal": 1, "Unequal": 2}.get(self.amb_model, 0)
+        if p.ndim != 1 or p.shape[0] not in (n_bio, n_bio + n_amb):
+            raise ValueError(
+                f"{self.bio_model}/{self.seq_model}/{self.amb_model}: expected {n_bio} log10 "
+                f"parameters{' (+' + str(n_amb) + ' ambient)' if n_amb else ''}, got shape {p.shape}"
+            )
+        if not np.all(np.isfinite(p)):
+            raise ValueError("parameters must be finite log10 values; got {}".format(p))
+        limits_arr = np.atleast_1d(np.asarray(limits))
+        n_species = len(self.model_modalities) + (1 if self.amb_model != "None" else 0)
+        if limits_arr.ndim != 1 or limits_arr.shape[0] != n_species:
+            raise ValueError(
+                f"{self.bio_model}: limits must have one grid size per species "
+                f"({n_species} for modalities {self.model_modalities}"
+                f"{' + ambient' if self.amb_model != 'None' else ''}), got {list(limits_arr)}"
+            )
+        if np.any(limits_arr < 1) or np.any(limits_arr != np.round(limits_arr)):
+            raise ValueError(f"limits must be positive integers, got {list(limits_arr)}")
+        return p, [int(x) for x in limits_arr]
+
     def eval_model_pss(self, p, limits, samp=None):
         """Evaluate the PMF of the model over a grid at a set of parameters.
 
@@ -928,6 +976,8 @@ class CMEModel:
         Pss: np.ndarray
             the steady-state model PMF over a grid.
         """
+
+        p, limits = self._check_pss_args(p, limits)
 
         # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
         # It will be implemented in a future version.
@@ -1096,6 +1146,13 @@ class CMEModel:
                     rxn_extra1.append(-1)
                     rxn_extra2.append(-1)
                 else:
+                    # ReactionNetwork guarantees a single first-order reactant;
+                    # guard anyway so a future parser change cannot silently
+                    # mis-encode a reaction for the Rust kernel.
+                    if len(rxn.reactants) != 1 or next(iter(rxn.reactants.values())) != 1:
+                        raise ValueError(
+                            f"Rust custom-network path requires first-order reactions; got {rxn}"
+                        )
                     src = next(iter(rxn.reactants))
                     rxn_kinds.append(2)
                     rxn_rate_idxs.append(rate_idx)

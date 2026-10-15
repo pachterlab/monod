@@ -6,8 +6,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
-from extract_data import make_dir, log, extract_data, make_histogram, _uns_pack, _uns_unpack, _build_sampling_grid
-from cme_toolbox import CMEModel, _HAS_RUST  # may be unnecessary
+from .extract_data import make_dir, log, extract_data, make_histogram, _uns_pack, _uns_unpack, _build_sampling_grid
+from .cme_toolbox import CMEModel, _HAS_RUST  # may be unnecessary
 try:
     import monod_core as _mc
 except ImportError:
@@ -15,16 +15,12 @@ except ImportError:
 
 _LBFGSB_RUST_MODELS_2D = {"Constitutive", "Bursty", "CIR", "Extrinsic", "Delay", "DelayedSplicing"}
 
-try:
-    from mminference import MEKMeansParameters
-except ImportError:
-    pass
 import multiprocessing
 import os
 
 # lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
 import warnings
-from plot_aesthetics import aesthetics
+from .plot_aesthetics import aesthetics
 
 from tqdm import tqdm
 code_ver_global = "029"  # bumping up version April 2024
@@ -125,7 +121,7 @@ def perform_inference(h5ad_filepath,
         poisson_average_log_length=poisson_average_log_length)
 
     else:
-        import mminference
+        from . import mminference
         # Stage 1: standard inference to find optimal technical parameters.
         # Technical noise is a batch-level property shared across all clusters,
         # so eta is estimated once from the full population before clustering.
@@ -495,6 +491,61 @@ def AIC_per_gene(search_result, monod_adata):
 _USE_LENGTHS_MODES = (None, "unspliced", "spliced", "both")
 
 
+def _validate_bounds(model, phys_lb, phys_ub, samp_lb, samp_ub, gridsize):
+    """Raise ValueError for malformed parameter bounds / sampling grids.
+
+    Checks lengths, finiteness and lb <= ub for the biological bounds, and
+    that samp_lb, samp_ub and gridsize agree in length with integer grid sizes
+    >= 1.  Without this, an inverted bound is silently accepted by
+    scipy.optimize.Bounds and by the Rust L-BFGS-B wrapper, which then reports
+    the projected starting point as a converged optimum.
+    """
+    phys_lb = np.asarray(phys_lb, dtype=float)
+    phys_ub = np.asarray(phys_ub, dtype=float)
+    n_par = model.get_num_params()
+    if phys_lb.ndim != 1 or phys_ub.ndim != 1 or phys_lb.shape != phys_ub.shape:
+        raise ValueError(
+            f"phys_lb and phys_ub must be 1-D with equal length; got shapes {phys_lb.shape} and {phys_ub.shape}"
+        )
+    if phys_lb.shape[0] < n_par:
+        raise ValueError(
+            f"{model.bio_model} has {n_par} parameters but phys_lb/phys_ub have {phys_lb.shape[0]} entries"
+        )
+    if not (np.all(np.isfinite(phys_lb)) and np.all(np.isfinite(phys_ub))):
+        raise ValueError("phys_lb and phys_ub must be finite log10 values")
+    bad = np.where(phys_lb > phys_ub)[0]
+    if bad.size:
+        i = int(bad[0])
+        raise ValueError(f"phys_lb[{i}]={phys_lb[i]} exceeds phys_ub[{i}]={phys_ub[i]}")
+    samp_lb = np.asarray(samp_lb, dtype=float)
+    samp_ub = np.asarray(samp_ub, dtype=float)
+    gridsize = list(gridsize)
+    if not (len(samp_lb) == len(samp_ub) == len(gridsize)):
+        raise ValueError(
+            f"samp_lb ({len(samp_lb)}), samp_ub ({len(samp_ub)}) and gridsize ({len(gridsize)}) must have the same length"
+        )
+    if any((int(g) != g) or g < 1 for g in gridsize):
+        raise ValueError(f"gridsize entries must be integers >= 1, got {gridsize}")
+    bad = np.where(samp_lb > samp_ub)[0]
+    if bad.size:
+        i = int(bad[0])
+        raise ValueError(f"samp_lb[{i}]={samp_lb[i]} exceeds samp_ub[{i}]={samp_ub[i]}")
+
+
+def _warn_optimizer_status(status, label):
+    """Log a summary when the Rust L-BFGS-B run did not converge for every gene."""
+    if status is None:
+        return
+    st = np.asarray(status)
+    n_max, n_ls, n_err = int((st == 1).sum()), int((st == 2).sum()), int((st == 3).sum())
+    if n_max or n_ls or n_err:
+        log.warning(
+            "%s: %d/%d genes did not converge (%d hit max_iterations, %d line-search failures, %d solver errors). "
+            "Consider raising gradient_params['max_iterations'] or checking the bounds.",
+            label, n_max + n_ls + n_err, st.size, n_max, n_ls, n_err,
+        )
+
+
 def _normalize_use_lengths(use_lengths, model):
     """Resolve the ``use_lengths`` option against the model's sequencing model.
 
@@ -673,6 +724,7 @@ class InferenceParameters:
             samp_ub = [0, 0]
             gridsize = [1, 1]
 
+        _validate_bounds(model, phys_lb, phys_ub, samp_lb, samp_ub, gridsize)
         self.samp_lb = np.array(samp_lb)
         self.samp_ub = np.array(samp_ub)
         self.gridsize = gridsize
@@ -1279,13 +1331,15 @@ class GradientInference:
                     base_samp = list(self.grid_point) if use_lengths_any else self.regressor[0].tolist()
                 else:
                     base_samp = None
-                params_arr, klds_arr = _mc.optimize_genes_2d_sd(
+                params_arr, klds_arr, status_arr = _mc.optimize_genes_2d_sd(
                     search_data,
+                    return_status=True,
                     base_samp=base_samp,
                     use_lengths_unspliced=use_lengths_unsp,
                     use_lengths_spliced=use_lengths_spl,
                     **_base_kwargs,
                 )
+                _warn_optimizer_status(status_arr, 'optimize_genes_2d_sd')
             else:
                 # Python SearchData fallback: build per-gene samp_list, unpack hist.
                 samp_list = None
@@ -1317,8 +1371,9 @@ class GradientInference:
             num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
             n_genes = search_data.n_genes
             x0_all = x0_all_shared
-            params_arr, klds_arr = _mc.optimize_genes_protein_bursty_sd(
+            params_arr, klds_arr, status_arr = _mc.optimize_genes_protein_bursty_sd(
                 search_data,
+                return_status=True,
                 x0_list=x0_all,
                 lb=self.phys_lb.tolist(),
                 ub=self.phys_ub.tolist(),
@@ -1334,6 +1389,7 @@ class GradientInference:
                 m_lbfgs=10,
                 num_threads=num_threads,
             )
+            _warn_optimizer_status(status_arr, 'optimize_genes_protein_bursty_sd')
             param_estimates = np.asarray(params_arr)
             klds = np.asarray(klds_arr)
 
@@ -1347,8 +1403,9 @@ class GradientInference:
                     (self.regressor[gi].tolist() if self.regressor[gi] is not None else None)
                     for gi in range(n_genes)
                 ]
-            params_arr, klds_arr = _mc.optimize_genes_2d_amb_sd(
+            params_arr, klds_arr, status_arr = _mc.optimize_genes_2d_amb_sd(
                 search_data,
+                return_status=True,
                 bio_model=model.bio_model,
                 amb_model=model.amb_model,
                 x0_list=x0_all,
@@ -1365,6 +1422,7 @@ class GradientInference:
                 m_lbfgs=10,
                 num_threads=num_threads,
             )
+            _warn_optimizer_status(status_arr, 'optimize_genes_2d_amb_sd')
             param_estimates = np.asarray(params_arr)
             klds = np.asarray(klds_arr)
 
@@ -1403,8 +1461,9 @@ class GradientInference:
                     prod_sp_flat.append(sp_idx_map[sp])
                     prod_st_flat.append(st)
                 prod_off_list.append(len(prod_sp_flat))
-            params_arr, klds_arr = _mc.optimize_genes_custom_sd(
+            params_arr, klds_arr, status_arr = _mc.optimize_genes_custom_sd(
                 search_data,
+                return_status=True,
                 x0_list=x0_all,
                 lb=self.phys_lb.tolist(),
                 ub=self.phys_ub.tolist(),
@@ -1427,6 +1486,7 @@ class GradientInference:
                 m_lbfgs=10,
                 num_threads=num_threads,
             )
+            _warn_optimizer_status(status_arr, 'optimize_genes_custom_sd')
             param_estimates = np.asarray(params_arr)
             klds = np.asarray(klds_arr)
 
@@ -2990,6 +3050,7 @@ class SearchResults:
 
         (nrows, ncols) = sz
         fig1, ax1 = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize)
+        axes = np.atleast_1d(ax1).ravel()
 
         nax = np.prod(sz)
         if genes_to_plot is None:
@@ -3022,7 +3083,7 @@ class SearchResults:
                     lm[:i] = 1
                     lm[i+1:]=1
                     
-            axloc = np.unravel_index(j_, sz) if (sz[0] > 1 and sz[1] > 1) else j_
+            ax = axes[j_]
 
             samp = self.regressor_optimum[i_]
             Pa = np.squeeze(self.model.eval_model_pss(self.phys_optimum[i_], lm, samp))
@@ -3033,48 +3094,49 @@ class SearchResults:
                     Pa = np.log10(Pa)
 
                 if num_modalities==2:
-                    ax1[axloc].imshow(Pa.T, aspect="auto", cmap="summer")
+                    ax.imshow(Pa.T, aspect="auto", cmap="summer")
                 # Set so that, for protein model, the joint distribution of protein and spliced is shown.
                 elif num_modalities==3:
-                    ax1[axloc].imshow(Pa.sum(axis=0).T, aspect="auto", cmap="summer")
+                    ax.imshow(Pa.sum(axis=0).T, aspect="auto", cmap="summer")
                 else:
                     log.error('Joint distribution plot only implemented for 2 or 3 modalities')
                     
-                ax1[axloc].invert_yaxis()
+                ax.invert_yaxis()
 
                 jitter_magn = 0.1
                 jitter = np.random.randn(2, self.n_cells) * jitter_magn
                 if num_modalities==2:
-                    ax1[axloc].scatter(
+                    ax.scatter(
                         *search_data.layers[:2, :, i_] + jitter, c="k", s=1, alpha=0.1)
                 # for protein model, scatter protein and spliced counts.
                 elif num_modalities==3:
-                    ax1[axloc].scatter(
+                    ax.scatter(
                         *search_data.layers[1:, :, i_] + jitter, c="k", s=1, alpha=0.1
                 )
                 if num_modalities==2:
-                    ax1[axloc].set_xlim([-0.5, search_data.M[0, i_] - 1.5])
-                    ax1[axloc].set_ylim([-0.5, search_data.M[1, i_] - 1.5])
+                    ax.set_xlim([-0.5, search_data.M[0, i_] - 1.5])
+                    ax.set_ylim([-0.5, search_data.M[1, i_] - 1.5])
                 elif num_modalities==3:
-                    ax1[axloc].set_xlim([-0.5, search_data.M[1, i_] - 1.5])
-                    ax1[axloc].set_ylim([-0.5, search_data.M[2, i_] - 1.5])
+                    ax.set_xlim([-0.5, search_data.M[1, i_] - 1.5])
+                    ax.set_ylim([-0.5, search_data.M[2, i_] - 1.5])
             else:
-                plot_hist_and_fit(ax1[axloc], search_data, i_, Pa, marg)
+                plot_hist_and_fit(ax, search_data, i_, Pa, marg, modalities=self.modalities)
                 if logscale:
-                    ax1[axloc].set_yscale("log")
+                    ax.set_yscale("log")
             if title:
                 titlestr = self.gene_names[i_]
                 if hasattr(self, "rejected_genes") and self.rejected_genes[i_]:
                     titlestr += " (rej.)"
-                ax1[axloc].set_title(titlestr, fontdict={"fontsize": 9})
+                ax.set_title(titlestr, fontdict={"fontsize": 9})
             if show_axes:
-                if axloc % sz[1] != 0:
-                    ax1[axloc].set_yticks([])
-                if axloc < (sz[0] - 1) * sz[1]:
-                    ax1[axloc].set_xticks([])
+                row, col = divmod(j_, sz[1])
+                if col != 0:
+                    ax.set_yticks([])
+                if row < sz[0] - 1:
+                    ax.set_xticks([])
             else:
-                ax1[axloc].set_xticks([])
-                ax1[axloc].set_yticks([])
+                ax.set_xticks([])
+                ax.set_yticks([])
             j_ += 1
         if show_axes:
             fig1.supxlabel(self.modalities[0 if num_modalities == 2 else 1])
@@ -3082,20 +3144,23 @@ class SearchResults:
         fig1.tight_layout(pad=0.02, rect=[0.05, 0.05, 0.98, 0.98])
 
         if savefig:
-            fig_string = (
-                self.analysis_figure_string + "/gene_distributions_{}.png".format(marg)
-            )
-            plt.savefig(fig_string, dpi=450)
-            log.info("Figure stored to {}.".format(fig_string))
+            figdir = getattr(self, "analysis_figure_string", None)
+            if figdir and os.path.isdir(figdir):
+                fig_string = figdir + "/gene_distributions_{}.png".format(marg)
+                plt.savefig(fig_string, dpi=450)
+                log.info("Figure stored to {}.".format(fig_string))
+            else:
+                log.info("No analysis figure directory (run with save=True to create one); figure not saved.")
 
     # the next two functions are useful for model selection, but are not currently in use.
-    def get_logL(self, search_data, n_cells, EPS=1e-20, offs=0):
+    def get_logL(self, search_data, n_cells=None, EPS=1e-20, offs=0):
         """
         This method calculates the log-likelihood for all genes at the sampling parameter optimum.
 
         Parameters
         ----------
         search_data: a SearchData instance.
+        n_cells: int, optional. Defaults to search_data.n_cells.
         EPS: probability rounding parameter -- anything below this is rounded to EPS.
 
         Output:
@@ -3105,6 +3170,8 @@ class SearchResults:
             "Constitutive", "Bursty", "CIR",
             "Extrinsic", "Delay", "DelayedSplicing",
         }
+        if n_cells is None:
+            n_cells = search_data.n_cells
         model = self.model
         if (
             _HAS_RUST
@@ -3174,21 +3241,23 @@ class SearchResults:
         return np.asarray(f).squeeze()
 
 def get_AIC_mek_means(search_result_list, search_data, AIC_EPS=1e-20, AIC_offs=0):
+    """Per-gene AIC of a meK-Means fit (lower is better).
 
+    Each gene carries one parameter set per surviving cluster, so the penalty
+    is 2 * n_phys_pars * K_final, where K_final = len(search_result_list) is
+    the number of clusters that received cells.  The log-likelihood is the sum
+    over clusters of the gene's log-likelihood on that cluster's cells.  (The
+    paper's whole-model AIC additionally counts K_final - 1 mixing weights,
+    which cannot be attributed to individual genes; see
+    ``mminference.mek_means_aic`` for the whole-model score.)
+    """
     LL = np.zeros(search_result_list[0].n_genes)
-    
     for sr in search_result_list:
+        LL += np.asarray(sr.get_logL(search_data, EPS=AIC_EPS, offs=AIC_offs))
 
-        n_cells = sr.n_cells
-        LL += sr.get_logL(search_data, EPS=AIC_EPS, offs=AIC_offs)
-
-    # Calculate the number of parameters
-    n_params = sr.sp.n_phys_pars
-    
-    # Calculate AIC for each gene
-    AIC = 2 * n_params - 2 * LL
-
-    return AIC
+    n_params = search_result_list[0].sp.n_phys_pars
+    k_final = len(search_result_list)
+    return 2 * n_params * k_final - 2 * LL
 
 
 def parallelize(
@@ -3245,157 +3314,64 @@ def parallelize(
     return x
 
 
+_MARG_ALIASES = {"nascent": "unspliced", "mature": "spliced", "U": "unspliced", "S": "spliced"}
+
+
+def _resolve_marg(marg, layer_names):
+    """Map a marginal name (or legacy alias) onto an index into layer_names."""
+    layer_names = list(layer_names)
+    if marg in layer_names:
+        return layer_names.index(marg)
+    alias = _MARG_ALIASES.get(marg)
+    if alias in layer_names:
+        return layer_names.index(alias)
+    raise ValueError(f"marg={marg!r} is not one of the modalities {layer_names}")
+
+
 def plot_hist_and_fit(
     ax1,
-    monod_adata,
+    search_data,
     i_,
     Pa,
-    marg="nascent",
+    marg="unspliced",
+    modalities=None,
     facecolor=aesthetics["hist_face_color"],
     fitcolor=aesthetics["hist_fit_color"],
     facealpha=aesthetics["hist_face_alpha"],
     linestyle=aesthetics["linestyle"],
 ):
-    """Plots marginal gene count distributions and their fits at the sampling parameter optimum.
+    """Plot one gene's marginal count histogram and its fitted PMF.
 
     Parameters
     ----------
-    ax: matplotlib.axes.Axes
+    ax1: matplotlib.axes.Axes
         axes to plot into.
-    monod_adata: anndata
-        anndata object with the fit data.
+    search_data: SearchData (Rust ``monod_core.SearchData`` or the Python fallback)
+        holds ``layers`` (n_layers x n_cells x n_genes) and ``M`` (n_layers x n_genes).
     i_: int
         gene index to plot.
     Pa: float np.ndarray
-        univariate probability mass function, typically computed through CMEModel.
+        univariate PMF for this gene and modality, typically from CMEModel.eval_model_pss
+        with the other modalities' limits set to 1.
     marg: str, optional
-        which marginal to plot, typically 'nascent' or 'mature'.
-    facecolor: str or tuple, optional
-        histogram face color in a matplotlib-compatible format.
-    fitcolor: str or tuple, optional
-        model fit line color in a matplotlib-compatible format.
-    facealpha: float, optional
-        histogram face alpha.
-    linestyle: str, optional
-        model fit line style in a matplotlib-compatible format.
+        modality to plot ('unspliced', 'spliced', 'protein', ...; 'nascent'/'mature' accepted).
+    modalities: list of str, optional
+        modality names in layer order; defaults to ``search_data.layer_names``.
+    facecolor, fitcolor, facealpha, linestyle: matplotlib styling.
     """
-
-    # Identify layer index of the layer we want to gain the marginal of.
-    layer_names = [i for i in monod_adata.layers.keys()]
-    for i in range(len(layer_names)):
-        if marg==layer_names[i]:
-            lind = i
-    # Otherwise use first modality.
-    else:
-        lind = 0
-    marg_name = layer_names[lind]
-        
+    layer_names = modalities if modalities is not None else getattr(search_data, "layer_names", None)
+    if layer_names is None:
+        raise ValueError("plot_hist_and_fit needs modality names: pass modalities=model.model_modalities")
+    lind = _resolve_marg(marg, layer_names)
+    counts = np.asarray(search_data.layers[lind])[:, i_]
+    M = int(search_data.M[lind, i_])
+    Pa = np.asarray(Pa).ravel()
     ax1.hist(
-        monod_adata.layers[marg_name][:, i_],
-        bins=np.arange(monod_adata.uns['M'][lind, i_]) - 0.5,
+        counts,
+        bins=np.arange(M + 1) - 0.5,
         density=True,
         color=facecolor,
         alpha=facealpha,
     )
-    ax1.plot(np.arange(sd.M[lind, i_]), Pa, color=fitcolor, linestyle=linestyle)
-    ax1.set_xlim([-0.5, sd.layers[lind, i_].max() + 2.5])
-
-
-# Differential expression analysis between mek-means clusters.
-def make_fcs(sr,sd,clus1=0,clus2=1,gf_rej=False,thrpars=2,thrmean=1,outlier_de=False,nuc=False,correct_off=False):
-    '''
-    Utilize different metrics to find fold-changes (FCs) between cluster parameters
-
-    sr: list of SearchResults objects from meK-Means runs
-    sd: SearchData object that corresponds to full, input data
-    clus1: cluster 1 (to compare FCS of cluster 1/cluster 2 )
-    clus2: cluster 2 (to compare FCS of cluster 1/cluster 2 )
-    gf_rej: whether to use boolean list of rejected genes from both clusters
-    thrpars: FC threshold value (to call DE-theta genes)
-    thrmean: Mean S expression threshold value, for genes to consider
-    outlier_de: Use iterative outlier calling procedure to assign DE-theta genes (see Monod https://github.com/pachterlab/monod_examples/blob/main/Monod_demo.ipynb)
-    nuc: is this nuclear RNA data
-    correct_off: correct offset between cluster parameters (through ODR)
-    '''
-
-    all_filt_fcs = pd.DataFrame()
-    fcs,types,which_pair,highFC,spliceFC,g_names,out_de = ([] for i in range(7))
-
-    ind1 = [i for i in range(len(sr)) if clus1 == sr[i].assigns][0]
-    ind2 = [i for i in range(len(sr)) if clus2 == sr[i].assigns][0]
-
-    sr1 = sr[ind1]
-    sr2 = sr[ind2]
-    if correct_off:
-        param_names = sr1.model.get_log_name_str()
-        offsets = []
-        par_vals = np.copy(sr2.param_estimates)
-        for k in range(3):
-            m1 = sr1.param_estimates[0,:,k]
-            m2 = sr2.param_estimates[0,:,k]
-            offset = diffexp_fpi(m1,m2,param_names[k],viz=False)[1]
-            par_vals[0,:,k] -= offset
-
-        fc_par = (sr1.param_estimates-par_vals)/np.log10(2)
-    else:
-        fc_par = (sr1.param_estimates-sr2.param_estimates)/np.log10(2)  #Get FCs between cluster params
-
-    # print('fc_par.shape: ',fc_par.shape)
-    if nuc:
-        fc_s_par = np.log2(sd.layers[0][:,sr1.filt].mean(1)/sd.layers[0][:,sr2.filt].mean(1))
-    else:
-        fc_s_par = np.log2(sd.layers[1][:,sr1.filt].mean(1)/sd.layers[1][:,sr2.filt].mean(1)) #Get spliced FCs
-
-    # print('fc_s_par.shape: ',fc_s_par.shape)
-
-    if outlier_de:
-        dr_analysis = monod.analysis.diffexp_pars(sr1,sr2,viz=True,modeltype='id',use_sigma=True)
-        par_bool_de = dr_analysis[1].T
-
-    parnames = ('b','beta','gamma')
-
-
-  #-----is parameter FC significant -----
-    if gf_rej is False:
-        gf_rej = [True]*sd.n_genes
-    else:
-        gf_rej = (~sr1.rejected_genes) & (~sr2.rejected_genes)
-
-    for n in range(len(parnames)):
-        #Boolean for if large param FC and not rejected gene (with minimum expression)
-        if nuc:
-            gf_highnoise = (np.abs(fc_par[0,:,n])>thrpars)  \
-                & ((sd.layers[0][:,sr1.filt].mean(1)>thrmean) | (sd.layers[0][:,sr2.filt].mean(1)>thrmean)) \
-                & gf_rej
-        else:
-            gf_highnoise = (np.abs(fc_par[0,:,n])>thrpars)  \
-                & ((sd.layers[1][:,sr1.filt].mean(1)>thrmean) | (sd.layers[1][:,sr2.filt].mean(1)>thrmean)) \
-                & gf_rej
-
-        #Boolean for FC (above) but no FC detected at S-level
-        gf_highnoise_meanS = gf_highnoise & (np.abs(fc_s_par)<1) & gf_rej
-
-        #Boolean for FC (above)
-        gf_onlyhigh = gf_highnoise & gf_rej
-
-        #For dataframe
-        fcs += list(fc_par[0,gf_rej,n])
-        g_names += list(sr1.gene_names[gf_rej])
-        which_pair += [[sr1.assigns,sr2.assigns]]*np.sum(gf_rej)
-        highFC += list(gf_onlyhigh[gf_rej])
-        spliceFC += list(gf_highnoise_meanS[gf_rej])
-        types += [parnames[n]]*np.sum(gf_rej)
-        if outlier_de:
-            out_de += list(par_bool_de[gf_rej,n])
-
-    if outlier_de:
-        all_filt_fcs['deTheta_outlier'] = out_de
-
-    all_filt_fcs['log2FC'] = fcs
-    all_filt_fcs['gene'] = g_names
-    all_filt_fcs['cluster_pair'] = which_pair
-    all_filt_fcs['deTheta_FC'] = highFC
-    all_filt_fcs['deTheta_noDeMuS'] = spliceFC
-    all_filt_fcs['param'] = types
-
-    return all_filt_fcs
+    ax1.plot(np.arange(min(M, Pa.size)), Pa[:M], color=fitcolor, linestyle=linestyle)
+    ax1.set_xlim([-0.5, counts.max() + 2.5])

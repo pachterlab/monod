@@ -13,9 +13,9 @@ import unittest.mock
 import numpy as np
 import pytest
 
-import cme_toolbox as _cme_toolbox_module
+import monod.cme_toolbox as _cme_toolbox_module
 from conftest import check_snapshot
-from cme_toolbox import CMEModel
+from monod.cme_toolbox import CMEModel
 
 
 # ---------------------------------------------------------------------------

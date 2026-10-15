@@ -33,3 +33,6 @@ example_h5ad/processed_pbmc_10k_raw.h5ad
 
 # Snapshot tied to large data
 tests/snapshots/gaba_bursty_poisson_params.npy
+
+# Reference papers (not distributed with the code)
+*.pdf

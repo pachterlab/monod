@@ -1,8 +1,8 @@
 """
 Pytest configuration and shared utilities for monod tests.
 
-Adds src/monod to sys.path so that the bare-import style used in the source
-files (e.g. `from extract_data import log`) works without an installed package.
+Adds src/ to sys.path so that `import monod.<module>` works from a checkout
+without `pip install -e .` (an installed package takes precedence if present).
 
 Snapshot helper
 ---------------
@@ -25,9 +25,9 @@ import pytest
 # Path setup
 # ---------------------------------------------------------------------------
 
-_SRC_MONOD = os.path.join(os.path.dirname(__file__), "..", "src", "monod")
-if _SRC_MONOD not in sys.path:
-    sys.path.insert(0, os.path.abspath(_SRC_MONOD))
+_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
 # ---------------------------------------------------------------------------
 # Snapshot directory

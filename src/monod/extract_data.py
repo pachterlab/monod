@@ -10,7 +10,6 @@ import anndata
 import numpy as np
 import matplotlib.pyplot as plt
 import time
-import loompy as lp  # will be necessary later, probably
 import anndata as ad
 import os
 import collections

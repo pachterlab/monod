@@ -12,11 +12,11 @@ import gc, sys, os, time, warnings
 import numpy as np
 warnings.filterwarnings('ignore')
 
-sys.path.insert(0, os.path.join(os.path.abspath('.'), 'src', 'monod'))
+sys.path.insert(0, os.path.join(os.path.abspath('.'), 'src'))
 
 import monod_core as _mc
-from cme_toolbox import CMEModel
-from inference import InferenceParameters
+from monod.cme_toolbox import CMEModel
+from monod.inference import InferenceParameters
 
 H5AD_PATH = 'example_h5ad/processed_pbmc_10k_raw.h5ad'
 MODEL     = CMEModel('Bursty', 'Poisson')

@@ -5,10 +5,12 @@ import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
 from scipy.special import logsumexp, softmax
-from extract_data import make_dir, log, _build_sampling_grid
-from cme_toolbox import CMEModel  # may be unnecessary
-from inference import (
+from .extract_data import make_dir, log, _build_sampling_grid
+from .cme_toolbox import CMEModel  # may be unnecessary
+from .inference import (
     _normalize_use_lengths,
+    _validate_bounds,
+    plot_hist_and_fit,
     GradientInference as _BaseGradientInference,
     InferenceParameters as _BaseInferenceParameters,
     GridPointResults as _BaseGridPointResults,
@@ -23,7 +25,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 # lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
 import warnings
-from plot_aesthetics import aesthetics
+from .plot_aesthetics import aesthetics
 
 try:
     import monod_core as _mc
@@ -115,7 +117,11 @@ class MEKMeansParameters(_BaseInferenceParameters):
         gridsize=None,
         poisson_average_log_length=5,
         k=10,
-        epochs=100
+        epochs=100,
+        em_tol=1e-4,
+        em_patience=2,
+        random_state=0,
+        init_modality="sum",
     ):
         """Initialize the InferenceParameters instance.
 
@@ -147,6 +153,32 @@ class MEKMeansParameters(_BaseInferenceParameters):
             "num_restarts" defines how many attempts should be made.
         run_meta: str, optional
             any additional metadata to append to the run directory name.
+        k: int, optional
+            number of mixture components.
+        epochs: int, optional
+            maximum number of EM epochs.
+        em_tol: float, optional
+            relative change in the per-cell log-likelihood lower bound below which an
+            epoch counts as stalled; EM stops early after ``em_patience`` consecutive
+            stalled epochs. Set to 0 to always run all ``epochs``.
+        em_patience: int, optional
+            number of consecutive stalled epochs required to stop early.
+        random_state: int or None, optional
+            seed for the posterior initialisation (k-means and the uniform
+            perturbation, on both the Rust and Python paths). The same seed and
+            data give the same clustering; None draws a fresh seed each run.
+        init_modality: str, optional
+            count matrix the initial k-means runs on, after per-cell scaling to
+            1e4 and log1p. "sum" (default) uses the sum of the first two
+            modalities (U + S); a modality name such as "spliced" uses that layer
+            alone, which is the setting described in the meK-Means paper.
+
+        Notes
+        -----
+        Early stopping (``em_tol`` > 0) is an addition to the published
+        algorithm, which runs a fixed number of epochs and reports the Q
+        function and KLD per epoch. Pass ``em_tol=0`` to reproduce that
+        behaviour exactly.
         """
         # Set biophysical parameter values to defaults.
         if phys_lb is None:
@@ -178,6 +210,7 @@ class MEKMeansParameters(_BaseInferenceParameters):
             samp_ub = [0, 0]
             gridsize = [1, 1]
 
+        _validate_bounds(model, phys_lb, phys_ub, samp_lb, samp_ub, gridsize)
         self.samp_lb = np.array(samp_lb)
         self.samp_ub = np.array(samp_ub)
         self.gridsize = gridsize
@@ -189,6 +222,14 @@ class MEKMeansParameters(_BaseInferenceParameters):
 
         self.k = k
         self.epochs = epochs
+        self.em_tol = float(em_tol)
+        self.em_patience = int(em_patience)
+        self.random_state = random_state
+        if init_modality != "sum" and init_modality not in model.model_modalities:
+            raise ValueError(
+                f"init_modality must be 'sum' or one of {list(model.model_modalities)}; got {init_modality!r}"
+            )
+        self.init_modality = init_modality
 
         self.n_phys_pars = model.get_num_params()
         self.n_samp_pars = len(self.samp_ub)  # this will always be 2 for now
@@ -405,6 +446,12 @@ class GradientInference(_BaseGradientInference):
         super().__init__(global_parameters, model, search_data, point_index)
         self.k = k
         self.epochs = epochs
+        self.em_tol = float(getattr(global_parameters, "em_tol", 1e-4))
+        self.em_patience = int(getattr(global_parameters, "em_patience", 2))
+        self.random_state = getattr(global_parameters, "random_state", 0)
+        self.init_modality = getattr(global_parameters, "init_modality", "sum")
+        self.init_modalities = list(model.model_modalities)
+        self.n_epochs_run = 0
         self.weights = np.ones(self.k) / self.k
         self.theta = {}
 
@@ -461,26 +508,52 @@ class GradientInference(_BaseGradientInference):
         """
         n = search_data.n_cells
 
+        # One seed drives k-means and the uniform perturbation on both paths,
+        # so a rerun with the same data and random_state reproduces the
+        # initial partition.  (The 0.9-plus-uniform scheme itself is a
+        # deliberate perturbation of the k-means labels.)
+        seed = getattr(self, "random_state", 0)
+        if seed is None:
+            seed = int(np.random.SeedSequence().generate_state(1)[0])
+        seed = int(seed) & 0xFFFFFFFF
+        self._init_seed_used = seed
+
+        # Which counts k-means sees: U + S (default) or a single modality
+        # ("spliced" reproduces the paper's description).  The Rust initializer
+        # always sums its first two layers, so a single modality is passed as
+        # [layer, zeros]; after per-cell scaling to 1e4 the result is identical.
+        init_modality = getattr(self, "init_modality", "sum")
+        layers_arr = np.asarray(search_data.layers)
+        if init_modality == "sum":
+            init_layers = layers_arr[:2]
+        else:
+            modalities = getattr(self, "init_modalities", None)
+            if not modalities or init_modality not in modalities:
+                raise ValueError(f"init_modality={init_modality!r} is not one of the modalities {modalities}")
+            lind = modalities.index(init_modality)
+            init_layers = np.stack([layers_arr[lind], np.zeros_like(layers_arr[lind])])
+
         # Rust fast-path: log1p-normalised KMeans + biased Q initialisation.
         if _HAS_KMEANS and isinstance(search_data, _mc.SearchData):
-            layers_3d = np.ascontiguousarray(search_data.layers, dtype=np.int64)
-            Q, _ = _mc.initialize_q_kmeans(layers_3d, self.k, seed=0)
+            layers_3d = np.ascontiguousarray(init_layers, dtype=np.int64)
+            Q, _ = _mc.initialize_q_kmeans(layers_3d, self.k, seed=seed)
             Q = Q * self.weights[None, :]
             Q = Q / Q.sum(axis=-1, keepdims=True)
             return Q
 
-        # Python fallback: U+S KMeans via sklearn.
-        S_total = search_data.layers[0,:,:] + search_data.layers[1,:,:]
+        # Python fallback: KMeans via sklearn on the chosen counts.
+        S_total = init_layers[0].astype(float) + init_layers[1].astype(float)
         tots = np.sum(S_total,axis=1)
         divids = (1e4/tots)[:,None]
         S_total = S_total*divids
         S_total = np.log1p(S_total)
         S_total[np.isnan(S_total)] = 0
 
-        kmeans = KMeans(n_clusters=self.k, random_state=0).fit(S_total)
+        kmeans = KMeans(n_clusters=self.k, random_state=seed).fit(S_total)
         labs = kmeans.labels_
 
-        Q=np.random.uniform(0,1,size=(n, self.k))
+        rng = np.random.default_rng(seed)
+        Q = rng.uniform(0, 1, size=(n, self.k))
         for ind in range(self.k):
             inds = labs==ind
             Q[inds,ind] = 0.9
@@ -670,6 +743,14 @@ class GradientInference(_BaseGradientInference):
         n_cells = search_data.n_cells
         n_genes = search_data.n_genes
         ks_present = sorted(self.theta.keys())
+        if not ks_present:
+            raise ValueError("E-step called before any cluster has fitted parameters.")
+        missing = [k for k in range(self.k) if k not in self.theta]
+        if missing:
+            log.warning(
+                "E-step: clusters %s have no fitted parameters (no cells were assigned to them); "
+                "their posterior is set to 0 for this epoch.", missing,
+            )
 
         # Rust CPU fast-path: all PSS + accumulate + softmax in one Rust call (rayon)
         if (
@@ -709,8 +790,11 @@ class GradientInference(_BaseGradientInference):
                 Q[:, k] = np.array(Q_sub)[:, i]
             return Q, lower_bound, q_func
 
-        # Python fallback
-        logL = np.zeros((n_cells, self.k))
+        # Python fallback.  Columns of clusters without a fitted theta stay at
+        # -inf (zero posterior), matching the Rust E-step; a 0 there would
+        # dominate the real (large negative) log-likelihoods and pull every
+        # cell into the empty cluster.
+        logL = np.full((n_cells, self.k), -np.inf)
         for k in ks_present:
             params, klds, obj_fun, d_time = self.theta[k]
             logL_k = np.zeros(n_cells)
@@ -727,7 +811,7 @@ class GradientInference(_BaseGradientInference):
         logL += np.log(self.weights)[None,:]
         Q = softmax(logL, axis=1)
         lower_bound = np.mean(logsumexp(a=logL, axis=1))
-        q_func = np.sum(Q*logL)
+        q_func = float(np.sum(np.where(Q > 0, Q * logL, 0.0)))   # 0 * -inf -> 0
         return Q, lower_bound, q_func
     
     def _fit(self,model,search_data,EPS=1e-15,num_cores=1): 
@@ -747,9 +831,18 @@ class GradientInference(_BaseGradientInference):
         lower_bound: float
             log-likelihood lower bound
         all_qs: list
-            1 x epochs, list of Q(theta|theta_t) values at each epoch
+            one Q(theta|theta_t) value per epoch actually run
         all_klds: list
-            1 x epochs, list of cellxk KLD matrices at each epoch
+            one n_genes x k KLD matrix per epoch actually run (NaN for clusters
+            that had no cells in that epoch)
+
+        Notes
+        -----
+        EM stops early when the lower bound changes by less than ``em_tol``
+        (relative) for ``em_patience`` consecutive epochs.  After the loop a
+        final E-step is run so that the returned Q and lower bound are
+        evaluated under the final parameters.  ``self.n_epochs_run`` records
+        the number of M-steps performed inside the loop.
 
         """
 
@@ -759,25 +852,47 @@ class GradientInference(_BaseGradientInference):
 
         if self.epochs < 1:
             raise ValueError("No. of epochs must be an int > 0")
-        else:
-            for i in range(self.epochs):
-                log.info("EM Epoch "+str(i+1)+'/'+str(self.epochs)+': ')
 
-                Q, lower_bound, q_func = self._e_step(model,search_data) 
-                k_dict = self._part_search_data(search_data,Q)
+        prev_lb = None
+        stalled = 0
+        n_run = 0
+        for i in range(self.epochs):
+            log.info("EM Epoch "+str(i+1)+'/'+str(self.epochs)+': ')
 
-                self._m_step(model,k_dict,Q,num_cores=num_cores)
-                kl = np.zeros((search_data.n_genes,self.k))
-                for k in range(self.k):
+            Q, lower_bound, q_func = self._e_step(model,search_data)
+            k_dict = self._part_search_data(search_data,Q)
+
+            self._m_step(model,k_dict,Q,num_cores=num_cores)
+            kl = np.full((search_data.n_genes,self.k), np.nan)
+            for k in range(self.k):
+                if k in self.theta:
                     params, klds, obj_fun, d_time = self.theta[k]
                     kl[:,k] = klds
-                   
-                all_klds += [kl]
-                all_qs += [q_func]
 
-            final_k_dict = self._part_search_data(search_data,Q)
-            
-            return Q, lower_bound, all_qs, all_klds
+            all_klds += [kl]
+            all_qs += [q_func]
+            n_run = i + 1
+
+            # Convergence: stop once the lower bound has stopped moving for
+            # em_patience consecutive epochs (em_tol=0 disables early stopping).
+            if prev_lb is not None and self.em_tol > 0 and np.isfinite(lower_bound) and np.isfinite(prev_lb):
+                if abs(lower_bound - prev_lb) <= self.em_tol * max(1.0, abs(prev_lb)):
+                    stalled += 1
+                else:
+                    stalled = 0
+                if stalled >= self.em_patience:
+                    log.info(
+                        "EM stopped after %d/%d epochs: lower bound changed by less than em_tol=%g "
+                        "for %d consecutive epochs.", n_run, self.epochs, self.em_tol, self.em_patience,
+                    )
+                    break
+            prev_lb = lower_bound
+
+        # One more E-step so the reported posteriors, assignments and lower
+        # bound correspond to the final theta rather than the one before it.
+        Q, lower_bound, q_func = self._e_step(model, search_data)
+        self.n_epochs_run = n_run
+        return Q, lower_bound, all_qs, all_klds
 
     # optimize_gene and iterate_over_genes are inherited from inference.GradientInference.
 
@@ -812,7 +927,7 @@ class GradientInference(_BaseGradientInference):
         assigns = np.argmax(Q, axis=1)
 
         num_comp = len(np.unique(assigns))
-        aic = lower_bound - (self.n_phys_pars * search_data.n_genes * num_comp + num_comp - 1)/search_data.n_cells
+        aic = mek_means_aic(Q, lower_bound, self.n_phys_pars, search_data.n_genes, search_data.n_cells)
 
 
         return GridPointResults(
@@ -830,6 +945,37 @@ class GradientInference(_BaseGradientInference):
 ########################
 ## Helper functions
 ########################
+
+def mek_means_aic(Q, lower_bound, n_phys_pars, n_genes, n_cells):
+    """Per-cell AIC of a fitted meK-Means mixture, as defined in the paper.
+
+        AIC = -log p(X, Z; theta) / N + K_param / N,
+        K_param = n_phys_pars * G * K_final + (K_final - 1),
+
+    where Z is the hard (argmax) assignment and K_final the number of clusters
+    that received at least one cell.  Lower is better.
+
+    The joint log-likelihood at the hard assignment is recovered from the
+    E-step outputs without a second pass: for each cell the log-likelihood of
+    its assigned cluster equals the log-marginal (``logsumexp`` over clusters)
+    plus the log of its maximum posterior, and ``lower_bound`` is the mean
+    log-marginal over cells.
+
+    Parameters
+    ----------
+    Q: np.ndarray, (n_cells, k)
+        posterior p(z=k|x) from the final E-step (rows sum to 1).
+    lower_bound: float
+        mean over cells of logsumexp_k(log p(x|theta_k) + log pi_k).
+    n_phys_pars, n_genes, n_cells: int
+    """
+    Q = np.asarray(Q, dtype=float)
+    assigns = np.argmax(Q, axis=1)
+    k_final = len(np.unique(assigns))
+    log_joint_per_cell = lower_bound + np.mean(np.log(np.max(Q, axis=1)))
+    k_param = n_phys_pars * n_genes * k_final + (k_final - 1)
+    return float(-log_joint_per_cell + k_param / n_cells)
+
 
 def make_histogram(layers, layer_names, hist_type, M):
     """
@@ -947,7 +1093,8 @@ class GridPointResults(_BaseGridPointResults):
     weights: np.ndarray
         weights for mixture components (k,)
     aic: float
-        final AIC statistic for model fit
+        per-cell AIC of the fitted mixture, as defined in the meK-Means paper
+        (lower is better); see ``mek_means_aic``.
     assigns: np.ndarray
         final k components assignments for each cell (n_cells,)
     all_qs: float list
@@ -1030,7 +1177,8 @@ class SearchResults(_BaseSearchResults):
     weights: float 
         weight of mixture component for assigned cluster (k)
     aic: float
-        negative AIC score for the final model fit (over all cells)
+        per-cell AIC of the fitted mixture, as defined in the meK-Means paper
+        (lower is better); see ``mek_means_aic``.
     assigns: int
         assigned cluster k
     all_qs: float np.ndarray
@@ -1528,7 +1676,7 @@ class SearchResults(_BaseSearchResults):
                 ax1[axloc].set_xlim([-0.5, search_data.M[0, i_] - 1.5])
                 ax1[axloc].set_ylim([-0.5, search_data.M[1, i_] - 1.5])
             else:
-                plot_hist_and_fit(ax1[axloc], search_data, i_, Pa, marg)
+                plot_hist_and_fit(ax1[axloc], search_data, i_, Pa, marg, modalities=self.model.model_modalities)
                 if logscale:
                     ax1[axloc].set_yscale("log")
             if title:
@@ -1643,58 +1791,6 @@ def parallelize(
         pool.terminate()
         pool.join()
     return x
-
-
-def plot_hist_and_fit(
-    ax1,
-    sd,
-    i_,
-    Pa,
-    marg="nascent",
-    facecolor=aesthetics["hist_face_color"],
-    fitcolor=aesthetics["hist_fit_color"],
-    facealpha=aesthetics["hist_face_alpha"],
-    linestyle=aesthetics["linestyle"],
-):
-    """Plots marginal gene count distributions and their fits at the sampling parameter optimum.
-
-    Parameters
-    ----------
-    ax: matplotlib.axes.Axes
-        axes to plot into.
-    sd: monod.extract_data.SearchData
-        SearchData object with the fit data.
-    i_: int
-        gene index to plot.
-    Pa: float np.ndarray
-        univariate probability mass function, typically computed through CMEModel.
-    marg: str, optional
-        which marginal to plot, typically 'nascent' or 'mature'.
-    facecolor: str or tuple, optional
-        histogram face color in a matplotlib-compatible format.
-    fitcolor: str or tuple, optional
-        model fit line color in a matplotlib-compatible format.
-    facealpha: float, optional
-        histogram face alpha.
-    linestyle: str, optional
-        model fit line style in a matplotlib-compatible format.
-    """
-
-    if marg == "nascent":
-        lind = 0
-    elif marg == "mature":
-        lind = 1
-    elif marg == "ambiguous":
-        lind = 2
-    ax1.hist(
-        sd.layers[lind, i_],
-        bins=np.arange(sd.M[lind, i_]) - 0.5,
-        density=True,
-        color=facecolor,
-        alpha=facealpha,
-    )
-    ax1.plot(np.arange(sd.M[lind, i_]), Pa, color=fitcolor, linestyle=linestyle)
-    ax1.set_xlim([-0.5, sd.layers[lind, i_].max() + 2.5])
 
 
 # Use class to make inference faster.

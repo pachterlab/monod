@@ -22,9 +22,6 @@ import pickle
 
 import numpy as np
 import pytest
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "monod"))
-
 try:
     import monod_core as _mc
     _HAS_RUST = True
@@ -349,9 +346,9 @@ class TestEndToEnd:
         return ad.read_h5ad(EXAMPLE_PATH)
 
     def test_searchdata_from_adata_returns_rust_type(self, adata):
-        from extract_data import extract_data
-        from inference import searchdata_from_adata
-        from cme_toolbox import CMEModel
+        from monod.extract_data import extract_data
+        from monod.inference import searchdata_from_adata
+        from monod.cme_toolbox import CMEModel
         model = CMEModel("Bursty", "None")
         processed = extract_data(adata, model, dataset_name="test_sd",
                                  n_genes=1, viz=False, hist_type="unique")
@@ -360,9 +357,9 @@ class TestEndToEnd:
             f"Expected _mc.SearchData, got {type(sd)}"
 
     def test_searchdata_attributes_consistent(self, adata):
-        from extract_data import extract_data
-        from inference import searchdata_from_adata
-        from cme_toolbox import CMEModel
+        from monod.extract_data import extract_data
+        from monod.inference import searchdata_from_adata
+        from monod.cme_toolbox import CMEModel
         model = CMEModel("Bursty", "None")
         processed = extract_data(adata, model, dataset_name="test_sd2",
                                  n_genes=1, viz=False, hist_type="unique")
@@ -380,9 +377,9 @@ class TestEndToEnd:
 
     def test_moments_match_adata_var(self, adata):
         """Rust moments must match the MOM_* columns written to adata.var."""
-        from extract_data import extract_data
-        from inference import searchdata_from_adata
-        from cme_toolbox import CMEModel
+        from monod.extract_data import extract_data
+        from monod.inference import searchdata_from_adata
+        from monod.cme_toolbox import CMEModel
         model = CMEModel("Bursty", "None")
         processed = extract_data(adata, model, dataset_name="test_sd3",
                                  n_genes=1, viz=False, hist_type="unique")

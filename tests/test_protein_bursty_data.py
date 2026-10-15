@@ -29,11 +29,8 @@ import pytest
 import anndata as ad
 
 from conftest import check_snapshot
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "monod"))
-
-from cme_toolbox import CMEModel
-from extract_data import extract_data, _uns_unpack
+from monod.cme_toolbox import CMEModel
+from monod.extract_data import extract_data, _uns_unpack
 
 try:
     import monod_core as _mc

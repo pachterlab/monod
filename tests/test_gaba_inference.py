@@ -30,14 +30,11 @@ matplotlib.use("Agg")
 import numpy as np
 import pytest
 import anndata as ad
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "monod"))
-
-import cme_toolbox as _cme_toolbox_module
+import monod.cme_toolbox as _cme_toolbox_module
 from conftest import check_snapshot
-from cme_toolbox import CMEModel
-from extract_data import extract_data
-from inference import (
+from monod.cme_toolbox import CMEModel
+from monod.extract_data import extract_data
+from monod.inference import (
     InferenceParameters,
     searchdata_from_adata,
 )

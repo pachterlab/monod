@@ -30,9 +30,6 @@ import sys
 
 import numpy as np
 import pytest
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "monod"))
-
 try:
     import monod_core as _mc
     _HAS_RUST = True
@@ -286,7 +283,7 @@ class TestOptimizeGenes2dAmbSd:
 
     def _kld_at_params(self, x, limits, coords, freqs, bio_model, amb_model):
         """KLD using eval_model_pss_2d with amb support."""
-        import cme_toolbox as ct
+        import monod.cme_toolbox as ct
         n_amb = 1 if amb_model == "Equal" else 2
         n_bio = len(x) - n_amb
         pss_flat = _mc.eval_model_pss_2d(
