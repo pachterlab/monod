@@ -7,10 +7,8 @@ import pytest
 import monod.cme_toolbox as ct
 from monod.cme_toolbox import CMEModel
 
-try:
-    import monod_core as _mc
-except ImportError:  # pragma: no cover
-    _mc = None
+from monod._core import _mc  # None unless the compiled extension is really installed
+_HAS_RUST = _mc is not None
 
 needs_rust = pytest.mark.skipif(_mc is None, reason="monod_core not installed")
 P = [0.3, 0.0, -0.1]

@@ -7,10 +7,7 @@ import scipy
 from scipy import optimize, stats
 from .extract_data import make_dir, log, extract_data, make_histogram, _uns_unpack, _build_sampling_grid, model_from_uns
 from .cme_toolbox import CMEModel, _HAS_RUST  # may be unnecessary
-try:
-    import monod_core as _mc
-except ImportError:
-    _mc = None
+from ._core import _mc          # None when the compiled extension is not installed
 
 _LBFGSB_RUST_MODELS_2D = {"Constitutive", "Bursty", "CIR", "Extrinsic", "Delay", "DelayedSplicing"}
 

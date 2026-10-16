@@ -53,11 +53,8 @@ def _build_mesh(limits_tuple, mx_tuple):
 # 2-modality models with seq_model="None" and amb_model="None" is delegated
 # to the Rust implementation (same results, faster computation).
 # ---------------------------------------------------------------------------
-try:
-    import monod_core as _mc
-    _HAS_RUST = True
-except ImportError:
-    _HAS_RUST = False
+from ._core import _mc          # None when the compiled extension is not installed
+_HAS_RUST = _mc is not None
 
 # ---------------------------------------------------------------------------
 # Optional GPU backend (PyTorch).  When a CUDA GPU with float64 support is

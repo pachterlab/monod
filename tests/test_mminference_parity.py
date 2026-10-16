@@ -12,12 +12,8 @@ import sys
 
 import numpy as np
 import pytest
-try:
-    import monod_core as _mc
-    _HAS_RUST = True
-except ImportError:
-    _mc = None
-    _HAS_RUST = False
+from monod._core import _mc  # None unless the compiled extension is really installed
+_HAS_RUST = _mc is not None
 
 _HAS_KMEANS = _HAS_RUST and hasattr(_mc, "initialize_q_kmeans")
 

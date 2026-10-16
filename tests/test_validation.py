@@ -13,10 +13,7 @@ from monod.cme_toolbox import CMEModel
 from monod.inference import InferenceParameters
 import monod.mminference as mminference
 
-try:
-    import monod_core as _mc
-except ImportError:  # pragma: no cover
-    _mc = None
+from monod._core import _mc  # None unless the compiled extension is really installed
 
 needs_rust = pytest.mark.skipif(_mc is None, reason="monod_core not installed")
 

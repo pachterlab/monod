@@ -105,3 +105,14 @@ class TestGradientInferenceLengthFallback:
         ip = InferenceParameters("ds", m, use_lengths="unspliced", gridsize=[1, 1])
         with pytest.raises(ValueError, match="no gene lengths"):
             GradientInference(ip, m, sd, 0)
+
+
+def test_core_loader_rejects_namespace_lookalike(monkeypatch):
+    """A bare `monod_core/` source dir imports as an empty namespace package; the loader must say no."""
+    import sys, types
+    from monod import _core
+    monkeypatch.setitem(sys.modules, "monod_core", types.ModuleType("monod_core"))
+    assert _core.load() is None
+    monkeypatch.delitem(sys.modules, "monod_core")
+    monkeypatch.setitem(sys.modules, "monod_core", None)   # makes `import monod_core` raise ImportError
+    assert _core.load() is None

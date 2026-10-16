@@ -36,3 +36,8 @@ tests/snapshots/gaba_bursty_poisson_params.npy
 
 # Reference papers (not distributed with the code)
 *.pdf
+
+# editor settings
+.vscode/
+# scratch images
+example/

@@ -28,12 +28,13 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           sudo apt-get update && sudo apt-get install -y libhdf5-dev pkg-config
-      - name: Build monod_core
+      - name: Build and install monod_core
         if: matrix.rust
-        working-directory: monod_core
+        # pip drives maturin as a PEP 517 backend; unlike `maturin develop` this does
+        # not require a virtualenv, which the runner's setup-python interpreter is not.
         run: |
-          python -m pip install maturin patchelf
-          maturin develop --release
+          python -m pip install -v ./monod_core
+          python -c "import monod_core; print('monod_core OK')"
       - name: Run the test suite
         env:
           CUDA_VISIBLE_DEVICES: ""

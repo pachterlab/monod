@@ -34,10 +34,8 @@ from conftest import check_snapshot
 from monod.cme_toolbox import CMEModel
 from monod.extract_data import extract_data, make_histogram, model_from_uns
 
-try:
-    import monod_core as _mc
-except ImportError:
-    _mc = None
+from monod._core import _mc  # None unless the compiled extension is really installed
+_HAS_RUST = _mc is not None
 
 # ---------------------------------------------------------------------------
 # Constants

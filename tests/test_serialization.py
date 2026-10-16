@@ -28,10 +28,7 @@ from monod.inference import (
     searchdata_from_adata,
 )
 
-try:
-    import monod_core as _mc
-except ImportError:  # pragma: no cover
-    _mc = None
+from monod._core import _mc  # None unless the compiled extension is really installed
 
 _HERE = os.path.dirname(__file__)
 EXAMPLE = os.path.join(_HERE, "..", "example_h5ad", "example_adata.h5ad")

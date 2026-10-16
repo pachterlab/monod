@@ -28,12 +28,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 import warnings
 from .plot_aesthetics import aesthetics
 
-try:
-    import monod_core as _mc
-    _HAS_RUST = True
-except ImportError:
-    _mc = None
-    _HAS_RUST = False
+from ._core import _mc          # None when the compiled extension is not installed
+_HAS_RUST = _mc is not None
 
 _RUST_MODELS_2D = {"Constitutive", "Bursty", "CIR", "Extrinsic", "Delay", "DelayedSplicing"}
 

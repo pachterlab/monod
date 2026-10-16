@@ -30,11 +30,8 @@ import sys
 
 import numpy as np
 import pytest
-try:
-    import monod_core as _mc
-    _HAS_RUST = True
-except ImportError:
-    _HAS_RUST = False
+from monod._core import _mc  # None unless the compiled extension is really installed
+_HAS_RUST = _mc is not None
 
 pytestmark = pytest.mark.skipif(not _HAS_RUST, reason="monod_core not available")
 

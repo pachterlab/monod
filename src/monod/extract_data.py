@@ -19,12 +19,8 @@ from scipy import sparse
 import pandas as pd
 code_ver_global = "029"  # bumping up version April 2024
 
-try:
-    import monod_core as _mc
-    _HAS_RUST = True
-except ImportError:
-    _mc = None
-    _HAS_RUST = False
+from ._core import _mc          # None when the compiled extension is not installed
+_HAS_RUST = _mc is not None
 
 # ---------------------------------------------------------------------------
 # uns serialization helpers
