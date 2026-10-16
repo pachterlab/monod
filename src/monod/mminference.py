@@ -253,6 +253,7 @@ class MEKMeansParameters(_BaseInferenceParameters):
         inference_string = inference_string[:-1]
         inference_string += f"{run_meta}"
         
+        inference_string = os.path.abspath(inference_string)
         self.inference_string = inference_string
         if save:
             make_dir(inference_string)
@@ -903,6 +904,10 @@ class GradientInference(_BaseGradientInference):
         if self.epochs < 1:
             raise ValueError("No. of epochs must be an int > 0")
 
+        # Tolerate objects built without __init__ (e.g. notebooks that assemble a
+        # GradientInference by hand): fall back to the constructor defaults.
+        em_tol = float(getattr(self, "em_tol", 1e-4))
+        em_patience = int(getattr(self, "em_patience", 2))
         prev_lb = None
         stalled = 0
         n_run = 0
@@ -925,15 +930,15 @@ class GradientInference(_BaseGradientInference):
 
             # Convergence: stop once the lower bound has stopped moving for
             # em_patience consecutive epochs (em_tol=0 disables early stopping).
-            if prev_lb is not None and self.em_tol > 0 and np.isfinite(lower_bound) and np.isfinite(prev_lb):
-                if abs(lower_bound - prev_lb) <= self.em_tol * max(1.0, abs(prev_lb)):
+            if prev_lb is not None and em_tol > 0 and np.isfinite(lower_bound) and np.isfinite(prev_lb):
+                if abs(lower_bound - prev_lb) <= em_tol * max(1.0, abs(prev_lb)):
                     stalled += 1
                 else:
                     stalled = 0
-                if stalled >= self.em_patience:
+                if stalled >= em_patience:
                     log.info(
                         "EM stopped after %d/%d epochs: lower bound changed by less than em_tol=%g "
-                        "for %d consecutive epochs.", n_run, self.epochs, self.em_tol, self.em_patience,
+                        "for %d consecutive epochs.", n_run, self.epochs, em_tol, em_patience,
                     )
                     break
             prev_lb = lower_bound

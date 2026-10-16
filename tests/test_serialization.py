@@ -138,14 +138,16 @@ class TestSearchResults:
         out, root = run
         monkeypatch.chdir(root)   # inference_string paths are relative to the run's cwd
         d = os.path.join(root, "savetest", "Bursty_None_1x1")
-        assert sorted(os.listdir(d)) == ["monod_adata.h5ad"], os.listdir(d)
+        # Earlier tests in this class may already have saved figures into the run dir.
+        assert set(os.listdir(d)) - {"analysis_figures"} == {"monod_adata.h5ad"}, os.listdir(d)
         assert sorted(os.listdir(os.path.join(root, "savetest"))) == ["Bursty_None_1x1"]
         sr = analysis.load_search_results(os.path.join(d, "monod_adata.h5ad"))
         sr0 = search_result_from_uns(out.uns["search_result"])
         np.testing.assert_allclose(sr.phys_optimum, sr0.phys_optimum)
         # Saving a figure afterwards creates analysis_figures on demand, nothing else.
         fig, ax = plt.subplots(); sr.plot_KL(ax); plt.close("all")
-        assert sorted(os.listdir(d)) == ["analysis_figures", "monod_adata.h5ad"]
+        assert set(os.listdir(d)) == {"analysis_figures", "monod_adata.h5ad"}
+        assert os.path.isfile(os.path.join(d, "analysis_figures", "kldiv.png"))
 
     def test_store_on_disk_round_trip(self, run, monkeypatch):
         out, root = run

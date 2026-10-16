@@ -377,3 +377,11 @@ class TestReviewRegressions:
         sr.plot_gene_distributions(sd, sz=(1, 1), marg="joint", savefig=False)
         sr.plot_gene_distributions(sd, sz=(1, 2), marg="spliced", savefig=True)
         plt.close("all")
+
+
+def test_fit_tolerates_objects_built_without_init():
+    """Notebooks assemble GradientInference by hand; _fit must not require the new attributes."""
+    stub = _LoopStub(epochs=3, em_tol=0.0, em_patience=2, lbs=[-3, -2, -1, -1])
+    del stub.em_tol, stub.em_patience
+    Q, lb, all_qs, all_klds = mm.GradientInference._fit(stub, None, types.SimpleNamespace(n_genes=3, n_cells=5))
+    assert stub.n_epochs_run == 3 and stub.calls[-1] == "E"

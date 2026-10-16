@@ -2301,6 +2301,12 @@ impl PySearchData {
         ub:        Vec<f64>,
         samp_list: Option<Vec<Option<Vec<f64>>>>,
     ) -> PyResult<Vec<Vec<f64>>> {
+        if n_bio_params(&bio_model).is_none() {
+            return verr(format!(
+                "mom_x0_all: unknown bio_model {bio_model:?}; method-of-moments initialisation is \
+                 available for Constitutive, Bursty, CIR, Extrinsic, Delay, DelayedSplicing, ProteinBursty"
+            ));
+        }
         validate_bounds(&lb, &ub, None, "mom_x0_all")?;
         if let Some(n) = n_bio_params(&bio_model) {
             if lb.len() < n {
@@ -4250,8 +4256,10 @@ fn chisquare_testing_2d_sd(
                 // Bin grouping + chi-squared.
                 let (bin_obs, bin_exp) = group_bins(&obs, &exp, grouping_thr);
                 let stat = chi2_statistic(&bin_obs, &bin_exp);
-                let dof  = (bin_obs.len() as i64 - 1 - n_params_ddof as i64).max(1) as usize;
-                let pval = chi2_sf(stat, dof);
+                // Match scipy.stats.chisquare: no degrees of freedom left -> NaN p-value
+                // (which the caller treats as "not rejected"), rather than clamping to 1.
+                let dof_i = bin_obs.len() as i64 - 1 - n_params_ddof as i64;
+                let pval = if dof_i <= 0 { f64::NAN } else { chi2_sf(stat, dof_i as usize) };
 
                 (stat, pval, h)
             }).collect()
@@ -5642,6 +5650,36 @@ fn e_step_2d(
     let n_k = params_per_k.len();
     let n_genes = limits_list.len();
     let n_cells = if n_genes > 0 && !u_obs.is_empty() { u_obs[0].len() } else { 0 };
+    if n_k == 0 {
+        return verr("e_step_2d: params_per_k is empty".to_string());
+    }
+    if weights.len() != n_k {
+        return verr(format!("e_step_2d: weights has {} entries, params_per_k has {n_k} clusters", weights.len()));
+    }
+    if u_obs.len() != n_genes || s_obs.len() != n_genes {
+        return verr(format!("e_step_2d: u_obs ({}) and s_obs ({}) must have n_genes={n_genes} entries", u_obs.len(), s_obs.len()));
+    }
+    if let Some(sl) = samp_list.as_ref() {
+        if sl.len() != n_genes {
+            return verr(format!("e_step_2d: samp_list has {} entries, expected n_genes={n_genes}", sl.len()));
+        }
+    }
+    let n_bio = n_bio_params(&bio_model).unwrap_or(0);
+    for (k, pk) in params_per_k.iter().enumerate() {
+        if pk.len() != n_genes {
+            return verr(format!("e_step_2d: params_per_k[{k}] has {} genes, expected {n_genes}", pk.len()));
+        }
+        if let Some(bad) = pk.iter().position(|p| p.len() < n_bio) {
+            return verr(format!("e_step_2d: params_per_k[{k}][{bad}] has {} entries, {bio_model} needs {n_bio}", pk[bad].len()));
+        }
+    }
+    for g in 0..n_genes {
+        validate_limits(&limits_list[g], 2, "e_step_2d")?;
+        if u_obs[g].len() != n_cells || s_obs[g].len() != n_cells {
+            return verr(format!("e_step_2d: gene {g} has {}/{} observations, expected n_cells={n_cells}", u_obs[g].len(), s_obs[g].len()));
+        }
+        validate_coords_2d(&u_obs[g], &s_obs[g], limits_list[g][0], limits_list[g][1], "e_step_2d")?;
+    }
 
     let result = py.allow_threads(|| {
         let run = || -> (Vec<Vec<f64>>, f64, f64) {

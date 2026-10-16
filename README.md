@@ -30,13 +30,13 @@ git clone https://github.com/cleartools/ruanndata.git ../ruanndata
 
 pip install maturin
 cd monod_core
-maturin build --release --compatibility linux --features kmeans -i "$(which python)"   # drop --compatibility on macOS
+maturin build --release --compatibility linux -i "$(which python)"   # drop --compatibility on macOS
 pip install --force-reinstall --no-deps target/wheels/monod_core-*.whl
 cd ..
 python -c "import monod_core; print('Rust extension OK, meK-Means init:', hasattr(monod_core, 'initialize_q_kmeans'))"
 ```
 
-`--features kmeans` compiles the Rust k-means initializer used by meK-Means; without it meK-Means still works but initializes through scikit-learn in Python.
+The `kmeans` cargo feature (the Rust k-means initializer used by meK-Means) is on by default; building with `--no-default-features` drops it, in which case meK-Means initializes through scikit-learn instead.
 
 On Apple Silicon with an x86_64 (Rosetta) Homebrew HDF5, set `HDF5_NO_RUNTIME_CHECK=1` for the build.
 
@@ -82,7 +82,7 @@ When you do ask for files:
 | `fit_all_grid_points(..., checkpoint=True)` | one `grid_point_<i>.h5` per grid point, for crash recovery |
 | any plot method with `savefig=True` | `analysis_figures/<name>.png`, created on first use, only if the run directory exists |
 
-`monod.analysis.load_search_results(path)` reads any of the h5ad or h5 files above (and, with a warning, legacy pickled `.res` files). Run directories are relative to the working directory at the time of the run.
+`monod.analysis.load_search_results(path)` reads any of the h5ad or h5 files above (and, with a warning, legacy pickled `.res` files). Run directories are resolved to absolute paths at construction, from the working directory at that time.
 
 ## Development
 

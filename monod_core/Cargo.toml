@@ -1,6 +1,6 @@
 [package]
 name = "monod_core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [lib]
@@ -8,7 +8,8 @@ name = "monod_core"
 crate-type = ["cdylib"]
 
 [features]
-default = []
+# kmeans: Rust initializer for meK-Means (otherwise scikit-learn is used). On by default.
+default = ["kmeans"]
 kmeans = ["dep:rand_xoshiro"]
 
 [dependencies]

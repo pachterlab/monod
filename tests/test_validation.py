@@ -5,6 +5,7 @@ Python-side checks live in CMEModel._check_pss_args and inference._validate_boun
 Rust-side checks live at every monod_core entry point and must surface as
 ValueError (never PanicException).
 """
+import os
 import numpy as np
 import pytest
 
@@ -211,3 +212,42 @@ class TestReviewRegressions:
         with pytest.raises(ValueError, match="must be 1-D with equal length"):
             mminference.MEKMeansParameters("ds", CMEModel("Bursty", "None"), k=2, epochs=1,
                                            phys_lb=[-1, -1, -1], phys_ub=[2, 2])
+
+
+@needs_rust
+class TestLeftoverValidation:
+    """e_step_2d argument checks, chi-square dof handling, MoM model check, absolute run dirs."""
+
+    def test_e_step_weights_length(self):
+        sd, layers, limits = _tiny_sd()
+        n_genes = 3
+        params = [[[0.3, 0.0, -0.1]] * n_genes] * 2
+        lims = [[int(limits[0, g]), int(limits[1, g])] for g in range(n_genes)]
+        u = [layers[0][:, g].tolist() for g in range(n_genes)]
+        s = [layers[1][:, g].tolist() for g in range(n_genes)]
+        with pytest.raises(ValueError, match="weights has 1 entries"):
+            _mc.e_step_2d("Bursty", params, lims, u, s, [1.0], 10.0, 60, seq_model="None")
+        with pytest.raises(ValueError, match=r"params_per_k\[0\] has 1 genes"):
+            _mc.e_step_2d("Bursty", [[[0.3, 0.0, -0.1]]] * 2, lims, u, s, [0.5, 0.5], 10.0, 60, seq_model="None")
+        Q, lb, q = _mc.e_step_2d("Bursty", params, lims, u, s, [0.5, 0.5], 10.0, 60, seq_model="None")
+        assert np.asarray(Q).shape == (30, 2)
+
+    def test_chisquare_no_dof_gives_nan_not_rejection(self):
+        """A gene with too few bins for the parameter count must yield NaN, as scipy does."""
+        sd, layers, limits = _tiny_sd(n_cells=12, n_genes=1, padding=2)
+        phys = [[0.3, 0.0, -0.1]]
+        csq, pval, hel = _mc.chisquare_testing_2d_sd(sd, "Bursty", phys, None, 10.0, 60, 3, 1e9, 1e-15, "None")
+        # grouping_thr=1e9 collapses everything into one bin -> dof = 1 - 1 - 3 < 0
+        assert np.isnan(pval[0]) and np.isfinite(csq[0])
+
+    def test_mom_x0_unknown_model(self):
+        sd, _, _ = _tiny_sd()
+        with pytest.raises(ValueError, match="unknown bio_model"):
+            sd.mom_x0_all("bursty", "None", "None", [-2, -2, -2], [2, 2, 2])
+
+    def test_run_directory_is_absolute(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        ip = InferenceParameters("ds", CMEModel("Bursty", "None"))
+        assert os.path.isabs(ip.inference_string) and ip.inference_string.startswith(str(tmp_path))
+        p = mminference.MEKMeansParameters("ds", CMEModel("Bursty", "None"), k=2, epochs=1)
+        assert os.path.isabs(p.inference_string)

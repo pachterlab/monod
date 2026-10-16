@@ -823,6 +823,9 @@ class InferenceParameters:
         inference_string = inference_string[:-1]
         inference_string += f"{run_meta}"
 
+        # Absolute so results, figures and checkpoints land in the same place
+        # regardless of later chdir calls, and so stored paths are unambiguous.
+        inference_string = os.path.abspath(inference_string)
         if save:
             make_dir(inference_string)
             inference_parameter_string = inference_string + "/parameters.h5"
