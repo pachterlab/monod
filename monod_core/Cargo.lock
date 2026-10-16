@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "monod_core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "indexmap",
  "lbfgsb-rs-pure",
@@ -599,6 +599,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 [[package]]
 name = "ruanndata"
 version = "0.1.0"
+source = "git+https://github.com/cleartools/ruanndata.git?rev=88a46860a59c9affb7b5605c6a267e2cfe01300d#88a46860a59c9affb7b5605c6a267e2cfe01300d"
 dependencies = [
  "hdf5-metno",
  "hdf5-metno-sys",

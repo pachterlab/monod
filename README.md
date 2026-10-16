@@ -25,9 +25,6 @@ The `monod_core` extension replaces the hot loops (PSS evaluation, histogramming
 Requirements: a Rust toolchain (`rustup`), a C compiler, a system HDF5 library discoverable via `pkg-config` or `HDF5_DIR`, and [maturin](https://www.maturin.rs/).
 
 ```bash
-# ruanndata must sit next to the monod checkout (Cargo.toml points at ../../ruanndata)
-git clone https://github.com/cleartools/ruanndata.git ../ruanndata
-
 pip install maturin
 cd monod_core
 maturin build --release --compatibility linux -i "$(which python)"   # drop --compatibility on macOS
@@ -36,7 +33,7 @@ cd ..
 python -c "import monod_core; print('Rust extension OK, meK-Means init:', hasattr(monod_core, 'initialize_q_kmeans'))"
 ```
 
-The `kmeans` cargo feature (the Rust k-means initializer used by meK-Means) is on by default; building with `--no-default-features` drops it, in which case meK-Means initializes through scikit-learn instead.
+The `kmeans` cargo feature (the Rust k-means initializer used by meK-Means) is on by default; building with `--no-default-features` drops it, in which case meK-Means initializes through scikit-learn instead. The `ruanndata` crate is fetched from GitHub at a pinned commit by cargo; if you are developing ruanndata alongside monod, see the commented `[patch]` block at the end of `monod_core/Cargo.toml`.
 
 On Apple Silicon with an x86_64 (Rosetta) Homebrew HDF5, set `HDF5_NO_RUNTIME_CHECK=1` for the build.
 
