@@ -11,16 +11,22 @@ Examples and tutorials are given at the [example repository](https://github.com/
 Python 3.9 or newer is required.
 
 ```bash
+pip install monod monod-core
+```
+
+`monod` is the Python package; `monod-core` is the optional Rust extension, shipped as prebuilt wheels for Linux x86_64 and Apple-silicon macOS. monod detects it at import time and falls back to pure Python (slower, otherwise identical) when it is absent, so `pip install monod` alone also works.
+
+To work from a checkout instead:
+
+```bash
 git clone https://github.com/pachterlab/monod.git
 cd monod
 pip install -e .
 ```
 
-This installs the pure-Python package and its dependencies (numpy, scipy, numba, anndata, scanpy, scikit-learn, and friends). Everything works without the Rust extension below, just more slowly.
+### Building the Rust extension from source
 
-### Optional: Rust acceleration (`monod_core`)
-
-The `monod_core` extension replaces the hot loops (PSS evaluation, histogramming, L-BFGS-B, chi-square and log-likelihood scoring) with multithreaded Rust. Monod detects it automatically at import time and falls back to Python when it is missing.
+The `monod_core` extension replaces the hot loops (PSS evaluation, histogramming, L-BFGS-B, chi-square and log-likelihood scoring) with multithreaded Rust. Use the prebuilt wheel above when one exists for your platform; otherwise, or to develop it, build it yourself.
 
 Requirements: a Rust toolchain (`rustup`), a C compiler, a system HDF5 library discoverable via `pkg-config` or `HDF5_DIR`, and [maturin](https://www.maturin.rs/).
 
@@ -86,14 +92,14 @@ When you do ask for files:
 Continuous integration lives in `.github/workflows/`:
 
 - `tests.yml` runs the test suite on every push and pull request, with and without the Rust extension.
-- `wheels.yml` runs on every `v*` tag (or by hand from the Actions tab). It builds self-contained `monod-core` wheels (Linux x86_64 and macOS arm64; Python 3.9 to 3.12; HDF5 linked statically; Intel Macs build from source) plus the `monod_anndata` sdist and wheel, creates a GitHub release with those files attached and auto-generated notes, and publishes both packages to PyPI.
+- `wheels.yml` runs on every `v*` tag (or by hand from the Actions tab). It builds self-contained `monod-core` wheels (Linux x86_64 and macOS arm64; Python 3.9 to 3.12; HDF5 linked statically; Intel Macs build from source) plus the pure-Python `monod` sdist and wheel, creates a GitHub release with those files attached and auto-generated notes, and publishes both packages to PyPI.
 
 To cut a release:
 
 1. Bump the version in `setup.cfg`, `monod_core/Cargo.toml`, and `monod_core/pyproject.toml`, and commit.
 2. `git tag vX.Y.Z && git push origin vX.Y.Z`.
 
-One-time setup before the first tagged release: create a `pypi` environment in the repository settings (Settings, Environments), and on PyPI add a *trusted publisher* for each project (`monod-core` and `monod_anndata`) pointing at `pachterlab/monod`, workflow `wheels.yml`, environment `pypi`. With that in place no API token is stored anywhere; the workflow authenticates with a short-lived token from GitHub.
+One-time setup before the first tagged release: create a `pypi` environment in the repository settings (Settings, Environments), and on PyPI add a *trusted publisher* for each project (`monod`, which already exists, and `monod-core`, added as a pending publisher until its first upload) pointing at `pachterlab/monod`, workflow `wheels.yml`, environment `pypi`. With that in place no API token is stored anywhere; the workflow authenticates with a short-lived token from GitHub.
 
 ## Development
 

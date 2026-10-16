@@ -16,7 +16,7 @@ import importlib as _importlib
 from importlib.metadata import PackageNotFoundError as _PNF, version as _version
 
 try:
-    __version__ = _version("monod_anndata")
+    __version__ = _version("monod")
 except _PNF:  # running from a checkout without pip install
     __version__ = "0.0.0+unknown"
 

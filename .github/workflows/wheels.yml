@@ -1,6 +1,6 @@
 name: wheels
 
-# Builds monod-core wheels (self-contained, static HDF5) and the monod_anndata
+# Builds monod-core wheels (self-contained, static HDF5) and the pure-Python monod
 # sdist/wheel on every version tag, and publishes both to PyPI via trusted
 # publishing. Run manually (workflow_dispatch) to build without publishing.
 
@@ -76,7 +76,7 @@ jobs:
           path: monod_core/dist/*.tar.gz
 
   python-dist:
-    name: monod_anndata sdist + wheel
+    name: monod sdist + wheel
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -104,10 +104,23 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Does this release already exist?
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
-          generate_release_notes: true   # from merged PRs / commits since the previous tag
+          # Generate notes only when creating the release; on a re-run (e.g. after
+          # fixing PyPI publishing) keep whatever notes were edited by hand and just
+          # refresh the attached files.
+          generate_release_notes: ${{ steps.existing.outputs.exists == 'false' }}
 
   publish:
     name: Publish to PyPI
@@ -131,7 +144,7 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist-core
-      - name: Publish monod_anndata
+      - name: Publish monod
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist-python
