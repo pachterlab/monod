@@ -76,17 +76,3 @@ When you do ask for files:
 | any plot method with `savefig=True` | `analysis_figures/<name>.png`, created on first use, only if the run directory exists |
 
 `monod.analysis.load_search_results(path)` reads any of the h5ad or h5 files above (and, with a warning, legacy pickled `.res` files). Run directories are resolved to absolute paths at construction, from the working directory at that time.
-
-## Releasing
-
-Continuous integration lives in `.github/workflows/`:
-
-- `tests.yml` runs the test suite on every push and pull request, with and without the Rust extension.
-- `wheels.yml` runs on every `v*` tag (or by hand from the Actions tab). It builds self-contained `monod-core` wheels (Linux x86_64 and macOS arm64; Python 3.9 to 3.12; HDF5 linked statically; Intel Macs build from source) plus the pure-Python `monod` sdist and wheel, creates a GitHub release with those files attached (release notes are generated only if the release does not already exist, so hand-edited notes survive re-runs), and publishes both packages to PyPI.
-
-To cut a release:
-
-1. Bump the version in `setup.cfg`, `monod_core/Cargo.toml`, and `monod_core/pyproject.toml`, and commit.
-2. `git tag vX.Y.Z && git push origin vX.Y.Z`.
-
-One-time setup before the first tagged release: create a `pypi` environment in the repository settings (Settings, Environments), and on PyPI add a *trusted publisher* for each project (`monod`, which already exists, and `monod-core`, added as a pending publisher until its first upload) pointing at `pachterlab/monod`, workflow `wheels.yml`, environment `pypi`. With that in place no API token is stored anywhere; the workflow authenticates with a short-lived token from GitHub.
