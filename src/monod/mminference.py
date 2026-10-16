@@ -1132,6 +1132,24 @@ def get_moment_dicts(layers, layer_names, cov_matrix_key='layer_covariances'):
 ########################
 ## Helper classes
 ########################
+def _deprecated_aic_property():
+    """``.aic`` used to be ``lower_bound - penalty`` (higher is better). It is now
+    the paper's per-cell AIC (lower is better) under the name ``aic_per_cell``.
+    Reading ``.aic`` still works but warns, so scripts that pick K with
+    ``argmax`` are told to switch to ``argmin``."""
+    def getter(self):
+        warnings.warn(
+            "'.aic' was renamed to '.aic_per_cell' and its convention changed: it is now the "
+            "meK-Means paper's AIC = -log p(X,Z;theta)/N + K_param/N, where LOWER is better "
+            "(the old value was its negative). Use .aic_per_cell and pick K with argmin.",
+            DeprecationWarning, stacklevel=2,
+        )
+        return self.aic_per_cell
+    def setter(self, value):
+        self.aic_per_cell = value
+    return property(getter, setter)
+
+
 class GridPointResults(_BaseGridPointResults):
     """Temporarily stores the fit parameters for a single grid point.
 
@@ -1147,9 +1165,9 @@ class GridPointResults(_BaseGridPointResults):
         runtime in seconds, (k,).
     weights: np.ndarray
         weights for mixture components (k,)
-    aic: float
+    aic_per_cell: float
         per-cell AIC of the fitted mixture, as defined in the meK-Means paper
-        (lower is better); see ``mek_means_aic``.
+        (lower is better); see ``mek_means_aic``. ``aic`` is a deprecated alias.
     assigns: np.ndarray
         final k components assignments for each cell (n_cells,)
     all_qs: float list
@@ -1188,13 +1206,15 @@ class GridPointResults(_BaseGridPointResults):
         """Creates a GridPointResults object and sets all of its attributes."""
         super().__init__(param_estimates, klds, obj_func, d_time, regressor, grid_point, point_index, inference_string)
         self.weights = weights
-        self.aic = aic
+        self.aic_per_cell = aic
         self.assigns = assigns
         self.all_qs = all_qs
         self.all_klds = all_klds
 
     _SERIAL_KIND = "MEKMeansGridPointResults"
-    _SERIAL_ATTRS = _BaseGridPointResults._SERIAL_ATTRS + ("weights", "aic", "assigns", "all_qs", "all_klds")
+    _SERIAL_ATTRS = _BaseGridPointResults._SERIAL_ATTRS + ("weights", "aic_per_cell", "assigns", "all_qs", "all_klds")
+
+    aic = _deprecated_aic_property()
 
 
 class SearchResults(_BaseSearchResults):
@@ -1234,9 +1254,9 @@ class SearchResults(_BaseSearchResults):
         MEKMeansParameters constructor.
     weights: float 
         weight of mixture component for assigned cluster (k)
-    aic: float
+    aic_per_cell: float
         per-cell AIC of the fitted mixture, as defined in the meK-Means paper
-        (lower is better); see ``mek_means_aic``.
+        (lower is better); see ``mek_means_aic``. ``aic`` is a deprecated alias.
     assigns: int
         assigned cluster k
     all_qs: float np.ndarray
@@ -1298,13 +1318,15 @@ class SearchResults(_BaseSearchResults):
         self.assigns = assign
         self.save = False
         self.weights = []
-        self.aic = []
+        self.aic_per_cell = []
         self.all_qs = []
         self.all_klds = []
         self.filt = []
 
     _SERIAL_KIND = "MEKMeansSearchResults"
-    _SERIAL_ATTRS = _BaseSearchResults._SERIAL_ATTRS + ("assigns", "save", "weights", "aic", "all_qs", "all_klds", "filt")
+    _SERIAL_ATTRS = _BaseSearchResults._SERIAL_ATTRS + ("assigns", "save", "weights", "aic_per_cell", "all_qs", "all_klds", "filt")
+
+    aic = _deprecated_aic_property()
 
     def _append_from_object(self, gpr):
         """Update result attributes from an in-memory GridPointResults object.
@@ -1320,7 +1342,7 @@ class SearchResults(_BaseSearchResults):
             self.obj_func += [gpr.obj_func[self.assigns]]
             self.d_time += [gpr.d_time[self.assigns]]
             self.regressor += [gpr.regressor]
-            self.aic += [gpr.aic]
+            self.aic_per_cell += [gpr.aic_per_cell]
             self.weights += [gpr.weights[self.assigns]]
             self.all_qs += [gpr.all_qs]
             self.all_klds += [[i[:, self.assigns] for i in gpr.all_klds]]
@@ -1351,7 +1373,7 @@ class SearchResults(_BaseSearchResults):
         self.d_time = np.asarray(self.d_time)
         self.regressor = np.asarray(self.regressor)
 
-        self.aic = np.asarray(self.aic)
+        self.aic_per_cell = np.asarray(self.aic_per_cell)
         self.weights = np.asarray(self.weights)
         self.all_qs = np.asarray(self.all_qs)
         self.all_klds = np.asarray(self.all_klds)

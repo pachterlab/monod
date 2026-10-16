@@ -2163,6 +2163,8 @@ class SearchResults:
             if n in d:
                 v = d[n]
                 setattr(obj, n, v.item() if isinstance(v, np.generic) else v)
+        if "aic" in d and "aic_per_cell" not in d and "aic_per_cell" in target._SERIAL_ATTRS:
+            obj.aic_per_cell = d["aic"]   # dicts written before the rename
         if hasattr(obj, "gene_names"):
             obj.gene_names = np.asarray(obj.gene_names).astype(str)
         return obj
@@ -2666,24 +2668,30 @@ class SearchResults:
             run_bin_exp = 0
             bin_obs = []
             bin_exp = []
+            # Same rule as the Rust path (group_bins): accumulate microstates until
+            # both observed and expected counts reach grouping_thr, then close a
+            # bin; the tail is merged into the last bin, or forms the only bin if
+            # none ever closed (tiny datasets).
             for i in range(len(counts)):
                 bins.append(bin_ind)
                 run_bin_obs += counts[i]
                 run_bin_exp += expect_freq[i]
-                if min(run_bin_obs, run_bin_exp) < 5:  # and i
-                    pass
-                else:
+                if min(run_bin_obs, run_bin_exp) >= grouping_thr:
                     bin_ind += 1
                     bin_obs.append(run_bin_obs)
                     bin_exp.append(run_bin_exp)
                     run_bin_obs = 0
                     run_bin_exp = 0
             bins = np.asarray(bins)
-            observed = np.asarray(bin_obs)
-            proposed = np.asarray(bin_exp)
-            observed[-1] += run_bin_obs
-            proposed[-1] += run_bin_exp
-            bins[bins == len(observed)] = len(observed) - 1
+            if not bin_obs:
+                observed = np.asarray([run_bin_obs], dtype=float)
+                proposed = np.asarray([run_bin_exp], dtype=float)
+            else:
+                observed = np.asarray(bin_obs, dtype=float)
+                proposed = np.asarray(bin_exp, dtype=float)
+                observed[-1] += run_bin_obs
+                proposed[-1] += run_bin_exp
+            bins[bins >= len(observed)] = len(observed) - 1
 
             for b_ in range(len(bin_obs)):
                 assert np.isclose(observed[b_], counts[bins == b_].sum())
@@ -3429,6 +3437,72 @@ class SearchResults:
                 ]
             )
         return np.asarray(f).squeeze()
+
+def reject_genes(adata, viz=False, EPS=1e-15, threshold=0.05, bonferroni=True,
+                 reject_at_bounds=True, bound_thr=0.01, grouping_thr=5,
+                 use_hellinger=True, hellinger_thr=0.05, mek_means=None,
+                 save_csq=True, save_pval=True, save_hellinger=True):
+    """Chi-square goodness-of-fit testing on a fitted AnnData; flags poorly fit genes.
+
+    Works on the AnnData returned by :func:`perform_inference`.  The search data
+    is rebuilt from the layers and the stored result(s) are updated in place, so
+    downstream calls with ``discard_rejected=True`` (e.g. ``analysis.DE_parameters``)
+    see the rejection flags.
+
+    Adds to ``adata.var``: ``rejected_genes`` plus ``csq``, ``pval``, ``hellinger``
+    (prefixed ``c<k>_`` per cluster for a meK-Means run).
+
+    Parameters
+    ----------
+    adata: AnnData from perform_inference.
+    mek_means: tuple or None
+        pass the same ``mek_means_params`` used for the fit (anything truthy
+        selects the per-cluster path).
+    Other arguments are forwarded to ``SearchResults.chisquare_testing``.
+
+    Returns
+    -------
+    adata (modified in place).
+    """
+    kw = dict(viz=viz, EPS=EPS, threshold=threshold, bonferroni=bonferroni,
+              reject_at_bounds=reject_at_bounds, bound_thr=bound_thr,
+              grouping_thr=grouping_thr, use_hellinger=use_hellinger,
+              hellinger_thr=hellinger_thr)
+    search_data = searchdata_from_adata(adata)
+
+    if not mek_means:
+        if 'search_result' not in adata.uns:
+            raise KeyError("adata.uns has no 'search_result'; for a meK-Means run pass mek_means=<params>.")
+        sr = search_result_from_uns(adata.uns['search_result'])
+        csq, pval, hellinger = sr.chisquare_testing(search_data, **kw)
+        adata.var['rejected_genes'] = np.asarray(sr.rejected_genes, dtype=bool)
+        if save_csq:
+            adata.var['csq'] = np.asarray(csq)
+        if save_pval:
+            adata.var['pval'] = np.asarray(pval)
+        if save_hellinger:
+            adata.var['hellinger'] = np.asarray(hellinger)
+        adata.uns['search_result'] = sr.to_dict()
+        log.info("Rejected %d/%d genes; flags stored in adata.var['rejected_genes'].",
+                 int(np.sum(sr.rejected_genes)), sr.n_genes)
+    else:
+        if 'search_result_list' not in adata.uns:
+            raise KeyError("adata.uns has no 'search_result_list'; this AnnData is not from a meK-Means run.")
+        srs = search_result_list_from_uns(adata.uns['search_result_list'])
+        for sr in srs:
+            k = int(sr.assigns)
+            csq, pval, hellinger = sr.chisquare_testing(search_data, **kw)   # subsets to the cluster itself
+            adata.var[f'c{k}_rejected_genes'] = np.asarray(sr.rejected_genes, dtype=bool)
+            if save_csq:
+                adata.var[f'c{k}_csq'] = np.asarray(csq)
+            if save_pval:
+                adata.var[f'c{k}_pval'] = np.asarray(pval)
+            if save_hellinger:
+                adata.var[f'c{k}_hellinger'] = np.asarray(hellinger)
+        adata.uns['search_result_list'] = search_result_list_to_uns(srs)
+        log.info("Rejection flags stored per cluster in adata.var['c<k>_rejected_genes'].")
+    return adata
+
 
 def get_AIC_mek_means(search_result_list, search_data, AIC_EPS=1e-20, AIC_offs=0):
     """Per-gene AIC of a meK-Means fit (lower is better).

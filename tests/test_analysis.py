@@ -173,3 +173,17 @@ def test_diffexp_fpi_tolerates_zero_sigma():
     s = np.full(100, 0.05); s[:10] = 0.0            # pinned-at-bound genes report sigma 0
     gf, beta, resid, pval = analysis.diffexp_fpi(m1, m2, s1=s, s2=s, nit=3, viz=False)
     assert np.isfinite(beta).all() and np.isfinite(resid).all()
+
+
+def test_reject_genes_round_trip(two_adatas):
+    from monod.inference import reject_genes, search_result_from_uns
+    a1, a2 = two_adatas
+    reject_genes(a1, reject_at_bounds=False)
+    for col in ("rejected_genes", "csq", "pval", "hellinger"):
+        assert col in a1.var.columns
+    sr = search_result_from_uns(a1.uns["search_result"])
+    assert hasattr(sr, "rejected_genes") and len(sr.rejected_genes) == a1.n_vars
+    # discard_rejected now has something to act on
+    reject_genes(a2, reject_at_bounds=False)
+    gn, gf, offs, resid = analysis.DE_parameters(a1, a2, viz=False, use_sigma=False, discard_rejected=True, nit=2)
+    assert gf.shape[1] == a1.n_vars

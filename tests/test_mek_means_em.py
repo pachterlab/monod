@@ -148,7 +148,7 @@ class TestMEKMeansEndToEnd:
         assigns = np.asarray(gpr.assigns)
         agreement = max(np.mean(assigns == truth), np.mean(assigns != truth))
         assert agreement > 0.9
-        assert np.isfinite(gpr.aic)
+        assert np.isfinite(gpr.aic_per_cell)
 
     def test_em_tol_zero_runs_every_epoch(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -277,7 +277,7 @@ class TestInitModality:
         gpr = p.par_fun((0, [sd, model], 2, 5, 1))
         assigns = np.asarray(gpr.assigns)
         assert max(np.mean(assigns == truth), np.mean(assigns != truth)) > 0.9
-        assert np.isfinite(gpr.aic)
+        assert np.isfinite(gpr.aic_per_cell)
 
 
 # ---------------------------------------------------------------------------
@@ -385,3 +385,12 @@ def test_fit_tolerates_objects_built_without_init():
     del stub.em_tol, stub.em_patience
     Q, lb, all_qs, all_klds = mm.GradientInference._fit(stub, None, types.SimpleNamespace(n_genes=3, n_cells=5))
     assert stub.n_epochs_run == 3 and stub.calls[-1] == "E"
+
+
+def test_aic_attribute_is_deprecated_alias():
+    gpr = mm.GridPointResults(np.zeros((1, 2, 3)), np.zeros((1, 2)), np.zeros(1), np.zeros(1),
+                              np.ones(2) / 2, 1.5, np.array([0, 1]), [-1.0], [np.zeros((2, 2))],
+                              np.zeros((2, 2)), np.zeros(2), 0, "x")
+    assert gpr.aic_per_cell == 1.5
+    with pytest.warns(DeprecationWarning, match="argmin"):
+        assert gpr.aic == 1.5

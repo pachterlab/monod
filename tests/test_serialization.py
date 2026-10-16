@@ -204,7 +204,7 @@ class TestMEKMeansResults:
             assert b.assigns == a.assigns and b.sp.k == 2
             np.testing.assert_allclose(b.phys_optimum, a.phys_optimum)
             np.testing.assert_array_equal(b.filt, a.filt)
-            np.testing.assert_allclose(np.asarray(b.aic), np.asarray(a.aic))
+            np.testing.assert_allclose(np.asarray(b.aic_per_cell), np.asarray(a.aic_per_cell))
         srs_saved = p.run_mek_means(sd, save=True)
         run_dir = srs_saved[0].inference_string
         assert sorted(os.listdir(run_dir)) == ["grid_scan_results.h5"]

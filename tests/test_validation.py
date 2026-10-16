@@ -251,3 +251,32 @@ class TestLeftoverValidation:
         assert os.path.isabs(ip.inference_string) and ip.inference_string.startswith(str(tmp_path))
         p = mminference.MEKMeansParameters("ds", CMEModel("Bursty", "None"), k=2, epochs=1)
         assert os.path.isabs(p.inference_string)
+
+
+    def test_python_chisquare_honours_grouping_thr_and_tiny_data(self):
+        """The Python chi-square path must use grouping_thr (not a hard-coded 5) and
+        must not crash when no bin ever closes; it should agree with Rust."""
+        import unittest.mock, warnings
+        import monod.inference as inf
+        from monod.extract_data import extract_data
+        from monod.inference import InferenceParameters, searchdata_from_adata
+        import anndata as ad, os
+        warnings.filterwarnings("ignore")
+        here = os.path.dirname(__file__)
+        model = CMEModel("Bursty", "None")
+        madata = extract_data(ad.read_h5ad(os.path.join(here, "..", "example_h5ad", "example_adata.h5ad")),
+                              model, dataset_name="x", n_genes=3, viz=False)
+        sd = searchdata_from_adata(madata)
+        sr = InferenceParameters("x", model, gradient_params={"max_iterations": 5, "num_restarts": 1}).fit_all_grid_points(sd)
+        sr.find_sampling_optimum()
+        csq_r, p_r, h_r = sr.chisquare_testing(sd, grouping_thr=20)
+        with unittest.mock.patch.object(inf, "_mc", None):
+            csq_p, p_p, h_p = sr.chisquare_testing(sd, grouping_thr=20)
+        np.testing.assert_allclose(csq_p, csq_r, rtol=1e-6)
+        np.testing.assert_allclose(h_p, h_r, rtol=1e-6)
+        both_nan = np.isnan(p_p) & np.isnan(p_r)
+        np.testing.assert_allclose(p_p[~both_nan], p_r[~both_nan], rtol=1e-6)
+        # absurd threshold: a single bin on both paths, NaN p-value, no crash
+        with unittest.mock.patch.object(inf, "_mc", None):
+            csq1, p1, _ = sr.chisquare_testing(sd, grouping_thr=1e9)
+        assert np.all(np.isnan(p1)) and np.all(np.isfinite(csq1))
