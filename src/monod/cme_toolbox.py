@@ -772,7 +772,34 @@ class CMEModel:
             )
             return kld0, np.array(grad_list)
 
+        # ProteinBursty: Rust forward FD with the integration schedule frozen at
+        # the base point (see monod_core::eval_kld_grad_protein_bursty).
+        if (
+            _HAS_RUST
+            and self.bio_model == "ProteinBursty"
+            and self.seq_model == "None"
+            and self.amb_model == "None"
+            and samp is None
+        ):
+            x, f_data = data
+            x_np = np.asarray(x, dtype=np.int64)
+            if x_np.ndim == 2 and x_np.shape[1] == 3:
+                kld0, grad_list = _mc.eval_kld_grad_protein_bursty(
+                    p.tolist(),
+                    [int(v) for v in limits],
+                    x_np.tolist(),
+                    np.asarray(f_data, dtype=float).tolist(),
+                    bool(self.fit_unspliced),
+                    float(self.protein_limit),
+                    float(self.min_fudge),
+                    float(self.max_fudge),
+                    float(eps),
+                    float(EPS),
+                )
+                return kld0, np.array(grad_list)
+
         # Python fallback: forward finite differences.
+        self._fixed_protein_schedule = None
         kld0 = self.eval_model_kld(p, limits, samp, data, EPS)
 
         def _perturbed(i):
@@ -781,12 +808,19 @@ class CMEModel:
             return self.eval_model_kld(p_eps, limits, samp, data, EPS)
 
         n_params = len(p)
-        if n_jobs == 1:
-            klds_eps = [_perturbed(i) for i in range(n_params)]
-        else:
-            klds_eps = Parallel(n_jobs=min(n_params, n_jobs) if n_jobs > 0 else n_jobs)(
-                delayed(_perturbed)(i) for i in range(n_params)
-            )
+        # ProteinBursty: integrate every stencil point with the base point's
+        # schedule so the quotient is not polluted by step-count jumps.
+        if self.bio_model == "ProteinBursty":
+            self._fixed_protein_schedule = getattr(self, "_last_protein_schedule", None)
+        try:
+            if n_jobs == 1:
+                klds_eps = [_perturbed(i) for i in range(n_params)]
+            else:
+                klds_eps = Parallel(n_jobs=min(n_params, n_jobs) if n_jobs > 0 else n_jobs)(
+                    delayed(_perturbed)(i) for i in range(n_params)
+                )
+        finally:
+            self._fixed_protein_schedule = None
         grad = (np.array(klds_eps) - kld0) / eps
         return kld0, grad
 
@@ -1528,34 +1562,47 @@ class CMEModel:
             return x_new
             
         b, beta, gamma, k_p, gamma_p = p
-        
-        dt = np.min(1 / np.array(p)) * self.min_fudge
-        t_max = np.max(1 / np.array(p)) * self.max_fudge
-        num_tsteps = int(np.ceil(t_max / dt))
-        #log.debug('dt: %s, t_max: %s', np.array2string(dt), np.array2string(t_max))
-        
-        t = 0
+
+        # Integration schedule: dt from the fastest rate, a fixed number of steps
+        # from the slowest, then extra steps until every grid point has decayed.
+        # All of these depend discontinuously on p, so finite-difference gradients
+        # pin the schedule of the base point (``_fixed_protein_schedule``) for the
+        # perturbed evaluations; the schedule actually used is recorded in
+        # ``_last_protein_schedule``.  Mirrors monod_core's protein_pgf_sched.
+        fixed = getattr(self, "_fixed_protein_schedule", None)
+        if fixed is not None:
+            # np.float64 (not a Python float) so dtype promotion of phi matches
+            # the adaptive branch exactly; otherwise base and stencil points
+            # would be integrated at different precisions.
+            dt, num_tsteps = np.float64(fixed[0]), int(fixed[1])
+            adaptive = False
+        else:
+            dt = np.min(1 / np.array(p)) * self.min_fudge
+            t_max = np.max(1 / np.array(p)) * self.max_fudge
+            num_tsteps = min(int(np.ceil(t_max / dt)), 50_000)
+            adaptive = True
+
         u_tilde = np.array(g, dtype=np.complex64)
         du_tilde = np.array(g, dtype=np.complex64)
-        
-        # Use numexpr for fast computation
+
         phi = b * u_tilde[0] / (1 - b * u_tilde[0]) * dt / 2
-    
-        # Solve ODE using RK4 method 
+
+        # Solve ODE using RK4 method
         for step in range(num_tsteps):
-            t += dt
             u_tilde = RK4(u_tilde, du_tilde, u_tilda_ode, dt, beta, gamma, k_p, gamma_p)
             phi += b * u_tilde[0] / (1 - b * u_tilde[0]) * dt
-        
-        while np.max(np.abs(u_tilde[0]))>1e-3:
-            t += dt
+
+        extra = 0
+        max_extra = 10 * num_tsteps + 10_000
+        while adaptive and np.max(np.abs(u_tilde[0])) > 1e-3 and extra < max_extra:
             u_tilde = RK4(u_tilde, du_tilde, u_tilda_ode, dt, beta, gamma, k_p, gamma_p)
             phi += b * u_tilde[0] / (1 - b * u_tilde[0]) * dt
-            
-        #log.debug('t: %s', np.array2string(t))
+            extra += 1
+
         u_tilde = RK4(u_tilde, du_tilde, u_tilda_ode,dt, beta, gamma, k_p, gamma_p)
         phi += b * u_tilde[0] / (1 - b * u_tilde[0]) * dt / 2
-        
+
+        self._last_protein_schedule = (dt, num_tsteps + extra)
         return phi
 
     def cir_intfun(self, x, g, b, beta, gamma):

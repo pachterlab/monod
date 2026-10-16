@@ -797,23 +797,36 @@ fn rk4_step(
 ///   Phase 2 — variable steps with global-max termination (matches Python's
 ///             `while np.max(np.abs(u_tilde[0])) >= 1e-3`); parallel per step.
 ///   Phase 3 — final half-step, parallel per point.
-fn protein_pgf(
+fn protein_pgf_sched(
     g0: &[Complex64],
     g1: &[Complex64],
     g2: &[Complex64],
     p: &[f64],
     min_fudge: f64,
     max_fudge: f64,
-) -> Vec<Complex64> {
+    fixed: Option<(f64, usize)>,
+) -> (Vec<Complex64>, (f64, usize)) {
     let n_grid = g0.len();
     let (b, beta, gamma, k_p, gamma_p) = (p[0], p[1], p[2], p[3], p[4]);
 
-    let dt = p.iter().map(|&v| 1.0 / v).fold(f64::INFINITY, f64::min) * min_fudge;
-    let t_max = p.iter().map(|&v| 1.0 / v).fold(0.0_f64, f64::max) * max_fudge;
-    // Cap num_tsteps so extreme params (tiny dt, huge t_max) can't cause multi-million
-    // step loops during optimizer exploration.  50_000 covers all realistic rate ranges
-    // (typical params give O(100–10_000) steps) while keeping gradients finite.
-    let num_tsteps = ((t_max / dt).ceil() as usize).min(50_000);
+    // Integration schedule.  Adaptive: dt from the fastest rate, a fixed number of
+    // steps from the slowest, then extra steps until every grid point has decayed
+    // (global-max termination).  All three depend discontinuously on `p`, which
+    // is harmless for a single PSS evaluation but makes finite-difference
+    // gradients noisy; callers computing gradients therefore pass the base
+    // point's schedule as `fixed = Some((dt, total_steps))` so every stencil
+    // point is integrated identically.
+    let (dt, num_tsteps, adaptive) = match fixed {
+        Some((dt_fixed, n_total)) => (dt_fixed, n_total, false),
+        None => {
+            let dt = p.iter().map(|&v| 1.0 / v).fold(f64::INFINITY, f64::min) * min_fudge;
+            let t_max = p.iter().map(|&v| 1.0 / v).fold(0.0_f64, f64::max) * max_fudge;
+            // Cap num_tsteps so extreme params (tiny dt, huge t_max) can't cause multi-million
+            // step loops during optimizer exploration.  50_000 covers all realistic rate ranges
+            // (typical params give O(100–10_000) steps) while keeping gradients finite.
+            (dt, ((t_max / dt).ceil() as usize).min(50_000), true)
+        }
+    };
     let one = Complex64::new(1.0, 0.0);
 
     let phase1_fn = |k: usize| {
@@ -847,7 +860,7 @@ fn protein_pgf(
         s.3 += nu0 * b / (one - nu0 * b) * dt;
     };
     let mut while_steps = 0usize;
-    loop {
+    while adaptive {
         let max_norm = if n_grid >= PAR_THRESHOLD {
             states.par_iter().map(|s| s.0.norm()).reduce(|| 0.0_f64, f64::max)
         } else {
@@ -875,11 +888,24 @@ fn protein_pgf(
         states.iter_mut().for_each(phase3_step);
     }
 
-    if n_grid >= PAR_THRESHOLD {
+    let gf_log: Vec<Complex64> = if n_grid >= PAR_THRESHOLD {
         states.into_par_iter().map(|s| s.3).collect()
     } else {
         states.into_iter().map(|s| s.3).collect()
-    }
+    };
+    (gf_log, (dt, num_tsteps + while_steps))
+}
+
+/// Adaptive-schedule log-PGF (see `protein_pgf_sched`).
+fn protein_pgf(
+    g0: &[Complex64],
+    g1: &[Complex64],
+    g2: &[Complex64],
+    p: &[f64],
+    min_fudge: f64,
+    max_fudge: f64,
+) -> Vec<Complex64> {
+    protein_pgf_sched(g0, g1, g2, p, min_fudge, max_fudge, None).0
 }
 
 // ============================================================================
@@ -1089,6 +1115,22 @@ fn protein_bursty_core(
     min_fudge: f64,
     max_fudge: f64,
 ) -> (Vec<Complex64>, [usize; 3], [usize; 3]) {
+    let (gf, mx, lims, _) =
+        protein_bursty_core_sched(p_log, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, None);
+    (gf, mx, lims)
+}
+
+/// `protein_bursty_core` with an optional fixed integration schedule; also returns
+/// the schedule actually used, so gradient stencils can reuse it.
+fn protein_bursty_core_sched(
+    p_log: &[f64],
+    limits: &[usize],
+    fit_unspliced: bool,
+    protein_limit: f64,
+    min_fudge: f64,
+    max_fudge: f64,
+    fixed: Option<(f64, usize)>,
+) -> (Vec<Complex64>, [usize; 3], [usize; 3], (f64, usize)) {
     let p: Vec<f64> = p_log.iter().map(|&x| 10.0_f64.powf(x)).collect();
     let mut mx = [limits[0], limits[1], limits[2]];
 
@@ -1102,14 +1144,14 @@ fn protein_bursty_core(
     let lims = [limits[0], limits[1], limits[2]];
     let (g0, g1, g2) = build_mesh_3d(&mx, &lims);
 
-    let gf_log = protein_pgf(&g0, &g1, &g2, &p, min_fudge, max_fudge);
+    let (gf_log, sched) = protein_pgf_sched(&g0, &g1, &g2, &p, min_fudge, max_fudge, fixed);
     let n = gf_log.len();
     let gf: Vec<Complex64> = if n >= PAR_THRESHOLD {
         gf_log.par_iter().map(|z| z.exp()).collect()
     } else {
         gf_log.iter().map(|z| z.exp()).collect()
     };
-    (gf, mx, lims)
+    (gf, mx, lims, sched)
 }
 
 // ============================================================================
@@ -1589,6 +1631,12 @@ const OPT_STATUS_CONVERGED: u8 = 0;
 const OPT_STATUS_MAXITER: u8 = 1;
 const OPT_STATUS_LINESEARCH: u8 = 2;
 const OPT_STATUS_ERROR: u8 = 3;
+
+/// Per-iteration L-BFGS-B trace on stderr when `MONOD_LBFGSB_VERBOSE` is set
+/// (debugging aid; columns: n, iter, nfev, nskip, col, ||proj g||, f).
+fn lbfgsb_verbose() -> bool {
+    std::env::var_os("MONOD_LBFGSB_VERBOSE").is_some()
+}
 
 fn solver_status_code(status: &lbfgsb_rs_pure::Status) -> u8 {
     match status {
@@ -3848,7 +3896,8 @@ fn custom_pgf_parallel(
     dt:              f64,
     n_steps:         usize,
     max_while_steps: usize,
-) -> Vec<Complex64> {
+    fixed_phase2:    Option<usize>,
+) -> (Vec<Complex64>, usize) {
     // Phase 1: fixed steps, fully parallel.
     let mut states: Vec<(Vec<Complex64>, Complex64)> = (0..n_grid)
         .into_par_iter()
@@ -3871,10 +3920,17 @@ fn custom_pgf_parallel(
         .collect();
 
     // Phase 2: global-max termination — matches Python `while np.max(|u[0]|) > 1e-3`.
+    // With `fixed_phase2 = Some(k)` exactly k steps are taken instead (gradient stencils).
     let mut while_steps = 0usize;
     loop {
-        let max_norm = states.par_iter().map(|(u, _)| u[0].norm()).reduce(|| 0.0_f64, f64::max);
-        if max_norm < 1e-3 || while_steps >= max_while_steps {
+        let stop = match fixed_phase2 {
+            Some(k) => while_steps >= k,
+            None => {
+                let max_norm = states.par_iter().map(|(u, _)| u[0].norm()).reduce(|| 0.0_f64, f64::max);
+                max_norm < 1e-3 || while_steps >= max_while_steps
+            }
+        };
+        if stop {
             break;
         }
         states.par_iter_mut().for_each(|(u, phi)| {
@@ -3884,7 +3940,7 @@ fn custom_pgf_parallel(
     }
 
     // Phase 3: exp(φ).
-    states.into_par_iter().map(|(_u, phi)| phi.exp()).collect()
+    (states.into_par_iter().map(|(_u, phi)| phi.exp()).collect(), while_steps)
 }
 
 /// Evaluate the custom reaction-network log-PGF over all grid points in
@@ -3931,9 +3987,10 @@ fn eval_custom_network_pgf(
 
     let (g, mx, n_grid) = build_mesh_nd(&limits);
 
-    let exp_phi = custom_pgf_parallel(
+    let (exp_phi, _) = custom_pgf_parallel(
         &g, &params, &rxns, &prod_sp, &prod_st,
         n_species, n_grid, dt, n_steps, max_while_steps,
+        None,
     );
 
     let re: Vec<f64> = exp_phi.iter().map(|z| z.re).collect();
@@ -4438,6 +4495,52 @@ fn eval_logl_2d_sd(
 /// fd_eps : finite-difference step size in log10 space (default 1e-6)
 ///
 /// Returns (kld: float, grad: list[float]) where grad[i] = d KLD / d log10(θ_i).
+/// KLD and forward-FD gradient (w.r.t. log10 parameters) for the ProteinBursty
+/// model.  All stencil points are integrated with the base point's schedule so the
+/// gradient is free of step-count discontinuities.  `coords` is (n_points, 3)
+/// histogram support, `f` the matching frequencies.
+#[pyfunction]
+#[pyo3(signature = (p_log, limits, coords, f, fit_unspliced, protein_limit, min_fudge, max_fudge, fd_eps=1e-6, eps=1e-15))]
+#[allow(clippy::too_many_arguments)]
+fn eval_kld_grad_protein_bursty(
+    py: Python<'_>,
+    p_log: Vec<f64>,
+    limits: Vec<usize>,
+    coords: Vec<Vec<i64>>,
+    f: Vec<f64>,
+    fit_unspliced: bool,
+    protein_limit: f64,
+    min_fudge: f64,
+    max_fudge: f64,
+    fd_eps: f64,
+    eps: f64,
+) -> PyResult<(f64, Vec<f64>)> {
+    use pyo3::exceptions::PyValueError;
+    if p_log.len() != 5 {
+        return Err(PyValueError::new_err("eval_kld_grad_protein_bursty: expected 5 log10 parameters"));
+    }
+    if limits.len() != 3 {
+        return Err(PyValueError::new_err("eval_kld_grad_protein_bursty: expected 3 limits"));
+    }
+    if coords.len() != f.len() {
+        return Err(PyValueError::new_err("eval_kld_grad_protein_bursty: coords and f length mismatch"));
+    }
+    for (i, c) in coords.iter().enumerate() {
+        if c.len() != 3 || c.iter().zip(limits.iter()).any(|(&v, &l)| v < 0 || v as usize >= l) {
+            return Err(PyValueError::new_err(format!(
+                "eval_kld_grad_protein_bursty: coords[{i}] outside grid {limits:?}"
+            )));
+        }
+    }
+    let strides = row_major_strides(&limits);
+    Ok(py.allow_threads(|| {
+        eval_kld_and_grad_seq_protein_bursty(
+            &p_log, &limits, &strides, &coords, &f,
+            fit_unspliced, protein_limit, min_fudge, max_fudge, fd_eps, eps,
+        )
+    }))
+}
+
 #[pyfunction]
 #[pyo3(signature = (bio_model, p_log, limits, u_idx, s_idx, f, fixed_quad_t, quad_order, fd_eps=1e-6, samp_log=None, eps=1e-15, seq_model="Poisson"))]
 #[allow(clippy::too_many_arguments)]
@@ -4582,7 +4685,8 @@ fn lbfgsb_minimize(
     let mut solver = LBFGSB::new(m_mem)
         .with_max_iter(maxiter)
         .with_pgtol(gtol)
-        .with_ftol(ftol);
+        .with_ftol(ftol)
+        .with_verbose(lbfgsb_verbose());
 
     let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
         eval_kld_and_grad_seq(
@@ -4924,11 +5028,24 @@ fn eval_model_pss_protein_bursty_seq(
     min_fudge:     f64,
     max_fudge:     f64,
 ) -> Vec<f64> {
-    let (gf, mx, lims) =
-        protein_bursty_core(p_log, limits, fit_unspliced, protein_limit, min_fudge, max_fudge);
+    eval_model_pss_protein_bursty_seq_sched(p_log, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, None).0
+}
+
+/// Sequential ProteinBursty PSS with an optional fixed integration schedule.
+fn eval_model_pss_protein_bursty_seq_sched(
+    p_log:         &[f64],
+    limits:        &[usize],
+    fit_unspliced: bool,
+    protein_limit: f64,
+    min_fudge:     f64,
+    max_fudge:     f64,
+    fixed:         Option<(f64, usize)>,
+) -> (Vec<f64>, (f64, usize)) {
+    let (gf, mx, lims, sched) =
+        protein_bursty_core_sched(p_log, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, fixed);
     let pss_raw = irfftn_3d(&gf, mx[0], mx[2], lims[0], lims[1], lims[2]);
     let abs_sum: f64 = pss_raw.iter().map(|x| x.abs()).sum();
-    pss_raw.iter().map(|x| x.abs() / abs_sum).collect()
+    (pss_raw.iter().map(|x| x.abs() / abs_sum).collect(), sched)
 }
 
 /// KLD + forward finite-difference gradient for ProteinBursty (sequential).
@@ -4947,16 +5064,19 @@ fn eval_kld_and_grad_seq_protein_bursty(
     eps:           f64,
 ) -> (f64, Vec<f64>) {
     let n = x.len();
-    let pss0 = eval_model_pss_protein_bursty_seq(
-        x, limits, fit_unspliced, protein_limit, min_fudge, max_fudge,
+    // Base point with the adaptive schedule; every perturbed point reuses that
+    // exact (dt, step count) so the difference quotient sees only the smooth
+    // dependence on the parameters, not jumps in the discretisation.
+    let (pss0, sched) = eval_model_pss_protein_bursty_seq_sched(
+        x, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, None,
     );
     let kld0 = compute_kld_sparse_nd(&pss0, strides, coords, f_data, eps);
     let grad: Vec<f64> = (0..n)
         .map(|i| {
             let mut x_eps = x.to_vec();
             x_eps[i] += fd_eps;
-            let pss = eval_model_pss_protein_bursty_seq(
-                &x_eps, limits, fit_unspliced, protein_limit, min_fudge, max_fudge,
+            let (pss, _) = eval_model_pss_protein_bursty_seq_sched(
+                &x_eps, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, Some(sched),
             );
             let kld = compute_kld_sparse_nd(&pss, strides, coords, f_data, eps);
             (kld - kld0) / fd_eps
@@ -4987,7 +5107,8 @@ fn lbfgsb_minimize_protein_bursty(
 ) -> (Vec<f64>, f64, u8) {
     let n = x0.len();
     let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
-    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol).with_ftol(ftol);
+    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol).with_ftol(ftol)
+        .with_verbose(lbfgsb_verbose());
     let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
         eval_kld_and_grad_seq_protein_bursty(
             xx, limits, strides, coords, f_data,
@@ -5227,7 +5348,8 @@ fn lbfgsb_minimize_amb(
 ) -> (Vec<f64>, f64, u8) {
     let n = x0.len();
     let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
-    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol).with_ftol(ftol);
+    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol).with_ftol(ftol)
+        .with_verbose(lbfgsb_verbose());
     let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
         eval_kld_and_grad_seq_amb(
             bio_model, xx, limits, strides, coords, f_data,
@@ -5377,11 +5499,12 @@ fn eval_custom_network_pss_seq(
     dt:               f64,
     n_steps:          usize,
     max_while_steps:  usize,
-) -> Vec<f64> {
+    fixed_phase2:     Option<usize>,
+) -> (Vec<f64>, usize) {
     let (g, mx, n_grid) = build_mesh_nd(limits);
-    let exp_phi = custom_pgf_parallel(
+    let (exp_phi, phase2_steps) = custom_pgf_parallel(
         &g, params_linear, rxns, prod_sp, prod_st,
-        n_species, n_grid, dt, n_steps, max_while_steps,
+        n_species, n_grid, dt, n_steps, max_while_steps, fixed_phase2,
     );
 
     let pss_raw: Vec<f64> = match n_species {
@@ -5391,7 +5514,7 @@ fn eval_custom_network_pss_seq(
     };
 
     let abs_sum: f64 = pss_raw.iter().map(|x| x.abs()).sum();
-    pss_raw.iter().map(|x| x.abs() / abs_sum).collect()
+    (pss_raw.iter().map(|x| x.abs() / abs_sum).collect(), phase2_steps)
 }
 
 /// Derive `params_linear`, `dt`, `n_steps`, and `max_while` from the log10 optimizer
@@ -5434,20 +5557,22 @@ fn eval_kld_and_grad_seq_custom(
     let n = x.len();
     let (params, dt, n_steps, max_while) =
         custom_network_integration_params(x, has_norm_rate, min_fudge, max_fudge);
-    let pss0 = eval_custom_network_pss_seq(
-        n_species, limits, rxns, prod_sp, prod_st, &params, dt, n_steps, max_while,
+    let (pss0, phase2) = eval_custom_network_pss_seq(
+        n_species, limits, rxns, prod_sp, prod_st, &params, dt, n_steps, max_while, None,
     );
     let kld0 = compute_kld_sparse_nd(&pss0, strides, coords, f_data, eps);
 
+    // Perturbed points reuse the base point's schedule (dt, n_steps, phase-2
+    // steps) so the finite difference is not polluted by discretisation jumps.
     let grad: Vec<f64> = (0..n)
         .map(|i| {
             let mut x_eps = x.to_vec();
             x_eps[i] += fd_eps;
-            let (params_eps, dt_eps, ns_eps, mw_eps) =
+            let (params_eps, _, _, _) =
                 custom_network_integration_params(&x_eps, has_norm_rate, min_fudge, max_fudge);
-            let pss = eval_custom_network_pss_seq(
+            let (pss, _) = eval_custom_network_pss_seq(
                 n_species, limits, rxns, prod_sp, prod_st,
-                &params_eps, dt_eps, ns_eps, mw_eps,
+                &params_eps, dt, n_steps, max_while, Some(phase2),
             );
             let kld = compute_kld_sparse_nd(&pss, strides, coords, f_data, eps);
             (kld - kld0) / fd_eps
@@ -5481,7 +5606,8 @@ fn lbfgsb_minimize_custom(
 ) -> (Vec<f64>, f64, u8) {
     let n = x0.len();
     let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
-    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol).with_ftol(ftol);
+    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol).with_ftol(ftol)
+        .with_verbose(lbfgsb_verbose());
     let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
         eval_kld_and_grad_seq_custom(
             xx, n_species, limits, strides, rxns, prod_sp, prod_st,
@@ -5915,6 +6041,7 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(eval_logl_2d_sd, m)?)?;
     m.add_function(wrap_pyfunction!(chisquare_testing_2d_sd, m)?)?;
     m.add_function(wrap_pyfunction!(eval_kld_grad_2d, m)?)?;
+    m.add_function(wrap_pyfunction!(eval_kld_grad_protein_bursty, m)?)?;
     m.add_function(wrap_pyfunction!(optimize_gene_2d, m)?)?;
     m.add_function(wrap_pyfunction!(optimize_genes_2d, m)?)?;
     m.add_function(wrap_pyfunction!(optimize_genes_2d_sd, m)?)?;
