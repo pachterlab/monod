@@ -11,6 +11,9 @@ crate-type = ["cdylib"]
 # kmeans: Rust initializer for meK-Means (otherwise scikit-learn is used). On by default.
 default = ["kmeans"]
 kmeans = ["dep:rand_xoshiro"]
+# static-hdf5: compile HDF5 from source (needs cmake) and link it statically, so the
+# wheel has no runtime dependency on a system libhdf5. Used for the published wheels.
+static-hdf5 = ["dep:hdf5-metno-sys", "hdf5-metno-sys/static", "dep:hdf5-metno-src"]
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"] }
@@ -27,6 +30,10 @@ ruanndata = { git = "https://github.com/cleartools/ruanndata.git", rev = "88a468
 indexmap = "2"
 matrixmultiply    = "0.3"
 rand_xoshiro      = { version = "0.6", optional = true }
+hdf5-metno-sys    = { version = "0.11", optional = true }   # only to toggle its `static` feature
+# Pinned: newer hdf5-metno-src releases bundle HDF5 2.2, which the 0.11 sys bindings
+# (and their version parser) do not accept yet. Bump together with the sys crate.
+hdf5-metno-src    = { version = "=0.10.2", optional = true }
 
 [patch.crates-io]
 hdf5-metno-sys = { path = "hdf5_metno_sys_patched" }

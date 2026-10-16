@@ -1,0 +1,138 @@
+name: wheels
+
+# Builds monod-core wheels (self-contained, static HDF5) and the monod_anndata
+# sdist/wheel on every version tag, and publishes both to PyPI via trusted
+# publishing. Run manually (workflow_dispatch) to build without publishing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core-wheels:
+    name: monod-core ${{ matrix.name }} py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The manylinux container ships every CPython, so one job builds all four.
+          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64, manylinux: "2014", python: "3.11",
+              interpreters: "-i python3.9 python3.10 python3.11 python3.12" }
+          # macOS runners only have the interpreter set up by setup-python: one job per version.
+          - { name: macos-arm64,  os: macos-14, target: aarch64, python: "3.9",  interpreters: "-i python3.9" }
+          - { name: macos-arm64,  os: macos-14, target: aarch64, python: "3.10", interpreters: "-i python3.10" }
+          - { name: macos-arm64,  os: macos-14, target: aarch64, python: "3.11", interpreters: "-i python3.11" }
+          - { name: macos-arm64,  os: macos-14, target: aarch64, python: "3.12", interpreters: "-i python3.12" }
+          - { name: macos-x86_64, os: macos-13, target: x86_64,  python: "3.9",  interpreters: "-i python3.9" }
+          - { name: macos-x86_64, os: macos-13, target: x86_64,  python: "3.10", interpreters: "-i python3.10" }
+          - { name: macos-x86_64, os: macos-13, target: x86_64,  python: "3.11", interpreters: "-i python3.11" }
+          - { name: macos-x86_64, os: macos-13, target: x86_64,  python: "3.12", interpreters: "-i python3.12" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        env:
+          # The bundled HDF5 sources' cmake_minimum_required is older than what CMake 4
+          # accepts by default; this is CMake's supported override for that case.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        with:
+          working-directory: monod_core
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist --features static-hdf5 ${{ matrix.interpreters }}
+          # HDF5 is compiled from source inside the build (static-hdf5), which needs a current cmake.
+          before-script-linux: pip install cmake
+      - name: Smoke-test the wheel for this interpreter
+        shell: bash
+        run: |
+          python -m pip install numpy
+          python -m pip install --no-index --find-links monod_core/dist monod-core
+          python -c "import monod_core, sys; print('monod_core', monod_core.__name__, 'OK on', sys.platform, sys.version.split()[0])"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-wheels-${{ matrix.name }}-py${{ matrix.python }}
+          path: monod_core/dist/*.whl
+
+  core-sdist:
+    name: monod-core sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: monod_core
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-sdist
+          path: monod_core/dist/*.tar.gz
+
+  python-dist:
+    name: monod_anndata sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+
+  github-release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [core-wheels, core-sdist, python-dist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write            # create the release and attach the artifacts
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true   # from merged PRs / commits since the previous tag
+
+  publish:
+    name: Publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [core-wheels, core-sdist, python-dist]
+    runs-on: ubuntu-latest
+    environment: pypi            # create this environment in the repo settings
+    permissions:
+      id-token: write            # trusted publishing, no API token stored
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: core-*
+          merge-multiple: true
+          path: dist-core
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist-python
+      - name: Publish monod-core
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-core
+      - name: Publish monod_anndata
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-python

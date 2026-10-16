@@ -5,6 +5,22 @@ build-backend = "maturin"
 [project]
 name = "monod-core"
 version = "0.3.0"
+description = "Rust acceleration for monod (CME model inference from single-cell sequencing data)"
+readme = "README.md"
+license = { text = "BSD-2-Clause" }
+authors = [{ name = "Conrad Oakes" }, { name = "Gennady Gorin" }, { name = "Lior Pachter" }]
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+]
+
+[project.urls]
+Homepage = "https://github.com/pachterlab/monod"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

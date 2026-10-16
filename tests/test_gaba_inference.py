@@ -47,6 +47,12 @@ _HERE = os.path.dirname(__file__)
 GABA_EXAMPLE_PATH = os.path.join(_HERE, "..", "example_h5ad", "gaba_example.h5ad")
 GABA_RESULTS_PATH = os.path.join(_HERE, "..", "example_h5ad", "gaba_results.h5ad")
 
+# Both files are gitignored (large); skip the whole module when they are absent (e.g. CI).
+pytestmark = pytest.mark.skipif(
+    not (os.path.exists(GABA_EXAMPLE_PATH) and os.path.exists(GABA_RESULTS_PATH)),
+    reason="gaba_example.h5ad / gaba_results.h5ad not available",
+)
+
 GENES = ["Eif5b", "Xrcc5", "Klhl12", "Rgs7", "Thsd7b"]
 REF_SAMP_IND = 17
 REF_SAMP_OPTIMUM = (-6.8, -1.5)

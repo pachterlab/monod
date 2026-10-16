@@ -294,7 +294,8 @@ class TestEvalModelKLDRealData:
         limits = _limits(usp_adata)
         coords, freqs = _unique_histogram(usp_adata)
         kld = model_usp.eval_model_kld(p, limits, None, (coords, freqs))
-        check_snapshot("kld_usp_fitted_params", np.array([kld]))
+        # Rust (f64 quadrature) and Python (float32 mesh) agree to ~2e-5 on this sum.
+        check_snapshot("kld_usp_fitted_params", np.array([kld]), rtol=1e-4)
 
     def test_sp_kld_finite(self, sp_adata, model_sp):
         """SP histogram: data still has 3 columns (USP), matching the 3D PSS."""
@@ -313,7 +314,7 @@ class TestEvalModelKLDRealData:
         kld = model_sp.eval_model_kld(
             p, limits, None, (coords, freqs)
         )
-        check_snapshot("kld_sp_fitted_params", np.array([kld]))
+        check_snapshot("kld_sp_fitted_params", np.array([kld]), rtol=1e-4)
 
 
 # ===========================================================================
