@@ -1,111 +1,49 @@
-# *Monod*: a package for CME inference from seq data
+# Monod
 
 [![PyPI version](https://badge.fury.io/py/monod.svg?branch=main&kill_cache=1)](https://badge.fury.io/py/monod)
 
-This repository contains the current version of the *Monod* package, which implements procedures for fitting and analyzing stochastic models of transcription and sequencing. The description of the package's functionality and several applications are given in the [paper](https://www.nature.com/articles/s41592-025-02832-x).
+Monod fits mechanistic models of transcription to single-cell sequencing data. Instead of summarising each gene by its mean expression, it treats the unspliced and spliced counts of every gene as draws from a stochastic model of bursting, splicing and degradation, and infers the model's rate parameters gene by gene. The result is a biophysical description of each gene, with the technical noise of the sequencing process modelled explicitly rather than normalised away.
 
-Examples and tutorials are given at the [example repository](https://github.com/pachterlab/monod_examples). For theoretical background, see [Gorin & Pachter 2022](https://www.cell.com/biophysreports/fulltext/S2667-0747(22)00054-4). For usage instructions, see the [readthedocs website](https://monod-examples.readthedocs.io/en/latest/index.html). For a sample workflow applied a small dataset, see the [Colaboratory notebook](https://github.com/pachterlab/monod/blob/main/Monod_demo_new.ipynb).
+The method is described in the [Monod paper](https://www.nature.com/articles/s41592-025-02832-x) (Nature Methods, 2025), with the theory in [Gorin & Pachter (2022)](https://www.cell.com/biophysreports/fulltext/S2667-0747(22)00054-4). meK-Means, Monod's model-based clustering of cells, is described in [Chari, Gorin & Pachter (2024)](https://www.nature.com/articles/s43588-024-00689-2).
 
 ## Installation
-
-Python 3.9 or newer is required.
 
 ```bash
 pip install monod monod-core
 ```
 
-`monod` is the Python package; `monod-core` is the optional Rust extension, shipped as prebuilt wheels for Linux x86_64 and Apple-silicon macOS. monod detects it at import time and falls back to pure Python (slower, otherwise identical) when it is absent, so `pip install monod` alone also works.
-
-To work from a checkout instead:
-
-```bash
-git clone https://github.com/pachterlab/monod.git
-cd monod
-pip install -e .
-```
-
-### Building the Rust extension from source
-
-The `monod_core` extension replaces the hot loops (PSS evaluation, histogramming, L-BFGS-B, chi-square and log-likelihood scoring) with multithreaded Rust. Use the prebuilt wheel above when one exists for your platform; otherwise, or to develop it, build it yourself.
-
-Requirements: a Rust toolchain (`rustup`), a C compiler, a system HDF5 library discoverable via `pkg-config` or `HDF5_DIR`, and [maturin](https://www.maturin.rs/).
-
-```bash
-pip install maturin
-cd monod_core
-maturin build --release --compatibility linux -i "$(which python)"   # drop --compatibility on macOS
-pip install --force-reinstall --no-deps target/wheels/monod_core-*.whl
-cd ..
-python -c "import monod_core; print('Rust extension OK, meK-Means init:', hasattr(monod_core, 'initialize_q_kmeans'))"
-```
-
-The `kmeans` cargo feature (the Rust k-means initializer used by meK-Means) is on by default; building with `--no-default-features` drops it, in which case meK-Means initializes through scikit-learn instead. The `ruanndata` crate is fetched from GitHub at a pinned commit by cargo; if you are developing ruanndata alongside monod, see the commented `[patch]` block at the end of `monod_core/Cargo.toml`.
-
-On Apple Silicon with an x86_64 (Rosetta) Homebrew HDF5, set `HDF5_NO_RUNTIME_CHECK=1` for the build.
-
-### Optional: GPU
-
-If PyTorch is installed and a CUDA device with float64 support is available, the two-species PSS evaluation runs on the GPU. Apple MPS does not support float64 and is not used.
+Python 3.9 or newer is required. `monod-core` is an optional accelerator written in Rust, with prebuilt wheels for Linux and Apple-silicon Macs. Monod uses it automatically when it is present and runs in pure Python otherwise, with identical results and more patience required. If `monod-core` has no wheel for your platform, `pip install monod` alone is enough to get started.
 
 ## Quick start
 
+Monod works on an [AnnData](https://anndata.readthedocs.io) object whose `layers` hold integer unspliced and spliced counts, as produced by kallisto|bustools, velocyto or similar tools.
+
 ```python
-import anndata as ad
 from monod.cme_toolbox import CMEModel
 from monod.inference import perform_inference
 
-model = CMEModel("Bursty", "Poisson")        # biology, technical noise
+model = CMEModel("Bursty", "Poisson")   # bursty transcription, Poisson sampling noise
 adata = perform_inference("example_h5ad/example_adata.h5ad", model, n_genes=100)
+
 adata.var[["$b$", r"$\beta$", r"$\gamma$", "AIC"]].head()
 ```
 
-`perform_inference` filters genes, builds the per-gene count histograms, scans a grid of technical-noise parameters, fits every gene by maximum likelihood at each grid point, and writes the log10 parameter estimates and AIC into `adata.var`. Parameter columns are named with the model's TeX labels minus the log prefix (`$b$`, `$\beta$`, `$\gamma$`; see `model.param_str`), and fold-change columns written by `monod.analysis.DE_parameters` follow the same convention (`FC_$b$`, `adj_FC_$b$`). For finer control use `extract_data`, `searchdata_from_adata`, and `InferenceParameters.fit_all_grid_points` directly; the `demo_*.ipynb` notebooks walk through each of these, the reaction-network and protein models, and the Rust and GPU paths.
+This selects the 100 most informative genes, fits each one, and writes the inferred burst size, splicing rate and degradation rate (all log10) into `adata.var`, alongside a goodness-of-fit score. Everything stays in the returned AnnData, which saves to an ordinary `.h5ad` file; nothing is written to disk unless you ask.
 
-### meK-Means (mixture-model clustering)
+From there you can:
 
-`monod.mminference.MEKMeansParameters` fits K clusters jointly with per-cluster CME parameters (the meK-Means algorithm of Carilli et al.). It takes the same bounds and `gradient_params` as `InferenceParameters` plus `k`, `epochs`, and three controls that are not in the paper's Algorithm 1: `random_state` seeds the k-means-plus-perturbation initialization so reruns are reproducible; `init_modality` chooses the counts k-means sees (`"sum"` = U + S, the default; `"spliced"` = the paper's description); and `em_tol` / `em_patience` stop EM early once the per-cell log-likelihood bound plateaus. Pass `em_tol=0` to run a fixed number of epochs exactly as published. The per-run `aic_per_cell` on the results follows the paper's definition (lower is better; pick K with `argmin`). The old `aic` attribute still reads but warns, because its sign convention was the opposite.
+- compare parameters between conditions with `monod.analysis`,
+- cluster cells by their transcriptional kinetics with meK-Means (`monod.mminference`),
+- swap in other models of transcription, sequencing noise, or ambient contamination,
+- add a protein layer or define your own reaction network.
 
-Input expectations: an AnnData whose `layers` hold integer counts for the model's modalities (`unspliced` and `spliced` by default; map other names with `modality_name_dict`). Gene lengths, if used, come from a transcriptome file or `adata.var['log_lengths']`.
+## Learning more
 
-### Logging and stored objects
+- [`Monod_demo_new.ipynb`](https://github.com/pachterlab/monod/blob/main/Monod_demo_new.ipynb): an end-to-end walkthrough on a small dataset, runnable in Colab.
+- The `demo_*.ipynb` notebooks in this repository: one topic each, covering the available models, reaction networks, the protein model, meK-Means, and the Rust and GPU paths.
+- The [example repository](https://github.com/pachterlab/monod_examples) and the [documentation site](https://monod-examples.readthedocs.io/en/latest/index.html).
+- [`DEVELOPING.md`](https://github.com/pachterlab/monod/blob/main/DEVELOPING.md): building the Rust extension from source, GPU use, what Monod stores and where, logging, running the tests, and cutting a release.
 
-monod logs through the `"monod"` logger and never reconfigures Python logging itself. To see progress messages, configure logging in your application, for example `logging.basicConfig(); logging.getLogger("monod").setLevel(logging.INFO)`.
+## Citing
 
-### Files on disk
-
-By default monod writes nothing. Results live in memory and in the returned AnnData: `adata.uns['model']` and `adata.uns['search_result']` (or `search_result_list` for meK-Means) are nested dicts of arrays and scalars, not pickles, so the AnnData writes to a plain h5ad with `adata.write_h5ad()` and reads back anywhere. Rebuild the Python objects with `CMEModel.from_dict`, `monod.inference.search_result_from_uns`, or `search_result_list_from_uns`.
-
-When you do ask for files:
-
-| Call | What is written |
-|---|---|
-| `perform_inference(..., save=True)` | one file, `<dataset>/<model>_<grid>/monod_adata.h5ad`, holding data, model, parameters, results and cluster labels |
-| `SearchResults.store_on_disk()` or `run_mek_means(save=True)` | one `grid_scan_results.h5` in the run directory |
-| `InferenceParameters(..., save=True)` | `parameters.h5` in the run directory |
-| `fit_all_grid_points(..., checkpoint=True)` | one `grid_point_<i>.h5` per grid point, for crash recovery |
-| any plot method with `savefig=True` | `analysis_figures/<name>.png`, created on first use, only if the run directory exists |
-
-`monod.analysis.load_search_results(path)` reads any of the h5ad or h5 files above (and, with a warning, legacy pickled `.res` files). Run directories are resolved to absolute paths at construction, from the working directory at that time.
-
-## Releasing
-
-Continuous integration lives in `.github/workflows/`:
-
-- `tests.yml` runs the test suite on every push and pull request, with and without the Rust extension.
-- `wheels.yml` runs on every `v*` tag (or by hand from the Actions tab). It builds self-contained `monod-core` wheels (Linux x86_64 and macOS arm64; Python 3.9 to 3.12; HDF5 linked statically; Intel Macs build from source) plus the pure-Python `monod` sdist and wheel, creates a GitHub release with those files attached and auto-generated notes, and publishes both packages to PyPI.
-
-To cut a release:
-
-1. Bump the version in `setup.cfg`, `monod_core/Cargo.toml`, and `monod_core/pyproject.toml`, and commit.
-2. `git tag vX.Y.Z && git push origin vX.Y.Z`.
-
-One-time setup before the first tagged release: create a `pypi` environment in the repository settings (Settings, Environments), and on PyPI add a *trusted publisher* for each project (`monod`, which already exists, and `monod-core`, added as a pending publisher until its first upload) pointing at `pachterlab/monod`, workflow `wheels.yml`, environment `pypi`. With that in place no API token is stored anywhere; the workflow authenticates with a short-lived token from GitHub.
-
-## Development
-
-```bash
-pip install -e .[test]
-python -m pytest tests/ -q
-```
-
-The tests run against `src/` directly (see `tests/conftest.py`), so an editable install is optional. Tests that need the large `gaba_example.h5ad` data are skipped when the file is absent.
+If you use Monod, please cite the [Monod paper](https://www.nature.com/articles/s41592-025-02832-x) (Nature Methods, 2025), and for meK-Means, [Chari, Gorin & Pachter (2024)](https://www.nature.com/articles/s43588-024-00689-2).
