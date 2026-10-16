@@ -28,10 +28,9 @@ jobs:
           - { name: macos-arm64,  os: macos-14, target: aarch64, python: "3.10", interpreters: "-i python3.10" }
           - { name: macos-arm64,  os: macos-14, target: aarch64, python: "3.11", interpreters: "-i python3.11" }
           - { name: macos-arm64,  os: macos-14, target: aarch64, python: "3.12", interpreters: "-i python3.12" }
-          - { name: macos-x86_64, os: macos-13, target: x86_64,  python: "3.9",  interpreters: "-i python3.9" }
-          - { name: macos-x86_64, os: macos-13, target: x86_64,  python: "3.10", interpreters: "-i python3.10" }
-          - { name: macos-x86_64, os: macos-13, target: x86_64,  python: "3.11", interpreters: "-i python3.11" }
-          - { name: macos-x86_64, os: macos-13, target: x86_64,  python: "3.12", interpreters: "-i python3.12" }
+          # No Intel-mac wheels: GitHub's macos-13 runners are being retired and jobs
+          # queue for hours, which held up the release. Intel Macs fall back to the
+          # Python path or build from source (see README).
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

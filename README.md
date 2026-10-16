@@ -86,7 +86,7 @@ When you do ask for files:
 Continuous integration lives in `.github/workflows/`:
 
 - `tests.yml` runs the test suite on every push and pull request, with and without the Rust extension.
-- `wheels.yml` runs on every `v*` tag (or by hand from the Actions tab). It builds self-contained `monod-core` wheels (Linux x86_64, macOS arm64 and x86_64; Python 3.9 to 3.12; HDF5 linked statically) plus the `monod_anndata` sdist and wheel, creates a GitHub release with those files attached and auto-generated notes, and publishes both packages to PyPI.
+- `wheels.yml` runs on every `v*` tag (or by hand from the Actions tab). It builds self-contained `monod-core` wheels (Linux x86_64 and macOS arm64; Python 3.9 to 3.12; HDF5 linked statically; Intel Macs build from source) plus the `monod_anndata` sdist and wheel, creates a GitHub release with those files attached and auto-generated notes, and publishes both packages to PyPI.
 
 To cut a release:
 

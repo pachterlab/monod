@@ -22,7 +22,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Install the Python package
-        run: python -m pip install -e ".[test]"
+        # the annotate plugin turns each failing test into a GitHub annotation
+        # (visible in the UI and via the API), so failures are readable without the raw log
+        run: python -m pip install -e ".[test]" pytest-github-actions-annotate-failures
       - name: Install Rust and HDF5
         if: matrix.rust
         run: |
@@ -38,4 +40,4 @@ jobs:
       - name: Run the test suite
         env:
           CUDA_VISIBLE_DEVICES: ""
-        run: python -m pytest tests/ -q -p no:cacheprovider
+        run: python -m pytest tests/ -q -ra --tb=short -p no:cacheprovider
