@@ -1,0 +1,38 @@
+[package]
+name = "monod_core"
+version = "0.3.0"
+edition = "2021"
+
+[lib]
+name = "monod_core"
+crate-type = ["cdylib"]
+
+[features]
+# kmeans: Rust initializer for meK-Means (otherwise scikit-learn is used). On by default.
+default = ["kmeans"]
+kmeans = ["dep:rand_xoshiro"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+num-complex = "0.4"
+rustfft = "6"
+realfft = "3"
+rayon = "1"
+numpy = "0.22"
+ndarray = "0.15"
+lbfgsb-rs-pure = "0.1.1"
+# ruanndata is pinned to a commit so builds are reproducible; bump `rev` deliberately
+# (and re-run the test suite) when picking up a newer ruanndata.
+ruanndata = { git = "https://github.com/cleartools/ruanndata.git", rev = "88a46860a59c9affb7b5605c6a267e2cfe01300d", default-features = false, features = ["h5ad"] }
+indexmap = "2"
+matrixmultiply    = "0.3"
+rand_xoshiro      = { version = "0.6", optional = true }
+
+[patch.crates-io]
+hdf5-metno-sys = { path = "hdf5_metno_sys_patched" }
+lbfgsb-rs-pure = { path = "lbfgsb_rs_pure_patched" }
+
+# Developing ruanndata alongside monod? Point the git dependency at your checkout
+# by uncommenting the block below (do not commit it):
+# [patch."https://github.com/cleartools/ruanndata.git"]
+# ruanndata = { path = "../../ruanndata" }

@@ -1,19 +1,25 @@
-import pickle
+import itertools
+import logging
 import time
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
-import mminference
+from .extract_data import make_dir, log, extract_data, make_histogram, _uns_unpack, _build_sampling_grid, model_from_uns
+from .cme_toolbox import CMEModel, _HAS_RUST  # may be unnecessary
+try:
+    import monod_core as _mc
+except ImportError:
+    _mc = None
 
-from extract_data import make_dir, log, extract_data
-from cme_toolbox import CMEModel  # may be unnecessary
+_LBFGSB_RUST_MODELS_2D = {"Constitutive", "Bursty", "CIR", "Extrinsic", "Delay", "DelayedSplicing"}
+
 import multiprocessing
 import os
 
 # lbfgsb has a deprecation warning for .tostring(), probably in FORTRAN interface
 import warnings
-from plot_aesthetics import aesthetics
+from .plot_aesthetics import aesthetics
 
 from tqdm import tqdm
 code_ver_global = "029"  # bumping up version April 2024
@@ -33,12 +39,9 @@ def perform_inference(h5ad_filepath,
     code_ver=code_ver_global,
     filt_param=None,
     exp_filter_threshold=1,
-    genes_to_fit=[],
-    gradient_params={
-        "max_iterations": 10,
-        "init_pattern": "moments",
-        "num_restarts": 1},
-    use_lengths=True,
+    genes_to_fit=None,
+    gradient_params=None,
+    use_lengths="auto",
     run_meta="",
     phys_lb=None,
     phys_ub=None,
@@ -49,12 +52,23 @@ def perform_inference(h5ad_filepath,
     exclude_sigma=True,
     poisson_average_log_length=5,
     mek_means_params=None,
-    num_cores=1, AIC_EPS=1e-20, AIC_offs=0):
+    num_cores=1, grid_cores=1, AIC_EPS=1e-20, AIC_offs=0,
+    save=False, checkpoint=False):
     '''
     Load and filter data from h5ad file.
     Run inference procedure for the desired model, save parameters, uncertainty from Hessian and AIC values automatically.
     '''
     
+    if gradient_params is None:
+        gradient_params = {
+            "max_iterations": 10,
+            "init_pattern": "moments",
+            "num_restarts": 3,
+            "num_gene_cores": 1,
+            "n_jac_jobs": 1,
+        }
+    if genes_to_fit is None:
+        genes_to_fit = []
     if mek_means_params:
         k, epochs = mek_means_params
     
@@ -65,8 +79,9 @@ def perform_inference(h5ad_filepath,
             # For anndata, use the name of the anndata object.
             dataset_string = model.bio_model + '_' + model.seq_model
             log.info("No dataset name given (dataset_string=None). Saving as {}".format(dataset_string))
-        
-    make_dir(dataset_string)
+
+    if save:
+        make_dir(dataset_string)
     
     monod_adata = extract_data(h5ad_filepath,
     model,
@@ -88,8 +103,11 @@ def perform_inference(h5ad_filepath,
     log.info('Search data created.')
 
     if not transcriptome_filepath:
-        use_lengths = False
-        log.info('Lengths have not been given so are not being used')
+        if 'log_lengths' in monod_adata.var.columns:
+            log.info('Gene lengths found in adata.var, using for inference.')
+        else:
+            use_lengths = None
+            log.info('Lengths have not been given so are not being used')
 
     if not mek_means_params:
         inference_parameters = InferenceParameters(
@@ -103,10 +121,14 @@ def perform_inference(h5ad_filepath,
             samp_lb=samp_lb,
             samp_ub=samp_ub,
             gridsize=gridsize,
-        poisson_average_log_length=poisson_average_log_length)
+            poisson_average_log_length=poisson_average_log_length)
 
     else:
-        inference_parameters = mminference.InferenceParameters(
+        from . import mminference
+        # Stage 1: standard inference to find optimal technical parameters.
+        # Technical noise is a batch-level property shared across all clusters,
+        # so eta is estimated once from the full population before clustering.
+        standard_ip = InferenceParameters(
             dataset_string,
             model,
             use_lengths=use_lengths,
@@ -117,14 +139,46 @@ def perform_inference(h5ad_filepath,
             samp_lb=samp_lb,
             samp_ub=samp_ub,
             gridsize=gridsize,
-        poisson_average_log_length=poisson_average_log_length,
-        k=k, epochs=epochs)
+            poisson_average_log_length=poisson_average_log_length)
+
+        if standard_ip.n_grid_points > 1:
+            log.info('Running standard inference to find optimal technical parameters for meK-Means.')
+            standard_result = standard_ip.fit_all_grid_points(
+                search_data, num_cores=num_cores, grid_cores=grid_cores,
+                checkpoint=checkpoint, save=False)
+            standard_result.find_sampling_optimum(discard_rejected=False)
+            optimal_eta = list(standard_result.samp_optimum)
+            log.info('Optimal technical parameters for meK-Means: {}'.format(optimal_eta))
+            fixed_samp_lb = optimal_eta
+            fixed_samp_ub = optimal_eta
+            fixed_gridsize = [1] * len(optimal_eta)
+        else:
+            fixed_samp_lb = samp_lb
+            fixed_samp_ub = samp_ub
+            fixed_gridsize = gridsize
+
+        # Stage 2: meK-Means at the fixed optimal technical parameters.
+        inference_parameters = mminference.MEKMeansParameters(
+            dataset_string,
+            model,
+            use_lengths=use_lengths,
+            gradient_params=gradient_params,
+            run_meta=run_meta,
+            phys_lb=phys_lb,
+            phys_ub=phys_ub,
+            samp_lb=fixed_samp_lb,
+            samp_ub=fixed_samp_ub,
+            gridsize=fixed_gridsize,
+            poisson_average_log_length=poisson_average_log_length,
+            k=k, epochs=epochs)
     
     log.info('Global inference parameters set.')
 
     if not mek_means_params:
         # Fit the model at all values of technical parameters, and save the location of the results.
-        search_result = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores)
+        # save=False here: with save=True the whole run (model, parameters, results)
+        # is written once, as monod_adata.h5ad, at the end.
+        search_result = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, grid_cores=grid_cores, checkpoint=checkpoint, save=False)
         log.info('Grid points fit.')
         search_result.find_sampling_optimum(discard_rejected=False)
         parameters_per_gene = search_result.phys_optimum
@@ -133,7 +187,7 @@ def perform_inference(h5ad_filepath,
 
     else:
         # Fit the model at all values of technical parameters, and save the location of the results.
-        search_result_list = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores)
+        search_result_list = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, grid_cores=grid_cores, checkpoint=checkpoint, save=False)
         log.info('Grid points fit.')
 
         cluster_params = {}
@@ -202,7 +256,7 @@ def perform_inference(h5ad_filepath,
             # Save uncertainties from Hessian.
             for j, sr in enumerate(search_result_list):
                 
-                sd =  sr._subset_search_data(search_data)
+                # compute_sigma subsets the search data to this cluster's cells itself.
                 sr.compute_sigma(search_data, num_cores=1)
                 all_sigmas = sr.sigma
                 
@@ -233,20 +287,26 @@ def perform_inference(h5ad_filepath,
     # Also save entire objects to adata.
 
     if not mek_means_params:
-        monod_adata.uns['search_result'] = search_result
-        sr = search_result.store_on_disk()
-        log.info('Search Result stored to %s', sr)
+        monod_adata.uns['search_result'] = search_result.to_dict()
     else:
-        monod_adata.uns['search_result_list'] = search_result_list
+        monod_adata.uns['search_result_list'] = search_result_list_to_uns(search_result_list)
 
-    monod_adata.uns['search_data'] = search_data
-    inference_string = search_result.inference_string
-    sd = search_data.store_on_disk(inference_string)
+    # The SearchData is deliberately not stored: it is rebuilt in memory from
+    # the AnnData (layers + uns['M']) via searchdata_from_adata(), which is fast
+    # and avoids serialising the (Rust-backed) histogram container.
+    log.info('Search data is not stored; rebuild it with searchdata_from_adata(monod_adata).')
 
-    adata_file_path = inference_string + '/monod_adata.pkl'
-    with open(adata_file_path, 'wb') as adfs:
-        pickle.dump(monod_adata, adfs)
-    log.info('Anndata object stored to %s', adata_file_path)
+    if save:
+        # Everything (data, model, parameters, results, cluster labels) lives in
+        # the AnnData, so one h5ad is the whole run on disk.
+        if mek_means_params:
+            inference_string = search_result_list[0].inference_string
+        else:
+            inference_string = search_result.inference_string
+        make_dir(inference_string)
+        adata_file_path = inference_string + '/monod_adata.h5ad'
+        monod_adata.write_h5ad(adata_file_path)
+        log.info('Run stored to %s (load results with analysis.load_search_results).', adata_file_path)
 
     return monod_adata
 
@@ -254,60 +314,82 @@ def searchdata_from_adata(adata):
 
     n_genes = adata.n_vars
 
-    # NB the order of the layers here will be enforced to be the same as the order of the model 
+    # NB the order of the layers here will be enforced to be the same as the order of the model
     # modalities defined in cme_toolbox.
     modality_name_dict = adata.uns['modality_name_dict']
-    model = adata.uns['model']
+    model = model_from_uns(adata.uns['model'])
 
     ordered_modalities = model.model_modalities
     ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
-    
-    layers = np.array([adata.layers[layer_name] for layer_name in ordered_layer_names])
 
     M = adata.uns['M']
-
-    hist = adata.uns['hist']
-
-    moments = get_gene_moments(adata)
-
-    gene_names = adata.var.index
-
     n_cells = adata.n_obs
+    gene_names = list(adata.var.index)
 
-    hist_type = get_hist_type_adata(adata)
-
-    attr_names = [
-        "M",
-        "hist",
-        "moments",
-        "n_genes",
-        "gene_names",
-        "n_cells",
-        "layers",
-        "hist_type",
-        "layer_names"
-    ]
-
-    attr_values = [M, hist, moments, n_genes, gene_names, n_cells, layers, hist_type, ordered_layer_names]
-
+    gene_log_lengths = None
     try:
-        gene_log_lengths = adata.var['log_lengths']
-        attr_names += ['gene_log_lengths']
-        attr_values += [gene_log_lengths]
-        
+        gene_log_lengths = np.asarray(adata.var['log_lengths'], dtype=np.float64)
     except KeyError:
         pass
 
-    try:
-        k, epochs = adata.uns['k'], adata.uns['epochs']
-        attr_names += ['k', 'epochs']
+    gene_log_lengths_spliced = None
+    spliced_lengths_col = adata.uns.get('spliced_lengths_col', None)
+    if spliced_lengths_col is not None:
+        try:
+            gene_log_lengths_spliced = np.asarray(adata.var[spliced_lengths_col], dtype=np.float64)
+        except KeyError:
+            pass
+
+    k = adata.uns.get('k', None)
+    epochs = adata.uns.get('epochs', None)
+
+    if _mc is not None:
+        # Build the pure-Rust SearchData container.
+        from scipy.sparse import issparse as _issparse
+        def _to_c_int64(arr):
+            a = arr.toarray() if _issparse(arr) else np.asarray(arr)
+            return np.ascontiguousarray(a, dtype=np.int64)
+        rust_layers = [_to_c_int64(adata.layers[ln]) for ln in ordered_layer_names]
+        coords_list, freqs_list = _mc.make_state_dist(rust_layers)
+        limits_arr  = np.ascontiguousarray(M, dtype=np.int64)
+        return _mc.searchdata_from_arrays(
+            rust_layers,
+            ordered_layer_names,
+            limits_arr,
+            coords_list,
+            freqs_list,
+            gene_names,
+            n_cells,
+            "unique",
+            gene_log_lengths,
+            gene_log_lengths_spliced,
+            k,
+            epochs,
+        )
+
+    # Python fallback (Rust unavailable).
+    if 'hist' in adata.uns:
+        hist = _uns_unpack(adata.uns['hist'])
+    else:
+        hist = make_histogram(adata, "unique", M)
+    layers  = np.array([adata.layers[layer_name] for layer_name in ordered_layer_names])
+    moments = get_gene_moments(adata)
+
+    attr_names = [
+        "M", "hist", "moments", "n_genes", "gene_names",
+        "n_cells", "layers", "hist_type", "layer_names"
+    ]
+    attr_values = [M, hist, moments, n_genes, gene_names, n_cells, layers, "unique", ordered_layer_names]
+
+    if gene_log_lengths is not None:
+        attr_names  += ['gene_log_lengths']
+        attr_values += [gene_log_lengths]
+
+    if k is not None:
+        attr_names  += ['k', 'epochs']
         attr_values += [k, epochs]
-    except KeyError:
-        pass        
-    
-    search_data = SearchData(attr_names, *attr_values)
-    
-    return search_data
+
+    return SearchData(attr_names, *attr_values)
 
 
 def get_gene_moments(adata):
@@ -327,135 +409,6 @@ def get_gene_moments(adata):
     list_of_dicts = selected_data.to_dict(orient='records')
     
     return list_of_dicts
-
-
-def get_gene_moments_single(adata, gene_index):
-
-    # Create an empty dictionary to store the gene attributes
-    gene_moment_dict = {}
-    
-    # Iterate through each column in adata.var and add it to the dictionary
-    for column in adata.var.columns:
-        if 'MOM_' in column:
-            gene_moment_dict[column[4:]] = adata.var[column].tolist()[gene_index]
-
-    return gene_moment_dict
-
-
-def reject_genes(adata, viz=False,
-        EPS=1e-15,
-        threshold=0.05,
-        bonferroni=True,
-        reject_at_bounds=True,
-        bound_thr=0.01,
-        grouping_thr=5,
-        use_hellinger=True,
-        hellinger_thr=0.05,
-        mek_means=False,
-        save_csq=True,
-                save_pval=False,
-                save_hellinger=False):
-    '''
-    Perform chi-squared testing and add list of rejected genes to anndata object.
-
-    Parameters
-    ------------------
-    save_csq: boolean
-        whether to save chi-squared values per cluster if performing mek-means 
-    save_pval: boolean
-        whether to save p-values per cluster if performing mek-means analysis
-    '''
-
-    if not mek_means:
-        search_data = adata.uns['search_data']
-        try:
-            search_result = adata.uns['search_result']
-        except AttributeError:
-            log.error('Did you mean to run with meK-Means? If so, make sure to set mek_means=True')
-    
-        csq, pval, hellinger = search_result.chisquare_testing(search_data,
-            viz=viz,
-            EPS=EPS,
-            threshold=threshold,
-            bonferroni=bonferroni,
-            reject_at_bounds=reject_at_bounds,
-            bound_thr=bound_thr,
-            grouping_thr=grouping_thr,
-            use_hellinger=use_hellinger,
-            hellinger_thr=hellinger_thr)
-    
-        # Save chi-squared values, p-values, and rejected genes to adata.
-        adata.var['csq'] = csq
-        log.info('Chi-squared values for each gene have been added as \"csq\" in .var')
-
-        adata.var['pval'] = pval
-        log.info('P-values for each gene have been added as \"pval\" in .var')
-
-        adata.var['hellinger'] = hellinger
-        log.info('Hellinger distances for each gene have been added as \"hellinger\" in .var')
-
-        adata.var['rejected_genes'] = search_result.rejected_genes
-        log.info('Rejected genes are recorded in \"rejected_genes\" in .var')
-
-        
-        # Reset search_data and search_result.
-        adata.uns['search_data'] = search_data
-        adata.uns['search_result'] = search_result
-        adata.uns['rejection_index'] = search_result.rejection_index
-
-    else:
-        search_data = adata.uns['search_data']
-        search_result_list = adata.uns['search_result_list']
-
-        new_sr_list = []
-        
-        for i in range(len(search_result_list)):
-            
-            sr = search_result_list[i]
-            sd =  sr._subset_search_data(search_data)
-            cluster_filter = sr.filt
-            cluster = sr.assigns
-            
-            csq, pval, hellinger = sr.chisquare_testing(sd,
-            viz=viz,
-            EPS=EPS,
-            threshold=threshold,
-            bonferroni=bonferroni,
-            reject_at_bounds=reject_at_bounds,
-            bound_thr=bound_thr,
-            grouping_thr=grouping_thr,
-            use_hellinger=use_hellinger,
-            hellinger_thr=hellinger_thr)
-
-            # Save chi-squared values, p-values, and rejected genes to adata.
-            if save_csq:
-                adata.var['{}_csq'.format(cluster)] = csq
-
-            if save_pval:
-                adata.var['{}_pval'.format(cluster)] = pval
-
-            if save_hellinger:
-                adata.var['{}_hellinger'.format(cluster)] = hellinger
-
-            adata.var['{}_rejected_genes'.format(cluster)] = sr.rejected_genes
-
-            new_sr_list += [sr]
-
-        log.info('Rejected genes in cluster i have been recorded under \"ci_rejected_genes\" in .var')
-        if save_csq:
-            log.info('Chi-squared values for each gene in cluster i have been added as \"ci_csq\" in .var')
-        if save_pval:
-            log.info('P-values for each gene in cluster i have been added as \"ci_pval\" in .var')
-        if save_hellinger:
-            log.info('Hellinger distances for each gene in cluster i have been added as \"ci_hellinger\" in .var')
-            
-        # Reset search_data and search_result.
-        adata.uns['search_result_list'] = new_sr_list
-        # This is the same for all clusters (all sr objects), so can be set once (correct?)
-        adata.uns['rejection_index'] = sr.rejection_index
-
-    # Return list of rejected genes.
-    return adata
 
 
 # Use class to make inference faster.
@@ -503,28 +456,6 @@ class SearchData:
         for j in range(len(input_data)):
             setattr(self, attr_names[j], input_data[j])
 
-    def store_on_disk(self, inference_string):
-        """This helper method attempts to store the SearchData object to disk.
-
-        Returns
-        -------
-        full_result_string: str
-            file location.
-        """
-        try:
-            full_result_string = inference_string + "/search_data.res"
-            with open(full_result_string, "wb") as sdfs:
-                pickle.dump(self, sdfs)
-            log.info("Search data stored to {}.".format(full_result_string))
-        except:
-            log.error(
-                "Search data could not be stored to {}.".format(
-                    full_result_string
-                )
-            )
-        self.full_result_string = full_result_string
-        return full_result_string
-
             
 
 def AIC_per_gene(search_result, monod_adata):
@@ -558,29 +489,169 @@ def AIC_per_gene(search_result, monod_adata):
     
     return AIC
 
-def get_hist_type(search_data):
-    """A helper function for backwards compatibility.
 
-    If the histogram type is not specified in the SearchData object, assume it is the legacy
-    type "grid".
 
-    Parameters
-    ----------
-    search_data: monod.extract_data.SearchData
-        SearchData object with the data to fit.
+# ---------------------------------------------------------------------------
+# Structured (pickle-free) serialisation.
+#
+# Every persistent object (CMEModel, InferenceParameters, GridPointResults,
+# SearchResults and their meK-Means subclasses) implements to_dict()/from_dict()
+# producing nested dicts of numpy arrays, scalars and strings.  Those dicts go
+# straight into adata.uns (so the AnnData writes to h5ad) and into standalone
+# HDF5 files via anndata's write_elem.  No pickle is involved, so loading does
+# not execute code and does not depend on the Python class layout at write time.
+# ---------------------------------------------------------------------------
 
-    Returns
-    -------
-    hist_type: str
-        flavor of histogram used to generate search_data, either "unique" or "grid" or "none".
+def _to_plain(v):
+    """Coerce an attribute value into something h5ad/HDF5 can store."""
+    if isinstance(v, np.generic):
+        return v.item()
+    if isinstance(v, (list, tuple)):
+        if len(v) == 0:
+            return np.zeros(0)
+        a = np.asarray(v)
+        if a.dtype == object:
+            raise TypeError("cannot serialise a ragged or object-typed attribute")
+        return a
+    return v
+
+
+def _attr_dict(obj, names):
+    d = {}
+    for n in names:
+        v = getattr(obj, n, None)
+        if v is None:
+            continue
+        d[n] = _to_plain(v)
+    return d
+
+
+def _write_h5(path, d):
+    """Write a structured dict to an HDF5 file (anndata element encoding)."""
+    import h5py
+    from anndata.io import write_elem
+    with h5py.File(path, "w") as f:
+        write_elem(f, "monod", d)
+
+
+def _read_h5(path):
+    import h5py
+    from anndata.io import read_elem
+    with h5py.File(path, "r") as f:
+        return read_elem(f["monod"])
+
+
+def search_result_from_uns(v):
+    """Return the SearchResults stored in ``adata.uns['search_result']``."""
+    if hasattr(v, "keys"):
+        return SearchResults.from_dict(v)
+    return _uns_unpack(v)  # legacy pickle
+
+
+def search_result_list_from_uns(v):
+    """Return the per-cluster SearchResults list stored in ``adata.uns['search_result_list']``."""
+    if hasattr(v, "keys"):
+        n = int(v["n_clusters"])
+        return [SearchResults.from_dict(v[f"cluster_{i}"]) for i in range(n)]
+    return _uns_unpack(v)  # legacy pickle
+
+
+def search_result_list_to_uns(srs):
+    d = {"format_version": 1, "kind": "SearchResultsList", "n_clusters": len(srs)}
+    for i, sr in enumerate(srs):
+        d[f"cluster_{i}"] = sr.to_dict()
+    return d
+
+
+_USE_LENGTHS_MODES = (None, "unspliced", "spliced", "both")
+
+
+def _validate_bounds(model, phys_lb, phys_ub, samp_lb, samp_ub, gridsize):
+    """Raise ValueError for malformed parameter bounds / sampling grids.
+
+    Checks lengths, finiteness and lb <= ub for the biological bounds, and
+    that samp_lb, samp_ub and gridsize agree in length with integer grid sizes
+    >= 1.  Without this, an inverted bound is silently accepted by
+    scipy.optimize.Bounds and by the Rust L-BFGS-B wrapper, which then reports
+    the projected starting point as a converged optimum.
     """
+    phys_lb = np.asarray(phys_lb, dtype=float)
+    phys_ub = np.asarray(phys_ub, dtype=float)
+    n_par = model.get_num_params()
+    if phys_lb.ndim != 1 or phys_ub.ndim != 1 or phys_lb.shape != phys_ub.shape:
+        raise ValueError(
+            f"phys_lb and phys_ub must be 1-D with equal length; got shapes {phys_lb.shape} and {phys_ub.shape}"
+        )
+    if phys_lb.shape[0] < n_par:
+        raise ValueError(
+            f"{model.bio_model} has {n_par} parameters but phys_lb/phys_ub have {phys_lb.shape[0]} entries"
+        )
+    if not (np.all(np.isfinite(phys_lb)) and np.all(np.isfinite(phys_ub))):
+        raise ValueError("phys_lb and phys_ub must be finite log10 values")
+    bad = np.where(phys_lb > phys_ub)[0]
+    if bad.size:
+        i = int(bad[0])
+        raise ValueError(f"phys_lb[{i}]={phys_lb[i]} exceeds phys_ub[{i}]={phys_ub[i]}")
+    samp_lb = np.asarray(samp_lb, dtype=float)
+    samp_ub = np.asarray(samp_ub, dtype=float)
+    gridsize = list(gridsize)
+    if not (len(samp_lb) == len(samp_ub) == len(gridsize)):
+        raise ValueError(
+            f"samp_lb ({len(samp_lb)}), samp_ub ({len(samp_ub)}) and gridsize ({len(gridsize)}) must have the same length"
+        )
+    if any((int(g) != g) or g < 1 for g in gridsize):
+        raise ValueError(f"gridsize entries must be integers >= 1, got {gridsize}")
+    bad = np.where(samp_lb > samp_ub)[0]
+    if bad.size:
+        i = int(bad[0])
+        raise ValueError(f"samp_lb[{i}]={samp_lb[i]} exceeds samp_ub[{i}]={samp_ub[i]}")
 
-    if hasattr(search_data, "hist_type") and search_data.hist_type == "unique" or "none":
-        hist_type = search_data.hist_type
-    else:
-        hist_type = "grid"
-    return hist_type
 
+def _warn_optimizer_status(status, label):
+    """Log a summary when the Rust L-BFGS-B run did not converge for every gene."""
+    if status is None:
+        return
+    st = np.asarray(status)
+    n_max, n_ls, n_err = int((st == 1).sum()), int((st == 2).sum()), int((st == 3).sum())
+    if n_max or n_ls or n_err:
+        log.warning(
+            "%s: %d/%d genes did not converge (%d hit max_iterations, %d line-search failures, %d solver errors). "
+            "Consider raising gradient_params['max_iterations'] or checking the bounds.",
+            label, n_max + n_ls + n_err, st.size, n_max, n_ls, n_err,
+        )
+
+
+def _normalize_use_lengths(use_lengths, model):
+    """Resolve the ``use_lengths`` option against the model's sequencing model.
+
+    Returns a tuple ``(mode, explicit)`` where ``mode`` is one of None,
+    "unspliced", "spliced", "both" and ``explicit`` is False when the caller
+    left the default ("auto"), so downstream code may silently fall back to
+    no length correction when gene lengths are unavailable.
+
+    "auto" (the default) means "unspliced" for the Poisson sequencing model
+    and None otherwise, since only the Poisson model has a length effect.
+    Legacy bools are accepted: True -> "unspliced", False -> None.
+    """
+    if use_lengths == "auto":
+        mode = "unspliced" if model.seq_model == "Poisson" else None
+        return mode, False
+    if use_lengths is True:
+        use_lengths = "unspliced"
+    elif use_lengths is False:
+        use_lengths = None
+    if use_lengths not in _USE_LENGTHS_MODES:
+        raise ValueError(
+            "use_lengths must be 'auto', None, 'unspliced', 'spliced', or 'both'; "
+            f"got {use_lengths!r}"
+        )
+    if use_lengths is not None and model.seq_model != "Poisson":
+        raise ValueError(
+            f"use_lengths={use_lengths!r} requires seq_model='Poisson'; the "
+            f"{model.seq_model!r} sequencing model has no gene-length effect. "
+            "Pass use_lengths=None (or leave the default)."
+        )
+    return use_lengths, True
 
 
 class InferenceParameters:
@@ -599,10 +670,12 @@ class InferenceParameters:
         log10 upper bounds on biological parameters.
     grad_bnd: scipy.optimize.Bounds
         log10 lower and upper bounds on biological parameters.
-    use_lengths: bool
-        if True, the nascent Poisson model technical variation parameter is a
-        coefficient multiplied by gene length.
-        if False, the parameter is the genome-wide nascent sampling rate.
+    use_lengths: None | "unspliced" | "spliced" | "both"
+        Controls which Poisson sampling channels receive a per-gene log-length offset.
+        None: no length correction (genome-wide sampling rate for all channels).
+        "unspliced": add log10(gene_length) to the unspliced sampling parameter.
+        "spliced": add log10(gene_length) to the spliced sampling parameter.
+        "both": add log10(gene_length) to both sampling parameters.
     samp_lb: np.ndarray
         log10 lower bounds on technical variation parameters.
     samp_ub: np.ndarray
@@ -635,11 +708,13 @@ class InferenceParameters:
         self,
         dataset_string,
         model,
-        use_lengths=True,
+        use_lengths="auto",
         gradient_params={
             "max_iterations": 10,
             "init_pattern": "moments",
-            "num_restarts": 1,
+            "num_restarts": 3,
+            "num_gene_cores": 1,
+            "n_jac_jobs": 1,
         },
         run_meta="",
         phys_lb=None,
@@ -647,7 +722,8 @@ class InferenceParameters:
         samp_lb=None,
         samp_ub=None,
         gridsize=None,
-        poisson_average_log_length=5
+        poisson_average_log_length=5,
+        save=False,
     ):
         """Initialize the InferenceParameters instance.
 
@@ -667,15 +743,22 @@ class InferenceParameters:
             dataset-specific directory location.
         model: monod.cme_toolbox.CMEModel
             CME model used for inference.
-        use_lengths: bool, optional
-            if True, the nascent Poisson model technical variation parameter is a
-            coefficient multiplied by gene length.
-            if False, the parameter is the genome-wide nascent sampling rate.
+        use_lengths: "auto" | None | "unspliced" | "spliced" | "both", optional
+            Which Poisson sampling channels receive a per-gene log-length offset.
+            "auto" (default): "unspliced" for the Poisson sequencing model, None
+            otherwise; falls back to None if the search data carries no lengths.
+            None: no correction. "unspliced": unspliced channel only.
+            "spliced": spliced channel only. "both": both channels.
+            Any non-None value with a non-Poisson sequencing model raises.
+            Legacy bool values are accepted: True → "unspliced", False → None.
         gradient_params: dict, optional
             settings for gradient descent.
             "max_iterations" defines the maximum number of gradient descent iterations.
             "init_pattern" defines whether the first try starts at the method of moments estimate.
             "num_restarts" defines how many attempts should be made.
+            "num_gene_cores" controls gene-level parallelism per grid point (-1 = all cores). Uses ThreadPoolExecutor + scipy by default; set "use_batch_optimizer"=True to use batch Adam with rayon instead.
+            "n_jac_jobs" controls joblib parallelism over FD perturbations (-1 = all cores); only
+            effective when num_gene_cores=1 to avoid nested parallelism.
         run_meta: str, optional
             any additional metadata to append to the run directory name.
         """
@@ -693,12 +776,22 @@ class InferenceParameters:
         if gridsize is None:
             gridsize = model.seq_bounds['gridsize']
         
-        self.gradient_params = gradient_params
+        _gp_defaults = {
+            "max_iterations": 10,
+            "init_pattern": "moments",
+            "num_restarts": 3,
+            "num_gene_cores": 1,
+            "n_jac_jobs": 1,
+        }
+        self.gradient_params = {**_gp_defaults, **gradient_params}
+        self.use_lengths, self.use_lengths_explicit = _normalize_use_lengths(use_lengths, model)
+        if model.seq_model == "None":
+            samp_lb, samp_ub, gridsize = [0, 0], [0, 0], [1, 1]
+        _validate_bounds(model, phys_lb, phys_ub, samp_lb, samp_ub, gridsize)
         self.phys_lb = np.array(phys_lb)
         self.phys_ub = np.array(phys_ub)
         self.grad_bnd = scipy.optimize.Bounds(phys_lb, phys_ub)
 
-        self.use_lengths = use_lengths
         self.poisson_average_log_length = poisson_average_log_length
 
         if model.seq_model == "None":
@@ -723,17 +816,79 @@ class InferenceParameters:
             run_meta = "_" + run_meta
 
         self.dataset_string = dataset_string
-        
+
         inference_string = f"{dataset_string}/{model.bio_model}_{model.seq_model}_"
         for i in range(len(gridsize)):
             inference_string += f"{gridsize[i]:.0f}x"
         inference_string = inference_string[:-1]
         inference_string += f"{run_meta}"
-        
-        make_dir(inference_string)
+
+        # Absolute so results, figures and checkpoints land in the same place
+        # regardless of later chdir calls, and so stored paths are unambiguous.
+        inference_string = os.path.abspath(inference_string)
+        if save:
+            make_dir(inference_string)
+            inference_parameter_string = inference_string + "/parameters.h5"
+            self.store_inference_parameters(inference_parameter_string)
         self.inference_string = inference_string
-        inference_parameter_string = inference_string + "/parameters.pr"
-        self.store_inference_parameters(inference_parameter_string)
+
+    # ------------------------------------------------------------------
+    # Structured (pickle-free) serialisation
+    # ------------------------------------------------------------------
+    _SERIAL_KIND = "InferenceParameters"
+
+    def to_dict(self):
+        gp = {}
+        for k, v in self.gradient_params.items():
+            if v is None:
+                continue
+            gp[k] = v.item() if isinstance(v, np.generic) else v
+        d = {
+            "format_version": 1,
+            "kind": self._SERIAL_KIND,
+            "dataset_string": self.dataset_string,
+            "inference_string": self.inference_string,
+            "model": self.model.to_dict(),
+            "use_lengths": self.use_lengths or "",
+            "use_lengths_explicit": bool(getattr(self, "use_lengths_explicit", True)),
+            "gradient_params": gp,
+            "phys_lb": np.asarray(self.phys_lb, dtype=float),
+            "phys_ub": np.asarray(self.phys_ub, dtype=float),
+            "samp_lb": np.asarray(self.samp_lb, dtype=float),
+            "samp_ub": np.asarray(self.samp_ub, dtype=float),
+            "gridsize": np.asarray(self.gridsize, dtype=int),
+            "poisson_average_log_length": float(self.poisson_average_log_length),
+        }
+        return d
+
+    @staticmethod
+    def _ctor_kwargs_from_dict(d):
+        from .cme_toolbox import CMEModel
+        ul = d.get("use_lengths", "")
+        return dict(
+            model=CMEModel.from_dict(d["model"]),
+            use_lengths=(None if ul == "" else str(ul)),
+            gradient_params={k: (v.item() if isinstance(v, np.generic) else v) for k, v in dict(d.get("gradient_params", {})).items()},
+            phys_lb=np.asarray(d["phys_lb"], dtype=float),
+            phys_ub=np.asarray(d["phys_ub"], dtype=float),
+            samp_lb=np.asarray(d["samp_lb"], dtype=float),
+            samp_ub=np.asarray(d["samp_ub"], dtype=float),
+            gridsize=[int(g) for g in np.asarray(d["gridsize"]).ravel()],
+            poisson_average_log_length=float(d.get("poisson_average_log_length", 5)),
+        )
+
+    @classmethod
+    def from_dict(cls, d):
+        kind = str(d.get("kind", "InferenceParameters"))
+        if kind == "MEKMeansParameters":
+            from .mminference import MEKMeansParameters
+            obj = MEKMeansParameters._from_dict_impl(d)
+        else:
+            kw = cls._ctor_kwargs_from_dict(d)
+            obj = InferenceParameters(str(d["dataset_string"]), save=False, **kw)
+        obj.inference_string = str(d["inference_string"])
+        obj.use_lengths_explicit = bool(d.get("use_lengths_explicit", True))
+        return obj
 
     def construct_grid(self):
         """Creates a grid of points over the two-dimensional technical variation parameter domain.
@@ -744,18 +899,12 @@ class InferenceParameters:
             list of grid points.
         grid_values_sampl: list of np.ndarrays
             grid point values representing sampling parameters for each modality.
-        n_grid_pts: int
+        n_grid_points: int
             total number of grid points to evaluate.
         """
-        linspaces = [np.linspace(self.samp_lb[i], self.samp_ub[i], self.gridsize[i]) for i in range(len(self.gridsize))]
-        grid_values_sampl = np.meshgrid(*linspaces, indexing="ij")
-        
-        grid_values_sampl = [i.flatten() for i in grid_values_sampl]
-        self.grid_values_sampl = grid_values_sampl
-        
-        self.sampl_vals = list(zip(*grid_values_sampl))
-        
-        self.n_grid_points = len(grid_values_sampl[0])
+        self.grid_values_sampl, self.sampl_vals, self.n_grid_points = _build_sampling_grid(
+            self.samp_lb, self.samp_ub, self.gridsize
+        )
 
     def store_inference_parameters(self, inference_parameter_string):
         """This helper method attempts to save the InferenceParameters object.
@@ -766,93 +915,173 @@ class InferenceParameters:
             file location.
         """
         try:
-            with open(inference_parameter_string, "wb") as ipfs:
-                pickle.dump(self, ipfs)
+            _write_h5(inference_parameter_string, self.to_dict())
             log.info(
                 "Global inference parameters stored to {}.".format(
                     inference_parameter_string
                 )
             )
-        except:
+        except Exception:
             log.error(
                 "Global inference parameters could not be stored to {}.".format(
                     inference_parameter_string
-                )
+                ),
+                exc_info=True,
             )
 
-    def fit_all_grid_points(self, search_data, num_cores=1):
+    def fit_all_grid_points(self, search_data, num_cores=1, grid_cores=1, coarse_to_fine=False, checkpoint=False, save=False):
         """Fits the search data for all genes over all grid points.
 
         Parameters
         ----------
         num_cores: int
-            number of cores to use for parallelization over grid points.
+            Number of cores for gene-level parallelization at each grid point.
+            Uses ThreadPoolExecutor with scipy L-BFGS-B per gene; the Rust PSS
+            fast-path fires automatically inside each thread. Pass -1 for all
+            available cores. Default 1 (sequential). Set
+            gradient_params["use_batch_optimizer"]=True to use batch Adam with
+            rayon instead (only beneficial for small-M datasets).
+        grid_cores: int
+            Number of cores to use for parallelization over grid points via
+            joblib. Default 1 (sequential). Note: combining grid_cores > 1 with
+            num_cores > 1 can oversubscribe CPU cores.
         search_data: monod.extract_data.SearchData
             SearchData object with the data to fit.
+        coarse_to_fine: bool, optional
+            If True and more than 1 grid point exists, runs a fast coarse scan
+            first (reduced iterations/restarts), then refines the top-3 grid
+            points with the full gradient_params. Default False.
+        checkpoint: bool, optional
+            If True, write each grid point result to disk as a crash-recovery
+            checkpoint (.gp file). Default False.
+        save: bool, optional
+            If True, write the final SearchResults object to disk. Default False.
 
         Returns
         -------
         results: SearchResults object
             Saves search_result to disk and returns it.
-
         """
-
         t1 = time.time()
-        warnings.filterwarnings("ignore", category=DeprecationWarning)
-        if num_cores > 1:
-            log.info("Starting parallelized grid scan.")
-            parallelize(
-                function=self.par_fun,
-                iterable=zip(
-                    range(self.n_grid_points),
-                    [[search_data, self.model]] * self.n_grid_points,
-                ),
-                num_cores=num_cores,
-                num_entries=self.n_grid_points,
-                completion_message="Parallelized grid scan complete.",
-                termination_message="The scan has been manually terminated.",
-                error_message="The scan has been terminated due to computation issues. Please check MoM estimates.",
-            )
-        else:
-            log.info("Starting non-parallelized grid scan.")
-            [
-                self.par_fun(x)
-                for x in zip(
-                    range(self.n_grid_points),
-                    [[search_data, self.model]] * self.n_grid_points,
+        self._checkpoint = checkpoint
+        if checkpoint:
+            make_dir(self.inference_string)
+
+        # Apply gene-level parallelism override for this call.
+        _prev_gene_cores = self.gradient_params.get("num_gene_cores", 1)
+        if num_cores != 1:
+            self.gradient_params["num_gene_cores"] = num_cores
+
+        from joblib import Parallel, delayed as jdelayed
+
+        # in-memory store: point_index -> GridPointResults
+        gp_results: dict = {}
+
+        def _run_points(point_indices, init_warm_start=None):
+            """Run optimization for the given grid point indices.
+
+            In serial mode, each grid point warm-starts from the previous point's
+            optimal parameters. In parallel mode, warm-starting is disabled (no
+            shared state across workers).
+
+            Parameters
+            ----------
+            init_warm_start: dict or None
+                Optional mapping point_index -> param array to seed the first
+                warm-start for each point (used in coarse-to-fine Phase 2).
+            """
+            if grid_cores > 1:
+                log.info("Starting parallelized grid scan (%d points).", len(point_indices))
+                # Thread backend: the SearchData is shared in memory rather than
+                # pickled to worker processes; the Rust kernels release the GIL.
+                returned = Parallel(n_jobs=grid_cores, prefer="threads")(
+                    jdelayed(self.par_fun)(idx, search_data, self.model)
+                    for idx in tqdm(point_indices, desc="Grid scan")
                 )
-            ]
-            log.info("Non-parallelized grid scan complete.")
+                for r in returned:
+                    if r is not None:
+                        gp_results[r.point_index] = r
+                log.info("Parallelized grid scan complete.")
+            else:
+                log.info("Starting non-parallelized grid scan (%d points).", len(point_indices))
+                prev_params = None
+                for idx in tqdm(point_indices, desc="Grid scan"):
+                    # Pick warm-start: point-specific seed first, then previous point
+                    if init_warm_start is not None and idx in init_warm_start:
+                        ws = init_warm_start[idx].param_estimates
+                    else:
+                        ws = prev_params
+                    r = self.par_fun(idx, search_data, self.model, warm_start=ws)
+                    if r is not None:
+                        gp_results[r.point_index] = r
+                        prev_params = r.param_estimates
+                log.info("Non-parallelized grid scan complete.")
 
-        # warnings.resetwarnings()
+        all_indices = list(range(self.n_grid_points))
+
+        if coarse_to_fine and self.n_grid_points > 1:
+            # ── Phase 1: fast coarse scan over all grid points ────────────────
+            orig_params = self.gradient_params.copy()
+            coarse_params = dict(orig_params)
+            coarse_params["max_iterations"] = max(3, orig_params.get("max_iterations", 10) // 4)
+            coarse_params["num_restarts"] = 1
+            self.gradient_params = coarse_params
+
+            _run_points(all_indices)
+
+            # Read coarse obj_func values from in-memory dict (fall back to disk if checkpoint)
+            coarse_klds = []
+            for i in all_indices:
+                if i in gp_results:
+                    coarse_klds.append(gp_results[i].obj_func)
+                else:
+                    gp_path = self.inference_string + "/grid_point_" + str(i) + ".h5"
+                    gp = GridPointResults.from_dict(_read_h5(gp_path))
+                    coarse_klds.append(gp.obj_func)
+
+            # ── Phase 2: refine top-k grid points using coarse results as warm-start
+            n_refine = min(3, self.n_grid_points)
+            top_k = list(np.argsort(coarse_klds)[:n_refine])
+            log.info("Coarse-to-fine: refining top-%d grid points %s.", n_refine, top_k)
+
+            self.gradient_params = orig_params
+            _run_points(top_k, init_warm_start=gp_results)
+        else:
+            _run_points(all_indices)
+
+        # Restore num_gene_cores to its value before this call.
+        self.gradient_params["num_gene_cores"] = _prev_gene_cores
+
         results = SearchResults(self, search_data)
-        results.aggregate_grid_points()
-
-        full_result_string = results.store_on_disk()
-
+        results.aggregate_grid_points(gp_results if gp_results else None)
+        if save:
+            make_dir(self.inference_string)
+            results.store_on_disk()
 
         t2 = time.time()
         log.info("Runtime: {:.1f} seconds.".format(t2 - t1))
-        
+
         return results
 
-    def par_fun(self, inputs):
+    def par_fun(self, point_index, search_data, model, warm_start=None):
         """Helper method for the grid point parallelization procedure.
 
         Parameters
         ----------
-        inputs: tuple
-            entry 0: int
-                point index within [0, n_grid_points) to evaluate at.
-            entry 1: tuple
-                entry 0: monod.extract_data.SearchData
-                    SearchData object with the data to fit.
-                entry 1: monod.cme_toolbox.CMEModel
-                    CME model used for inference.
+        point_index: int
+            index within [0, n_grid_points) to evaluate at.
+        search_data: SearchData
+        model: CMEModel
+        warm_start: np.ndarray or None, optional
+            Shape (n_genes, n_phys_pars). If provided, seeds the first L-BFGS-B
+            restart for each gene instead of the method-of-moments estimate.
+
+        Returns
+        -------
+        GridPointResults or None
         """
-        point_index, (search_data, model) = inputs
-        grad_inference = GradientInference(self, model, search_data, point_index)
-        grad_inference.fit_all_genes(model, search_data)
+        grad_inference = GradientInference(self, model, search_data, point_index, warm_start=warm_start)
+        return grad_inference.fit_all_genes(model, search_data, checkpoint=getattr(self, '_checkpoint', False))
 
 
 class GradientInference:
@@ -866,7 +1095,7 @@ class GradientInference:
         the index of the current point, within [0, n_grid_points).
     regressor: np.ndarray
         gene-specific technical variation parameter values at the current grid point.
-        these values will be different for each gene if use_lengths=True in the
+        these values will be different for each gene if use_lengths is not None in the
         InferenceParameters constructor.
     grad_bnd: scipy.optimize.Bounds
         log10 lower and upper bounds on biological parameters.
@@ -889,7 +1118,7 @@ class GradientInference:
         method of moments estimates for all genes under the current technical variation parameters.
     """
 
-    def __init__(self, global_parameters, model, search_data, point_index):
+    def __init__(self, global_parameters, model, search_data, point_index, warm_start=None):
         """Initialize a GradientInference object.
 
         Parameters
@@ -911,7 +1140,7 @@ class GradientInference:
             the index of the current point, within [0, n_grid_points).
         regressor: np.ndarray
             gene-specific technical variation parameter values at the current grid point.
-            these values will be different for each gene if use_lengths=True in the
+            these values will be different for each gene if use_lengths is not None in the
             InferenceParameters constructor.
         grad_bnd: scipy.optimize.Bounds
             log10 lower and upper bounds on biological parameters.
@@ -939,7 +1168,17 @@ class GradientInference:
             [global_parameters.sampl_vals[point_index]] * search_data.n_genes
         )
 
-        if global_parameters.use_lengths:
+        use_lengths_mode = global_parameters.use_lengths
+        if use_lengths_mode is not None and getattr(search_data, "gene_log_lengths", None) is None:
+            if getattr(global_parameters, "use_lengths_explicit", True):
+                raise ValueError(
+                    f"use_lengths={use_lengths_mode!r} was requested but the search data has "
+                    "no gene lengths. Provide a transcriptome_filepath / adata.var['log_lengths'], "
+                    "or pass use_lengths=None."
+                )
+            log.info("No gene lengths in search data; use_lengths='auto' resolved to None.")
+            use_lengths_mode = None
+        if use_lengths_mode is not None:
             if model.seq_model == "Bernoulli":
                 raise ValueError(
                     "The Bernoulli model does not yet have a physical length-based model."
@@ -949,20 +1188,26 @@ class GradientInference:
                     "The model without technical noise has no length effects."
                 )
             elif model.seq_model == "Poisson":
-                regressor[:, 0] += search_data.gene_log_lengths
+                if use_lengths_mode in ("unspliced", "both"):
+                    regressor[:, 0] += search_data.gene_log_lengths
+                if use_lengths_mode in ("spliced", "both"):
+                    spl_lengths = getattr(search_data, 'gene_log_lengths_spliced', None)
+                    if spl_lengths is None:
+                        spl_lengths = search_data.gene_log_lengths
+                    regressor[:, 1] += spl_lengths
             else:
                 raise ValueError(
                     "Please select a technical noise model from {Poisson}, {Bernoulli}, {None}."
                 )
-
         else:
             # If no specific lengths given, multiply the unspliced sampling rate by an average length value for all genes.
-            if model.seq_model == "Poisson" and model.fit_unspliced:
+            if model.seq_model == "Poisson" and getattr(model, 'fit_unspliced', False):
                 regressor[:, 0] += global_parameters.poisson_average_log_length
             
         self.grid_point = global_parameters.sampl_vals[point_index]
         self.point_index = point_index
         self.regressor = regressor
+        self.use_lengths = global_parameters.use_lengths
         self.grad_bnd = global_parameters.grad_bnd
         self.gradient_params = global_parameters.gradient_params
         self.phys_lb = global_parameters.phys_lb
@@ -971,22 +1216,51 @@ class GradientInference:
         self.n_samp_pars = global_parameters.n_samp_pars
 
         self.inference_string = global_parameters.inference_string
-        if self.gradient_params["init_pattern"] == "moments":
-            warnings.filterwarnings("ignore", category=RuntimeWarning)
-            self.param_MoM = np.asarray(
-                [
-                    model.get_MoM(
-                        search_data.moments[i],
-                        global_parameters.phys_lb,
-                        global_parameters.phys_ub,
-                        regressor[i],
-                    )
-                    for i in range(search_data.n_genes)
-                ]
-            )
-            warnings.resetwarnings()
+        self.warm_start = warm_start  # shape (n_genes, n_phys_pars) or None
 
-    def optimize_gene(self, gene_index, model, search_data):
+        # Pre-allocate restart initialisation bounds (constant across all genes/restarts).
+        self._restart_lb = -2.0 * np.ones(self.n_phys_pars)
+        self._restart_lb[0] = 0.0
+        self._restart_ub = 2.0 * np.ones(self.n_phys_pars)
+        self._restart_range = self._restart_ub - self._restart_lb
+
+        if self.gradient_params["init_pattern"] == "moments":
+            _sd_is_rust_sd = _mc is not None and isinstance(search_data, _mc.SearchData)
+            if _sd_is_rust_sd:
+                # Zero-Python-loop path: Rust computes MoM for all genes at once.
+                samp_list_mom = None
+                if model.seq_model in ("Poisson", "Bernoulli"):
+                    samp_list_mom = [
+                        (regressor[gi].tolist() if regressor[gi] is not None else None)
+                        for gi in range(search_data.n_genes)
+                    ]
+                self.param_MoM = np.asarray(
+                    search_data.mom_x0_all(
+                        model.bio_model,
+                        model.seq_model,
+                        model.amb_model,
+                        global_parameters.phys_lb.tolist(),
+                        global_parameters.phys_ub.tolist(),
+                        samp_list_mom,
+                    )
+                )
+            else:
+                _saved_filters = warnings.filters[:]
+                warnings.filterwarnings("ignore", category=RuntimeWarning)
+                self.param_MoM = np.asarray(
+                    [
+                        model.get_MoM(
+                            search_data.moments[i],
+                            global_parameters.phys_lb,
+                            global_parameters.phys_ub,
+                            regressor[i],
+                        )
+                        for i in range(search_data.n_genes)
+                    ]
+                )
+                warnings.filters[:] = _saved_filters   # restore the caller's filters
+
+    def optimize_gene(self, gene_index, model, search_data, x0=None):
         """Fit the data for a single gene using KL divergence gradient descent.
 
         If init_pattern = moments, the first search's starting point is set to the
@@ -1002,6 +1276,9 @@ class GradientInference:
             CME model used for inference.
         search_data: monod.extract_data.SearchData
             SearchData object with the data to fit.
+        x0: array-like or None
+            Pre-built starting points (n_restarts × n_params). If None, starting
+            points are drawn fresh with np.random.rand.
 
         Returns
         -------
@@ -1010,44 +1287,45 @@ class GradientInference:
         err: float
             Kullback-Leibler divergence of the model at x, relative to data.
         """
-        # Further cap the random initializations within a smaller box.
-        restricted_bounds_lb = -2* np.ones(self.n_phys_pars)
-        restricted_bounds_lb[0] = 0
-        restricted_bounds_ub = 2* np.ones(self.n_phys_pars)
-        x0 = (
-            np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
-            * (restricted_bounds_ub - restricted_bounds_lb)
-            + restricted_bounds_lb
-        )
-        # x0 = (
-        #     np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
-        #     * (self.phys_ub - self.phys_lb)
-        #     + self.phys_lb
-        # )
-        if (
-            self.gradient_params["init_pattern"] == "moments"
-        ):  # this can be extended to other initialization patterns, like latin squares
-            x0[0] = self.param_MoM[gene_index]
-        #x = x0[0]
+        if x0 is None:
+            x0 = (
+                np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
+                * self._restart_range
+                + self._restart_lb
+            )
+            if self.gradient_params["init_pattern"] == "moments":
+                x0[0] = self.param_MoM[gene_index]
+            if self.warm_start is not None:
+                x0[0] = np.clip(self.warm_start[gene_index], self.phys_lb, self.phys_ub)
+        else:
+            x0 = np.asarray(x0)
         err = np.inf
         ERR_THRESH = 0.99
-        log.info('Optimizing gene %d with initial value %s', gene_index, np.array2string(10**x0))
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug('Optimizing gene %d with initial value %s', gene_index, np.array2string(10**x0))
         
-        hist_type = get_hist_type(search_data)
         for restart in range(self.gradient_params["num_restarts"]):
-            res_arr = scipy.optimize.minimize(
-                lambda x: model.eval_model_kld(
-                    p=x,  # limits=[search_data.M[gene_index],search_data.N[gene_index]],\
+            n_jac_jobs = self.gradient_params.get("n_jac_jobs", 1)
+
+            def _obj_and_grad(x):
+                return model.eval_model_kld_and_grad(
+                    p=x,
                     limits=search_data.M[:, gene_index],
                     samp=self.regressor[gene_index],
                     data=search_data.hist[gene_index],
-                    hist_type=hist_type,
-                ),
+                    n_jobs=n_jac_jobs,
+                )
+
+            res_arr = scipy.optimize.minimize(
+                _obj_and_grad,
                 x0=x0[restart],
-                method='Nelder-Mead',
+                method='L-BFGS-B',
+                jac=True,
                 bounds=self.grad_bnd,
                 options={
                     "maxiter": self.gradient_params["max_iterations"],
+                    "ftol": 2.22e-9,
+                    "gtol": 1e-5,
                 },
             )
             if (
@@ -1058,7 +1336,8 @@ class GradientInference:
         if not (np.isfinite(x).all()):
             log.warning("Gene index: " + str(gene_index))
             raise ValueError("Search failed. Please check input data.")
-        log.info('Optimized parameters for gene %d is %s', gene_index, np.array2string(10**x))
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug('Optimized parameters for gene %d is %s', gene_index, np.array2string(10**x))
         return x, err
 
     def iterate_over_genes(self, model, search_data):
@@ -1083,13 +1362,304 @@ class GradientInference:
             runtime in seconds.
         """
         t1 = time.time()
-        
-        param_estimates, klds = zip(
-            *[
-                self.optimize_gene(gene_index=gene_index, model=model, search_data=search_data)
-                for gene_index in range(search_data.n_genes)
-            ]
+
+        n_gene_cores = self.gradient_params.get("num_gene_cores", 1)
+        use_batch = self.gradient_params.get("use_batch_optimizer", False)
+
+        # --- Rust L-BFGS-B fast paths: run the full optimization loop in Rust
+        # with rayon parallelism over genes. No Python callbacks, no GIL round-trips.
+        # Opt-in: set gradient_params["use_rust_lbfgsb"] = True to enable.
+        _use_rust_opt = (
+            _mc is not None
+            and self.gradient_params.get("use_rust_lbfgsb", False)
+            and not use_batch
         )
+        _sd_is_rust = _mc is not None and isinstance(search_data, _mc.SearchData)
+
+        use_rust_lbfgsb = (
+            _use_rust_opt
+            and model.bio_model in _LBFGSB_RUST_MODELS_2D
+            and model.seq_model in ("None", "Poisson", "Bernoulli")
+            and model.amb_model == "None"
+            and model.quad_method == "fixed_quad"
+        )
+        use_rust_protein_bursty = (
+            _use_rust_opt
+            and _sd_is_rust
+            and model.bio_model == "ProteinBursty"
+            and model.seq_model == "None"
+            and model.amb_model == "None"
+        )
+        use_rust_amb = (
+            _use_rust_opt
+            and _sd_is_rust
+            and model.bio_model in _LBFGSB_RUST_MODELS_2D
+            and model.seq_model in ("None", "Poisson")
+            and model.amb_model in ("Equal", "Unequal")
+            and model.quad_method == "fixed_quad"
+        )
+        use_rust_custom = (
+            _use_rust_opt
+            and _sd_is_rust
+            and model.bio_model == "Custom"
+            and not model.network._has_delays
+            and model.seq_model == "None"
+            and model.amb_model == "None"
+            and len(model.network.species) in (2, 3)
+        )
+
+        _rust_opt_active = use_rust_lbfgsb or use_rust_protein_bursty or use_rust_amb or use_rust_custom
+
+        def _build_x0_all(n_genes, n_restarts):
+            x0_all = []
+            for gi in range(n_genes):
+                x0 = (
+                    np.random.rand(n_restarts, self.n_phys_pars)
+                    * self._restart_range
+                    + self._restart_lb
+                )
+                if self.gradient_params["init_pattern"] == "moments":
+                    x0[0] = self.param_MoM[gi]
+                # Warm-start override: skip for Rust optimizer paths.
+                # The Rust optimizer runs >10× faster so warm starts give no speed benefit,
+                # and propagating a bad solution from an earlier grid point can cascade into
+                # poor local minima for all subsequent grid points (the landscape shifts
+                # significantly across the grid). MoM is already a strong starting point.
+                if self.warm_start is not None and not _rust_opt_active:
+                    x0[0] = np.clip(self.warm_start[gi], self.phys_lb, self.phys_ub)
+                x0_all.append(x0.tolist())
+            return x0_all
+
+        # Build starting points once so scipy and Rust paths share identical restarts.
+        x0_all_shared = _build_x0_all(search_data.n_genes, self.gradient_params["num_restarts"])
+
+        if use_rust_lbfgsb:
+            num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
+            n_genes = search_data.n_genes
+            x0_all = x0_all_shared
+
+            _base_kwargs = dict(
+                bio_model=model.bio_model,
+                x0_list=x0_all,
+                lb=self.phys_lb.tolist(),
+                ub=self.phys_ub.tolist(),
+                fixed_quad_t=float(model.fixed_quad_T),
+                quad_order=int(model.quad_order),
+                fd_eps=1e-6,
+                maxiter=self.gradient_params["max_iterations"],
+                ftol=2.22e-9,
+                gtol=1e-5,
+                eps=1e-15,
+                m_lbfgs=10,
+                num_threads=num_threads,
+                seq_model=model.seq_model,
+            )
+
+            if _sd_is_rust:
+                # Zero round-trip path: Rust reads coords/freqs/limits from SearchData
+                # and computes per-gene samp inside the rayon loop — no Python marshal.
+                _ul = self.use_lengths if model.seq_model == "Poisson" else None
+                use_lengths_unsp = _ul in ("unspliced", "both")
+                use_lengths_spl  = _ul in ("spliced", "both")
+                use_lengths_any  = use_lengths_unsp or use_lengths_spl
+                if model.seq_model in ("Poisson", "Bernoulli"):
+                    # When using gene lengths, pass raw grid_point so Rust adds per-gene
+                    # log-lengths. Otherwise pass regressor[0] (same for all genes).
+                    base_samp = list(self.grid_point) if use_lengths_any else self.regressor[0].tolist()
+                else:
+                    base_samp = None
+                params_arr, klds_arr, status_arr = _mc.optimize_genes_2d_sd(
+                    search_data,
+                    return_status=True,
+                    base_samp=base_samp,
+                    use_lengths_unspliced=use_lengths_unsp,
+                    use_lengths_spliced=use_lengths_spl,
+                    **_base_kwargs,
+                )
+                _warn_optimizer_status(status_arr, 'optimize_genes_2d_sd')
+            else:
+                # Python SearchData fallback: build per-gene samp_list, unpack hist.
+                samp_list = None
+                if model.seq_model in ("Poisson", "Bernoulli"):
+                    samp_list = [
+                        (self.regressor[gi].tolist() if self.regressor[gi] is not None else None)
+                        for gi in range(n_genes)
+                    ]
+                u_idx_list, s_idx_list, f_list, limits_list = [], [], [], []
+                for gi in range(n_genes):
+                    x_data, f_data = search_data.hist[gi]
+                    x_np = np.asarray(x_data, dtype=np.int64)
+                    u_idx_list.append(x_np[:, 0].tolist())
+                    s_idx_list.append(x_np[:, 1].tolist())
+                    f_list.append(np.asarray(f_data).tolist())
+                    limits_list.append([int(v) for v in search_data.M[:, gi]])
+                params_arr, klds_arr = _mc.optimize_genes_2d(
+                    limits_list=limits_list,
+                    u_idx_list=u_idx_list,
+                    s_idx_list=s_idx_list,
+                    f_list=f_list,
+                    samp_list=samp_list,
+                    **_base_kwargs,
+                )
+            param_estimates = np.asarray(params_arr)
+            klds = np.asarray(klds_arr)
+
+        elif use_rust_protein_bursty:
+            num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
+            n_genes = search_data.n_genes
+            x0_all = x0_all_shared
+            params_arr, klds_arr, status_arr = _mc.optimize_genes_protein_bursty_sd(
+                search_data,
+                return_status=True,
+                x0_list=x0_all,
+                lb=self.phys_lb.tolist(),
+                ub=self.phys_ub.tolist(),
+                fit_unspliced=bool(model.fit_unspliced),
+                protein_limit=float(model.protein_limit),
+                min_fudge=float(model.min_fudge),
+                max_fudge=float(model.max_fudge),
+                fd_eps=1e-6,
+                maxiter=self.gradient_params["max_iterations"],
+                ftol=2.22e-9,
+                gtol=1e-5,
+                eps=1e-15,
+                m_lbfgs=10,
+                num_threads=num_threads,
+            )
+            _warn_optimizer_status(status_arr, 'optimize_genes_protein_bursty_sd')
+            param_estimates = np.asarray(params_arr)
+            klds = np.asarray(klds_arr)
+
+        elif use_rust_amb:
+            num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
+            n_genes = search_data.n_genes
+            x0_all = x0_all_shared
+            samp_list = None
+            if model.seq_model == "Poisson":
+                samp_list = [
+                    (self.regressor[gi].tolist() if self.regressor[gi] is not None else None)
+                    for gi in range(n_genes)
+                ]
+            params_arr, klds_arr, status_arr = _mc.optimize_genes_2d_amb_sd(
+                search_data,
+                return_status=True,
+                bio_model=model.bio_model,
+                amb_model=model.amb_model,
+                x0_list=x0_all,
+                lb=self.phys_lb.tolist(),
+                ub=self.phys_ub.tolist(),
+                fixed_quad_t=float(model.fixed_quad_T),
+                quad_order=int(model.quad_order),
+                fd_eps=1e-6,
+                maxiter=self.gradient_params["max_iterations"],
+                ftol=2.22e-9,
+                gtol=1e-5,
+                samp_list=samp_list,
+                eps=1e-15,
+                m_lbfgs=10,
+                num_threads=num_threads,
+            )
+            _warn_optimizer_status(status_arr, 'optimize_genes_2d_amb_sd')
+            param_estimates = np.asarray(params_arr)
+            klds = np.asarray(klds_arr)
+
+        elif use_rust_custom:
+            num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
+            n_genes = search_data.n_genes
+            x0_all = x0_all_shared
+            # Serialise the network topology (constant across all L-BFGS-B evaluations).
+            net = model.network
+            name_to_idx = {name: i for i, name in enumerate(
+                list(net.all_params) + ([net._norm_rate] if net._norm_rate else [])
+            )}
+            sp_idx_map = {s: i for i, s in enumerate(net.species)}
+            rxn_kinds_list, rxn_rate_idxs_list = [], []
+            rxn_extra1_list, rxn_extra2_list   = [], []
+            prod_sp_flat, prod_st_flat, prod_off_list = [], [], [0]
+            for rxn in net.reactions:
+                rate_idx = name_to_idx[rxn.rate_name]
+                if not rxn.reactants and rxn.burst_param is not None:
+                    rxn_kinds_list.append(0)
+                    rxn_rate_idxs_list.append(rate_idx)
+                    rxn_extra1_list.append(name_to_idx[rxn.burst_param])
+                    rxn_extra2_list.append(sp_idx_map[rxn.burst_species])
+                elif not rxn.reactants:
+                    rxn_kinds_list.append(1)
+                    rxn_rate_idxs_list.append(rate_idx)
+                    rxn_extra1_list.append(-1)
+                    rxn_extra2_list.append(-1)
+                else:
+                    src = next(iter(rxn.reactants))
+                    rxn_kinds_list.append(2)
+                    rxn_rate_idxs_list.append(rate_idx)
+                    rxn_extra1_list.append(sp_idx_map[src])
+                    rxn_extra2_list.append(-1)
+                for sp, st in rxn.products.items():
+                    prod_sp_flat.append(sp_idx_map[sp])
+                    prod_st_flat.append(st)
+                prod_off_list.append(len(prod_sp_flat))
+            params_arr, klds_arr, status_arr = _mc.optimize_genes_custom_sd(
+                search_data,
+                return_status=True,
+                x0_list=x0_all,
+                lb=self.phys_lb.tolist(),
+                ub=self.phys_ub.tolist(),
+                n_species=len(net.species),
+                rxn_kinds=rxn_kinds_list,
+                rxn_rate_idxs=rxn_rate_idxs_list,
+                rxn_extra1=rxn_extra1_list,
+                rxn_extra2=rxn_extra2_list,
+                prod_sp=prod_sp_flat,
+                prod_st=prod_st_flat,
+                prod_off=prod_off_list,
+                has_norm_rate=(net._norm_rate is not None),
+                min_fudge=float(model.min_fudge),
+                max_fudge=float(model.max_fudge),
+                fd_eps=1e-6,
+                maxiter=self.gradient_params["max_iterations"],
+                ftol=2.22e-9,
+                gtol=1e-5,
+                eps=1e-15,
+                m_lbfgs=10,
+                num_threads=num_threads,
+            )
+            _warn_optimizer_status(status_arr, 'optimize_genes_custom_sd')
+            param_estimates = np.asarray(params_arr)
+            klds = np.asarray(klds_arr)
+
+        elif n_gene_cores != 1:
+            num_threads = None if n_gene_cores < 0 else n_gene_cores
+            if use_batch and _HAS_RUST:
+                # Explicit opt-in: batch Adam with rayon, all genes in one call.
+                param_estimates, klds = self._iterate_over_genes_batch(
+                    model, search_data, num_threads=num_threads
+                )
+            else:
+                # Default: ThreadPoolExecutor + scipy L-BFGS-B per gene.
+                # Rust PSS fast-path fires automatically inside each thread.
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                n_workers = os.cpu_count() if num_threads is None else num_threads
+                results_list = [None] * search_data.n_genes
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    futures = {
+                        pool.submit(
+                            self.optimize_gene,
+                            gene_index=i, model=model, search_data=search_data,
+                            x0=x0_all_shared[i],
+                        ): i
+                        for i in range(search_data.n_genes)
+                    }
+                    for f in as_completed(futures):
+                        results_list[futures[f]] = f.result()
+                param_estimates, klds = zip(*results_list)
+        else:
+            param_estimates, klds = zip(
+                *[
+                    self.optimize_gene(gene_index=gi, model=model, search_data=search_data,
+                                       x0=x0_all_shared[gi])
+                    for gi in range(search_data.n_genes)
+                ]
+            )
 
         klds = np.asarray(klds)
         param_estimates = np.asarray(param_estimates)
@@ -1100,8 +1670,158 @@ class GradientInference:
 
         return param_estimates, klds, obj_func, d_time
 
-    def fit_all_genes(self, model, search_data):
-        """Wraps iterate_over_genes and stores the results on disk.
+    def _iterate_over_genes_batch(self, model, search_data, num_threads=None):
+        """Vectorized gradient descent over all genes using a single batched Rust PSS call
+        per optimizer step.
+
+        Uses Adam optimizer.  At each step, all genes' PSS evaluations
+        (center + FD perturbations) are computed in one `eval_model_pss_batch`
+        call, releasing the GIL and letting rayon parallelize over genes.
+
+        Parameters
+        ----------
+        num_threads : int or None
+            Rayon thread count passed to `eval_model_pss_batch`. None uses all
+            available cores.
+
+        Note: uses Adam optimizer (not scipy L-BFGS-B), so parameter estimates
+        may differ slightly from the default optimizer.  Key tunables in
+        ``gradient_params``:
+            - ``max_iterations``  : optimizer steps per restart; the batch path
+                                    uses ``4 × max_iterations`` by default to
+                                    compensate for Adam vs L-BFGS-B convergence
+            - ``batch_max_iterations``: override the step count for the batch
+                                        path directly
+            - ``num_restarts``    : random restarts; keep best KLD (default 1)
+            - ``batch_lr``        : Adam base learning rate (default 0.05)
+            - ``batch_fd_eps``    : finite-difference step size (default 1e-4)
+
+        Returns
+        -------
+        param_estimates : np.ndarray, shape (n_genes, n_phys_pars)
+        klds            : np.ndarray, shape (n_genes,)
+        """
+        n_genes   = search_data.n_genes
+        n_params  = self.n_phys_pars
+        EPS       = 1e-15
+        eps_fd    = self.gradient_params.get("batch_fd_eps", 1e-4)
+        # Default: 4× scipy max_iterations so Adam can match L-BFGS-B quality.
+        _scipy_iters = self.gradient_params.get("max_iterations", 100)
+        max_iter  = self.gradient_params.get("batch_max_iterations", 4 * _scipy_iters)
+        restarts  = self.gradient_params.get("num_restarts", 1)
+        lr        = self.gradient_params.get("batch_lr", 0.05)
+        # Adam hyperparameters
+        beta1, beta2, adam_eps = 0.9, 0.999, 1e-8
+
+        lb = np.array(self.phys_lb)
+        ub = np.array(self.phys_ub)
+
+        # Per-gene grid limits and sampling params (fixed across restarts/iters).
+        limits_list = [search_data.M[:, i].tolist() for i in range(n_genes)]
+        if model.seq_model == "None":
+            samp_list = [None] * n_genes
+        else:
+            samp_list = [self.regressor[i] for i in range(n_genes)]
+
+        # ---- KLD helpers -------------------------------------------------- #
+        def _kld_from_pss(pss_flat, gene_idx, limits):
+            """Compute KLD between a flat PSS and the gene's empirical histogram."""
+            pss = np.array(pss_flat).reshape(int(limits[0]), int(limits[1])).squeeze()
+            np.clip(pss, EPS, None, out=pss)
+            x, f = search_data.hist[gene_idx]
+            return float(np.sum(f * np.log(f / pss[tuple(x.T)])))
+
+        def _batch_kld(params_mat):
+            """Evaluate KLD for all genes given params_mat (n_genes, n_params)."""
+            pss_list = model.eval_model_pss_batch(
+                [params_mat[i] for i in range(n_genes)],
+                limits_list,
+                samp_list,
+                num_threads,
+            )
+            return np.array([
+                _kld_from_pss(pss_list[i], i, limits_list[i])
+                for i in range(n_genes)
+            ])
+
+        def _batch_kld_and_grad(params_mat):
+            """One batch call for all genes: center + n_params FD perturbations."""
+            # Build augmented list: n_genes center + n_genes × n_params perturbed.
+            aug_params  = [params_mat[i] for i in range(n_genes)]
+            aug_limits  = list(limits_list)
+            aug_samp    = list(samp_list)
+            for j in range(n_params):
+                p_eps = params_mat.copy()
+                p_eps[:, j] = params_mat[:, j] + eps_fd
+                aug_params.extend([p_eps[i] for i in range(n_genes)])
+                aug_limits.extend(limits_list)
+                aug_samp.extend(samp_list)
+
+            all_pss = model.eval_model_pss_batch(aug_params, aug_limits, aug_samp, num_threads)
+
+            kld0 = np.array([
+                _kld_from_pss(all_pss[i], i, limits_list[i])
+                for i in range(n_genes)
+            ])
+            grad = np.zeros((n_genes, n_params))
+            for j in range(n_params):
+                offset = (j + 1) * n_genes
+                kld_j = np.array([
+                    _kld_from_pss(all_pss[offset + i], i, limits_list[i])
+                    for i in range(n_genes)
+                ])
+                grad[:, j] = (kld_j - kld0) / eps_fd
+
+            return kld0, grad
+
+        # ---- Optimization -------------------------------------------------- #
+        best_params = np.full((n_genes, n_params), np.nan)
+        best_klds   = np.full(n_genes, np.inf)
+
+        rng = np.random.default_rng()
+        for restart in range(restarts):
+            # Random initialization within restart bounds.
+            x = (
+                rng.random((n_genes, n_params)) * self._restart_range
+                + self._restart_lb
+            )
+            if self.gradient_params.get("init_pattern") == "moments" and hasattr(self, "param_MoM"):
+                x = np.clip(self.param_MoM.copy(), lb, ub)
+            if self.warm_start is not None:
+                x = np.clip(self.warm_start, lb, ub)
+
+            # Adam optimizer state (reset each restart).
+            m_adam = np.zeros_like(x)
+            v_adam = np.zeros_like(x)
+
+            for t in range(1, max_iter + 1):
+                kld0, grad = _batch_kld_and_grad(x)
+                if np.max(np.abs(grad)) < 1e-10:
+                    break
+
+                # Adam update (per-gene, per-parameter adaptive step sizes).
+                m_adam = beta1 * m_adam + (1.0 - beta1) * grad
+                v_adam = beta2 * v_adam + (1.0 - beta2) * grad ** 2
+                m_hat  = m_adam / (1.0 - beta1 ** t)
+                v_hat  = v_adam / (1.0 - beta2 ** t)
+                x = np.clip(x - lr * m_hat / (np.sqrt(v_hat) + adam_eps), lb, ub)
+
+            # Final KLD at converged params.
+            final_klds = _batch_kld(x)
+
+            # Update best per gene (only if strictly better by >1%).
+            improved = final_klds < best_klds * 0.99
+            best_params[improved] = x[improved]
+            best_klds[improved]   = final_klds[improved]
+            # First restart: accept anything finite.
+            uninit = ~np.isfinite(best_klds)
+            best_params[uninit] = x[uninit]
+            best_klds[uninit]   = final_klds[uninit]
+
+        return best_params, best_klds
+
+    def fit_all_genes(self, model, search_data, checkpoint=False):
+        """Wraps iterate_over_genes and optionally stores the results on disk.
 
         Parameters
         ----------
@@ -1109,9 +1829,14 @@ class GradientInference:
             CME model used for inference.
         search_data: monod.extract_data.SearchData
             SearchData object with the data to fit.
+        checkpoint: bool, optional
+            If True, write result to disk as a crash-recovery checkpoint. Default False.
 
+        Returns
+        -------
+        results: GridPointResults
         """
-        
+
         search_out = self.iterate_over_genes(model=model, search_data=search_data)
         results = GridPointResults(
             *search_out,
@@ -1120,37 +1845,13 @@ class GradientInference:
             self.point_index,
             self.inference_string,
         )
-        results.store_grid_point_results()
+        if checkpoint:
+            results.store_grid_point_results()
+        return results
 
 ########################
 ## Helper functions
 ########################
-
-
-def get_hist_type_adata(monod_adata):
-    """A helper function for backwards compatibility.
-
-    If the histogram type is not specified in the anndata object, assume it is the legacy
-    type "grid".
-
-    Parameters
-    ----------
-    monod_adata: Anndata
-        anndata object with the data to fit.
-
-    Returns
-    -------
-    hist_type: str
-        flavor of histogram used to generate monod_adata, either "unique" or "grid" or "none".
-    """
-    
-    if "hist_type" in monod_adata.uns and monod_adata.uns["hist_type"] in {"unique", "none"}:
-        hist_type = monod_adata.uns["hist_type"]
-        
-    else:
-        hist_type = "grid"
-        
-    return hist_type
 
 
 ########################
@@ -1171,7 +1872,7 @@ class GridPointResults:
         runtime in seconds.
     regressor: np.ndarray
         gene-specific technical variation parameter values at the current grid point.
-        these values will be different for each gene if use_lengths=True in the
+        these values will be different for each gene if use_lengths is not None in the
         InferenceParameters constructor.
     grid_point: list of floats
         genome-wide technical variation parameter values at the current grid point.
@@ -1203,14 +1904,36 @@ class GridPointResults:
         self.point_index = point_index
         self.inference_string = inference_string
 
+    _SERIAL_KIND = "GridPointResults"
+    _SERIAL_ATTRS = ("param_estimates", "klds", "obj_func", "d_time", "regressor",
+                     "grid_point", "point_index", "inference_string")
+
+    def to_dict(self):
+        d = {"format_version": 1, "kind": self._SERIAL_KIND}
+        d.update(_attr_dict(self, self._SERIAL_ATTRS))
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        kind = str(d.get("kind", "GridPointResults"))
+        if kind == "MEKMeansGridPointResults":
+            from .mminference import GridPointResults as target
+        else:
+            target = GridPointResults
+        obj = target.__new__(target)
+        for n in target._SERIAL_ATTRS:
+            if n in d:
+                v = d[n]
+                setattr(obj, n, v.item() if isinstance(v, np.generic) else v)
+        return obj
+
     def store_grid_point_results(self):
-        """This helper method attempts to store the grid point results to disk as a grid_point_X.gp object."""
+        """Store the grid point results to disk as grid_point_X.h5 (structured HDF5, no pickle)."""
         try:
             grid_point_result_string = (
-                self.inference_string + "/grid_point_" + str(self.point_index) + ".gp"
+                self.inference_string + "/grid_point_" + str(self.point_index) + ".h5"
             )
-            with open(grid_point_result_string, "wb") as gpfs:
-                pickle.dump(self, gpfs)
+            _write_h5(grid_point_result_string, self.to_dict())
             log.debug(
                 "Grid point {:.0f} results stored to {}.".format(
                     self.point_index, grid_point_result_string
@@ -1257,7 +1980,7 @@ class SearchResults:
     regressor: float np.ndarray
         gene-specific technical variation parameter values at each grid point.
         an n_grid_pts x n_genes array.
-        these values will be different for each gene if use_lengths=True in the
+        these values will be different for each gene if use_lengths is not None in the
         InferenceParameters constructor.
     analysis_figure_string: str
         directory for analysis figures.
@@ -1327,14 +2050,35 @@ class SearchResults:
         self.d_time = []
         self.regressor = []
 
-    def aggregate_grid_points(self):
+    def aggregate_grid_points(self, grid_point_results=None):
         """This helper method concatenates all of the grid point results.
 
-        The method runs append_grid_point for all grid points, then removes the original grid point files.
+        Parameters
+        ----------
+        grid_point_results: dict or None, optional
+            If provided, a dict mapping point_index -> GridPointResults for in-memory
+            aggregation. If None or incomplete, falls back to reading .gp files from disk.
         """
         for point_index in range(self.sp.n_grid_points):
-            self.append_grid_point(point_index)
-        self.clean_up()
+            if grid_point_results is not None and point_index in grid_point_results:
+                self._append_from_object(grid_point_results[point_index])
+            else:
+                self.append_grid_point(point_index)
+        self.clean_up(remove_files=(grid_point_results is None))
+
+    def _append_from_object(self, gp):
+        """This helper method updates the result attributes from an in-memory GridPointResults object.
+
+        Parameters
+        ----------
+        gp: GridPointResults
+            in-memory grid point results.
+        """
+        self.param_estimates += [gp.param_estimates]
+        self.klds += [gp.klds]
+        self.obj_func += [gp.obj_func]
+        self.d_time += [gp.d_time]
+        self.regressor += [gp.regressor]
 
     def append_grid_point(self, point_index):
         """This helper method updates the result attributes from a GridPointResult object stored on disk.
@@ -1345,34 +2089,85 @@ class SearchResults:
             index of the grid point results to load from disk.
         """
         grid_point_result_string = (
-            self.inference_string + "/grid_point_" + str(point_index) + ".gp"
+            self.inference_string + "/grid_point_" + str(point_index) + ".h5"
         )
-        with open(grid_point_result_string, "rb") as ipfs:
-            grid_point_results = pickle.load(ipfs)
-            self.param_estimates += [grid_point_results.param_estimates]
-            self.klds += [grid_point_results.klds]
-            self.obj_func += [grid_point_results.obj_func]
-            self.d_time += [grid_point_results.d_time]
-            self.regressor += [grid_point_results.regressor]
+        gp = GridPointResults.from_dict(_read_h5(grid_point_result_string))
+        self._append_from_object(gp)
 
-    def clean_up(self):
+    def clean_up(self, remove_files=False):
         """This helper method removes temporary files and finalizes the SearchResults object.
 
-        The GridPointResult objects are erased from disk, the attributes are converted to
-        np.ndarrays, and a directory for analysis figures is created.
+        The GridPointResult objects are optionally erased from disk, the attributes are converted to
+        np.ndarrays, and a directory for analysis figures is created (only if inference_string exists).
+
+        Parameters
+        ----------
+        remove_files: bool, optional
+            If True, delete .gp checkpoint files from disk. Default False.
         """
-        for point_index in range(self.sp.n_grid_points):
-            os.remove(self.inference_string + "/grid_point_" + str(point_index) + ".gp")
-        log.info("All grid point data cleaned from disk.")
+        if remove_files:
+            for point_index in range(self.sp.n_grid_points):
+                gp_path = self.inference_string + "/grid_point_" + str(point_index) + ".h5"
+                if os.path.exists(gp_path):
+                    os.remove(gp_path)
+            log.info("All grid point data cleaned from disk.")
         self.param_estimates = np.asarray(self.param_estimates)
         self.klds = np.asarray(self.klds)
         self.obj_func = np.asarray(self.obj_func)
         self.d_time = np.asarray(self.d_time)
         self.regressor = np.asarray(self.regressor)
 
-        analysis_figure_string = self.inference_string + "/analysis_figures"
-        self.analysis_figure_string = analysis_figure_string
-        make_dir(analysis_figure_string)
+        # Created lazily by _savefig the first time a figure is actually saved.
+        self.analysis_figure_string = self.inference_string + "/analysis_figures"
+
+    @property
+    def _result_filename(self):
+        return self.inference_string + "/grid_scan_results.h5"
+
+    @property
+    def _upd_result_filename(self):
+        return self.inference_string + "/grid_scan_results_upd.h5"
+
+    # ------------------------------------------------------------------
+    # Structured (pickle-free) serialisation
+    # ------------------------------------------------------------------
+    _SERIAL_KIND = "SearchResults"
+    _SERIAL_ATTRS = (
+        "inference_string", "n_genes", "n_cells", "gene_names", "gene_log_lengths",
+        "param_estimates", "klds", "obj_func", "d_time", "regressor",
+        "samp_optimum_ind", "samp_optimum", "phys_optimum", "regressor_optimum",
+        "rejected_genes", "pval", "csq", "hellinger", "sigma",
+        "analysis_figure_string", "full_result_string",
+    )
+
+    def to_dict(self):
+        """Nested dict of arrays/scalars describing this result (h5ad/HDF5 friendly)."""
+        d = {"format_version": 1, "kind": self._SERIAL_KIND, "sp": self.sp.to_dict()}
+        d.update(_attr_dict(self, self._SERIAL_ATTRS))
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        """Rebuild a SearchResults (or meK-Means subclass) from :meth:`to_dict` output."""
+        kind = str(d.get("kind", "SearchResults"))
+        if kind == "MEKMeansSearchResults":
+            from .mminference import SearchResults as target
+        else:
+            target = SearchResults
+        obj = target.__new__(target)
+        obj.sp = InferenceParameters.from_dict(d["sp"])
+        obj.model = obj.sp.model
+        for n in ("param_estimates", "klds", "obj_func", "d_time", "regressor"):
+            setattr(obj, n, np.zeros(0))
+        for n in target._SERIAL_ATTRS:
+            if n in d:
+                v = d[n]
+                setattr(obj, n, v.item() if isinstance(v, np.generic) else v)
+        if "aic" in d and "aic_per_cell" not in d and "aic_per_cell" in target._SERIAL_ATTRS:
+            obj.aic_per_cell = d["aic"]   # dicts written before the rename
+        if hasattr(obj, "gene_names"):
+            obj.gene_names = np.asarray(obj.gene_names).astype(str)
+        return obj
 
     def store_on_disk(self):
         """This helper method attempts to store the SearchResults object to disk.
@@ -1383,15 +2178,15 @@ class SearchResults:
             file location.
         """
         try:
-            full_result_string = self.inference_string + "/grid_scan_results.res"
-            with open(full_result_string, "wb") as srfs:
-                pickle.dump(self, srfs)
+            full_result_string = self._result_filename
+            _write_h5(full_result_string, self.to_dict())
             log.info("Grid scan results stored to {}.".format(full_result_string))
-        except:
+        except Exception:
             log.error(
                 "Grid scan results could not be stored to {}.".format(
                     full_result_string
-                )
+                ),
+                exc_info=True,
             )
         self.full_result_string = full_result_string
         return full_result_string
@@ -1407,9 +2202,8 @@ class SearchResults:
             file location.
         """
         try:
-            upd_result_string = self.inference_string + "/grid_scan_results_upd.res"
-            with open(upd_result_string, "wb") as srfs:
-                pickle.dump(self, srfs)
+            upd_result_string = self._upd_result_filename
+            _write_h5(upd_result_string, self.to_dict())
             log.debug("Updated results stored to {}.".format(upd_result_string))
         except:
             log.error(
@@ -1469,6 +2263,23 @@ class SearchResults:
         self.regressor_optimum = self.regressor[samp_optimum_ind]
         return self.samp_optimum
 
+    def _savefig(self, filename, dpi=450):
+        """Save the current figure into the analysis figure directory if it exists.
+
+        The directory is created only when the search was run with save=True or
+        checkpoint=True; otherwise the figure is left on screen and a message is
+        logged instead of raising FileNotFoundError.
+        """
+        figdir = getattr(self, "analysis_figure_string", None)
+        run_dir = os.path.dirname(figdir) if figdir else None
+        if run_dir and os.path.isdir(run_dir):
+            os.makedirs(figdir, exist_ok=True)
+            fig_string = figdir + "/" + filename
+            plt.savefig(fig_string, dpi=dpi)
+            log.info("Figure stored to {}.".format(fig_string))
+        else:
+            log.info("Run directory %s does not exist (run with save=True to create it); %s not saved.", run_dir, filename)
+
     def plot_landscape(
         self,
         ax,
@@ -1516,10 +2327,13 @@ class SearchResults:
         if logscale:
             total_divergence = np.log10(total_divergence)
 
-        dx = (np.asarray(self.sp.samp_ub) - np.asarray(self.sp.samp_lb)) / (
-            np.asarray(self.sp.gridsize) - 1
-        )
-        dx[dx < 1e-10] = 0.1
+        # Cell width per axis; a one-point axis (gridsize 1) gets a nominal width
+        # instead of the 0/0 that would make the extent NaN.
+        span = np.asarray(self.sp.samp_ub, dtype=float) - np.asarray(self.sp.samp_lb, dtype=float)
+        steps = np.asarray(self.sp.gridsize, dtype=float) - 1
+        with np.errstate(divide="ignore", invalid="ignore"):
+            dx = np.where(steps > 0, span / np.maximum(steps, 1), np.nan)
+        dx[~np.isfinite(dx) | (dx < 1e-10)] = 0.1
         extent = [
             self.sp.samp_lb[0] - dx[0] / 2,
             self.sp.samp_ub[0] + dx[0] / 2,
@@ -1538,9 +2352,7 @@ class SearchResults:
             ax.set_xticks([])
             ax.set_yticks([])
         if savefig:
-            fig_string = self.analysis_figure_string + "/landscape.png"
-            plt.savefig(fig_string, dpi=450)
-            log.info("Figure stored to {}.".format(fig_string))
+            self._savefig("landscape.png")
 
     def get_bool_filt(self, gene_filter, discard_rejected):
         """This helper method constructs gene filters.
@@ -1640,9 +2452,7 @@ class SearchResults:
             ax1[i].set_title(self.model.get_log_name_str()[i])
             ax1[i].set_xlabel(r"$log_{10}$ value")
         fig1.tight_layout()
-        fig_string = self.analysis_figure_string + "/parameter_marginals.png"
-        plt.savefig(fig_string, dpi=450)
-        log.info("Figure stored to {}.".format(fig_string))
+        self._savefig("parameter_marginals.png")
 
     def plot_KL(self, ax, gene_filter=None, discard_rejected=True, nbin=15):
         """Plot the distribution of KL divergences at the sampling parameter optimum.
@@ -1665,9 +2475,7 @@ class SearchResults:
         ax.hist(kld_data, nbin, color=aesthetics["hist_face_color"])
         ax.set_xlabel("KL divergence")
         ax.set_ylabel("# genes")
-        fig_string = self.analysis_figure_string + "/kldiv.png"
-        plt.savefig(fig_string, dpi=450)
-        log.info("Figure stored to {}.".format(fig_string))
+        self._savefig("kldiv.png")
 
     def chisquare_testing(
         self,
@@ -1746,7 +2554,65 @@ class SearchResults:
 
         """
         t1 = time.time()
-        hist_type = get_hist_type(search_data)
+
+        _CSQ_RUST_MODELS = {
+            "Constitutive", "Bursty", "CIR",
+            "Extrinsic", "Delay", "DelayedSplicing",
+        }
+        _sd_is_rust = _mc is not None and isinstance(search_data, _mc.SearchData)
+        if (
+            _sd_is_rust
+            and self.model.bio_model in _CSQ_RUST_MODELS
+            and self.model.amb_model == "None"
+            and self.model.quad_method == "fixed_quad"
+            and self.model.seq_model in ("None", "Poisson", "Bernoulli")
+        ):
+            samp_list = None
+            if self.model.seq_model in ("Poisson", "Bernoulli"):
+                samp_list = [
+                    (self.regressor_optimum[gi].tolist()
+                     if self.regressor_optimum[gi] is not None else None)
+                    for gi in range(self.n_genes)
+                ]
+            csq, pval, hellinger = _mc.chisquare_testing_2d_sd(
+                search_data,
+                self.model.bio_model,
+                [row.tolist() for row in self.phys_optimum],
+                samp_list,
+                float(self.model.fixed_quad_T),
+                int(self.model.quad_order),
+                int(self.model.get_num_params()),
+                float(grouping_thr),
+                float(EPS),
+                self.model.seq_model,
+            )
+            csq = np.asarray(csq)
+            pval = np.asarray(pval)
+            hellinger = np.asarray(hellinger)
+
+            if bonferroni:
+                threshold /= self.n_genes
+            self.rejected_genes = pval < threshold
+            if use_hellinger:
+                self.rejected_genes = self.rejected_genes & (hellinger > hellinger_thr)
+            if reject_at_bounds:
+                bound_range = self.sp.phys_ub - self.sp.phys_lb
+                lb_b = self.sp.phys_lb + bound_range * bound_thr
+                ub_b = self.sp.phys_ub - bound_range * bound_thr
+                self.rejected_genes = self.rejected_genes | (
+                    (self.phys_optimum < lb_b) | (self.phys_optimum > ub_b)
+                ).any(1)
+            self.pval = pval
+            self.csq = csq
+            self.hellinger = hellinger
+            self.rejection_index = self.samp_optimum_ind
+            t2 = time.time()
+            log.info(
+                "Chi-square computation complete (Rust). Rejected {:.0f} genes out of {:.0f}. Runtime: {:.1f} seconds.".format(
+                    np.sum(self.rejected_genes), self.n_genes, t2 - t1
+                )
+            )
+            return csq, pval, hellinger
 
         csqarr = []
         hellinger = []
@@ -1765,33 +2631,24 @@ class SearchResults:
             # expected_freq /= expected_freq.sum()
             # PROPOSAL = search_data.n_cells * expected_freq
 
-            if hist_type == "grid":
-                raise ValueError("Not implemented in current version.")
-            elif hist_type == "unique":
-                counts = np.concatenate(
-                    (search_data.n_cells * search_data.hist[gene_index][1], [0])
-                )
-                # print(search_data.hist)
-                number_of_modalities = len(search_data.hist[gene_index][0][0])
-                if number_of_modalities == 2:
-                    expect_freq = expect_freq[
-                        search_data.hist[gene_index][0][:, 0],
-                        search_data.hist[gene_index][0][:, 1],
-                    ]
-                elif number_of_modalities == 3:
-                    expect_freq = expect_freq[
-                        search_data.hist[gene_index][0][:, 0],
-                        search_data.hist[gene_index][0][:, 1],
-                        search_data.hist[gene_index][0][:, 2]
-                    ]
-
-                # expect_freq = expect_freq[ [
-                #     search_data.hist[gene_index][0][:, i] for i in range(len(search_data.hist[gene_index][0][0]))
-                # ]]
-
-                expect_freq = np.concatenate(
-                    (expect_freq, [search_data.n_cells - expect_freq.sum()])
-                )
+            counts = np.concatenate(
+                (search_data.n_cells * search_data.hist[gene_index][1], [0])
+            )
+            number_of_modalities = len(search_data.hist[gene_index][0][0])
+            if number_of_modalities == 2:
+                expect_freq = expect_freq[
+                    search_data.hist[gene_index][0][:, 0],
+                    search_data.hist[gene_index][0][:, 1],
+                ]
+            elif number_of_modalities == 3:
+                expect_freq = expect_freq[
+                    search_data.hist[gene_index][0][:, 0],
+                    search_data.hist[gene_index][0][:, 1],
+                    search_data.hist[gene_index][0][:, 2]
+                ]
+            expect_freq = np.concatenate(
+                (expect_freq, [search_data.n_cells - expect_freq.sum()])
+            )
 
             hellinger_ = (
                 1
@@ -1811,24 +2668,30 @@ class SearchResults:
             run_bin_exp = 0
             bin_obs = []
             bin_exp = []
+            # Same rule as the Rust path (group_bins): accumulate microstates until
+            # both observed and expected counts reach grouping_thr, then close a
+            # bin; the tail is merged into the last bin, or forms the only bin if
+            # none ever closed (tiny datasets).
             for i in range(len(counts)):
                 bins.append(bin_ind)
                 run_bin_obs += counts[i]
                 run_bin_exp += expect_freq[i]
-                if min(run_bin_obs, run_bin_exp) < 5:  # and i
-                    pass
-                else:
+                if min(run_bin_obs, run_bin_exp) >= grouping_thr:
                     bin_ind += 1
                     bin_obs.append(run_bin_obs)
                     bin_exp.append(run_bin_exp)
                     run_bin_obs = 0
                     run_bin_exp = 0
             bins = np.asarray(bins)
-            observed = np.asarray(bin_obs)
-            proposed = np.asarray(bin_exp)
-            observed[-1] += run_bin_obs
-            proposed[-1] += run_bin_exp
-            bins[bins == len(observed)] = len(observed) - 1
+            if not bin_obs:
+                observed = np.asarray([run_bin_obs], dtype=float)
+                proposed = np.asarray([run_bin_exp], dtype=float)
+            else:
+                observed = np.asarray(bin_obs, dtype=float)
+                proposed = np.asarray(bin_exp, dtype=float)
+                observed[-1] += run_bin_obs
+                proposed[-1] += run_bin_exp
+            bins[bins >= len(observed)] = len(observed) - 1
 
             for b_ in range(len(bin_obs)):
                 assert np.isclose(observed[b_], counts[bins == b_].sum())
@@ -1897,9 +2760,7 @@ class SearchResults:
             plt.hist(csq)
             plt.xlabel("Chi-square statistic")
             plt.ylabel("# genes")
-            fig_string = self.analysis_figure_string + "/chisquare.png"
-            plt.savefig(fig_string, dpi=450)
-            log.info("Figure stored to {}.".format(fig_string))
+            self._savefig("chisquare.png")
 
         t2 = time.time()
         log.info(
@@ -1930,18 +2791,12 @@ class SearchResults:
         import numdifftools  # this will fail if numdifftools has not been evaluted.
 
         gene_index, search_data = inputs
-        hist_type = get_hist_type(search_data)
-        # if hasattr(search_data, "hist_type") and search_data.hist_type == "unique":
-        #     hist_type = "unique"
-        # else:
-        #     hist_type = "grid"
         Hfun = numdifftools.Hessian(
             lambda x: self.model.eval_model_kld(
                 p=x,
                 limits=search_data.M[:, gene_index],
                 samp=self.regressor_optimum[gene_index],
                 data=search_data.hist[gene_index],
-                hist_type=hist_type,
             )
         )
         hess = Hfun(self.phys_optimum[gene_index])
@@ -1980,12 +2835,11 @@ class SearchResults:
         """
         log.info("Computing local Hessian.")
         t1 = time.time()
-        warnings.filterwarnings("ignore", category=DeprecationWarning)
         if num_cores > 1:
             log.info("Starting parallelized Hessian computation.")
             hess = parallelize(
                 function=self.par_fun_hess,
-                iterable=zip(range(self.n_genes), [search_data] * self.n_genes),
+                iterable=zip(range(self.n_genes), itertools.repeat(search_data, self.n_genes)),
                 num_cores=num_cores,
                 num_entries=self.n_genes,
                 completion_message="Parallelized Hessian computation complete.",
@@ -1997,10 +2851,9 @@ class SearchResults:
             log.info("Starting non-parallelized Hessian computation.")
             hess = [
                 self.par_fun_hess(x)
-                for x in zip(range(self.n_genes), [search_data] * self.n_genes)
+                for x in zip(range(self.n_genes), itertools.repeat(search_data, self.n_genes))
             ]
             log.info("Non-parallelized Hessian computation complete.")
-        warnings.resetwarnings()
         hess = np.asarray(hess)
 
         fail = np.zeros(self.n_genes, dtype=bool)
@@ -2074,9 +2927,7 @@ class SearchResults:
                 if i_ == 0:
                     ax1[axloc].set_ylabel("n_genes = " + str(resamp_vec[samp_num]))
 
-        fig_string = self.analysis_figure_string + "/subsampling.png"
-        plt.savefig(fig_string, dpi=450)
-        log.info("Figure stored to {}.".format(fig_string))
+        self._savefig("subsampling.png")
         self.find_sampling_optimum()  # reset sampling optimum here
 
     def resample_opt_mc_viz(
@@ -2127,9 +2978,7 @@ class SearchResults:
             )
             ax1[axloc].set_title("n_genes = " + str(resamp_vec[samp_num]))
 
-        fig_string = self.analysis_figure_string + "/subsampling_stability.png"
-        plt.savefig(fig_string, dpi=450)
-        log.info("Figure stored to {}.".format(fig_string))
+        self._savefig("subsampling_stability.png")
 
         self.find_sampling_optimum()  # reset sampling optimum.
 
@@ -2198,9 +3047,7 @@ class SearchResults:
                 )
                 self.plot_landscape(ax1[axloc], discard_rejected=True, hideticks=True)
         if viz:
-            fig_string = self.analysis_figure_string + "/chisquare_stability.png"
-            plt.savefig(fig_string, dpi=450)
-            log.info("Figure stored to {}.".format(fig_string))
+            self._savefig("chisquare_stability.png")
 
         if overwrite:
             self.chisquare_testing(search_data, threshold=threshold)
@@ -2359,9 +3206,7 @@ class SearchResults:
                 ax1[i].set_ylim([self.sp.phys_lb[i], self.sp.phys_ub[i]])
         
         fig1.tight_layout()
-        fig_string = self.analysis_figure_string + "/length_dependence.png"
-        plt.savefig(fig_string, dpi=450)
-        log.info("Figure stored to {}.".format(fig_string))
+        self._savefig("length_dependence.png")
 
     def plot_gene_distributions(
         self,
@@ -2409,6 +3254,7 @@ class SearchResults:
 
         (nrows, ncols) = sz
         fig1, ax1 = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize)
+        axes = np.atleast_1d(ax1).ravel()
 
         nax = np.prod(sz)
         if genes_to_plot is None:
@@ -2441,7 +3287,7 @@ class SearchResults:
                     lm[:i] = 1
                     lm[i+1:]=1
                     
-            axloc = np.unravel_index(j_, sz) if (sz[0] > 1 and sz[1] > 1) else j_
+            ax = axes[j_]
 
             samp = self.regressor_optimum[i_]
             Pa = np.squeeze(self.model.eval_model_pss(self.phys_optimum[i_], lm, samp))
@@ -2452,48 +3298,49 @@ class SearchResults:
                     Pa = np.log10(Pa)
 
                 if num_modalities==2:
-                    ax1[axloc].imshow(Pa.T, aspect="auto", cmap="summer")
+                    ax.imshow(Pa.T, aspect="auto", cmap="summer")
                 # Set so that, for protein model, the joint distribution of protein and spliced is shown.
                 elif num_modalities==3:
-                    ax1[axloc].imshow(Pa.sum(axis=0).T, aspect="auto", cmap="summer")
+                    ax.imshow(Pa.sum(axis=0).T, aspect="auto", cmap="summer")
                 else:
                     log.error('Joint distribution plot only implemented for 2 or 3 modalities')
                     
-                ax1[axloc].invert_yaxis()
+                ax.invert_yaxis()
 
                 jitter_magn = 0.1
                 jitter = np.random.randn(2, self.n_cells) * jitter_magn
                 if num_modalities==2:
-                    ax1[axloc].scatter(
+                    ax.scatter(
                         *search_data.layers[:2, :, i_] + jitter, c="k", s=1, alpha=0.1)
                 # for protein model, scatter protein and spliced counts.
                 elif num_modalities==3:
-                    ax1[axloc].scatter(
+                    ax.scatter(
                         *search_data.layers[1:, :, i_] + jitter, c="k", s=1, alpha=0.1
                 )
                 if num_modalities==2:
-                    ax1[axloc].set_xlim([-0.5, search_data.M[0, i_] - 1.5])
-                    ax1[axloc].set_ylim([-0.5, search_data.M[1, i_] - 1.5])
+                    ax.set_xlim([-0.5, search_data.M[0, i_] - 1.5])
+                    ax.set_ylim([-0.5, search_data.M[1, i_] - 1.5])
                 elif num_modalities==3:
-                    ax1[axloc].set_xlim([-0.5, search_data.M[1, i_] - 1.5])
-                    ax1[axloc].set_ylim([-0.5, search_data.M[2, i_] - 1.5])
+                    ax.set_xlim([-0.5, search_data.M[1, i_] - 1.5])
+                    ax.set_ylim([-0.5, search_data.M[2, i_] - 1.5])
             else:
-                plot_hist_and_fit(ax1[axloc], search_data, i_, Pa, marg)
+                plot_hist_and_fit(ax, search_data, i_, Pa, marg, modalities=self.modalities)
                 if logscale:
-                    ax1[axloc].set_yscale("log")
+                    ax.set_yscale("log")
             if title:
                 titlestr = self.gene_names[i_]
                 if hasattr(self, "rejected_genes") and self.rejected_genes[i_]:
                     titlestr += " (rej.)"
-                ax1[axloc].set_title(titlestr, fontdict={"fontsize": 9})
+                ax.set_title(titlestr, fontdict={"fontsize": 9})
             if show_axes:
-                if axloc % sz[1] != 0:
-                    ax1[axloc].set_yticks([])
-                if axloc < (sz[0] - 1) * sz[1]:
-                    ax1[axloc].set_xticks([])
+                row, col = divmod(j_, sz[1])
+                if col != 0:
+                    ax.set_yticks([])
+                if row < sz[0] - 1:
+                    ax.set_xticks([])
             else:
-                ax1[axloc].set_xticks([])
-                ax1[axloc].set_yticks([])
+                ax.set_xticks([])
+                ax.set_yticks([])
             j_ += 1
         if show_axes:
             fig1.supxlabel(self.modalities[0 if num_modalities == 2 else 1])
@@ -2501,44 +3348,68 @@ class SearchResults:
         fig1.tight_layout(pad=0.02, rect=[0.05, 0.05, 0.98, 0.98])
 
         if savefig:
-            fig_string = (
-                self.analysis_figure_string + "/gene_distributions_{}.png".format(marg)
-            )
-            plt.savefig(fig_string, dpi=450)
-            log.info("Figure stored to {}.".format(fig_string))
+            self._savefig("gene_distributions_{}.png".format(marg))
 
     # the next two functions are useful for model selection, but are not currently in use.
-    def get_logL(self, search_data, n_cells, EPS=1e-20, offs=0):
+    def get_logL(self, search_data, n_cells=None, EPS=1e-20, offs=0):
         """
         This method calculates the log-likelihood for all genes at the sampling parameter optimum.
 
         Parameters
         ----------
         search_data: a SearchData instance.
+        n_cells: int, optional. Defaults to search_data.n_cells.
         EPS: probability rounding parameter -- anything below this is rounded to EPS.
 
         Output:
         logL: a vector of size n_genes containing model log-likelihoods.
         """
-        hist_type = get_hist_type(search_data)
-        logL = np.zeros(self.n_genes)
+        _LOGL_RUST_MODELS = {
+            "Constitutive", "Bursty", "CIR",
+            "Extrinsic", "Delay", "DelayedSplicing",
+        }
+        if n_cells is None:
+            n_cells = search_data.n_cells
+        model = self.model
+        if (
+            _HAS_RUST
+            and offs == 0
+            and isinstance(search_data, _mc.SearchData)
+            and model.bio_model in _LOGL_RUST_MODELS
+            and model.amb_model == "None"
+            and model.quad_method == "fixed_quad"
+            and (model.seq_model == "None" or model.seq_model in ("Poisson", "Bernoulli"))
+        ):
+            phys_optimum = [p.tolist() for p in self.phys_optimum]
+            if model.seq_model == "None":
+                samp_list = None
+            else:
+                samp_list = [
+                    r.tolist() if r is not None else None
+                    for r in self.regressor_optimum
+                ]
+            return np.array(_mc.eval_logl_2d_sd(
+                search_data,
+                model.bio_model,
+                phys_optimum,
+                float(n_cells),
+                samp_list,
+                float(model.fixed_quad_T),
+                int(model.quad_order),
+                float(EPS),
+                model.seq_model,
+            ))
 
+        logL = np.zeros(self.n_genes)
         for gene_index in range(self.n_genes):
-            logL[gene_index] = self.model.eval_model_logL(
+            logL[gene_index] = model.eval_model_logL(
                 p=self.phys_optimum[gene_index],
                 limits=search_data.M[:, gene_index] + offs,
                 samp=self.regressor_optimum[gene_index],
                 data=search_data.hist[gene_index],
                 n_cells=n_cells,
-                hist_type=hist_type,
                 EPS=EPS,
             )
-            # Pss = self.model.eval_model_pss(self.phys_optimum[gene_index],lm,samp)
-            # if np.any(Pss<EPS):
-            #     Pss[Pss<EPS] = EPS
-            # expected_log_lik = np.log(Pss)
-            # eval_model_kld(self, p, limits, samp, data, hist_type="unique", EPS=EPS)
-            # logL[gene_index] = expected_log_lik[search_data.U[gene_index].astype(int),search_data.S[gene_index].astype(int)].sum()
         return logL
 
     def get_noise_decomp(self):
@@ -2567,22 +3438,90 @@ class SearchResults:
             )
         return np.asarray(f).squeeze()
 
+def reject_genes(adata, viz=False, EPS=1e-15, threshold=0.05, bonferroni=True,
+                 reject_at_bounds=True, bound_thr=0.01, grouping_thr=5,
+                 use_hellinger=True, hellinger_thr=0.05, mek_means=None,
+                 save_csq=True, save_pval=True, save_hellinger=True):
+    """Chi-square goodness-of-fit testing on a fitted AnnData; flags poorly fit genes.
+
+    Works on the AnnData returned by :func:`perform_inference`.  The search data
+    is rebuilt from the layers and the stored result(s) are updated in place, so
+    downstream calls with ``discard_rejected=True`` (e.g. ``analysis.DE_parameters``)
+    see the rejection flags.
+
+    Adds to ``adata.var``: ``rejected_genes`` plus ``csq``, ``pval``, ``hellinger``
+    (prefixed ``c<k>_`` per cluster for a meK-Means run).
+
+    Parameters
+    ----------
+    adata: AnnData from perform_inference.
+    mek_means: tuple or None
+        pass the same ``mek_means_params`` used for the fit (anything truthy
+        selects the per-cluster path).
+    Other arguments are forwarded to ``SearchResults.chisquare_testing``.
+
+    Returns
+    -------
+    adata (modified in place).
+    """
+    kw = dict(viz=viz, EPS=EPS, threshold=threshold, bonferroni=bonferroni,
+              reject_at_bounds=reject_at_bounds, bound_thr=bound_thr,
+              grouping_thr=grouping_thr, use_hellinger=use_hellinger,
+              hellinger_thr=hellinger_thr)
+    search_data = searchdata_from_adata(adata)
+
+    if not mek_means:
+        if 'search_result' not in adata.uns:
+            raise KeyError("adata.uns has no 'search_result'; for a meK-Means run pass mek_means=<params>.")
+        sr = search_result_from_uns(adata.uns['search_result'])
+        csq, pval, hellinger = sr.chisquare_testing(search_data, **kw)
+        adata.var['rejected_genes'] = np.asarray(sr.rejected_genes, dtype=bool)
+        if save_csq:
+            adata.var['csq'] = np.asarray(csq)
+        if save_pval:
+            adata.var['pval'] = np.asarray(pval)
+        if save_hellinger:
+            adata.var['hellinger'] = np.asarray(hellinger)
+        adata.uns['search_result'] = sr.to_dict()
+        log.info("Rejected %d/%d genes; flags stored in adata.var['rejected_genes'].",
+                 int(np.sum(sr.rejected_genes)), sr.n_genes)
+    else:
+        if 'search_result_list' not in adata.uns:
+            raise KeyError("adata.uns has no 'search_result_list'; this AnnData is not from a meK-Means run.")
+        srs = search_result_list_from_uns(adata.uns['search_result_list'])
+        for sr in srs:
+            k = int(sr.assigns)
+            csq, pval, hellinger = sr.chisquare_testing(search_data, **kw)   # subsets to the cluster itself
+            adata.var[f'c{k}_rejected_genes'] = np.asarray(sr.rejected_genes, dtype=bool)
+            if save_csq:
+                adata.var[f'c{k}_csq'] = np.asarray(csq)
+            if save_pval:
+                adata.var[f'c{k}_pval'] = np.asarray(pval)
+            if save_hellinger:
+                adata.var[f'c{k}_hellinger'] = np.asarray(hellinger)
+        adata.uns['search_result_list'] = search_result_list_to_uns(srs)
+        log.info("Rejection flags stored per cluster in adata.var['c<k>_rejected_genes'].")
+    return adata
+
+
 def get_AIC_mek_means(search_result_list, search_data, AIC_EPS=1e-20, AIC_offs=0):
+    """Per-gene AIC of a meK-Means fit (lower is better).
 
+    Each gene carries one parameter set per surviving cluster, so the penalty
+    is 2 * n_phys_pars * K_final, where K_final = len(search_result_list) is
+    the number of clusters that received cells.  The log-likelihood is the sum
+    over clusters of the gene's log-likelihood on that cluster's cells.  (The
+    paper's whole-model AIC additionally counts K_final - 1 mixing weights,
+    which cannot be attributed to individual genes; see
+    ``mminference.mek_means_aic`` for the whole-model score.)
+    """
     LL = np.zeros(search_result_list[0].n_genes)
-    
     for sr in search_result_list:
+        LL += np.asarray(sr.get_logL(search_data, EPS=AIC_EPS, offs=AIC_offs))
 
-        n_cells = sr.n_cells
-        LL += sr.get_logL(search_data, EPS=AIC_EPS, offs=AIC_offs)
-
-    # Calculate the number of parameters
-    n_params = sr.sp.n_phys_pars
-    
-    # Calculate AIC for each gene
-    AIC = 2 * n_params - 2 * LL
-
-    return AIC
+    n_params = search_result_list[0].sp.n_phys_pars
+    k_final = len(search_result_list)
+    return 2 * n_params * k_final - 2 * LL
 
 
 def parallelize(
@@ -2595,9 +3534,9 @@ def parallelize(
     error_message="Parallelization terminated due to error.",
     use_tqdm=True,
 ):
-    """Helper function to safely parallelize computations.
+    """Helper function to safely parallelize computations using joblib.
 
-    Inputs a single-parameter function and an iterable, requests a number of cores, \
+    Inputs a single-parameter function and an iterable, requests a number of cores,
     and gracefully shuts down if needed.
 
     Parameters
@@ -2605,7 +3544,7 @@ def parallelize(
     function: function
         a one-parameter function that can be mapped using entries of the iterable.
     iterable: iterable
-        an iterable to be passed into the function.        
+        an iterable to be passed into the function.
     num_cores: int
         number of cores to use for parallelization.
     num_entries: int
@@ -2621,181 +3560,82 @@ def parallelize(
 
     Returns
     -------
-    x: iterable
-        result of applying function to iterable.
-
+    x: list
+        result of applying function to each item in iterable.
     """
+    from joblib import Parallel, delayed
+    x = []
     try:
-        pool = multiprocessing.Pool(processes=num_cores)
-        if use_tqdm:
-            x = list(tqdm(pool.imap(function, iterable), total=num_entries))  # hacky
-        else:
-            x = pool.map(function, iterable)
-        pool.close()
-        pool.join()
+        items = list(tqdm(iterable, total=num_entries) if use_tqdm else iterable)
+        # Thread backend: items may contain a SearchData, which is shared in
+        # memory rather than pickled to worker processes.
+        x = Parallel(n_jobs=num_cores, prefer="threads")(delayed(function)(item) for item in items)
         log.info(completion_message)
     except KeyboardInterrupt:
         log.warning(termination_message)
-        pool.terminate()
-        pool.join()
     except ValueError:
         log.warning(error_message)
-        pool.terminate()
-        pool.join()
     return x
+
+
+_MARG_ALIASES = {"nascent": "unspliced", "mature": "spliced", "U": "unspliced", "S": "spliced"}
+
+
+def _resolve_marg(marg, layer_names):
+    """Map a marginal name (or legacy alias) onto an index into layer_names."""
+    layer_names = list(layer_names)
+    if marg in layer_names:
+        return layer_names.index(marg)
+    alias = _MARG_ALIASES.get(marg)
+    if alias in layer_names:
+        return layer_names.index(alias)
+    raise ValueError(f"marg={marg!r} is not one of the modalities {layer_names}")
 
 
 def plot_hist_and_fit(
     ax1,
-    monod_adata,
+    search_data,
     i_,
     Pa,
-    marg="nascent",
+    marg="unspliced",
+    modalities=None,
     facecolor=aesthetics["hist_face_color"],
     fitcolor=aesthetics["hist_fit_color"],
     facealpha=aesthetics["hist_face_alpha"],
     linestyle=aesthetics["linestyle"],
 ):
-    """Plots marginal gene count distributions and their fits at the sampling parameter optimum.
+    """Plot one gene's marginal count histogram and its fitted PMF.
 
     Parameters
     ----------
-    ax: matplotlib.axes.Axes
+    ax1: matplotlib.axes.Axes
         axes to plot into.
-    monod_adata: anndata
-        anndata object with the fit data.
+    search_data: SearchData (Rust ``monod_core.SearchData`` or the Python fallback)
+        holds ``layers`` (n_layers x n_cells x n_genes) and ``M`` (n_layers x n_genes).
     i_: int
         gene index to plot.
     Pa: float np.ndarray
-        univariate probability mass function, typically computed through CMEModel.
+        univariate PMF for this gene and modality, typically from CMEModel.eval_model_pss
+        with the other modalities' limits set to 1.
     marg: str, optional
-        which marginal to plot, typically 'nascent' or 'mature'.
-    facecolor: str or tuple, optional
-        histogram face color in a matplotlib-compatible format.
-    fitcolor: str or tuple, optional
-        model fit line color in a matplotlib-compatible format.
-    facealpha: float, optional
-        histogram face alpha.
-    linestyle: str, optional
-        model fit line style in a matplotlib-compatible format.
+        modality to plot ('unspliced', 'spliced', 'protein', ...; 'nascent'/'mature' accepted).
+    modalities: list of str, optional
+        modality names in layer order; defaults to ``search_data.layer_names``.
+    facecolor, fitcolor, facealpha, linestyle: matplotlib styling.
     """
-
-    # Identify layer index of the layer we want to gain the marginal of.
-    layer_names = [i for i in monod_adata.layers.keys()]
-    for i in range(len(layer_names)):
-        if marg==layer_names[i]:
-            lind = i
-    # Otherwise use first modality.
-    else:
-        lind = 0
-    marg_name = layer_names[lind]
-        
+    layer_names = modalities if modalities is not None else getattr(search_data, "layer_names", None)
+    if layer_names is None:
+        raise ValueError("plot_hist_and_fit needs modality names: pass modalities=model.model_modalities")
+    lind = _resolve_marg(marg, layer_names)
+    counts = np.asarray(search_data.layers[lind])[:, i_]
+    M = int(search_data.M[lind, i_])
+    Pa = np.asarray(Pa).ravel()
     ax1.hist(
-        monod_adata.layers[marg_name][:, i_],
-        bins=np.arange(monod_adata.uns['M'][lind, i_]) - 0.5,
+        counts,
+        bins=np.arange(M + 1) - 0.5,
         density=True,
         color=facecolor,
         alpha=facealpha,
     )
-    ax1.plot(np.arange(sd.M[lind, i_]), Pa, color=fitcolor, linestyle=linestyle)
-    ax1.set_xlim([-0.5, sd.layers[lind, i_].max() + 2.5])
-
-
-# Differential expression analysis between mek-means clusters.
-def make_fcs(sr,sd,clus1=0,clus2=1,gf_rej=False,thrpars=2,thrmean=1,outlier_de=False,nuc=False,correct_off=False):
-    '''
-    Utilize different metrics to find fold-changes (FCs) between cluster parameters
-
-    sr: list of SearchResults objects from meK-Means runs
-    sd: SearchData object that corresponds to full, input data
-    clus1: cluster 1 (to compare FCS of cluster 1/cluster 2 )
-    clus2: cluster 2 (to compare FCS of cluster 1/cluster 2 )
-    gf_rej: whether to use boolean list of rejected genes from both clusters
-    thrpars: FC threshold value (to call DE-theta genes)
-    thrmean: Mean S expression threshold value, for genes to consider
-    outlier_de: Use iterative outlier calling procedure to assign DE-theta genes (see Monod https://github.com/pachterlab/monod_examples/blob/main/Monod_demo.ipynb)
-    nuc: is this nuclear RNA data
-    correct_off: correct offset between cluster parameters (through ODR)
-    '''
-
-    all_filt_fcs = pd.DataFrame()
-    fcs,types,which_pair,highFC,spliceFC,g_names,out_de = ([] for i in range(7))
-
-    ind1 = [i for i in range(len(sr)) if clus1 == sr[i].assigns][0]
-    ind2 = [i for i in range(len(sr)) if clus2 == sr[i].assigns][0]
-
-    sr1 = sr[ind1]
-    sr2 = sr[ind2]
-    if correct_off:
-        param_names = sr1.model.get_log_name_str()
-        offsets = []
-        par_vals = np.copy(sr2.param_estimates)
-        for k in range(3):
-            m1 = sr1.param_estimates[0,:,k]
-            m2 = sr2.param_estimates[0,:,k]
-            offset = diffexp_fpi(m1,m2,param_names[k],viz=False)[1]
-            par_vals[0,:,k] -= offset
-
-        fc_par = (sr1.param_estimates-par_vals)/np.log10(2)
-    else:
-        fc_par = (sr1.param_estimates-sr2.param_estimates)/np.log10(2)  #Get FCs between cluster params
-
-    # print('fc_par.shape: ',fc_par.shape)
-    if nuc:
-        fc_s_par = np.log2(sd.layers[0][:,sr1.filt].mean(1)/sd.layers[0][:,sr2.filt].mean(1))
-    else:
-        fc_s_par = np.log2(sd.layers[1][:,sr1.filt].mean(1)/sd.layers[1][:,sr2.filt].mean(1)) #Get spliced FCs
-
-    # print('fc_s_par.shape: ',fc_s_par.shape)
-
-    if outlier_de:
-        dr_analysis = monod.analysis.diffexp_pars(sr1,sr2,viz=True,modeltype='id',use_sigma=True)
-        par_bool_de = dr_analysis[1].T
-
-    parnames = ('b','beta','gamma')
-
-
-  #-----is parameter FC significant -----
-    if gf_rej is False:
-        gf_rej = [True]*sd.n_genes
-    else:
-        gf_rej = (~sr1.rejected_genes) & (~sr2.rejected_genes)
-
-    for n in range(len(parnames)):
-        #Boolean for if large param FC and not rejected gene (with minimum expression)
-        if nuc:
-            gf_highnoise = (np.abs(fc_par[0,:,n])>thrpars)  \
-                & ((sd.layers[0][:,sr1.filt].mean(1)>thrmean) | (sd.layers[0][:,sr2.filt].mean(1)>thrmean)) \
-                & gf_rej
-        else:
-            gf_highnoise = (np.abs(fc_par[0,:,n])>thrpars)  \
-                & ((sd.layers[1][:,sr1.filt].mean(1)>thrmean) | (sd.layers[1][:,sr2.filt].mean(1)>thrmean)) \
-                & gf_rej
-
-        #Boolean for FC (above) but no FC detected at S-level
-        gf_highnoise_meanS = gf_highnoise & (np.abs(fc_s_par)<1) & gf_rej
-
-        #Boolean for FC (above)
-        gf_onlyhigh = gf_highnoise & gf_rej
-
-        #For dataframe
-        fcs += list(fc_par[0,gf_rej,n])
-        g_names += list(sr1.gene_names[gf_rej])
-        which_pair += [[sr1.assigns,sr2.assigns]]*np.sum(gf_rej)
-        highFC += list(gf_onlyhigh[gf_rej])
-        spliceFC += list(gf_highnoise_meanS[gf_rej])
-        types += [parnames[n]]*np.sum(gf_rej)
-        if outlier_de:
-            out_de += list(par_bool_de[gf_rej,n])
-
-    if outlier_de:
-        all_filt_fcs['deTheta_outlier'] = out_de
-
-    all_filt_fcs['log2FC'] = fcs
-    all_filt_fcs['gene'] = g_names
-    all_filt_fcs['cluster_pair'] = which_pair
-    all_filt_fcs['deTheta_FC'] = highFC
-    all_filt_fcs['deTheta_noDeMuS'] = spliceFC
-    all_filt_fcs['param'] = types
-
-    return all_filt_fcs
+    ax1.plot(np.arange(min(M, Pa.size)), Pa[:M], color=fitcolor, linestyle=linestyle)
+    ax1.set_xlim([-0.5, counts.max() + 2.5])

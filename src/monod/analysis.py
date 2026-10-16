@@ -1,21 +1,13 @@
-from cme_toolbox import CMEModel
-from inference import SearchResults, plot_hist_and_fit
-# from extract_data import SearchData, normalize_count_matrix
-# from preprocess import make_dir, log
-from plot_aesthetics import aesthetics
+from .cme_toolbox import CMEModel
+from .inference import SearchResults, plot_hist_and_fit, _resolve_marg, searchdata_from_adata, _read_h5, search_result_from_uns, search_result_list_from_uns
+from .extract_data import make_dir, knee_plot, log
+from .plot_aesthetics import aesthetics
 import pickle
 import scipy
 from scipy import stats
 from scipy import odr
 import numpy as np
 import matplotlib.pyplot as plt
-from extract_data import log
-import sys
-
-import logging
-logging.basicConfig(stream=sys.stdout)
-log = logging.getLogger()
-log.setLevel(logging.INFO)
 
 
 ########################
@@ -24,12 +16,13 @@ log.setLevel(logging.INFO)
 
 def run_qc(monod_adata, mek_means_params=None,cluster=0, discard_rejected=True, marg='joint',
            gene_dist_size=(5, 5), show_axes=False):
-    sd = monod_adata.uns['search_data']
+    # The SearchData is never stored in the AnnData; rebuild it in memory.
+    sd = searchdata_from_adata(monod_adata)
 
     if not mek_means_params:
-        sr = monod_adata.uns['search_result']
+        sr = search_result_from_uns(monod_adata.uns['search_result'])
     else:
-        sr = monod_adata.uns['search_result_list'][cluster]
+        sr = search_result_list_from_uns(monod_adata.uns['search_result_list'])[cluster]
         
     fig1,ax1 = plt.subplots(1,1)
     sr.find_sampling_optimum()
@@ -56,63 +49,49 @@ def run_qc(monod_adata, mek_means_params=None,cluster=0, discard_rejected=True, 
 
 
 def load_search_results(full_result_string):
-    """Attempt to load search results from disk.
+    """Load search results from disk.
+
+    Accepts the ``monod_adata.h5ad`` written by ``perform_inference(save=True)``
+    (returns the SearchResults, or the per-cluster list for a meK-Means run), a
+    ``grid_scan_results.h5`` written by ``SearchResults.store_on_disk`` or
+    ``run_mek_means(save=True)``, or a legacy pickled ``.res`` file.
 
     Parameters
     ----------
     full_result_string: str
-        disk location of the SearchResults object.
+        file location.
 
     Returns
     -------
-    search_results: monod.inference.SearchResults
-        the SearchResults object.
+    search_results: SearchResults or list of SearchResults
     """
     try:
-        with open(full_result_string, "rb") as srfs:
-            search_results = pickle.load(srfs)
+        try:
+            if full_result_string.endswith(".h5ad"):
+                import h5py
+                from anndata.io import read_elem
+                with h5py.File(full_result_string, "r") as f:
+                    uns = read_elem(f["uns"])
+                if "search_result_list" in uns:
+                    return search_result_list_from_uns(uns["search_result_list"])
+                return search_result_from_uns(uns["search_result"])
+            d = _read_h5(full_result_string)
+            if str(d.get("kind", "")) == "SearchResultsList":
+                return search_result_list_from_uns(d)
+            search_results = SearchResults.from_dict(d)
+        except OSError:
+            # Legacy pickled .res file written by older monod versions.
+            log.warning("%s is not an HDF5 results file; falling back to the legacy pickle loader.", full_result_string)
+            with open(full_result_string, "rb") as srfs:
+                search_results = pickle.load(srfs)
+            if not hasattr(search_results.model, "amb_model"):  # bck
+                search_results.model.amb_model = "None"
         log.info("Grid scan results loaded from {}.".format(full_result_string))
-        if not hasattr(search_results.model, "amb_model"):  # bck
-            search_results.model.amb_model = "None"
-
         return search_results
     except Exception as ex:
         log.error(
             "Grid scan results could not be loaded from {}.".format(full_result_string)
         )
-        raise ex
-
-
-def load_search_data(search_data_string):
-    """Attempt to load search data from disk.
-
-    If the SearchData object is in the old format, with separate spliced and unspliced count
-    matrix attributes, they are concatenated during the import.
-
-    Parameters
-    ----------
-    search_data_string: str
-        disk location of the SearchData object.
-
-    Returns
-    -------
-    sd: monod.extract_data.SearchData
-        the SearchData object.
-    """
-    try:
-        with open(search_data_string, "rb") as sdfs:
-            sd = pickle.load(sdfs)
-        log.info("Search data loaded from {}.".format(search_data_string))
-
-        if hasattr(sd, "S"):
-            sd.layers = np.asarray([sd.U, sd.S])
-            sd.M = np.asarray([sd.M, sd.N])
-            delattr(sd, "N")
-            delattr(sd, "U")
-            delattr(sd, "S")
-        return sd
-    except Exception as ex:
-        log.error("Search data could not be loaded from {}.".format(search_data_string))
         raise ex
 
 
@@ -150,6 +129,7 @@ def plot_params_for_pair(
     meta="12",
     xlabel="dataset 1",
     ylabel="dataset 2",
+    savefig=True,
 ):
     """Plot the inferred physical parameters at the sampling parameter optimum for a matched pair of datasets.
 
@@ -185,10 +165,21 @@ def plot_params_for_pair(
         figure x-label, name of the first dataset.
     ylabel: str, optional
         figure y-label, name of the second dataset.
+    savefig: bool, optional
+        save to ``sr1.batch_analysis_string`` when that directory has been set
+        with make_batch_analysis_dir; otherwise the figure is only returned.
+
+    Returns
+    -------
+    fig1: matplotlib.figure.Figure
     """
     num_params = sr1.sp.n_phys_pars
     figsize = figsize or (4 * num_params, 4)
     fig1, ax1 = plt.subplots(nrows=1, ncols=num_params, figsize=figsize)
+    ax1 = np.atleast_1d(ax1)
+    if plot_errorbars and not (hasattr(sr1, "sigma") and hasattr(sr2, "sigma")):
+        log.warning("plot_errorbars requested but sigma is missing; run compute_sigma first. Plotting without error bars.")
+        plot_errorbars = False
 
     gene_filter = sr1.get_bool_filt(gene_filter_, discard_rejected=False)
     # gene_filter2 = sr2.get_bool_filt(gene_filter_,discard_rejected=False)
@@ -220,7 +211,7 @@ def plot_params_for_pair(
         )
         log.info("Falling back on generic marker properties.")
 
-    for i in range(3):
+    for i in range(num_params):
         if plot_errorbars:
             ax1[i].errorbar(
                 sr1.phys_optimum[gene_filter, i],
@@ -259,11 +250,14 @@ def plot_params_for_pair(
             ax1[i].plot(xl, xl, "r--", linewidth=2)
     fig1.tight_layout()
 
-    fig_string = sr1.batch_analysis_string + "/pair_parameter_comparison_{}.png".format(
-        meta
-    )
-    plt.savefig(fig_string, dpi=450)
-    log.info("Figure stored to {}.".format(fig_string))
+    batch_dir = getattr(sr1, "batch_analysis_string", None)
+    if savefig and batch_dir:
+        fig_string = batch_dir + "/pair_parameter_comparison_{}.png".format(meta)
+        plt.savefig(fig_string, dpi=450)
+        log.info("Figure stored to {}.".format(fig_string))
+    elif savefig:
+        log.info("No batch analysis directory set (see make_batch_analysis_dir); figure not saved.")
+    return fig1
 
 
 def find_most_concordant_samp(sr1, sr2):
@@ -311,8 +305,6 @@ def get_AIC_weights(sr_arr, sd):
 
     For more reference, see Burnham and Anderson (2002).
 
-    This is not yet functional, because the get_logL method of SearchResults is commented out.
-
     Parameters
     ---------
     sr_arr: list of monod.inference.SearchResults
@@ -329,7 +321,7 @@ def get_AIC_weights(sr_arr, sd):
     n_models = len(sr_arr)
     AIC = []
     for j in range(n_models):
-        AIC += [2 * sr_arr[j].sp.n_phys_pars - 2 * sr_arr[j].get_logL(sd)]
+        AIC += [2 * sr_arr[j].sp.n_phys_pars - 2 * np.asarray(sr_arr[j].get_logL(sd))]
     AIC = np.asarray(AIC)
     min_AIC = AIC.min(0)
     normalization = np.exp(-(AIC - min_AIC) / 2).sum(0)
@@ -398,6 +390,7 @@ def plot_AIC_weights(
         fig1, ax1 = plt.subplots(nrows=1, ncols=n_models, figsize=figsize)
     else:
         fig1 = plt.gcf()
+    ax1 = np.atleast_1d(ax1)
 
     for i in range(n_models):
         ax1[i].hist(w[i], bins=nbin, density=False, color=facecolor, alpha=facealpha)
@@ -406,13 +399,13 @@ def plot_AIC_weights(
         ax1[i].set_title(models[i])
 
     fig1.tight_layout()
-    if savefig:
-        fig_string = (sr_arr[0].batch_analysis_string) + (
-            "/AIC_comparison{}.png".format(meta)
-        )
-
+    batch_dir = getattr(sr_arr[0], "batch_analysis_string", None)
+    if savefig and batch_dir:
+        fig_string = batch_dir + "/AIC_comparison{}.png".format(meta)
         plt.savefig(fig_string, dpi=450)
         log.info("Figure stored to {}.".format(fig_string))
+    elif savefig:
+        log.info("No batch analysis directory set (see make_batch_analysis_dir); figure not saved.")
     return w
 
 
@@ -494,7 +487,8 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
             raise KeyError('Genes are not the same between datasets')
             # log.error('Genes are not the same between datasets')
     
-        sr1, sr2 = adata1.uns['search_result'], adata2.uns['search_result']
+        sr1 = search_result_from_uns(adata1.uns['search_result'])
+        sr2 = search_result_from_uns(adata2.uns['search_result'])
             
         gn, gf, offs, resid = diffexp_pars(sr1, sr2, modeltype=modeltype,
         gene_filter_=gene_filter_,
@@ -506,22 +500,22 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
         pval_thr=pval_thr,
         nit=nit)
         
-        param_strings = adata1.uns['model'].get_log_name_str()
+        param_strings = sr1.model.get_log_name_str()
         fold_changes = offs + resid
     
         # Save fold changes and adjusted fold changes (with offset removed).
-        for i, param in enumerate(param_strings):
+        for pi, param in enumerate(param_strings):
             without_log = param.replace(r"\log_{10} ", "")
 
             FC_label = "FC_{}".format(without_log)
-            adata2.var[FC_label] = fold_changes[i]
-            adata1.var[FC_label] = -fold_changes[i]
+            adata2.var[FC_label] = fold_changes[pi]
+            adata1.var[FC_label] = -fold_changes[pi]
 
             # Save adjusted parameters, subtracting the offset from adata2
             adjusted_param_label = "adj_{}".format(without_log)
-            adata2.var[adjusted_param_label] = adata2.var[without_log] - offs[i]
+            adata2.var[adjusted_param_label] = adata2.var[without_log] - offs[pi]
         
-            adj_fold_changes = resid[i]
+            adj_fold_changes = resid[pi]
 
             adj_FC_label = "adj_FC_{}".format(without_log)
             adata2.var[adj_FC_label] = adj_fold_changes
@@ -534,7 +528,7 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
     else:
         
         mek_means = True
-        sr_list = adata1.uns['search_result_list']
+        sr_list = search_result_list_from_uns(adata1.uns['search_result_list'])
     
         gn, gf, offs, resid = {}, {}, {}, {}
     
@@ -561,14 +555,14 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
                 gn[dict_key], gf[dict_key], offs[dict_key], resid[dict_key] = gn_clusts, gf_clusts, offs_clusts, resid_clusts
                 
                 if save_cluster_FCs:
-                    param_strings = adata1.uns['model'].get_log_name_str()
+                    param_strings = sr1.model.get_log_name_str()
                     fold_changes = offs_clusts + resid_clusts
                 
-                    # Save fold changes.
-                    for i, param in enumerate(param_strings):
+                    # Save fold changes.  (Do not reuse the outer loop index here.)
+                    for pi, param in enumerate(param_strings):
                         without_log = param.replace(r"\log_{10} ", "")
                         FC_label = "FC_{}_{}".format(without_log, dict_key)
-                        adata1.var[FC_label] = fold_changes[i]
+                        adata1.var[FC_label] = fold_changes[pi]
 
                     print('Fold changes between two clusters recorded in .var in form: ' + FC_label + ', where the tuple (i,j) represents the fold change between cluster i and j.')
     
@@ -655,6 +649,10 @@ def diffexp_pars(
     if viz:
         figsize = figsize or (4 * num_params, 4)
         fig1, ax1 = plt.subplots(nrows=1, ncols=num_params, figsize=figsize)
+        ax1 = np.atleast_1d(ax1)
+    if use_sigma and not (hasattr(sr1, "sigma") and hasattr(sr2, "sigma")):
+        log.warning("use_sigma=True but sigma has not been computed (run compute_sigma); falling back to use_sigma=False.")
+        use_sigma = False
 
     gene_filter = sr1.get_bool_filt(gene_filter_, discard_rejected=False)
 
@@ -713,7 +711,7 @@ def diffexp_pars(
         filtind = filtind[gf_]
         gf__ = np.zeros(sr1.n_genes, dtype=bool)
         gf__[filtind] = True
-        gn_ = sr1.gene_names[gf__]
+        gn_ = np.asarray(sr1.gene_names)[gf__]   # gene_names may be a list (Rust SearchData)
         gn.append(gn_)
         gf.append(gf__)
         offs.append(offs_)
@@ -839,7 +837,13 @@ def diffexp_fpi(
         if s1 is None and s2 is None:
             d = odr.Data(m1[gf], m2[gf])
         else:
-            d = odr.Data(m1[gf], m2[gf], s1[gf], s2[gf])
+            # RealData takes standard deviations (sx, sy) and converts them to
+            # inverse-variance weights; odr.Data's positional arguments are
+            # weights, which would have *up*-weighted uncertain points.
+            # A zero standard error (parameter pinned at a bound) would become an
+            # infinite weight; floor it at a tiny positive value.
+            tiny = 1e-12
+            d = odr.RealData(m1[gf], m2[gf], sx=np.maximum(s1[gf], tiny), sy=np.maximum(s2[gf], tiny))
 
         md = lambda B, x: linoffset(B, x, modeltype=modeltype)
         odrmodel = scipy.odr.Model(md)
@@ -966,21 +970,25 @@ def compare_gene_distributions(
     number_of_genes_to_plot = len(genes_to_plot)
     if number_of_genes_to_plot > sr_arr[0].n_genes:
         number_of_genes_to_plot = sr_arr[0].n_genes
-        genes_to_plot = genes_to_plot[: self.n_genes]
+        genes_to_plot = genes_to_plot[: sr_arr[0].n_genes]
     if number_of_genes_to_plot > nax:
         number_of_genes_to_plot = nax
         genes_to_plot = genes_to_plot[:nax]
 
+    if marg == "joint":
+        raise ValueError("compare_gene_distributions plots marginals; joint comparison is not supported.")
+    modalities = list(sr_arr[0].model.model_modalities)
+    lind = _resolve_marg(marg, modalities)
+    axes = np.atleast_1d(ax1).ravel()
+
     j_ = 0
     for i_ in genes_to_plot:
-        axloc = np.unravel_index(j_, sz) if (sz[0] > 1 and sz[1] > 1) else j_
+        axloc = j_
         xlim = 1
         for j in range(len(sr_arr)):
             lm = np.copy(sd_arr[j].M[:, i_])
-            if marg == "mature":
-                lm[0] = 1
-            if marg == "nascent":
-                lm[1] = 1
+            lm[:lind] = 1
+            lm[lind + 1:] = 1
             xlim = np.max([max(lm), xlim])
             samp = (
                 None
@@ -991,31 +999,48 @@ def compare_gene_distributions(
                 sr_arr[j].model.eval_model_pss(sr_arr[j].phys_optimum[i_], lm, samp)
             )
 
-            if marg == "joint":
-                log.error("Potentially implement this later...")
-                raise ValueError("Cannot compare two 2D histograms!")
-            else:
-                plot_hist_and_fit(
-                    ax1[axloc],
-                    sd_arr[j],
-                    i_,
-                    Pa,
-                    marg,
-                    facealpha=aesthetics["hist_face_alpha_" + str(j + 1)],
-                    facecolor=aesthetics["hist_face_color_" + str(j + 1)],
-                    fitcolor=aesthetics["hist_fit_color_" + str(j + 1)],
-                )
-        ax1[axloc].set_xlim([-0.5, xlim - 8])
+            plot_hist_and_fit(
+                axes[axloc],
+                sd_arr[j],
+                i_,
+                Pa,
+                marg,
+                modalities=modalities,
+                facealpha=aesthetics["hist_face_alpha_" + str(j + 1)],
+                facecolor=aesthetics["hist_face_color_" + str(j + 1)],
+                fitcolor=aesthetics["hist_fit_color_" + str(j + 1)],
+            )
+        axes[axloc].set_xlim([-0.5, max(xlim - 8, 1)])
         if logscale:
-            ax1[axloc].set_yscale("log")
+            axes[axloc].set_yscale("log")
         if title:
-            ax1[axloc].set_title(sr_arr[0].gene_names[i_], fontdict={"fontsize": 9})
+            axes[axloc].set_title(sr_arr[0].gene_names[i_], fontdict={"fontsize": 9})
 
-        ax1[axloc].set_xticks([])
-        ax1[axloc].set_yticks([])
+        axes[axloc].set_xticks([])
+        axes[axloc].set_yticks([])
 
         j_ += 1
     fig1.tight_layout(pad=0.02)
+    return fig1
+
+
+def _normalize_count_matrix(X, sizefactor="pf", lognormalize=True, pcount=0, logbase=2):
+    """Size-normalise (and optionally log-transform) a genes x cells count matrix.
+
+    sizefactor: 'pf' scales every cell to the mean total count (proportional
+    fitting); a float scales to that total (e.g. 1e4 for cp10k); None skips
+    depth normalisation.
+    """
+    X = np.asarray(X, dtype=float)
+    if sizefactor is not None:
+        totals = X.sum(0)
+        target = totals.mean() if sizefactor == "pf" else float(sizefactor)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            scale = np.where(totals > 0, target / totals, 0.0)
+        X = X * scale[None, :]
+    if lognormalize:
+        X = np.log(X + pcount + 1) / np.log(logbase)
+    return X
 
 
 def diffexp_mean(
@@ -1093,8 +1118,9 @@ def diffexp_mean(
 
     """
 
-    s1 = np.copy(sd1.layers[1])
-    s2 = np.copy(sd2.layers[1])
+    # layers are stored n_layers x n_cells x n_genes; work in genes x cells here.
+    s1 = np.asarray(sd1.layers[1]).T.copy()
+    s2 = np.asarray(sd2.layers[1]).T.copy()
 
     if (viz or viz_resid) and ax1 is None:
         fig1, ax1 = plt.subplots(1, 1)
@@ -1102,19 +1128,19 @@ def diffexp_mean(
     if method == "ttest":
 
         if knee_thr is not None:
-            cf1 = sd1.knee_plot(thr=knee_thr[0])
-            cf2 = sd2.knee_plot(thr=knee_thr[1])
+            cf1 = knee_plot(s1, thr=knee_thr[0])
+            cf2 = knee_plot(s2, thr=knee_thr[1])
             s1 = s1[:, cf1]
             s2 = s2[:, cf2]
 
         gf = np.zeros(sd1.n_genes, dtype=bool)
         if bonferroni:
             pval_thr /= sd1.n_genes
-        s1 = normalize_count_matrix(
-            s1, sizefactor=sizefactor, lognormalize=lognormalize, pcount=0, logbase=2
+        s1 = _normalize_count_matrix(
+            s1, sizefactor=sizefactor, lognormalize=lognormalize, pcount=pcount, logbase=2
         )
-        s2 = normalize_count_matrix(
-            s2, sizefactor=sizefactor, lognormalize=lognormalize, pcount=0, logbase=2
+        s2 = _normalize_count_matrix(
+            s2, sizefactor=sizefactor, lognormalize=lognormalize, pcount=pcount, logbase=2
         )
 
         p = np.zeros(sd1.n_genes)

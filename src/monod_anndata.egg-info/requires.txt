@@ -1,0 +1,9 @@
+numpy
+scipy
+numdifftools
+pytz
+anndata
+loompy
+matplotlib
+scikit-learn
+tqdm

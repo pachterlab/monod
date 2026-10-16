@@ -10,7 +10,6 @@ import anndata
 import numpy as np
 import matplotlib.pyplot as plt
 import time
-import loompy as lp  # will be necessary later, probably
 import anndata as ad
 import os
 import collections
@@ -20,44 +19,103 @@ from scipy import sparse
 import pandas as pd
 code_ver_global = "029"  # bumping up version April 2024
 
-import logging, sys
+try:
+    import monod_core as _mc
+    _HAS_RUST = True
+except ImportError:
+    _mc = None
+    _HAS_RUST = False
+
+# ---------------------------------------------------------------------------
+# uns serialization helpers
+# ---------------------------------------------------------------------------
+# anndata's h5ad backend cannot write arbitrary Python objects.  Wrapping them
+# as pickle bytes keeps them round-trip-safe while allowing adata.write_h5ad().
+
+def _uns_pack(obj):
+    """Deprecated: pickle *obj* to bytes for storage in adata.uns.
+
+    monod no longer writes pickled objects into ``uns``; models and results are
+    stored as nested dicts (see ``CMEModel.to_dict`` and
+    ``SearchResults.to_dict``). Kept so old code paths keep working.
+    """
+    warnings.warn("_uns_pack is deprecated; use the object's to_dict()", DeprecationWarning, stacklevel=2)
+    return np.frombuffer(pickle.dumps(obj), dtype=np.uint8)
+
+def _uns_unpack(v):
+    """Restore an object previously packed with the (legacy) pickle format.
+
+    Returns *v* unchanged unless it is a bytes / uint8 blob.  This unpickles,
+    so it executes code embedded in the bytes: only call it on ``uns`` entries
+    from h5ad files you trust.  Files written by current monod versions store
+    structured dicts instead and never hit this path.
+    """
+    if isinstance(v, (bytes, np.ndarray)) and (
+        isinstance(v, bytes) or v.dtype == np.uint8
+    ):
+        try:
+            log.warning("Loading a legacy pickled object from adata.uns; re-run extract_data/perform_inference to store it in the structured format.")
+            return pickle.loads(bytes(v))
+        except Exception:
+            pass
+    return v
+
+
+def model_from_uns(v):
+    """Return the CMEModel stored in ``adata.uns['model']`` (structured dict or legacy pickle)."""
+    from .cme_toolbox import CMEModel
+    if hasattr(v, "keys"):
+        return CMEModel.from_dict(v)
+    return _uns_unpack(v)
+
+def _build_sampling_grid(samp_lb, samp_ub, gridsize):
+    """Build a flat meshgrid over the sampling-parameter space.
+
+    Returns (grid_values, sampl_vals, n_grid_points) where grid_values is a
+    list of flattened per-axis arrays, sampl_vals is a list of (v0, v1, ...)
+    tuples, and n_grid_points is the total number of points.
+    """
+    linspaces = [np.linspace(samp_lb[i], samp_ub[i], gridsize[i]) for i in range(len(gridsize))]
+    grid_values = np.meshgrid(*linspaces, indexing="ij")
+    grid_values = [g.flatten() for g in grid_values]
+    sampl_vals = list(zip(*grid_values))
+    return grid_values, sampl_vals, len(grid_values[0])
+
+import logging
 from scipy.sparse import csr_matrix
 from scipy.sparse import issparse
 
-logging.basicConfig(stream=sys.stdout)
-log = logging.getLogger()
-log.setLevel(logging.WARNING)
+# Library logger.  monod does not configure handlers or touch the root logger;
+# messages propagate to whatever logging setup the application has.  To see
+# progress messages: ``logging.getLogger("monod").setLevel(logging.INFO)`` after
+# ``logging.basicConfig()``.
+log = logging.getLogger("monod")
 
-import logging.config
+def _plain_string_index(adata):
+    """Make obs/var names and string columns plain object dtype so the AnnData writes to h5ad.
 
-logging.config.dictConfig(
-    {
-        "version": 1,
-        "disable_existing_loggers": True,
-    }
-)
+    pandas may give h5ad-loaded indices and text columns the nullable
+    ``string`` dtype, which anndata refuses to write unless
+    ``allow_write_nullable_strings`` is set.  Converting to object dtype keeps
+    the AnnData writable with default settings.
+    """
+    adata.obs_names = pd.Index(np.asarray(adata.obs_names, dtype=object).astype(str), dtype=object)
+    adata.var_names = pd.Index(np.asarray(adata.var_names, dtype=object).astype(str), dtype=object)
+    for df in (adata.obs, adata.var):
+        for col in df.columns:
+            if isinstance(df[col].dtype, pd.StringDtype):
+                df[col] = df[col].astype(object)
+    return adata
+
 
 def make_dir(dir_string):
-    """Convenience function to create a directory.
-
-    Parameters
-    ----------
-    dir_string: str
-        directory location to create.
-    """
+    """Create *dir_string* (and any missing parents); a no-op if it already exists."""
     try:
-        os.mkdir(dir_string)
-        log.info("Directory " + dir_string + " created.")
-    except OSError as error:
-        log.info(
-            "Directory " + dir_string + " already exists."
-        )  # used to be warning, but should be ok for now
-
-
-
-########################
-## Main code
-########################
+        os.makedirs(dir_string, exist_ok=True)
+        log.debug("Directory %s ready.", dir_string)
+    except OSError as e:
+        log.error("Directory %s could not be created: %s", dir_string, e)
+        raise
 
 def extract_data(
     h5ad_filepath,
@@ -72,10 +130,10 @@ def extract_data(
     cf=None,
     code_ver=code_ver_global,
     exp_filter_threshold=1,
-    genes_to_fit=[],
-    hist_type = 'grid',
+    genes_to_fit=None,
+    hist_type = 'unique',
     padding=None,
-    mek_means_params=None
+    mek_means_params=None,
 ):
     """Extract data for selected genes from a single dataset.
 
@@ -86,8 +144,9 @@ def extract_data(
         if AnnData, an object in memory that contains the count data.
     transcriptome_filepath: str
         location of the transcriptome length reference.
-    dataset_name: str
+    dataset_name: str, optional
         dataset metadata; name assigned to dataset-specific directory.
+        Defaults to "<bio_model>_<seq_model>" when not given.
     dataset_string: str
         dataset-specific directory location.
     dir_string: str
@@ -119,13 +178,17 @@ def extract_data(
     anndata: adata object.
     """
     log.info("Beginning data extraction.")
-    log.info("Dataset: " + dataset_name)
+    if dataset_name is None:
+        dataset_name = f"{model.bio_model}_{model.seq_model}"
+    log.info("Dataset: %s", dataset_name)
 
     if mek_means_params:
         k, epochs = mek_means_params
 
     if not filt_param:
         filt_param = model.filter_bounds
+    if genes_to_fit is None:
+        genes_to_fit = []
         log.info('Using default gene filtering parameters')
 
     # If no mapping given, assume that the layers are named according to the conventional modalities for the model
@@ -152,6 +215,7 @@ def extract_data(
     if monod_adata.isbacked:
         monod_adata = monod_adata.to_memory()
     # Store the raw data.
+    monod_adata = _plain_string_index(monod_adata)
     raw_adata = monod_adata.copy()
 
     # Check whether the given data is in sparse or numpy format.
@@ -171,12 +235,12 @@ def extract_data(
 
     if layer_type == 'sparse':
         monod_adata = CSRDataset_to_arrays(monod_adata)
-        print('is sparse')
+        log.debug('layers are sparse; converting to dense arrays')
     elif layer_type == 'numpy_array':
         pass
     else:
         monod_adata = CSRDataset_to_arrays(monod_adata)
-        print('CSRDataset')
+        log.debug('layers are backed CSRDataset; converting to dense arrays')
 
     # # Save entire raw data object to monod_adata
     # mono
@@ -185,35 +249,28 @@ def extract_data(
     adata = monod_adata.to_memory()
 
     
+    # Build a new AnnData containing only the required layers.
+    # Avoid copying large data arrays — share references with adata (which
+    # is itself a copy of the input, so mutations are safe).
     adata_subset = ad.AnnData(
-    X=adata.X.copy(),
-    obs=adata.obs.copy(),
-    var=adata.var.copy(),
-    obsm=adata.obsm.copy(),
-    varm=adata.varm.copy(),
-    obsp=adata.obsp.copy(),
-    varp=adata.varp.copy(),
-    uns=adata.uns.copy()
-)
-    # Ensure var and obs names are preserved
+        X=adata.X,
+        obs=adata.obs,
+        var=adata.var,
+        uns={},   # fresh dict; uns will be populated below
+    )
     adata_subset.obs_names = adata.obs_names
     adata_subset.var_names = adata.var_names
-
-
-    # Copy over only the desired layers
     for layer in ordered_layer_names:
         if layer in adata.layers:
-            adata_subset.layers[layer] = adata.layers[layer].copy()
+            adata_subset.layers[layer] = adata.layers[layer]
 
     monod_adata = adata_subset.to_memory()
 
 
 
     monod_adata.uns['modality_name_dict'] = modality_name_dict
-    monod_adata.uns['model'] = model
+    monod_adata.uns['model'] = model.to_dict()
 
-
-    
     if padding is None:
         padding = np.asarray([10] * len(ordered_layer_names))
 
@@ -224,14 +281,23 @@ def extract_data(
     # if this is ever necessary, just make a different reference list.
     
     if transcriptome_filepath:
-        
+
         # Add gene attribute indicating whether each gene's length is included in the transcriptome,
         # and add an attribute called 'lengths' containing the lengths, and log_lengths.
         monod_adata = add_gene_lengths(monod_adata, transcriptome_dict, attribute_name='length_given')
-        
+
         # Filter the data based on whether the length is given.
         gene_filter = monod_adata.var['length_given'] == 1
         monod_adata = monod_adata[:, gene_filter].copy()
+
+    elif 'log_lengths' in monod_adata.var.columns:
+        # log_lengths already present — use as-is (no gene filtering needed).
+        log.info('Using log_lengths from adata.var for gene length bias.')
+
+    elif 'gene_length' in monod_adata.var.columns:
+        # Compute log10 lengths from raw gene_length column (same convention as transcriptome path).
+        monod_adata.var['log_lengths'] = np.log10(monod_adata.var['gene_length'])
+        log.info('Computed log_lengths from adata.var[gene_length] for gene length bias.')
 
     # Filter genes, then pick a number of random genes to make up the total desired number of genes.
     monod_adata = process_adata(monod_adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes, transcriptome_dict=transcriptome_dict, seed=seed)
@@ -244,15 +310,18 @@ def extract_data(
             visualize_gene_filtering(monod_adata)
 
     # # Save the filter for selected genes, which should be applied to the raw adata.
-    monod_adata.uns['selected_genes'] = monod_adata.var['selected_genes'].astype(bool)
+    monod_adata.uns['selected_genes'] = monod_adata.var['selected_genes'].to_numpy().astype(bool)
 
     # Filter for selected genes.
     monod_adata = monod_adata[:, monod_adata.var['selected_genes'].astype(bool)].to_memory()
     
     gene_names, n_cells = monod_adata.var.index, len(monod_adata.obs.index)
 
-    # Extract layers
-    layers = np.array([monod_adata.layers[layer_name].T for layer_name in ordered_layer_names]) # toarray
+    # Extract layers — densify sparse matrices if necessary.
+    def _to_dense(arr):
+        return arr.toarray() if issparse(arr) else np.asarray(arr)
+    layers = np.array([_to_dense(monod_adata.layers[layer_name]).T
+                       for layer_name in ordered_layer_names])
 
     # Compute maximum expression value across cells for each gene and each layer
     max_values = np.amax(layers, axis=2)  # Shape: (n_genes, n_layers)
@@ -272,52 +341,31 @@ def extract_data(
     if monod_adata.isbacked:
         monod_adata = monod_adata.to_memory()
 
+    if hist_type != "unique":
+        raise ValueError(
+            f"hist_type={hist_type!r} is not implemented; only 'unique' (per-gene unique "
+            "microstate counts) is supported in this version."
+        )
     monod_adata.uns['hist_type'] = hist_type
 
     monod_adata = add_moments(monod_adata)
     log.debug('Moments were added')
     
-    monod_adata.uns['model'] = model
+    monod_adata.uns['model'] = model.to_dict()
 
-    hist = make_histogram(monod_adata, hist_type, M)
-    
-    monod_adata.uns['hist'] = hist
+    # Histograms are not stored in uns: searchdata_from_adata rebuilds them from
+    # the layers (in Rust when available), which is faster than unpickling and
+    # keeps the AnnData writable as a plain h5ad.
     # Save adata?
     if mek_means_params:
         monod_adata.uns['k'] = k
         monod_adata.uns['epochs'] = epochs
 
     # Save the raw data as an attribute.
+    monod_adata = _plain_string_index(monod_adata)
     monod_adata.raw = raw_adata
     
     return monod_adata
-
-def sparse_to_arrays(adata):
-
-    # Assuming `adata` is your existing AnnData object
-    adata_dense_layers = ad.AnnData(
-        X=adata.X.copy(),
-        obs=adata.obs.copy(),
-        var=adata.var.copy(),
-        obsm=adata.obsm.copy(),
-        varm=adata.varm.copy(),
-        obsp=adata.obsp.copy(),
-        varp=adata.varp.copy(),
-        uns=adata.uns.copy()
-    )
-    
-    # Replace sparse layers with dense NumPy arrays
-    for layer in adata.layers:
-        if issparse(adata.layers[layer]):
-            adata_dense_layers.layers[layer] = adata.layers[layer].toarray()  # Convert to dense array
-        else:
-            adata_dense_layers.layers[layer] = adata.layers[layer].copy()  # Copy if already dense
-    
-    # Preserve obs_names and var_names
-    adata_dense_layers.obs_names = adata.obs_names
-    adata_dense_layers.var_names = adata.var_names
-
-    return adata_dense_layers
 
 def CSRDataset_to_arrays(adata):
 
@@ -471,47 +519,57 @@ def plot_diagnostic(monod_adata):
             dataset_diagnostics_dir_string + "/{}.png".format(dataset_name), dpi=450
         )
 
-def make_histogram(monod_adata, hist_type, M):
+def _make_histogram_one_gene(gene_index, layers, hist_type, M, n_cells):
+    """Compute the histogram for a single gene (parallelisable worker)."""
+    from scipy.sparse import issparse as _issparse
+    gene_cols = [
+        (x[:, gene_index].toarray().ravel() if _issparse(x) else np.asarray(x[:, gene_index]).ravel())
+        for x in layers
+    ]
+    stacked = np.column_stack(gene_cols)  # (n_cells, n_modalities) — built once
 
-    # NB the order of the layers here will be enforced to be the same as the order of the model 
+    unique, unique_counts = np.unique(stacked, axis=0, return_counts=True)
+    return (unique.astype(int), unique_counts / n_cells)
+
+
+def make_histogram(monod_adata, hist_type, M, n_jobs=1):
+    """Build per-gene expression histograms.
+
+    Parameters
+    ----------
+    monod_adata : AnnData
+    hist_type : str
+        Must be "unique".
+    M : array-like
+        Grid limits per layer per gene.
+    n_jobs : int
+        Number of joblib workers (1 = serial; -1 = all cores).
+    """
+    from joblib import Parallel, delayed as jdelayed
+
+    # NB the order of the layers here will be enforced to be the same as the order of the model
     # modalities defined in cme_toolbox.
 
     modality_name_dict = monod_adata.uns['modality_name_dict']
-    model = monod_adata.uns['model']
+    model = model_from_uns(monod_adata.uns['model'])
 
     ordered_modalities = model.model_modalities
     ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
 
-    hist = []
-    layers = [monod_adata.layers[layer_name] for layer_name in ordered_layer_names] # toarray
+    layers = [monod_adata.layers[layer_name] for layer_name in ordered_layer_names]
     n_cells = monod_adata.n_obs
     n_genes = monod_adata.n_vars
-    
-    for gene_index in range(n_genes):
-        
-        if hist_type == "grid":
-            bins = [np.arange(x[gene_index] + 1) - 0.5 for x in M]
-            stacked_data = np.vstack([x[:,gene_index] for x in layers]).T
-            H, edges = np.histogramdd(
-                stacked_data,
-                bins=bins,
-                density=True
-            )
-            xedges = edges[0]  # Assuming only one dimension for each bin
-            yedges = edges[1] 
-        elif hist_type == "unique":
-            
-            unique, unique_counts = np.unique(
-                np.vstack([x[:,gene_index] for x in layers]).T, axis=0, return_counts=True
-            )
-            frequencies = unique_counts / n_cells
-            unique = unique.astype(int)
-            H = (unique, frequencies)
-            
-        elif hist_type == "none":
-            H = [x[:, gene_index] for x in layers]
 
-        hist.append(H)
+    if n_jobs == 1:
+        hist = [
+            _make_histogram_one_gene(i, layers, hist_type, M, n_cells)
+            for i in range(n_genes)
+        ]
+    else:
+        hist = Parallel(n_jobs=n_jobs)(
+            jdelayed(_make_histogram_one_gene)(i, layers, hist_type, M, n_cells)
+            for i in range(n_genes)
+        )
 
     return hist
 
@@ -554,7 +612,11 @@ def get_noise_decomp(
         # Copy the layer to a temporary AnnData object for normalization
         temp_adata = anndata.AnnData(X=adata.layers[layer])
 
-        temp_adata = normalize_count_matrix(temp_adata, sizefactor=sizefactor, lognormalize=lognormalize, pcount=pcount)
+        if sizefactor is not None:
+            target = temp_adata.X.sum(0).mean() if sizefactor == "pf" else sizefactor
+            sc.pp.normalize_total(temp_adata, target_sum=target, inplace=True)
+        if lognormalize:
+            sc.pp.log1p(temp_adata)
 
         # Compute variance before and after normalization
         original_variance = var_fun(anndata.AnnData(X=adata.layers[layer]), which_variance_measure)
@@ -582,45 +644,6 @@ def var_fun(adata, measure):
         variance = adata.X.var(axis=1).A1
         return variance / mean
 
-
-def normalize_count_matrix(
-    adata, sizefactor="pf", lognormalize=True, pcount=1, logbase=np.e
-):
-    """
-    This function performs normalization and variance stabilization on a raw data matrix in an AnnData object
-    using Scanpy's built-in functions.
-
-    Parameters
-    ----------
-    adata: anndata.AnnData
-        AnnData object with a gene x cell count matrix in adata.X.
-    sizefactor: str, float, int, or None, optional
-        What size factor to use.
-        If 'pf', use proportional fitting; set the size of each cell to the mean size.
-        If int or float, use this number (e.g., 1e4 for cp10k).
-        If None, do not do size/depth normalization.
-    lognormalize: bool, optional
-        Whether to apply log transformation.
-    pcount: int or float, optional
-        Pseudocount added in size normalization to ensure division by zero does not occur.
-    logbase: int or float
-        log base for scanpy.
-
-    Returns
-    -------
-    adata: anndata.AnnData
-        AnnData object with normalized and transformed count matrix in adata.X.
-    """
-    if sizefactor is not None:
-        if sizefactor == "pf":
-            sc.pp.normalize_total(adata, target_sum=adata.X.sum(0).mean(), inplace=True)
-        else:
-            sc.pp.normalize_total(adata, target_sum=sizefactor, inplace=True)
-
-    if lognormalize:
-        sc.pp.log1p(adata, base=logbase)
-    
-    return adata
 
 ########################
 ## Main code
@@ -742,8 +765,7 @@ def add_gene_lengths(adata, length_dict, attribute_name='length_given', lengths_
     log.info('Added lengths')
     return adata
 
-def threshold_by_expression(adata, filt_param={'min_means': [0.01, 0.01], 
-                                               'max_maxes': [350, 350], 'min_maxes': [4, 4]}):
+def threshold_by_expression(adata, filt_param=None):
     """
     Filters genes in an AnnData object based on expression thresholds for each layer.
 
@@ -762,7 +784,9 @@ def threshold_by_expression(adata, filt_param={'min_means': [0.01, 0.01],
     adata: anndata.AnnData
         Filtered AnnData object with genes that meet the expression thresholds.
     """
-    model = adata.uns['model']
+    if filt_param is None:
+        filt_param = {'min_means': [0.01, 0.01], 'max_maxes': [350, 350], 'min_maxes': [4, 4]}
+    model = model_from_uns(adata.uns['model'])
     ordered_modalities = model.model_modalities
     modality_name_dict = adata.uns['modality_name_dict']
     ordered_layer_names = [modality_name_dict[mod] for mod in ordered_modalities]
@@ -802,7 +826,7 @@ def threshold_by_expression(adata, filt_param={'min_means': [0.01, 0.01],
     adata.var['gene_exp_filter'] = gene_exp_filter
 
     # Log the number of genes retained
-    print(f"{np.sum(gene_exp_filter)} genes retained after expression filter.")
+    log.info("%d genes retained after expression filter.", int(np.sum(gene_exp_filter)))
     
     return adata
     
@@ -863,7 +887,7 @@ def visualize_gene_filtering_lengths(monod_adata):
         len_arr = monod_adata.var['log_lengths']
     except AttributeError:
         log.error('No gene lengths given')
-    modality_names = monod_adata.uns['model'].model_modalities
+    modality_names = model_from_uns(monod_adata.uns['model']).model_modalities
     
     # len_arr = np.array([transcriptome_dict[k] for k in gene_names])
     var_name = tuple([name[0].upper() for name in modality_names[::-1]])
@@ -899,7 +923,7 @@ def visualize_gene_filtering(monod_adata):
     """
     gene_names = monod_adata.var_names
 
-    modality_names = monod_adata.uns['model'].model_modalities
+    modality_names = model_from_uns(monod_adata.uns['model']).model_modalities
     
     # len_arr = np.array([transcriptome_dict[k] for k in gene_names])
     var_name = tuple([name[0].upper() for name in modality_names[::-1]])
