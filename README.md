@@ -42,7 +42,7 @@ From there you can:
 - [`Monod_demo_new.ipynb`](https://github.com/pachterlab/monod/blob/main/Monod_demo_new.ipynb): an end-to-end walkthrough on a small dataset, runnable in Colab.
 - The `demo_*.ipynb` notebooks in this repository: one topic each, covering the available models, reaction networks, the protein model, meK-Means, and the Rust and GPU paths.
 - The [example repository](https://github.com/pachterlab/monod_examples) and the [documentation site](https://monod-examples.readthedocs.io/en/latest/index.html).
-- [`DEVELOPING.md`](https://github.com/pachterlab/monod/blob/main/DEVELOPING.md): building the Rust extension from source, GPU use, what Monod stores and where, logging, running the tests, and cutting a release.
+- The [documentation pages](https://github.com/pachterlab/monod/tree/main/docs) in this repository: installation and the Rust accelerator, running an analysis and reading the results, and meK-Means.
 
 ## Citing
 
