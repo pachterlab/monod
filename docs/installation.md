@@ -51,3 +51,4 @@ Notes:
 - The `ruanndata` crate is fetched from GitHub at a pinned commit by cargo. If you are developing ruanndata alongside monod, see the commented `[patch]` block at the end of `monod_core/Cargo.toml`.
 - On Apple Silicon with an x86_64 (Rosetta) Homebrew HDF5, set `HDF5_NO_RUNTIME_CHECK=1` for the build.
 - The published wheels link HDF5 statically via the `static-hdf5` cargo feature; `.github/workflows/wheels.yml` has the exact invocation.
+- `MONOD_LBFGSB_VERBOSE=1` makes every Rust optimizer print a per-iteration trace to stderr (iteration, function evaluations, skipped curvature pairs, memory size, projected-gradient norm, objective), useful when a fit misbehaves.
