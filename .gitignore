@@ -1,11 +1,6 @@
-.gitignore
-src/.DS_Store
-.DS_Store
 **/.DS_Store
 
 # Python cache
-src/monod/__pycache__
-tests/__pycache__
 **/__pycache__/
 *.py[cod]
 *.pyo

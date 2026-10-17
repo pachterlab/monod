@@ -18,7 +18,7 @@ model = CMEModel("Bursty", "Bernoulli", amb_model="Equal")  # plus ambient conta
 - **Sequencing noise** (`seq_model`): `None`, `Poisson`, or `Bernoulli`.
 - **Ambient contamination** (`amb_model`): `None`, `Equal`, or `Unequal`.
 
-The `demo_models.ipynb`, `demo_reaction_network.ipynb` and `demo_protein_bursty.ipynb` notebooks show each family.
+The `models`, `reaction_networks` and `protein_bursty` notebooks in `demos/` show each family.
 
 ## Running inference
 
@@ -27,7 +27,7 @@ from monod.inference import perform_inference
 adata = perform_inference("example_h5ad/example_adata.h5ad", model, n_genes=100)
 ```
 
-`perform_inference` filters genes, builds the per-gene count histograms, scans a grid of technical-noise parameters, fits every gene by maximum likelihood at each grid point, and writes the results into the returned AnnData. For finer control, the same steps are available individually: `extract_data`, `searchdata_from_adata`, and `InferenceParameters.fit_all_grid_points`; `demo_rusty_pipeline.ipynb` walks through them.
+`perform_inference` filters genes, builds the per-gene count histograms, scans a grid of technical-noise parameters, fits every gene by maximum likelihood at each grid point, and writes the results into the returned AnnData. For finer control, the same steps are available individually: `extract_data`, `searchdata_from_adata`, and `InferenceParameters.fit_all_grid_points`; the `rust_pipeline` notebook in `demos/` walks through them.
 
 ## Reading the results
 
@@ -47,7 +47,7 @@ model = CMEModel.from_dict(adata.uns["model"])
 result = search_result_from_uns(adata.uns["search_result"])
 ```
 
-Plots, gene rejection, noise decomposition and differential-parameter tests are methods on the result object and functions in `monod.analysis`; `Monod_demo_new.ipynb` shows the typical sequence.
+Plots, gene rejection, noise decomposition and differential-parameter tests are methods on the result object and functions in `monod.analysis`; the `monod_walkthrough` notebook in `demos/` shows the typical sequence.
 
 ## What is written to disk
 

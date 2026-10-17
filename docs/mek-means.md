@@ -18,4 +18,4 @@ results = params.run_mek_means(search_data)     # a list of SearchResults, one p
 
 Each run exposes `aic_per_cell`, defined as in the paper; lower is better, so fit a range of K and take the `argmin`. The older `aic` attribute still reads but warns, because its sign convention was the opposite.
 
-`demo_mminference_main.ipynb` and `demo_mminference_rust.ipynb` show a complete run with and without the Rust accelerator.
+The `mek_means` and `mek_means_rust` notebooks in `demos/` show a complete run with and without the Rust accelerator.
