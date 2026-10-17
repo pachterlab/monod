@@ -190,15 +190,12 @@ class TestOptimizeGenesProteinBurstySd:
             )
 
     def test_scipy_parity(self, synthetic_sd):
-        """Rust L-BFGS-B ends within 10 % of scipy's KLD from the same x0.
+        """Rust L-BFGS-B converges (not MaxIter) to scipy's KLD from the same x0.
 
-        The ProteinBursty objective is an ODE-integrated PMF whose step count
-        changes discretely with the parameters, so finite-difference gradients
-        are noisy and both optimizers converge slowly into platform-dependent
-        local optima (on GitHub's Ubuntu runners Rust stopped at 0.584 vs scipy
-        0.568 from the same x0; on other hosts Rust is the better of the two).
-        Exact parity is therefore not a meaningful assertion; comparable quality
-        is.  Rust is given scipy's tolerances.
+        The Rust gradient integrates every finite-difference stencil point with
+        the base point's (dt, step count), so it is smooth in the parameters;
+        scipy here uses its own adaptive-schedule FD.  Both reach the same
+        optimum; Rust is allowed 0.2 % slack for the different gradients.
         """
         from scipy.optimize import minimize as scipy_minimize
 
@@ -206,13 +203,14 @@ class TestOptimizeGenesProteinBurstySd:
         n_genes = sd.n_genes
         x0_all = self._x0_all(n_genes)
 
-        params_out, klds_out = _mc.optimize_genes_protein_bursty_sd(
+        params_out, klds_out, status = _mc.optimize_genes_protein_bursty_sd(
             sd, x0_list=x0_all,
             lb=self.LB.tolist(), ub=self.UB.tolist(),
             fit_unspliced=self.FIT_UNSPLICED,
             protein_limit=float(self.PROTEIN_LIMIT),
             min_fudge=self.MIN_FUDGE, max_fudge=self.MAX_FUDGE,
-            fd_eps=1e-6, maxiter=200, ftol=1e-15, gtol=1e-9, eps=1e-15,
+            fd_eps=1e-6, maxiter=200, ftol=1e-10, gtol=1e-6, eps=1e-15,
+            return_status=True,
         )
 
         for gi in range(n_genes):
@@ -223,11 +221,12 @@ class TestOptimizeGenesProteinBurstySd:
                 return self._kld_at_params(x, limits, coords_list[gi], freqs_list[gi])
 
             res = scipy_minimize(obj, x0, method="L-BFGS-B", bounds=list(zip(self.LB, self.UB)),
-                                 options={"maxiter": 200, "ftol": 1e-15, "gtol": 1e-9})
+                                 options={"maxiter": 200, "ftol": 1e-10, "gtol": 1e-6})
             kld_x0 = obj(x0)
+            assert status[gi] != 1, f"gene {gi}: Rust L-BFGS-B hit maxiter (status {status[gi]})"
             assert klds_out[gi] < kld_x0, f"gene {gi}: Rust did not improve on x0 ({klds_out[gi]:.6g} vs {kld_x0:.6g})"
-            assert klds_out[gi] <= res.fun * 1.10 + 1e-8, (
-                f"gene {gi}: Rust KLD {klds_out[gi]:.6g} far worse than scipy KLD {res.fun:.6g}"
+            assert klds_out[gi] <= res.fun * 1.002 + 1e-8, (
+                f"gene {gi}: Rust KLD {klds_out[gi]:.6g} worse than scipy KLD {res.fun:.6g}"
             )
 
     def test_three_layer_required(self):

@@ -605,16 +605,31 @@ def _validate_bounds(model, phys_lb, phys_ub, samp_lb, samp_ub, gridsize):
 
 
 def _warn_optimizer_status(status, label):
-    """Log a summary when the Rust L-BFGS-B run did not converge for every gene."""
+    """Log a summary of how the Rust L-BFGS-B runs ended.
+
+    Status codes: 0 converged (tolerance met), 1 hit ``max_iterations``,
+    2 stopped because the line search could find no further decrease,
+    3 solver error.  Code 2 is the normal end point for an objective with a
+    finite-difference gradient: once the remaining improvement is below the
+    gradient's noise floor no step along it is accepted, exactly as scipy's
+    ``ABNORMAL_TERMINATION_IN_LNSRCH``.  The returned point is the best one
+    seen, so it is reported at INFO level; only codes 1 and 3 are warnings.
+    """
     if status is None:
         return
     st = np.asarray(status)
     n_max, n_ls, n_err = int((st == 1).sum()), int((st == 2).sum()), int((st == 3).sum())
-    if n_max or n_ls or n_err:
+    if n_max or n_err:
         log.warning(
-            "%s: %d/%d genes did not converge (%d hit max_iterations, %d line-search failures, %d solver errors). "
+            "%s: %d/%d genes did not converge (%d hit max_iterations, %d solver errors). "
             "Consider raising gradient_params['max_iterations'] or checking the bounds.",
-            label, n_max + n_ls + n_err, st.size, n_max, n_ls, n_err,
+            label, n_max + n_err, st.size, n_max, n_err,
+        )
+    if n_ls:
+        log.info(
+            "%s: %d/%d genes stopped at the precision of the finite-difference gradient "
+            "(line search found no further decrease).",
+            label, n_ls, st.size,
         )
 
 

@@ -1,21 +1,23 @@
 #![allow(clippy::many_single_char_names)]
-//! High-level LBFGS-B solver implementation using the helper modules.
+//! High-level LBFGS-B solver implementation.
 //!
-//! This module provides `LBFGSB`, a Rust implementation of the full reference
-//! L-BFGS-B algorithm with:
-//!   - Generalized Cauchy point computation (`cauchy`)
-//!   - Free-variable subspace minimization via restricted two-loop L-BFGS
-//!   - Compact matrix maintenance (`matupd`, `formt_ref`) for `bmv`/Cauchy
-//!   - Scipy-compatible sty threshold and ftol stopping
+//! `LBFGSB` follows the reference algorithm (Byrd, Lu, Nocedal & Zhu 1995)
+//! with the search direction computed by *dense* small-n linear algebra
+//! rather than the compact-representation machinery:
+//!   - H (inverse Hessian approximation) from the two-loop recursion applied
+//!     to each unit vector; B = H⁻¹ by Cholesky
+//!   - generalized Cauchy point along the projected steepest-descent path
+//!   - quadratic model minimised over the free variables (reduced Newton
+//!     step), truncated to the box
+//!   - scipy-compatible s'y skip threshold, line search and ftol stopping
 //!
-//! Per-iteration algorithm:
-//!   1. Compute Cauchy point xcp (determines which variables hit their bounds)
-//!   2. Identify free variables at xcp
-//!   3. Build reduced gradient at xcp (includes W_Z * M * c correction via bmv)
-//!   4. Apply L-BFGS two-loop restricted to free variables → Newton correction
-//!   5. x_bar = xcp + correction (projected to box)
-//!   6. d = x_bar - x; line search along d
-//!   If any step fails, falls back to projected L-BFGS (no Cauchy).
+//! This is exact for the quadratic model and costs O(n³) per iteration, which
+//! is negligible for the problems this crate serves (a handful of parameters,
+//! objectives that cost milliseconds to seconds).  The compact-form helpers in
+//! `subalgorithms` are still maintained each iteration (`matupd`, `formt_ref`)
+//! but no longer drive the direction.
+//!
+//! Set the `verbose` flag for a per-iteration trace on stderr.
 
 use crate::blas;
 use crate::linesearch;
@@ -281,10 +283,16 @@ impl LBFGSB {
 
             // ── Line search ───────────────────────────────────────────────────
             let f_prev = f;
+            // The line search overwrites `f` and `grad` in place on success, so
+            // keep the pre-step gradient: the curvature pair needs
+            // y = g_new - g_old.  (Computing it against the already-updated
+            // `grad` gives y = 0, every pair is skipped, and the solver
+            // degenerates to projected steepest descent.)
+            let g_old = grad.clone();
             match linesearch::lnsrlb_scipy_search(x, &d, &mut f, &mut grad, lower, upper, &mut func) {
                 Ok((x_new, f_new, g_new, stp_accepted, gdold)) => {
                     let s_vec = sub_vecs(&x_new, x);
-                    let y_vec = sub_vecs(&g_new, &grad);
+                    let y_vec = sub_vecs(&g_new, &g_old);
                     let sty = blas::ddot(&s_vec, &y_vec);
                     let yy  = blas::ddot(&y_vec, &y_vec);
                     // Match scipy Fortran: skip if s'y <= eps * |g0'd| * stp
@@ -404,183 +412,113 @@ impl LBFGSB {
     /// Falls back to projected L-BFGS (no Cauchy) if:
     ///   - col == 0 (no curvature yet), or
     ///   - cauchy computation fails.
+    /// Search direction d = x̄ - x, where x̄ is the L-BFGS-B subspace minimiser
+    /// (generalized Cauchy point, then the quadratic model minimised over the
+    /// free variables and truncated to the box).
+    ///
+    /// The model Hessian B is formed *densely* from the stored (s, y) pairs:
+    /// H = two-loop inverse, B = H⁻¹.  monod's problems have a handful of
+    /// parameters, so the O(n³) dense algebra is negligible next to one
+    /// objective evaluation, and it sidesteps the compact-representation
+    /// bookkeeping entirely.  Falls back to the projected negative gradient
+    /// when B is not positive definite or there is no memory yet.
     fn compute_direction(
         &mut self,
         n: usize,
         x: &[f64],
         lower: &[f64],
         upper: &[f64],
-        nbd: &[i32],
+        _nbd: &[i32],
         grad: &[f64],
-        iwhere: &mut [i32],
-        pg_norm: f64,
+        _iwhere: &mut [i32],
+        _pg_norm: f64,
     ) -> Vec<f64> {
-        if self.col == 0 {
-            // No curvature yet: projected steepest descent.
+        if self.s.is_empty() {
             return projected_neg_grad(x, lower, upper, grad, n);
         }
+        let h = self.dense_inverse_hessian(n);
+        let b = match dense::cholesky_inverse(&h, n) {
+            Some(b) => b,
+            None => return projected_neg_grad(x, lower, upper, grad, n),
+        };
 
-        // ── Step 1: Cauchy point ─────────────────────────────────────────────
-        let mut nseg = 0i32;
-        let mut info_cau = 0i32;
-        let cauchy_ok = subalgorithms::cauchy(
-            n, x, lower, upper, nbd, grad,
-            &mut self.iorder_ws, iwhere,
-            &mut self.t_ws, &mut self.d_ws,
-            &mut self.xcp,
-            self.m, &self.wy, &self.ws, &self.sy, &self.wt,
-            self.theta, self.col, self.head,
-            &mut self.p_ws, &mut self.c_ws, &mut self.wbp_ws, &mut self.v_ws,
-            &mut nseg, -1, pg_norm, &mut info_cau, f64::EPSILON,
-        ).is_ok() && info_cau == 0;
-
-        if !cauchy_ok {
-            // Cauchy failed: fall back to projected L-BFGS direction.
-            return self.projected_lbfgs_direction(x, lower, upper, grad, n);
-        }
-
-        // ── Step 2: Free-variable set ─────────────────────────────────────────
-        let (index, nfree) = subalgorithms::freev_ref(iwhere);
+        // ── Generalized Cauchy point ──────────────────────────────────────
+        let (xcp, free) = dense::generalized_cauchy_point(x, lower, upper, grad, &b, n);
+        let nfree = free.len();
         if nfree == 0 {
-            // All variables at their Cauchy-point bounds: step = xcp - x.
-            return sub_vecs(&self.xcp[..n], x);
-        }
-        let ind = &index[0..nfree];
-
-        // ── Step 3: Reduced gradient at xcp ──────────────────────────────────
-        // r_free[jj] = g[k] + theta*(xcp[k] - x[k])  (gradient of quadratic model at xcp)
-        // Then subtract the W_Z * M * c correction (curvature adjustment for the xcp step).
-        let col = self.col;
-        let col2 = 2 * col;
-        let mut r_free = vec![0.0f64; nfree];
-        for (jj, &k) in ind.iter().enumerate() {
-            r_free[jj] = grad[k] + self.theta * (self.xcp[k] - x[k]);
+            return sub_vecs(&xcp, x);
         }
 
-        // W_Z * M * c, where c = W'(xcp-x) was built by cauchy into c_ws.
-        // M * c is computed via bmv using the Cholesky factor in wt.
-        let mut mv = vec![0.0f64; col2];
-        if subalgorithms::bmv(
-            self.m, &self.sy, &self.wt, col,
-            &self.c_ws[0..col2], &mut mv,
-        ).is_ok() {
-            // Subtract W_Z * mv from r_free.
-            // W = [WY, WS] so W[k, j] = wy[cidx*n+k] (j<col) or ws[cidx*n+k] (j>=col).
-            let mut pointr = self.head;
-            for j in 0..col {
-                let cidx = pointr % self.m;
-                for (jj, &k) in ind.iter().enumerate() {
-                    r_free[jj] -= self.wy[cidx * n + k] * mv[j]
-                                + self.ws[cidx * n + k] * mv[col + j];
-                }
-                pointr += 1;
+        // ── Subspace minimisation over the free variables ─────────────────
+        // r = g + B (xcp - x);  solve B_FF d̄ = -r_F.
+        let dz = sub_vecs(&xcp, x);
+        let r: Vec<f64> = (0..n)
+            .map(|i| grad[i] + (0..n).map(|k| b[i * n + k] * dz[k]).sum::<f64>())
+            .collect();
+        let mut bff = vec![0.0; nfree * nfree];
+        for (a, &i) in free.iter().enumerate() {
+            for (c, &k) in free.iter().enumerate() {
+                bff[a * nfree + c] = b[i * n + k];
             }
         }
-        // If bmv fails (wt not yet factored, degenerate curvature), we proceed
-        // without the correction — still a valid (if imprecise) descent direction.
+        let rhs: Vec<f64> = free.iter().map(|&i| -r[i]).collect();
+        let dbar = match dense::cholesky_solve(&bff, &rhs, nfree) {
+            Some(d) => d,
+            None => return projected_neg_grad(x, lower, upper, grad, n),
+        };
 
-        // ── Step 4: L-BFGS two-loop restricted to free variables ─────────────
-        // Computes d_free = -B_ZZ^{-1} r_free, where B_ZZ is the L-BFGS Hessian
-        // restricted to the free-variable subspace Z.
-        //
-        // Implementation: standard two-loop with inner products summed only over
-        // the free indices, using the full-space s/y history.
-        let mut q: Vec<f64> = r_free.iter().map(|v| -*v).collect();
-        let mut alpha = vec![0.0f64; col];
-
-        // First pass (newest → oldest)
-        for i in (0..col).rev() {
-            let dot: f64 = ind.iter().enumerate()
-                .map(|(jj, &k)| self.s[i][k] * q[jj])
-                .sum();
-            alpha[i] = self.rho[i] * dot;
-            for (jj, &k) in ind.iter().enumerate() {
-                q[jj] -= alpha[i] * self.y[i][k];
+        // Truncate the subspace step to the feasible box (L-BFGS-B 2.1 style).
+        let mut alpha = 1.0_f64;
+        for (a, &i) in free.iter().enumerate() {
+            let d = dbar[a];
+            if d > 0.0 && upper[i].is_finite() {
+                alpha = alpha.min((upper[i] - xcp[i]) / d);
+            } else if d < 0.0 && lower[i].is_finite() {
+                alpha = alpha.min((lower[i] - xcp[i]) / d);
             }
         }
-
-        // H₀ scaling: use full-space s/y to be consistent with theta.
-        if col > 0 {
-            let last = col - 1;
-            let sy_val = blas::ddot(&self.s[last], &self.y[last]);
-            let yy_val = blas::ddot(&self.y[last], &self.y[last]);
-            let gamma  = if yy_val > 0.0 { sy_val / yy_val } else { 1.0 };
-            let g = gamma.max(1e-20);
-            for q_item in q.iter_mut() { *q_item *= g; }
+        let alpha = alpha.max(0.0);
+        let mut xbar = xcp.clone();
+        for (a, &i) in free.iter().enumerate() {
+            xbar[i] = (xcp[i] + alpha * dbar[a]).max(lower[i]).min(upper[i]);
         }
-
-        // Second pass (oldest → newest)
-        for i in 0..col {
-            let dot: f64 = ind.iter().enumerate()
-                .map(|(jj, &k)| self.y[i][k] * q[jj])
-                .sum();
-            let beta = self.rho[i] * dot;
-            for (jj, &k) in ind.iter().enumerate() {
-                q[jj] += self.s[i][k] * (alpha[i] - beta);
-            }
-        }
-        // q is now the Newton step d_free = B_ZZ^{-1} (-r_free) = -B_ZZ^{-1} r_free.
-
-        // ── Step 5: Build x_bar = xcp + correction, project to box ───────────
-        let mut x_bar = self.xcp[..n].to_vec();
-        for (jj, &k) in ind.iter().enumerate() {
-            let xi = (x_bar[k] + q[jj]).max(lower[k]).min(upper[k]);
-            x_bar[k] = xi;
-        }
-
-        // d = x_bar - x
-        sub_vecs(&x_bar, x)
+        sub_vecs(&xbar, x)
     }
 
-    /// Fallback projected L-BFGS direction (no Cauchy point).
-    /// Used when cauchy() fails or col==0.
-    fn projected_lbfgs_direction(
-        &self,
-        x: &[f64],
-        lower: &[f64],
-        upper: &[f64],
-        grad: &[f64],
-        n: usize,
-    ) -> Vec<f64> {
+    /// Dense n×n inverse Hessian approximation from the two-loop recursion
+    /// applied to each unit vector (row-major).
+    fn dense_inverse_hessian(&self, n: usize) -> Vec<f64> {
         let col = self.s.len();
-        let mut q: Vec<f64> = grad.iter().map(|v| -*v).collect();
-        let mut alpha = vec![0.0f64; col];
-
-        for i in (0..col).rev() {
-            alpha[i] = self.rho[i] * blas::ddot(&self.s[i], &q);
-            for (qi, &yi) in q.iter_mut().zip(self.y[i].iter()) {
-                *qi -= alpha[i] * yi;
-            }
-        }
-        if col > 0 {
+        let gamma = {
             let last = col - 1;
             let sy = blas::ddot(&self.s[last], &self.y[last]);
             let yy = blas::ddot(&self.y[last], &self.y[last]);
-            let gamma = if yy > 0.0 { sy / yy } else { 1.0 };
-            for v in q.iter_mut() { *v *= gamma.max(1e-20); }
-        }
-        for (i, ((&rho_i, &alpha_i), (y_i, s_i))) in self.rho.iter()
-            .zip(alpha.iter())
-            .zip(self.y.iter().zip(self.s.iter()))
-            .take(col)
-            .enumerate()
-        {
-            let _ = i;
-            let beta = rho_i * blas::ddot(y_i, &q);
-            for (qi, &si) in q.iter_mut().zip(s_i.iter()) {
-                *qi += si * (alpha_i - beta);
+            if yy > 0.0 { (sy / yy).max(1e-20) } else { 1.0 }
+        };
+        let mut h = vec![0.0; n * n];
+        let mut alpha = vec![0.0f64; col];
+        for k in 0..n {
+            let mut q = vec![0.0; n];
+            q[k] = 1.0;
+            for i in (0..col).rev() {
+                alpha[i] = self.rho[i] * blas::ddot(&self.s[i], &q);
+                for (qi, &yi) in q.iter_mut().zip(self.y[i].iter()) { *qi -= alpha[i] * yi; }
             }
-        }
-        // Active-set projection: zero components pushing into active bounds.
-        for i in 0..n {
-            if (x[i] <= lower[i] && q[i] < 0.0) || (x[i] >= upper[i] && q[i] > 0.0) {
-                q[i] = 0.0;
+            for v in q.iter_mut() { *v *= gamma; }
+            for i in 0..col {
+                let beta = self.rho[i] * blas::ddot(&self.y[i], &q);
+                for (qi, &si) in q.iter_mut().zip(self.s[i].iter()) { *qi += si * (alpha[i] - beta); }
             }
+            for i in 0..n { h[i * n + k] = q[i]; }
         }
-        q
+        // symmetrise against round-off
+        for i in 0..n { for k in (i + 1)..n {
+            let v = 0.5 * (h[i * n + k] + h[k * n + i]);
+            h[i * n + k] = v; h[k * n + i] = v;
+        } }
+        h
     }
 
-    /// Push a new correction pair (s, y) into the L-BFGS memory.
     fn push_correction(&mut self, s_vec: &[f64], y_vec: &[f64]) {
         let sty = blas::ddot(s_vec, y_vec);
         if sty == 0.0 { return; }
@@ -612,4 +550,128 @@ fn projected_neg_grad(x: &[f64], lower: &[f64], upper: &[f64], grad: &[f64], n: 
 /// Element-wise a - b.
 fn sub_vecs(a: &[f64], b: &[f64]) -> Vec<f64> {
     a.iter().zip(b.iter()).map(|(ai, bi)| ai - bi).collect()
+}
+
+/// Small dense linear algebra for the subspace step (row-major matrices).
+mod dense {
+    /// Cholesky factor L (lower, row-major) of SPD `a`; None if not SPD.
+    fn cholesky(a: &[f64], n: usize) -> Option<Vec<f64>> {
+        let mut l = vec![0.0; n * n];
+        for i in 0..n {
+            for j in 0..=i {
+                let mut sum = a[i * n + j];
+                for k in 0..j { sum -= l[i * n + k] * l[j * n + k]; }
+                if i == j {
+                    if !(sum > 0.0) || !sum.is_finite() { return None; }
+                    l[i * n + i] = sum.sqrt();
+                } else {
+                    l[i * n + j] = sum / l[j * n + j];
+                }
+            }
+        }
+        Some(l)
+    }
+
+    fn solve_with_factor(l: &[f64], rhs: &[f64], n: usize) -> Vec<f64> {
+        let mut z = vec![0.0; n];
+        for i in 0..n {
+            let mut sum = rhs[i];
+            for k in 0..i { sum -= l[i * n + k] * z[k]; }
+            z[i] = sum / l[i * n + i];
+        }
+        let mut xs = vec![0.0; n];
+        for i in (0..n).rev() {
+            let mut sum = z[i];
+            for k in (i + 1)..n { sum -= l[k * n + i] * xs[k]; }
+            xs[i] = sum / l[i * n + i];
+        }
+        xs
+    }
+
+    /// Solve a x = rhs for SPD `a`.
+    pub fn cholesky_solve(a: &[f64], rhs: &[f64], n: usize) -> Option<Vec<f64>> {
+        let l = cholesky(a, n)?;
+        Some(solve_with_factor(&l, rhs, n))
+    }
+
+    /// Inverse of SPD `a`.
+    pub fn cholesky_inverse(a: &[f64], n: usize) -> Option<Vec<f64>> {
+        let l = cholesky(a, n)?;
+        let mut inv = vec![0.0; n * n];
+        for k in 0..n {
+            let mut e = vec![0.0; n];
+            e[k] = 1.0;
+            let col = solve_with_factor(&l, &e, n);
+            for i in 0..n { inv[i * n + k] = col[i]; }
+        }
+        for i in 0..n { for k in (i + 1)..n {
+            let v = 0.5 * (inv[i * n + k] + inv[k * n + i]);
+            inv[i * n + k] = v; inv[k * n + i] = v;
+        } }
+        Some(inv)
+    }
+
+    /// Generalized Cauchy point of the quadratic model
+    /// m(x + z) = g'z + ½ z'Bz along the projected steepest-descent path
+    /// (Byrd, Lu, Nocedal & Zhu 1995, Algorithm CP), with a dense B.
+    /// Returns (xcp, indices of variables free at xcp).
+    pub fn generalized_cauchy_point(
+        x: &[f64], lower: &[f64], upper: &[f64], g: &[f64], b: &[f64], n: usize,
+    ) -> (Vec<f64>, Vec<usize>) {
+        // Breakpoints along d = -g.
+        let mut t = vec![f64::INFINITY; n];
+        let mut d = vec![0.0; n];
+        for i in 0..n {
+            if g[i] < 0.0 && upper[i].is_finite() {
+                t[i] = (x[i] - upper[i]) / g[i];
+            } else if g[i] > 0.0 && lower[i].is_finite() {
+                t[i] = (x[i] - lower[i]) / g[i];
+            }
+            if t[i] > 0.0 && g[i] != 0.0 { d[i] = -g[i]; }
+        }
+        let mut order: Vec<usize> = (0..n).filter(|&i| t[i] > 0.0 && t[i].is_finite()).collect();
+        order.sort_by(|&a, &c| t[a].partial_cmp(&t[c]).unwrap());
+
+        let mut z = vec![0.0; n];      // displacement so far
+        let mut fixed = vec![false; n];
+        for i in 0..n { if d[i] == 0.0 { fixed[i] = true; } }
+        let mut t_old = 0.0_f64;
+        let mut idx = 0usize;
+        loop {
+            // model derivatives along the current segment
+            let bz: Vec<f64> = (0..n).map(|i| (0..n).map(|k| b[i * n + k] * z[k]).sum()).collect();
+            let bd: Vec<f64> = (0..n).map(|i| (0..n).map(|k| b[i * n + k] * d[k]).sum()).collect();
+            let fp: f64 = (0..n).map(|i| d[i] * (g[i] + bz[i])).sum();
+            let fpp: f64 = (0..n).map(|i| d[i] * bd[i]).sum();
+            let seg_end = if idx < order.len() { t[order[idx]] } else { f64::INFINITY };
+            let dt_seg = seg_end - t_old;
+            // minimiser within the segment
+            let dt_min = if fpp > 0.0 { -fp / fpp } else if fp < 0.0 { f64::INFINITY } else { 0.0 };
+            if fp >= 0.0 || dt_min < dt_seg {
+                let dt = dt_min.max(0.0);
+                for i in 0..n { z[i] += dt * d[i]; }
+                break;
+            }
+            if idx >= order.len() { break; } // unbounded segment, fp<0, fpp<=0: cannot happen for SPD B
+            // advance to the breakpoint and fix that variable
+            for i in 0..n { z[i] += dt_seg * d[i]; }
+            let bidx = order[idx];
+            z[bidx] = if g[bidx] < 0.0 { upper[bidx] - x[bidx] } else { lower[bidx] - x[bidx] };
+            d[bidx] = 0.0;
+            fixed[bidx] = true;
+            t_old = seg_end;
+            idx += 1;
+            // all breakpoints with the same t
+            while idx < order.len() && t[order[idx]] <= t_old {
+                let bj = order[idx];
+                z[bj] = if g[bj] < 0.0 { upper[bj] - x[bj] } else { lower[bj] - x[bj] };
+                d[bj] = 0.0; fixed[bj] = true; idx += 1;
+            }
+        }
+        let xcp: Vec<f64> = (0..n).map(|i| (x[i] + z[i]).max(lower[i]).min(upper[i])).collect();
+        let free: Vec<usize> = (0..n)
+            .filter(|&i| !fixed[i] && xcp[i] > lower[i] && xcp[i] < upper[i])
+            .collect();
+        (xcp, free)
+    }
 }
