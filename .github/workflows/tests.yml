@@ -30,6 +30,12 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           sudo apt-get update && sudo apt-get install -y libhdf5-dev pkg-config
+      - name: Test the vendored L-BFGS-B solver
+        if: matrix.rust
+        # Standalone tests against problems with known solutions (Rosenbrock,
+        # quadratics) with iteration-count bounds calibrated against scipy.
+        working-directory: monod_core/lbfgsb_rs_pure_patched
+        run: cargo test --release
       - name: Build and install monod_core
         if: matrix.rust
         # pip drives maturin as a PEP 517 backend; unlike `maturin develop` this does
