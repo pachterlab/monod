@@ -1461,6 +1461,7 @@ fn eval_model_pss_2d_batch(
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn eval_model_pss_protein_bursty(
+    py: Python<'_>,
     p_log: Vec<f64>,
     limits: Vec<usize>,
     fit_unspliced: bool,
@@ -1479,9 +1480,13 @@ fn eval_model_pss_protein_bursty(
     if !(min_fudge > 0.0) || !(max_fudge > 0.0) {
         return verr(format!("eval_model_pss_protein_bursty: min_fudge/max_fudge must be > 0"));
     }
-    let (gf, mx, lims) =
-        protein_bursty_core(&p_log, &limits, fit_unspliced, protein_limit, min_fudge, max_fudge);
-    let pss_raw = irfftn_3d(&gf, mx[0], mx[2], lims[0], lims[1], lims[2]);
+    // Released GIL: lets Python threads run several genes' integrations at once
+    // (the Nelder-Mead pre-search in inference.py relies on this).
+    let pss_raw = py.allow_threads(|| {
+        let (gf, mx, lims) =
+            protein_bursty_core(&p_log, &limits, fit_unspliced, protein_limit, min_fudge, max_fudge);
+        irfftn_3d(&gf, mx[0], mx[2], lims[0], lims[1], lims[2])
+    });
     let pn = pss_raw.len();
     let abs_sum: f64 = if pn >= PAR_THRESHOLD {
         pss_raw.par_iter().map(|x| x.abs()).sum()

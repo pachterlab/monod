@@ -20,6 +20,15 @@ model = CMEModel("Bursty", "Bernoulli", amb_model="Equal")  # plus ambient conta
 
 The `models`, `reaction_networks` and `protein_bursty` notebooks in `demos/` show each family.
 
+### A note on the protein model
+
+`ProteinBursty` adds protein translation (`k_p`) and degradation (`γ_p`) to the bursty model. Two properties of this model are worth knowing before fitting it:
+
+- **`k_p` and `γ_p` are only separately identifiable when protein turnover is comparable to or slower than mRNA turnover.** When protein degrades much faster than mRNA, the protein count tracks the mRNA count instantly and the data only constrain the ratio `k_p/γ_p`; the likelihood is then flat along the `k_p + γ_p` direction and the fitted pair can sit anywhere along it with the same quality of fit. Inspect the two estimates together, and treat their ratio as the robust quantity.
+- **Evaluation time grows with the spread between the fastest and slowest rate.** The steady state is obtained by integrating an ordinary differential equation with a step set by the fastest rate over a horizon set by the slowest, so a gene whose fitted rates span four orders of magnitude costs a hundred times more per evaluation than one whose rates are within a decade of each other. Tight parameter bounds keep fits fast.
+
+Because the finite-difference gradient is unreliable on the flat valley, the protein model is fitted in two stages by default: a short Nelder-Mead search from the moments estimate, then the usual L-BFGS-B polish. This is controlled by `gradient_params["presearch"]` (`"auto"`, `"nelder-mead"` or `None`) and `gradient_params["presearch_maxiter"]` (default 300).
+
 ## Running inference
 
 ```python

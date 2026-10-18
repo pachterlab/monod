@@ -58,11 +58,21 @@ _HAS_RUST = _mc is not None
 
 # ---------------------------------------------------------------------------
 # Optional GPU backend (PyTorch).  When a CUDA GPU with float64 support is
-# available, eval_model_pss for 2-modality models with seq_model="None" is
-# delegated to a fully-vectorised torch implementation that broadcasts the
-# grid × quadrature computation onto the GPU.  Results match the Python/Rust
-# baseline within rtol=1e-5.
+# available, eval_model_pss for 2-modality models (seq_model "None", "Poisson"
+# or "Bernoulli"; no ambient model) is delegated to a fully-vectorised torch
+# implementation that broadcasts the grid × quadrature computation onto the
+# GPU.  Results match the Python/Rust baseline within rtol=1e-5.
 # ---------------------------------------------------------------------------
+def _samp_is_null(samp):
+    """True when no sampling transform applies: samp is None or all zeros.
+
+    Inference hands every model a sampling vector for the current grid point;
+    for seq_model="None" that vector is zeros rather than None, and the
+    noise-free fast paths must accept both spellings.
+    """
+    return samp is None or bool(np.all(np.asarray(samp, dtype=float) == 0))
+
+
 try:
     import torch as _torch
 
@@ -153,16 +163,35 @@ def _gpu_pgf_cir(g0, g1, b, beta, gamma, T, quad_order):
     return (integrand * (wi * t_half)).sum(dim=1) / 2.0  # [N]
 
 
-def _eval_model_pss_gpu(bio_model, p_log, limits, fixed_quad_T, quad_order, device):
+def _eval_model_pss_gpu(bio_model, p_log, limits, fixed_quad_T, quad_order, device,
+                        samp=None, seq_model="None"):
     """Evaluate 2D PSS on GPU for the six supported bio_models.
 
     p_log is an array of log10 parameters (same convention as Python/Rust).
+    ``samp`` holds log10 sampling parameters, one per modality, and is applied
+    to the generating-function mesh exactly as in the CPU paths: Poisson
+    sampling composes g -> exp(lam*g) - 1, Bernoulli sampling g -> lam*g.
     Returns a numpy array of shape (l0, l1).
     """
     p = 10.0 ** np.asarray(p_log)
     l0, l1 = int(limits[0]), int(limits[1])
 
     g0, g1 = _gpu_build_mesh_2d(l0, l1, device)
+
+    if seq_model in ("Poisson", "Bernoulli"):
+        if samp is None:
+            raise ValueError(f"seq_model={seq_model!r} requires samp (log10 sampling parameters).")
+        lam = np.power(10.0, np.asarray(samp, dtype=float).ravel())
+        if lam.size < 2:
+            raise ValueError("samp must hold one sampling parameter per modality (2 for 2-D models).")
+        if seq_model == "Poisson":
+            g0 = _torch.exp(float(lam[0]) * g0) - 1.0
+            g1 = _torch.exp(float(lam[1]) * g1) - 1.0
+        else:
+            g0 = g0 * float(lam[0])
+            g1 = g1 * float(lam[1])
+    elif seq_model != "None":
+        raise ValueError(f"Unknown seq_model for GPU path: {seq_model}")
 
     if bio_model == "Constitutive":
         beta, gamma = p[0], p[1]
@@ -779,7 +808,7 @@ class CMEModel:
             and self.bio_model == "ProteinBursty"
             and self.seq_model == "None"
             and self.amb_model == "None"
-            and samp is None
+            and _samp_is_null(samp)
         ):
             x, f_data = data
             x_np = np.asarray(x, dtype=np.int64)
@@ -1104,6 +1133,27 @@ class CMEModel:
             )
             return pss.reshape(int(limits[0]), int(limits[1])).squeeze()
 
+        # GPU path with Poisson or Bernoulli technical noise (all six 2-D models).
+        if (
+            _HAS_GPU
+            and self.bio_model in _FAST_MODELS_2D
+            and self.seq_model in ("Poisson", "Bernoulli")
+            and self.amb_model == "None"
+            and self.quad_method == "fixed_quad"
+            and samp is not None
+        ):
+            pss = _eval_model_pss_gpu(
+                self.bio_model,
+                p.tolist(),
+                limits,
+                float(self.fixed_quad_T),
+                int(self.quad_order),
+                _GPU_DEVICE,
+                samp=np.asarray(samp, dtype=float).tolist(),
+                seq_model=self.seq_model,
+            )
+            return pss.reshape(int(limits[0]), int(limits[1])).squeeze()
+
         if (
             _HAS_RUST
             and _fast_cond
@@ -1152,7 +1202,7 @@ class CMEModel:
             and self.seq_model == "None"
             and self.amb_model in ("Equal", "Unequal")
             and self.quad_method == "fixed_quad"
-            and samp is None
+            and _samp_is_null(samp)
         ):
             n_amb = 1 if self.amb_model == "Equal" else 2
             p_bio = p[:-n_amb]
@@ -1176,7 +1226,7 @@ class CMEModel:
             and self.bio_model == "ProteinBursty"
             and self.seq_model == "None"
             and self.amb_model == "None"
-            and samp is None
+            and _samp_is_null(samp)
         ):
             pss_flat = _mc.eval_model_pss_protein_bursty(
                 p.tolist(),
@@ -1199,7 +1249,7 @@ class CMEModel:
             and not self.network._has_delays
             and self.seq_model == "None"
             and self.amb_model == "None"
-            and samp is None
+            and _samp_is_null(samp)
         ):
             p_lin = np.power(10.0, p)
             dt      = float(np.min(1.0 / p_lin) * self.min_fudge)

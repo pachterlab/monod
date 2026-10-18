@@ -676,6 +676,9 @@ class InferenceParameters:
         "max_iterations" defines the maximum number of gradient descent iterations.
         "init_pattern" defines whether the first try starts at the method of moments estimate.
         "num_restarts" defines how many attempts should be made.
+        "presearch" selects a derivative-free search run from the first starting point before
+            gradient descent: "auto" (default; Nelder-Mead for ProteinBursty, nothing otherwise),
+            "nelder-mead", or None. "presearch_maxiter" caps its iterations (default 300).
     phys_lb: float np.ndarray
         log10 lower bounds on biological parameters.
     phys_ub: float np.ndarray
@@ -768,6 +771,9 @@ class InferenceParameters:
             "max_iterations" defines the maximum number of gradient descent iterations.
             "init_pattern" defines whether the first try starts at the method of moments estimate.
             "num_restarts" defines how many attempts should be made.
+            "presearch" selects a derivative-free search run from the first starting point before
+                gradient descent: "auto" (default; Nelder-Mead for ProteinBursty, nothing otherwise),
+                "nelder-mead", or None. "presearch_maxiter" caps its iterations (default 300).
             "num_gene_cores" controls gene-level parallelism per grid point (-1 = all cores). Uses ThreadPoolExecutor + scipy by default; set "use_batch_optimizer"=True to use batch Adam with rayon instead.
             "n_jac_jobs" controls joblib parallelism over FD perturbations (-1 = all cores); only
             effective when num_gene_cores=1 to avoid nested parallelism.
@@ -1116,6 +1122,9 @@ class GradientInference:
         "max_iterations" defines the maximum number of gradient descent iterations.
         "init_pattern" defines whether the first try starts at the method of moments estimate.
         "num_restarts" defines how many attempts should be made.
+        "presearch" selects a derivative-free search run from the first starting point before
+            gradient descent: "auto" (default; Nelder-Mead for ProteinBursty, nothing otherwise),
+            "nelder-mead", or None. "presearch_maxiter" caps its iterations (default 300).
     phys_lb: float np.ndarray
         log10 lower bounds on biological parameters.
     phys_ub: float np.ndarray
@@ -1352,6 +1361,77 @@ class GradientInference:
             log.debug('Optimized parameters for gene %d is %s', gene_index, np.array2string(10**x))
         return x, err
 
+    def _presearch_x0(self, model, search_data, x0_all, n_gene_cores=1):
+        """Refine each gene's first starting point with a derivative-free search.
+
+        The ProteinBursty likelihood has a long, nearly flat valley along the
+        k_p/gamma_p direction. L-BFGS-B with a finite-difference gradient stops
+        early on that plateau (the gradient falls below its own noise), usually
+        after drifting toward small rates where every evaluation is slowest.
+        A short Nelder-Mead run from the moments estimate crosses the plateau in
+        a few hundred evaluations; the gradient fit then only has to polish.
+
+        Controlled by gradient_params["presearch"] ("auto", "nelder-mead" or
+        None) and gradient_params["presearch_maxiter"]. Only the first starting
+        point of each gene (the moments or warm start) is refined; random
+        restarts are left untouched.
+
+        Parameters
+        ----------
+        model: monod.cme_toolbox.CMEModel
+        search_data: SearchData
+        x0_all: list of lists
+            per-gene starting points, n_genes x n_restarts x n_phys_pars.
+        n_gene_cores: int
+            thread count for the per-gene search; 1 runs serially, <=0 uses all cores.
+
+        Returns
+        -------
+        x0_all: list of lists
+            the starting points with the first one per gene replaced.
+        """
+        mode = self.gradient_params.get("presearch", "auto")
+        if mode == "auto":
+            mode = "nelder-mead" if model.bio_model == "ProteinBursty" else None
+        if not mode:
+            return x0_all
+        if mode != "nelder-mead":
+            raise ValueError(f"gradient_params['presearch'] must be 'auto', 'nelder-mead' or None, got {mode!r}")
+        maxiter = int(self.gradient_params.get("presearch_maxiter", 300))
+        bounds = list(zip(self.phys_lb, self.phys_ub))
+
+        def _one(gi):
+            limits = search_data.M[:, gi]
+            samp = self.regressor[gi]
+            data = search_data.hist[gi]
+            x0 = np.asarray(x0_all[gi][0], dtype=float)
+
+            def kld(x):
+                return model.eval_model_kld(np.asarray(x, dtype=float), limits, samp, data)
+
+            res = scipy.optimize.minimize(
+                kld, x0, method="Nelder-Mead", bounds=bounds,
+                options={"maxiter": maxiter, "xatol": 1e-3, "fatol": 1e-5},
+            )
+            if np.isfinite(res.fun) and res.fun <= kld(x0):
+                return np.clip(res.x, self.phys_lb, self.phys_ub).tolist()
+            return x0.tolist()
+
+        n_genes = len(x0_all)
+        if n_gene_cores == 1 or n_genes == 1:
+            refined = [_one(gi) for gi in range(n_genes)]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            n_workers = os.cpu_count() if n_gene_cores <= 0 else n_gene_cores
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                refined = list(pool.map(_one, range(n_genes)))
+        out = [list(map(list, x0)) for x0 in x0_all]
+        for gi in range(n_genes):
+            out[gi][0] = refined[gi]
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("Nelder-Mead pre-search refined %d starting points", n_genes)
+        return out
+
     def iterate_over_genes(self, model, search_data):
         """Run gradient descent for every gene at the current grid point.
 
@@ -1444,6 +1524,7 @@ class GradientInference:
 
         # Build starting points once so scipy and Rust paths share identical restarts.
         x0_all_shared = _build_x0_all(search_data.n_genes, self.gradient_params["num_restarts"])
+        x0_all_shared = self._presearch_x0(model, search_data, x0_all_shared, n_gene_cores)
 
         if use_rust_lbfgsb:
             num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
