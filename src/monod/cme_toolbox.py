@@ -1247,12 +1247,11 @@ class CMEModel:
             )
             return pss.squeeze()
 
-        # Rust fast-path for Custom networks (non-delayed, seq_model="None",
-        # amb_model="None").  Error-controlled exponential integrator, parallel over grid points via rayon.
+        # Rust fast-path for Custom networks (seq_model="None", amb_model="None"),
+        # delayed reactions included.  Fixed-step RK4 parallel over grid points.
         if (
             _HAS_RUST
             and self.bio_model == "Custom"
-            and not self.network._has_delays
             and self.seq_model == "None"
             and self.amb_model == "None"
             and _samp_is_null(samp)
@@ -1263,60 +1262,23 @@ class CMEModel:
             n_steps = int(np.ceil(t_max / dt))
             max_while = 10 * n_steps + 10_000
 
-            # Serialise network topology to flat arrays for Rust.
-            net       = self.network
-            params_d  = net._param_map(p)          # name → linear float
+            net  = self.network
+            topo = net.rust_topology()
+            params_d = net._param_map(p)          # name → linear float
             if net._norm_rate is not None:
                 params_d[net._norm_rate] = 1.0
-            all_names = list(net.all_params) + ([net._norm_rate] if net._norm_rate else [])
-            params_linear = [float(params_d[name]) for name in all_names]
-            name_to_idx   = {name: i for i, name in enumerate(all_names)}
-            sp_idx_map    = {s: i for i, s in enumerate(net.species)}
-
-            rxn_kinds, rxn_rate_idxs = [], []
-            rxn_extra1, rxn_extra2   = [], []
-            prod_sp_flat, prod_st_flat, prod_off = [], [], [0]
-
-            for rxn in net.reactions:
-                rate_idx = name_to_idx[rxn.rate_name]
-                if not rxn.reactants and rxn.burst_param is not None:
-                    rxn_kinds.append(0)
-                    rxn_rate_idxs.append(rate_idx)
-                    rxn_extra1.append(name_to_idx[rxn.burst_param])
-                    rxn_extra2.append(sp_idx_map[rxn.burst_species])
-                elif not rxn.reactants:
-                    rxn_kinds.append(1)
-                    rxn_rate_idxs.append(rate_idx)
-                    rxn_extra1.append(-1)
-                    rxn_extra2.append(-1)
-                else:
-                    # ReactionNetwork guarantees a single first-order reactant;
-                    # guard anyway so a future parser change cannot silently
-                    # mis-encode a reaction for the Rust kernel.
-                    if len(rxn.reactants) != 1 or next(iter(rxn.reactants.values())) != 1:
-                        raise ValueError(
-                            f"Rust custom-network path requires first-order reactions; got {rxn}"
-                        )
-                    src = next(iter(rxn.reactants))
-                    rxn_kinds.append(2)
-                    rxn_rate_idxs.append(rate_idx)
-                    rxn_extra1.append(sp_idx_map[src])
-                    rxn_extra2.append(-1)
-                for sp, st in rxn.products.items():
-                    prod_sp_flat.append(sp_idx_map[sp])
-                    prod_st_flat.append(st)
-                prod_off.append(len(prod_sp_flat))
+            params_linear = [float(params_d[name]) for name in topo["param_names"]]
 
             re_e, im_e, mx_shape = _mc.eval_custom_network_pgf(
                 len(net.species),
                 [int(x) for x in limits],
-                rxn_kinds,
-                rxn_rate_idxs,
-                rxn_extra1,
-                rxn_extra2,
-                prod_sp_flat,
-                prod_st_flat,
-                prod_off,
+                topo["rxn_kinds"],
+                topo["rxn_rate_idxs"],
+                topo["rxn_extra1"],
+                topo["rxn_extra2"],
+                topo["prod_sp"],
+                topo["prod_st"],
+                topo["prod_off"],
                 params_linear,
                 dt,
                 n_steps,

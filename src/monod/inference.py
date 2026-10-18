@@ -1494,7 +1494,6 @@ class GradientInference:
             _use_rust_opt
             and _sd_is_rust
             and model.bio_model == "Custom"
-            and not model.network._has_delays
             and model.seq_model == "None"
             and model.amb_model == "None"
             and len(model.network.species) in (2, 3)
@@ -1662,35 +1661,7 @@ class GradientInference:
             x0_all = x0_all_shared
             # Serialise the network topology (constant across all L-BFGS-B evaluations).
             net = model.network
-            name_to_idx = {name: i for i, name in enumerate(
-                list(net.all_params) + ([net._norm_rate] if net._norm_rate else [])
-            )}
-            sp_idx_map = {s: i for i, s in enumerate(net.species)}
-            rxn_kinds_list, rxn_rate_idxs_list = [], []
-            rxn_extra1_list, rxn_extra2_list   = [], []
-            prod_sp_flat, prod_st_flat, prod_off_list = [], [], [0]
-            for rxn in net.reactions:
-                rate_idx = name_to_idx[rxn.rate_name]
-                if not rxn.reactants and rxn.burst_param is not None:
-                    rxn_kinds_list.append(0)
-                    rxn_rate_idxs_list.append(rate_idx)
-                    rxn_extra1_list.append(name_to_idx[rxn.burst_param])
-                    rxn_extra2_list.append(sp_idx_map[rxn.burst_species])
-                elif not rxn.reactants:
-                    rxn_kinds_list.append(1)
-                    rxn_rate_idxs_list.append(rate_idx)
-                    rxn_extra1_list.append(-1)
-                    rxn_extra2_list.append(-1)
-                else:
-                    src = next(iter(rxn.reactants))
-                    rxn_kinds_list.append(2)
-                    rxn_rate_idxs_list.append(rate_idx)
-                    rxn_extra1_list.append(sp_idx_map[src])
-                    rxn_extra2_list.append(-1)
-                for sp, st in rxn.products.items():
-                    prod_sp_flat.append(sp_idx_map[sp])
-                    prod_st_flat.append(st)
-                prod_off_list.append(len(prod_sp_flat))
+            topo = net.rust_topology()
             params_arr, klds_arr, status_arr = _mc.optimize_genes_custom_sd(
                 search_data,
                 return_status=True,
@@ -1698,13 +1669,13 @@ class GradientInference:
                 lb=self.phys_lb.tolist(),
                 ub=self.phys_ub.tolist(),
                 n_species=len(net.species),
-                rxn_kinds=rxn_kinds_list,
-                rxn_rate_idxs=rxn_rate_idxs_list,
-                rxn_extra1=rxn_extra1_list,
-                rxn_extra2=rxn_extra2_list,
-                prod_sp=prod_sp_flat,
-                prod_st=prod_st_flat,
-                prod_off=prod_off_list,
+                rxn_kinds=topo["rxn_kinds"],
+                rxn_rate_idxs=topo["rxn_rate_idxs"],
+                rxn_extra1=topo["rxn_extra1"],
+                rxn_extra2=topo["rxn_extra2"],
+                prod_sp=topo["prod_sp"],
+                prod_st=topo["prod_st"],
+                prod_off=topo["prod_off"],
                 has_norm_rate=(net._norm_rate is not None),
                 min_fudge=float(model.min_fudge),
                 max_fudge=float(model.max_fudge),

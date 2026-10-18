@@ -14,7 +14,7 @@ model = CMEModel("Bursty", "Poisson")                      # transcription, sequ
 model = CMEModel("Bursty", "Bernoulli", amb_model="Equal")  # plus ambient contamination
 ```
 
-- **Transcription** (`bio_model`): `Constitutive`, `Bursty`, `CIR`, `Extrinsic`, `Delay`, `DelayedSplicing`, `ProteinBursty` (adds a protein layer), or a custom reaction network passed as `network=`. `Bursty` is the usual choice for mammalian and bacterial cells.
+- **Transcription** (`bio_model`): `Constitutive`, `Bursty`, `CIR`, `Extrinsic`, `Delay`, `DelayedSplicing`, `ProteinBursty` (adds a protein layer), or a custom reaction network passed as `network=`, including time-delayed reactions written with `=>`. All of these run on the Rust accelerator when it is installed. `Bursty` is the usual choice for mammalian and bacterial cells.
 - **Sequencing noise** (`seq_model`): `None`, `Poisson`, or `Bernoulli`.
 - **Ambient contamination** (`amb_model`): `None`, `Equal`, or `Unequal`.
 

@@ -26,8 +26,11 @@ Arrow types
 
           ``du_A/dt += k · (u_B(t−τ) − u_A(t))``
 
-        Numerically integrated via RK4 with a frozen-delay circular history
-        buffer (method-of-steps approach).
+        Numerically integrated by fixed-step RK4 (method of steps) with the
+        delayed state read from a history buffer by linear interpolation
+        between stored steps, so the result depends smoothly on τ.  Before
+        t = τ the delayed state is zero: a product that would only appear
+        after the observation time contributes nothing (z = 1).
 
 The ``N x A`` notation for the *target* of a production reaction (source
 = ``0``) controls the type of burst:
@@ -480,47 +483,52 @@ class ReactionNetwork:
         u_init: List[np.ndarray],
         params: Dict[str, float],
         dt: float,
-    ) -> Tuple[Deque, Dict[str, int]]:
-        """Allocate a circular history deque pre-filled with the initial state.
+    ) -> Tuple[Deque, Dict[str, Tuple[int, float]]]:
+        """Allocate the history ring and the interpolation weights per delay.
+
+        For each delay τ = 1/tauinv, ``τ/dt = j + α`` with integer ``j`` and
+        ``0 <= α < 1``; the delayed state is ``(1 − α)·u_{n−j} + α·u_{n−j−1}``,
+        with ``u_m = 0`` for ``m < 0``: a product that would appear after the
+        observation time contributes nothing.  Mirrors ``monod_core``'s
+        ``DelaySpec``.
 
         Returns
         -------
         u_hist : deque of List[np.ndarray]
-            Circular buffer of length ``max_delay_steps + 1``.
-            All slots initialised to copies of ``u_init``.
-        tau_d_steps : dict  tau_name → int
-            Number of integration steps corresponding to each delay τ.
+            Ring of the last ``max_j + 2`` states, newest last; zeros for the
+            pre-history and ``u_init`` in the last slot.
+        specs : dict  tau_name → (j, α)
         """
-        tau_d_steps: Dict[str, int] = {}
+        specs: Dict[str, Tuple[int, float]] = {}
         for rxn in self.reactions:
-            if rxn.is_delayed and rxn.tau_name not in tau_d_steps:
-                tau = params[rxn.tau_name]  # linear scale, τ = 1/tauinv
-                d = max(1, int(round(tau / dt)))
-                tau_d_steps[rxn.tau_name] = d
+            if rxn.is_delayed and rxn.tau_name not in specs:
+                s = (1.0 / params[rxn.tau_name]) / dt
+                j = int(np.floor(s))
+                specs[rxn.tau_name] = (j, float(s - j))
 
-        max_d = max(tau_d_steps.values()) if tau_d_steps else 1
+        max_j = max((j for j, _ in specs.values()), default=0)
         u_hist: Deque = deque(
-            [[arr.copy() for arr in u_init] for _ in range(max_d + 1)],
-            maxlen=max_d + 1,
+            [[np.zeros_like(arr) for arr in u_init] for _ in range(max_j + 1)]
+            + [[arr.copy() for arr in u_init]],
+            maxlen=max_j + 2,
         )
-        return u_hist, tau_d_steps
+        return u_hist, specs
 
     @staticmethod
     def _delayed_state(
         u_hist: Deque,
-        tau_d_steps: Dict[str, int],
+        specs: Dict[str, Tuple[int, float]],
     ) -> Dict[str, List[np.ndarray]]:
-        """Extract the delayed u state for each tauinv parameter.
+        """Interpolated delayed state for each delay parameter.
 
-        ``u_hist[-d]`` gives the state from ``d`` steps ago (with ``d >= 1``).
-        If the buffer is smaller than ``d`` (early steps), the oldest available
-        state (initial condition) is used.
+        ``u_hist[-1]`` is the current state ``u_n`` and ``u_hist[-1-m]`` is
+        ``u_{n-m}``.
         """
         result: Dict[str, List[np.ndarray]] = {}
-        hist_len = len(u_hist)
-        for tau_name, d in tau_d_steps.items():
-            idx = -min(d, hist_len)  # negative index into deque
-            result[tau_name] = u_hist[idx]
+        for tau_name, (j, alpha) in specs.items():
+            a = u_hist[-1 - j]
+            b = u_hist[-2 - j]
+            result[tau_name] = [x * (1.0 - alpha) + y * alpha for x, y in zip(a, b)]
         return result
 
     # ------------------------------------------------------------------
@@ -622,7 +630,7 @@ class ReactionNetwork:
 
         For delayed networks (``=>``) the fixed-step RK4 integrator is
         used instead, because the history buffer requires a uniform step
-        size.
+        size; the delayed state is interpolated between stored steps.
 
         Parameters
         ----------
@@ -686,21 +694,23 @@ class ReactionNetwork:
     ) -> np.ndarray:
         """Fixed-step RK4 integrator (used for delayed networks).
 
-        Maintains a circular history buffer for the ``=>`` DDE reactions.
-        The step size is fixed throughout so the buffer index arithmetic
-        stays exact.
+        Maintains a history ring for the ``=>`` DDE reactions; the delayed
+        state is linearly interpolated between stored steps (see
+        ``_build_history``).  The step size is fixed throughout so the ring
+        index arithmetic stays exact.  Mirrors ``monod_core``'s
+        ``custom_pgf_delayed_parallel``.
         """
         params = self._param_map(p_log)
         sp_idx = {s: i for i, s in enumerate(self.species)}
 
-        u   = [np.array(g[i], dtype=np.complex64) for i in range(len(self.species))]
+        u   = [np.array(g[i], dtype=np.complex128) for i in range(len(self.species))]
         phi = np.zeros_like(u[0])
         dt  = T / n_steps if n_steps > 0 else T
 
-        u_hist, tau_d_steps = self._build_history(u, params, dt)
+        u_hist, specs = self._build_history(u, params, dt)
 
         def _step(u, phi):
-            u_del = self._delayed_state(u_hist, tau_d_steps)
+            u_del = self._delayed_state(u_hist, specs)
             u_new, phi_new = self._rk4_step(u, phi, params, sp_idx, dt, u_del)
             u_hist.append([arr.copy() for arr in u_new])
             return u_new, phi_new
@@ -719,6 +729,43 @@ class ReactionNetwork:
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
+
+    def rust_topology(self) -> Dict[str, list]:
+        """Flat encoding of the network for the ``monod_core`` kernels.
+
+        Returns a dict with ``rxn_kinds`` (0 geometric burst, 1 deterministic
+        production, 2 first-order, 3 delayed first-order), ``rxn_rate_idxs``,
+        ``rxn_extra1``, ``rxn_extra2``, the CSR product arrays ``prod_sp``,
+        ``prod_st``, ``prod_off``, and ``param_names``: the parameter order the
+        indices refer to (``all_params`` plus the normalised rate, if any).
+        """
+        param_names = list(self.all_params) + ([self._norm_rate] if self._norm_rate else [])
+        name_to_idx = {name: i for i, name in enumerate(param_names)}
+        sp_idx = {s: i for i, s in enumerate(self.species)}
+        kinds, rate_idxs, extra1, extra2 = [], [], [], []
+        prod_sp, prod_st, prod_off = [], [], [0]
+        for rxn in self.reactions:
+            rate_idx = name_to_idx[rxn.rate_name]
+            if not rxn.reactants and rxn.burst_param is not None:
+                kinds.append(0); extra1.append(name_to_idx[rxn.burst_param]); extra2.append(sp_idx[rxn.burst_species])
+            elif not rxn.reactants:
+                kinds.append(1); extra1.append(-1); extra2.append(-1)
+            else:
+                # The parser guarantees a single first-order reactant; guard so a
+                # future parser change cannot silently mis-encode a reaction.
+                if len(rxn.reactants) != 1 or next(iter(rxn.reactants.values())) != 1:
+                    raise ValueError(f"Rust custom-network path requires first-order reactions; got {rxn}")
+                src = next(iter(rxn.reactants))
+                if rxn.is_delayed:
+                    kinds.append(3); extra1.append(sp_idx[src]); extra2.append(name_to_idx[rxn.tau_name])
+                else:
+                    kinds.append(2); extra1.append(sp_idx[src]); extra2.append(-1)
+            rate_idxs.append(rate_idx)
+            for sp, st in rxn.products.items():
+                prod_sp.append(sp_idx[sp]); prod_st.append(int(st))
+            prod_off.append(len(prod_sp))
+        return dict(rxn_kinds=kinds, rxn_rate_idxs=rate_idxs, rxn_extra1=extra1, rxn_extra2=extra2,
+                    prod_sp=prod_sp, prod_st=prod_st, prod_off=prod_off, param_names=param_names)
 
     def get_log_name_str(self) -> List[str]:
         """TeX-formatted log₁₀ parameter labels (for plot axes)."""
