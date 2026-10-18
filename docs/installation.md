@@ -12,7 +12,7 @@ Prebuilt `monod-core` wheels are published for Linux x86_64 and Apple-silicon ma
 
 ## GPU
 
-If PyTorch is installed and a CUDA device with float64 support is available, the two-species steady-state evaluation runs on the GPU, for all six transcription models with no sequencing noise or with Poisson or Bernoulli noise (ambient-contamination models stay on the CPU). Apple MPS does not support float64 and is not used. The order of preference is GPU, then the Rust accelerator, then pure Python; no configuration is needed. On a single evaluation the GPU is only modestly faster than the Rust path (about 2 ms against 3 ms on a 120 by 80 grid with an RTX 3070); the GPU matters more for very large grids.
+If PyTorch is installed and a CUDA device with float64 support is available, the two-species steady-state evaluation runs on the GPU, for all six transcription models with no sequencing noise or with Poisson or Bernoulli noise (ambient-contamination models stay on the CPU). Apple MPS does not support float64 and is not used. The order of preference is GPU, then the Rust accelerator, then pure Python; no configuration is needed. On a single evaluation the GPU is only modestly faster than the Rust path (about 1.6 ms against 3 ms on a 120 by 80 grid with an RTX 3070 and 24 CPU cores). It pays off when many genes are evaluated at once: `CMEModel.eval_model_pss_batch` groups genes by grid size and evaluates each group in one batched call, about 0.4 ms per gene for 1000 genes against 0.7 ms on the Rust thread pool. The batch optimizer (`gradient_params["use_batch_optimizer"]=True`) uses it for every gradient step.
 
 ## Checking what is active
 

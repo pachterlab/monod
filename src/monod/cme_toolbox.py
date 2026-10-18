@@ -102,6 +102,29 @@ except ImportError:
     _GPU_DEVICE = None
 
 
+_GPU_NUMPY_OK = None
+
+
+def _gpu_to_numpy(t):
+    """Move a float64 tensor to host memory as a numpy array.
+
+    ``Tensor.numpy()`` is a zero-copy view and is what we want; torch builds
+    compiled against an older numpy raise ``RuntimeError`` from it, in which
+    case the (much slower) ``tolist`` round trip is used instead.  The choice
+    is probed once.
+    """
+    global _GPU_NUMPY_OK
+    cpu = t.detach().cpu()
+    if _GPU_NUMPY_OK is None:
+        try:
+            _GPU_NUMPY_OK = isinstance(cpu[:1].numpy(), np.ndarray)
+        except Exception:  # noqa: BLE001 - any failure means "do not use numpy()"
+            _GPU_NUMPY_OK = False
+    if _GPU_NUMPY_OK:
+        return np.array(cpu.numpy(), dtype=np.float64, copy=True)
+    return np.array(cpu.tolist(), dtype=np.float64)
+
+
 def _gpu_build_mesh_2d(l0, l1, device):
     """Return (g0, g1) flat complex128 tensors of length l0*(l1//2+1)."""
     mx1 = l1 // 2 + 1
@@ -243,8 +266,137 @@ def _eval_model_pss_gpu(bio_model, p_log, limits, fixed_quad_T, quad_order, devi
     pss = _torch.fft.irfftn(gf, s=(l0, l1))
     pss = pss.abs()
     pss = pss / pss.sum()
-    # Use tolist() then np.array to avoid ABI issues with some torch+numpy combos.
-    return np.array(pss.cpu().tolist(), dtype=np.float64)
+    return _gpu_to_numpy(pss)
+
+
+# Memory budget for the batched quadrature tensor [genes, grid, quad] on the GPU.
+_GPU_BATCH_BYTES = 512 * 1024 ** 2
+
+
+def _gpu_apply_noise(g0, g1, lam, seq_model):
+    """Per-gene sequencing transform of the mesh.  g0/g1: [N]; lam: [G, 2] linear
+    sampling rates.  Returns [G, N] tensors."""
+    if seq_model == "None":
+        return g0.unsqueeze(0), g1.unsqueeze(0)
+    l0 = lam[:, 0:1]
+    l1 = lam[:, 1:2]
+    if seq_model == "Poisson":
+        return _torch.exp(l0 * g0.unsqueeze(0)) - 1.0, _torch.exp(l1 * g1.unsqueeze(0)) - 1.0
+    if seq_model == "Bernoulli":
+        return l0 * g0.unsqueeze(0), l1 * g1.unsqueeze(0)
+    raise ValueError(f"Unknown seq_model for GPU path: {seq_model}")
+
+
+def _gpu_pgf_quadrature_batch(bio_model, g0, g1, b, beta, gamma, T, quad_order):
+    """Batched Bursty/CIR log-PGF.  g0/g1: [G, N]; b/beta/gamma/T: [G]."""
+    from numpy.polynomial.legendre import leggauss
+    device = g0.device
+    G, N = g0.shape
+    xi_np, wi_np = leggauss(quad_order)
+    xi = _torch.tensor(xi_np, dtype=_torch.float64, device=device)
+    wi = _torch.tensor(wi_np, dtype=_torch.float64, device=device)
+    t_half = (T / 2.0).reshape(G, 1)                          # [G, 1]
+    x = t_half + t_half * xi.unsqueeze(0)                     # [G, Q]
+    b_ = b.reshape(G, 1, 1)
+    beta_ = beta.reshape(G, 1, 1)
+    gamma_ = gamma.reshape(G, 1, 1)
+    eb = _torch.exp(-beta_ * x.unsqueeze(1))                  # [G, 1, Q]
+    eg = _torch.exp(-gamma_ * x.unsqueeze(1))                 # [G, 1, Q]
+    close = _torch.isclose(beta, gamma).reshape(G, 1, 1)      # per-gene branch, as in the CPU paths
+    denom = _torch.where(close, _torch.ones_like(beta_), beta_ - gamma_)
+    f = beta_ / denom
+    w = (wi.unsqueeze(0) * t_half).unsqueeze(1)               # [G, 1, Q]
+    out = _torch.empty((G, N), dtype=_torch.complex128, device=device)
+    # chunk the grid axis so [G, n, Q] complex128 stays within the memory budget
+    per_point = G * quad_order * 16 * 3
+    n_chunk = max(1, int(_GPU_BATCH_BYTES // per_point))
+    for s in range(0, N, n_chunk):
+        g0c = g0[:, s:s + n_chunk].unsqueeze(2)               # [G, n, 1]
+        g1c = g1[:, s:s + n_chunk].unsqueeze(2)
+        u_general = b_ * ((g0c - g1c * f) * eb + g1c * f * eg)
+        u_close = b_ * (g0c * eb + g1c * (beta_ * x.unsqueeze(1) * eg))
+        u = _torch.where(close, u_close, u_general)           # [G, n, Q]
+        if bio_model == "Bursty":
+            integrand = u / (1.0 - u)
+            out[:, s:s + n_chunk] = (integrand * w).sum(dim=2)
+        else:
+            integrand = 1.0 - _torch.sqrt(1.0 - 4.0 * u)
+            out[:, s:s + n_chunk] = (integrand * w).sum(dim=2) / 2.0
+    return out
+
+
+def _eval_model_pss_gpu_batch(bio_model, params_list, limits_list, fixed_quad_T, quad_order,
+                              device, samp_list=None, seq_model="None"):
+    """Evaluate the 2-D PSS of many genes on the GPU.
+
+    Genes are grouped by grid size; within a group the log-PGF of all genes is
+    computed with one broadcast expression and inverted with one batched
+    irfftn.  Per gene this matches ``_eval_model_pss_gpu`` to rounding.
+
+    Returns a list of numpy arrays shaped like each gene's limits.
+    """
+    n = len(params_list)
+    if samp_list is None:
+        samp_list = [None] * n
+    out = [None] * n
+    groups = {}
+    for i, lim in enumerate(limits_list):
+        groups.setdefault((int(lim[0]), int(lim[1])), []).append(i)
+    one = _torch.ones(1, dtype=_torch.complex128, device=device)
+    for (l0, l1), idx in groups.items():
+        G = len(idx)
+        p = _torch.tensor(np.power(10.0, np.asarray([np.asarray(params_list[i], dtype=float) for i in idx])),
+                          dtype=_torch.float64, device=device)                 # [G, n_params]
+        g0, g1 = _gpu_build_mesh_2d(l0, l1, device)
+        if seq_model in ("Poisson", "Bernoulli"):
+            samp = []
+            for i in idx:
+                if samp_list[i] is None:
+                    raise ValueError(f"seq_model={seq_model!r} requires samp (log10 sampling parameters).")
+                s_ = np.asarray(samp_list[i], dtype=float).ravel()
+                if s_.size < 2:
+                    raise ValueError("samp must hold one sampling parameter per modality (2 for 2-D models).")
+                samp.append(s_[:2])
+            lam = _torch.tensor(np.power(10.0, np.asarray(samp)), dtype=_torch.float64, device=device)
+        else:
+            lam = None
+        g0b, g1b = _gpu_apply_noise(g0, g1, lam, seq_model)                    # [G or 1, N]
+        g0b = g0b.expand(G, -1)
+        g1b = g1b.expand(G, -1)
+
+        if bio_model == "Constitutive":
+            gf = g0b / p[:, 0:1] + g1b / p[:, 1:2]
+        elif bio_model == "Extrinsic":
+            gf = -p[:, 0:1] * _torch.log(one - g0b / p[:, 1:2] - g1b / p[:, 2:3])
+        elif bio_model == "Delay":
+            b, beta, tauinv = p[:, 0:1], p[:, 1:2], p[:, 2:3]
+            tau = 1.0 / tauinv
+            exp_bt = _torch.exp(-beta * tau)
+            u = g1b + (g0b - g1b) * exp_bt
+            term1 = -_torch.log(one - u * b) / beta
+            ratio = (u * b - one) / (g0b * b - one)
+            term2 = _torch.log(ratio) / (beta * (one - g1b * b))
+            term3 = g1b * b * tau / (one - g1b * b)
+            gf = term1 + term2 + term3
+        elif bio_model == "DelayedSplicing":
+            b, tauinv, gamma = p[:, 0:1], p[:, 1:2], p[:, 2:3]
+            tau = 1.0 / tauinv
+            gf = g0b * b * tau / (one - g0b * b) - _torch.log(one - g1b * b) / gamma
+        elif bio_model in ("Bursty", "CIR"):
+            b, beta, gamma = p[:, 0], p[:, 1], p[:, 2]
+            T = fixed_quad_T * (1.0 / beta + 1.0 / gamma + 1.0)
+            gf = _gpu_pgf_quadrature_batch(bio_model, g0b, g1b, b, beta, gamma, T, quad_order)
+        else:
+            raise ValueError(f"Unknown bio_model for GPU path: {bio_model}")
+
+        gf = _torch.exp(gf).reshape(G, l0, l1 // 2 + 1)
+        pss = _torch.fft.irfftn(gf, s=(l0, l1), dim=(1, 2)).abs()
+        pss = pss / pss.sum(dim=(1, 2), keepdim=True)
+        arr = _gpu_to_numpy(pss)
+        for k, i in enumerate(idx):
+            out[i] = arr[k]
+    return out
+
 
 class CMEModel:
     """Stores and evaluates biological and technical variation models.
@@ -1357,11 +1509,13 @@ class CMEModel:
         return Pss
 
     def eval_model_pss_batch(self, params_list, limits_list, samp_list=None, num_threads=None):
-        """Evaluate PSS for N genes in a single batched Rust call (rayon-parallel).
+        """Evaluate PSS for N genes in one batched call.
 
-        All N evaluations run in parallel on the Rust thread pool (rayon), with
-        the GIL released for the entire computation.  Falls back to sequential
-        `eval_model_pss` calls when the Rust batch path is not available.
+        On a CUDA device with float64 support the genes are evaluated on the
+        GPU, grouped by grid size, with one batched inverse FFT per group.
+        Otherwise all N evaluations run in parallel on the Rust thread pool
+        (rayon), with the GIL released for the entire computation.  Falls back
+        to sequential `eval_model_pss` calls when neither is available.
 
         Supported for all six 2-D bio_models with seq_model in {"None","Poisson"}
         and amb_model="None", quad_method="fixed_quad".
@@ -1392,13 +1546,20 @@ class CMEModel:
         if samp_list is None:
             samp_list = [None] * n
 
-        _batch_ok = (
-            _HAS_RUST
-            and self.bio_model in _RUST_BATCH_MODELS
+        _model_ok = (
+            self.bio_model in _RUST_BATCH_MODELS
             and self.amb_model == "None"
             and self.quad_method == "fixed_quad"
             and self.seq_model in ("None", "Poisson", "Bernoulli")
         )
+        if _HAS_GPU and _model_ok and (self.seq_model == "None" or all(s is not None for s in samp_list)):
+            return _eval_model_pss_gpu_batch(
+                self.bio_model, params_list, limits_list, float(self.fixed_quad_T),
+                int(self.quad_order), _GPU_DEVICE,
+                samp_list=None if self.seq_model == "None" else samp_list,
+                seq_model=self.seq_model,
+            )
+        _batch_ok = _HAS_RUST and _model_ok
         if not _batch_ok:
             return [
                 self.eval_model_pss(p, lim, s)
