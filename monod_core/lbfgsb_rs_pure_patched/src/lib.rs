@@ -31,8 +31,6 @@
 //! Modules
 //! - `blas`         : lightweight level-1 BLAS helpers used throughout the crate.
 //! - `linesearch`   : line-search helpers (dcstep / lnsrlb / convenience methods).
-//! - `linpack`      : small linpack routines (Cholesky / triangular solve).
-//! - `subalgorithms`: helper routines (active-set initialization, bmv partial port).
 //! - `solver`       : high-level LBFGS-B driver (uses the above modules).
 //!
 //! The crate re-exports `LBFGSB` from `solver` and provides the `Status` and
@@ -45,9 +43,7 @@ use std::f64;
 
 mod blas;
 mod linesearch;
-pub mod linpack;
 pub mod solver;
-pub mod subalgorithms;
 
 pub use crate::blas::*;
 pub use crate::linesearch::*;

@@ -436,7 +436,16 @@ class CMEModel:
         quadrature method to use.
         if 'fixed_quad', use Gaussian quadrature via scipy.integrate.fixed_quad.
         if 'quad_vec', use adaptive integration via scipy.integrate.quad_vec.
-    prot
+    protein_limit: float
+        ProteinBursty only: protein counts above this are coarse-grained.
+    fit_unspliced: bool
+        ProteinBursty only: whether the unspliced layer is part of the fit.
+    min_fudge, max_fudge: float
+        Custom networks only: the fixed integration step is min_fudge times
+        the fastest time scale and the horizon max_fudge times the slowest.
+        (The protein model chooses its steps by error control and ignores them.)
+    network: ReactionNetwork or None
+        the user-defined network for bio_model="Custom".
     """
     def __init__(
         self,

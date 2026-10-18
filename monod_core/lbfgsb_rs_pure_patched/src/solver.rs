@@ -13,15 +13,14 @@
 //!
 //! This is exact for the quadratic model and costs O(n³) per iteration, which
 //! is negligible for the problems this crate serves (a handful of parameters,
-//! objectives that cost milliseconds to seconds).  The compact-form helpers in
-//! `subalgorithms` are still maintained each iteration (`matupd`, `formt_ref`)
-//! but no longer drive the direction.
+//! objectives that cost milliseconds to seconds).  The solver keeps only the
+//! (s, y) correction pairs; the compact-representation matrices of the
+//! reference implementation are not maintained.
 //!
 //! Set the `verbose` flag for a per-iteration trace on stderr.
 
 use crate::blas;
 use crate::linesearch;
-use crate::subalgorithms;
 use std::f64;
 
 /// Information passed to iteration callbacks.
@@ -44,7 +43,7 @@ pub enum IterationControl {
     StopCustom,
 }
 
-/// Compact L-BFGS-B solver with full Cauchy + subspace minimization.
+/// L-BFGS-B solver: generalized Cauchy point plus dense subspace minimisation.
 pub struct LBFGSB {
     /// maximum number of corrections to keep (m)
     m: usize,
@@ -61,38 +60,6 @@ pub struct LBFGSB {
     y: Vec<Vec<f64>>,
     rho: Vec<f64>,
 
-    // ── Compact column-major matrices (reference pipeline) ──────────────────
-    /// WS: n×m column-major storage for S vectors
-    ws: Vec<f64>,
-    /// WY: n×m column-major storage for Y vectors
-    wy: Vec<f64>,
-    /// SY: m×m column-major  S'Y
-    sy: Vec<f64>,
-    /// SS: m×m column-major  S'S
-    ss: Vec<f64>,
-    /// WT: m×m Cholesky factor, updated by formt_ref after each matupd.
-    ///     Required by bmv (inside cauchy) for the W*M*W' products.
-    wt: Vec<f64>,
-
-    // ── Cauchy workspace (all n-sized) ──────────────────────────────────────
-    xcp: Vec<f64>,       // Cauchy point
-    d_ws: Vec<f64>,      // direction scratch used inside cauchy
-    t_ws: Vec<f64>,      // breakpoint times
-    iorder_ws: Vec<i32>, // breakpoint ordering
-
-    // ── Cauchy workspace (2m-sized) ─────────────────────────────────────────
-    /// c = W'(xcp - x), built by cauchy; used for the bmv RHS correction
-    c_ws: Vec<f64>,
-    p_ws: Vec<f64>,   // scratch inside cauchy
-    wbp_ws: Vec<f64>, // scratch inside cauchy
-    v_ws: Vec<f64>,   // scratch inside cauchy
-
-    // ── Algorithm state ─────────────────────────────────────────────────────
-    head: usize,
-    itail: usize,
-    iupdat: usize,
-    col: usize,
-    theta: f64,
 }
 
 impl LBFGSB {
@@ -107,24 +74,6 @@ impl LBFGSB {
             s: Vec::new(),
             y: Vec::new(),
             rho: Vec::new(),
-            ws: Vec::new(),
-            wy: Vec::new(),
-            sy: Vec::new(),
-            ss: Vec::new(),
-            wt: Vec::new(),
-            xcp: Vec::new(),
-            d_ws: Vec::new(),
-            t_ws: Vec::new(),
-            iorder_ws: Vec::new(),
-            c_ws: Vec::new(),
-            p_ws: Vec::new(),
-            wbp_ws: Vec::new(),
-            v_ws: Vec::new(),
-            head: 0,
-            itail: 0,
-            iupdat: 0,
-            col: 0,
-            theta: 1.0,
         }
     }
 
@@ -192,21 +141,6 @@ impl LBFGSB {
             x[i] = x[i].max(lower[i]).min(upper[i]);
         }
 
-        // nbd flags: 0=unbounded, 1=lower only, 2=both, 3=upper only
-        let mut nbd = vec![0i32; n];
-        for i in 0..n {
-            let lo_inf = lower[i].is_infinite() && lower[i].is_sign_negative();
-            let hi_inf = upper[i].is_infinite() && upper[i].is_sign_positive();
-            nbd[i] = if lo_inf && hi_inf { 0 }
-                     else if !lo_inf && hi_inf { 1 }
-                     else if lo_inf && !hi_inf { 3 }
-                     else { 2 };
-        }
-
-        // iwhere tracks bound status of each variable (updated by cauchy each iter).
-        let mut iwhere = vec![0_i32; n];
-        subalgorithms::cmprlb(x, lower, upper, &nbd, &mut iwhere)
-            .map_err(|_| "cmprlb failed")?;
 
         // Evaluation counter (shared with line-search wrapper).
         let eval_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
@@ -221,31 +155,12 @@ impl LBFGSB {
             return Err("gradient length mismatch");
         }
 
-        // Lazy workspace allocation — keyed on n (problem dimension).
-        if self.ws.len() != n * self.m {
-            self.ws       = vec![0.0; n * self.m];
-            self.wy       = vec![0.0; n * self.m];
-            self.sy       = vec![0.0; self.m * self.m];
-            self.ss       = vec![0.0; self.m * self.m];
-            self.wt       = vec![0.0; self.m * self.m];
-            self.xcp      = vec![0.0; n];
-            self.d_ws     = vec![0.0; n];
-            self.t_ws     = vec![0.0; n];
-            self.iorder_ws= vec![0i32; n];
-            self.c_ws     = vec![0.0; 2 * self.m];
-            self.p_ws     = vec![0.0; 2 * self.m];
-            self.wbp_ws   = vec![0.0; 2 * self.m];
-            self.v_ws     = vec![0.0; 2 * self.m];
-            self.head  = 0;
-            self.itail = 0;
-            self.iupdat= 0;
-            self.col   = 0;
-            self.theta = 1.0;
-        }
+        // Every call is a fresh problem: start with empty curvature memory.
+        self.s.clear();
+        self.y.clear();
+        self.rho.clear();
 
-        let mut pg_norm =
-            subalgorithms::projgr(x, lower, upper, &nbd, &grad)
-                .map_err(|_| "projgr failed")?;
+        let mut pg_norm = proj_grad_norm(x, lower, upper, &grad);
 
         if self.verbose {
             eprintln!("iter=0 f={:.6e} ||proj_grad||_inf={:.3e}", f, pg_norm);
@@ -260,9 +175,7 @@ impl LBFGSB {
 
         for iter in 1..=self.max_iter {
             // ── Direction computation ──────────────────────────────────────────
-            let d = self.compute_direction(
-                n, x, lower, upper, &nbd, &grad, &mut iwhere, pg_norm,
-            );
+            let d = self.compute_direction(n, x, lower, upper, &grad);
 
             // ── Descent check; fallback to projected gradient if needed ────────
             let mut d = d;
@@ -294,27 +207,11 @@ impl LBFGSB {
                     let s_vec = sub_vecs(&x_new, x);
                     let y_vec = sub_vecs(&g_new, &g_old);
                     let sty = blas::ddot(&s_vec, &y_vec);
-                    let yy  = blas::ddot(&y_vec, &y_vec);
                     // Match scipy Fortran: skip if s'y <= eps * |g0'd| * stp
                     // i.e., sty <= eps * (-gdold * stp_accepted)
                     let ddum = (-gdold * stp_accepted).max(0.0);
                     if sty > f64::EPSILON * ddum {
                         self.push_correction(&s_vec, &y_vec);
-                        self.iupdat += 1;
-                        let _ = subalgorithms::matupd(
-                            n, self.m,
-                            &mut self.ws, &mut self.wy, &mut self.sy, &mut self.ss,
-                            &s_vec, &y_vec,
-                            &mut self.itail, self.iupdat,
-                            &mut self.col, &mut self.head, &mut self.theta,
-                            yy, sty, 1.0, blas::ddot(&s_vec, &s_vec),
-                        );
-                        // Update WT (Cholesky of theta*S'S + L*D^{-1}*L') so that
-                        // cauchy's bmv calls are correct next iteration.
-                        let _ = subalgorithms::formt_ref(
-                            self.m, &mut self.wt, &self.sy, &self.ss,
-                            self.col, self.theta,
-                        );
                     } else {
                         nskip = nskip.saturating_add(1);
                     }
@@ -325,19 +222,10 @@ impl LBFGSB {
                 Err(_) => {
                     // Match Fortran mainlb: if memory is non-empty, reset and restart.
                     // If memory is empty (col==0), the step itself failed — return error.
-                    if self.col > 0 {
-                        self.col = 0;
-                        self.head = 0;
-                        self.iupdat = 0;
-                        self.theta = 1.0;
+                    if !self.s.is_empty() {
                         self.s.clear();
                         self.y.clear();
                         self.rho.clear();
-                        for v in self.ws.iter_mut() { *v = 0.0; }
-                        for v in self.wy.iter_mut() { *v = 0.0; }
-                        for v in self.sy.iter_mut() { *v = 0.0; }
-                        for v in self.ss.iter_mut() { *v = 0.0; }
-                        for v in self.wt.iter_mut() { *v = 0.0; }
                         continue;
                     } else {
                         return Ok(crate::Solution { x: x.to_vec(), f,
@@ -360,12 +248,11 @@ impl LBFGSB {
             }
 
             // ── Convergence check ─────────────────────────────────────────────
-            pg_norm = subalgorithms::projgr(x, lower, upper, &nbd, &grad)
-                .map_err(|_| "projgr failed")?;
+            pg_norm = proj_grad_norm(x, lower, upper, &grad);
 
             if self.verbose {
                 eprintln!("{:5} {:5} {:5} {:5} {:5} {:12.5e} {:12.5e}",
-                          n, iter, eval_count.get(), nskip, self.col, pg_norm, f);
+                          n, iter, eval_count.get(), nskip, self.s.len(), pg_norm, f);
             }
 
             let info = IterationInfo {
@@ -402,16 +289,6 @@ impl LBFGSB {
 
     // ── Direction computation ────────────────────────────────────────────────
 
-    /// Compute a descent direction using the full L-BFGS-B algorithm:
-    ///   1. Cauchy point → identifies which variables hit bounds.
-    ///   2. Free-variable set from `iwhere`.
-    ///   3. Reduced gradient at xcp (with W_Z * M * c correction via bmv).
-    ///   4. L-BFGS two-loop restricted to free variables → Newton correction.
-    ///   5. x_bar = project(xcp + correction); d = x_bar - x.
-    ///
-    /// Falls back to projected L-BFGS (no Cauchy) if:
-    ///   - col == 0 (no curvature yet), or
-    ///   - cauchy computation fails.
     /// Search direction d = x̄ - x, where x̄ is the L-BFGS-B subspace minimiser
     /// (generalized Cauchy point, then the quadratic model minimised over the
     /// free variables and truncated to the box).
@@ -428,10 +305,7 @@ impl LBFGSB {
         x: &[f64],
         lower: &[f64],
         upper: &[f64],
-        _nbd: &[i32],
         grad: &[f64],
-        _iwhere: &mut [i32],
-        _pg_norm: f64,
     ) -> Vec<f64> {
         if self.s.is_empty() {
             return projected_neg_grad(x, lower, upper, grad, n);
@@ -545,6 +419,22 @@ fn projected_neg_grad(x: &[f64], lower: &[f64], upper: &[f64], grad: &[f64], n: 
             -grad[i]
         }
     }).collect()
+}
+
+/// Infinity norm of the projected gradient (Fortran `projgr`): a component
+/// pointing into a bound is replaced by the distance to that bound.
+fn proj_grad_norm(x: &[f64], lower: &[f64], upper: &[f64], grad: &[f64]) -> f64 {
+    let mut norm = 0.0_f64;
+    for i in 0..x.len() {
+        let mut gi = grad[i];
+        if gi < 0.0 {
+            if upper[i].is_finite() { gi = (x[i] - upper[i]).max(gi); }
+        } else if lower[i].is_finite() {
+            gi = (x[i] - lower[i]).min(gi);
+        }
+        norm = norm.max(gi.abs());
+    }
+    norm
 }
 
 /// Element-wise a - b.
