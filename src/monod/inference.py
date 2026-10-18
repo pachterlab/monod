@@ -5,11 +5,27 @@ import numpy as np
 import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
-from .extract_data import make_dir, log, extract_data, make_histogram, _uns_unpack, _build_sampling_grid, model_from_uns
-from .cme_toolbox import CMEModel, _HAS_RUST  # may be unnecessary
+from .extract_data import make_dir, log, extract_data, make_histogram, _uns_unpack, _build_sampling_grid, model_from_uns, to_dense
+from .cme_toolbox import CMEModel, _HAS_RUST, _MODELS_2D
 from ._core import _mc          # None when the compiled extension is not installed
 
-_LBFGSB_RUST_MODELS_2D = {"Constitutive", "Bursty", "CIR", "Extrinsic", "Delay", "DelayedSplicing"}
+
+#: Default settings for the per-gene fits.  Keys:
+#:   max_iterations   maximum L-BFGS-B iterations per start
+#:   init_pattern     "moments" starts the first attempt at the method-of-moments estimate
+#:   num_restarts     number of starts per gene; later starts are drawn uniformly in the restart box
+#:   num_gene_cores   gene-level parallelism per grid point (-1 = all cores)
+#:   n_jac_jobs       joblib parallelism over finite-difference perturbations (Python path)
+#: Optional keys: use_rust_lbfgsb (run the whole fit in Rust), use_batch_optimizer
+#: (batched Adam), presearch / presearch_maxiter (derivative-free pre-search, on by
+#: default for ProteinBursty).
+DEFAULT_GRADIENT_PARAMS = {
+    "max_iterations": 10,
+    "init_pattern": "moments",
+    "num_restarts": 3,
+    "num_gene_cores": 1,
+    "n_jac_jobs": 1,
+}
 
 import multiprocessing
 import os
@@ -57,13 +73,7 @@ def perform_inference(h5ad_filepath,
     '''
     
     if gradient_params is None:
-        gradient_params = {
-            "max_iterations": 10,
-            "init_pattern": "moments",
-            "num_restarts": 3,
-            "num_gene_cores": 1,
-            "n_jac_jobs": 1,
-        }
+        gradient_params = dict(DEFAULT_GRADIENT_PARAMS)
     if genes_to_fit is None:
         genes_to_fit = []
     if mek_means_params:
@@ -342,9 +352,8 @@ def searchdata_from_adata(adata):
 
     if _mc is not None:
         # Build the pure-Rust SearchData container.
-        from scipy.sparse import issparse as _issparse
         def _to_c_int64(arr):
-            a = arr.toarray() if _issparse(arr) else np.asarray(arr)
+            a = to_dense(arr)
             return np.ascontiguousarray(a, dtype=np.int64)
         rust_layers = [_to_c_int64(adata.layers[ln]) for ln in ordered_layer_names]
         coords_list, freqs_list = _mc.make_state_dist(rust_layers)
@@ -672,13 +681,7 @@ class InferenceParameters:
     Attributes
     ----------
     gradient_params: dict
-        settings for gradient descent.
-        "max_iterations" defines the maximum number of gradient descent iterations.
-        "init_pattern" defines whether the first try starts at the method of moments estimate.
-        "num_restarts" defines how many attempts should be made.
-        "presearch" selects a derivative-free search run from the first starting point before
-            gradient descent: "auto" (default; Nelder-Mead for ProteinBursty, nothing otherwise),
-            "nelder-mead", or None. "presearch_maxiter" caps its iterations (default 300).
+        settings for the per-gene fits; see ``DEFAULT_GRADIENT_PARAMS`` for the keys.
     phys_lb: float np.ndarray
         log10 lower bounds on biological parameters.
     phys_ub: float np.ndarray
@@ -724,13 +727,7 @@ class InferenceParameters:
         dataset_string,
         model,
         use_lengths="auto",
-        gradient_params={
-            "max_iterations": 10,
-            "init_pattern": "moments",
-            "num_restarts": 3,
-            "num_gene_cores": 1,
-            "n_jac_jobs": 1,
-        },
+        gradient_params=None,
         run_meta="",
         phys_lb=None,
         phys_ub=None,
@@ -767,7 +764,7 @@ class InferenceParameters:
             Any non-None value with a non-Poisson sequencing model raises.
             Legacy bool values are accepted: True → "unspliced", False → None.
         gradient_params: dict, optional
-            settings for gradient descent.
+            settings for the per-gene fits; missing keys take ``DEFAULT_GRADIENT_PARAMS``.
             "max_iterations" defines the maximum number of gradient descent iterations.
             "init_pattern" defines whether the first try starts at the method of moments estimate.
             "num_restarts" defines how many attempts should be made.
@@ -794,14 +791,7 @@ class InferenceParameters:
         if gridsize is None:
             gridsize = model.seq_bounds['gridsize']
         
-        _gp_defaults = {
-            "max_iterations": 10,
-            "init_pattern": "moments",
-            "num_restarts": 3,
-            "num_gene_cores": 1,
-            "n_jac_jobs": 1,
-        }
-        self.gradient_params = {**_gp_defaults, **gradient_params}
+        self.gradient_params = {**DEFAULT_GRADIENT_PARAMS, **(gradient_params or {})}
         self.use_lengths, self.use_lengths_explicit = _normalize_use_lengths(use_lengths, model)
         if model.seq_model == "None":
             samp_lb, samp_ub, gridsize = [0, 0], [0, 0], [1, 1]
@@ -1118,13 +1108,7 @@ class GradientInference:
     grad_bnd: scipy.optimize.Bounds
         log10 lower and upper bounds on biological parameters.
     gradient_params: dict
-        settings for gradient descent.
-        "max_iterations" defines the maximum number of gradient descent iterations.
-        "init_pattern" defines whether the first try starts at the method of moments estimate.
-        "num_restarts" defines how many attempts should be made.
-        "presearch" selects a derivative-free search run from the first starting point before
-            gradient descent: "auto" (default; Nelder-Mead for ProteinBursty, nothing otherwise),
-            "nelder-mead", or None. "presearch_maxiter" caps its iterations (default 300).
+        settings for the per-gene fits; see ``DEFAULT_GRADIENT_PARAMS`` for the keys.
     phys_lb: float np.ndarray
         log10 lower bounds on biological parameters.
     phys_ub: float np.ndarray
@@ -1166,7 +1150,7 @@ class GradientInference:
         grad_bnd: scipy.optimize.Bounds
             log10 lower and upper bounds on biological parameters.
         gradient_params: dict
-            settings for gradient descent.
+            settings for the per-gene fits; missing keys take ``DEFAULT_GRADIENT_PARAMS``.
             "max_iterations" defines the maximum number of gradient descent iterations.
             "init_pattern" defines whether the first try starts at the method of moments estimate.
             "num_restarts" defines how many attempts should be made.
@@ -1432,6 +1416,96 @@ class GradientInference:
             log.debug("Nelder-Mead pre-search refined %d starting points", n_genes)
         return out
 
+    def _rust_optimizer_family(self, model, search_data):
+        """Kernel family of the Rust optimizer that applies, or None.
+
+        Requires the compiled extension, a Rust ``SearchData``, the opt-in flag
+        ``gradient_params["use_rust_lbfgsb"]`` and no batch optimizer; the
+        family itself comes from ``CMEModel._kernel_family``.
+        """
+        if (
+            _mc is None
+            or not self.gradient_params.get("use_rust_lbfgsb", False)
+            or self.gradient_params.get("use_batch_optimizer", False)
+            or not isinstance(search_data, _mc.SearchData)
+        ):
+            return None
+        family = model._kernel_family()
+        if family == "custom" and len(model.network.species) not in (2, 3):
+            return None
+        return family
+
+    def _optimize_genes_rust(self, family, model, search_data, x0_all, n_gene_cores):
+        """Fit every gene with the Rust L-BFGS-B kernel of ``family``.
+
+        Returns (param_estimates, klds) as arrays.  All families share the
+        solver settings; they differ only in how the model is described.
+        """
+        n_genes = search_data.n_genes
+        common = dict(
+            x0_list=x0_all,
+            lb=self.phys_lb.tolist(),
+            ub=self.phys_ub.tolist(),
+            fd_eps=1e-6,
+            maxiter=self.gradient_params["max_iterations"],
+            ftol=2.22e-9,
+            gtol=1e-5,
+            eps=1e-15,
+            m_lbfgs=10,
+            num_threads=None if n_gene_cores <= 1 else n_gene_cores,
+            return_status=True,
+        )
+        quad = dict(fixed_quad_t=float(model.fixed_quad_T), quad_order=int(model.quad_order))
+        if family == "2d":
+            _ul = self.use_lengths if model.seq_model == "Poisson" else None
+            use_unsp = _ul in ("unspliced", "both")
+            use_spl = _ul in ("spliced", "both")
+            if model.seq_model in ("Poisson", "Bernoulli"):
+                base_samp = list(self.grid_point) if (use_unsp or use_spl) else self.regressor[0].tolist()
+            else:
+                base_samp = None
+            name = "optimize_genes_2d_sd"
+            out = _mc.optimize_genes_2d_sd(
+                search_data, bio_model=model.bio_model, seq_model=model.seq_model,
+                base_samp=base_samp, use_lengths_unspliced=use_unsp, use_lengths_spliced=use_spl,
+                **quad, **common,
+            )
+        elif family == "amb":
+            samp_list = None
+            if model.seq_model == "Poisson":
+                samp_list = [self.regressor[gi].tolist() for gi in range(n_genes)]
+            name = "optimize_genes_2d_amb_sd"
+            out = _mc.optimize_genes_2d_amb_sd(
+                search_data, bio_model=model.bio_model, amb_model=model.amb_model,
+                samp_list=samp_list, **quad, **common,
+            )
+        elif family == "protein":
+            name = "optimize_genes_protein_bursty_sd"
+            out = _mc.optimize_genes_protein_bursty_sd(
+                search_data, fit_unspliced=bool(model.fit_unspliced),
+                protein_limit=float(model.protein_limit),
+                min_fudge=float(model.min_fudge), max_fudge=float(model.max_fudge),
+                **common,
+            )
+        elif family == "custom":
+            net = model.network
+            topo = net.rust_topology()
+            name = "optimize_genes_custom_sd"
+            out = _mc.optimize_genes_custom_sd(
+                search_data, n_species=len(net.species),
+                rxn_kinds=topo["rxn_kinds"], rxn_rate_idxs=topo["rxn_rate_idxs"],
+                rxn_extra1=topo["rxn_extra1"], rxn_extra2=topo["rxn_extra2"],
+                prod_sp=topo["prod_sp"], prod_st=topo["prod_st"], prod_off=topo["prod_off"],
+                has_norm_rate=(net._norm_rate is not None),
+                min_fudge=float(model.min_fudge), max_fudge=float(model.max_fudge),
+                **common,
+            )
+        else:
+            raise ValueError(f"unknown Rust optimizer family {family!r}")
+        params_arr, klds_arr, status_arr = out
+        _warn_optimizer_status(status_arr, name)
+        return np.asarray(params_arr), np.asarray(klds_arr)
+
     def iterate_over_genes(self, model, search_data):
         """Run gradient descent for every gene at the current grid point.
 
@@ -1458,48 +1532,10 @@ class GradientInference:
         n_gene_cores = self.gradient_params.get("num_gene_cores", 1)
         use_batch = self.gradient_params.get("use_batch_optimizer", False)
 
-        # --- Rust L-BFGS-B fast paths: run the full optimization loop in Rust
-        # with rayon parallelism over genes. No Python callbacks, no GIL round-trips.
-        # Opt-in: set gradient_params["use_rust_lbfgsb"] = True to enable.
-        _use_rust_opt = (
-            _mc is not None
-            and self.gradient_params.get("use_rust_lbfgsb", False)
-            and not use_batch
-        )
-        _sd_is_rust = _mc is not None and isinstance(search_data, _mc.SearchData)
-
-        use_rust_lbfgsb = (
-            _use_rust_opt
-            and model.bio_model in _LBFGSB_RUST_MODELS_2D
-            and model.seq_model in ("None", "Poisson", "Bernoulli")
-            and model.amb_model == "None"
-            and model.quad_method == "fixed_quad"
-        )
-        use_rust_protein_bursty = (
-            _use_rust_opt
-            and _sd_is_rust
-            and model.bio_model == "ProteinBursty"
-            and model.seq_model == "None"
-            and model.amb_model == "None"
-        )
-        use_rust_amb = (
-            _use_rust_opt
-            and _sd_is_rust
-            and model.bio_model in _LBFGSB_RUST_MODELS_2D
-            and model.seq_model in ("None", "Poisson")
-            and model.amb_model in ("Equal", "Unequal")
-            and model.quad_method == "fixed_quad"
-        )
-        use_rust_custom = (
-            _use_rust_opt
-            and _sd_is_rust
-            and model.bio_model == "Custom"
-            and model.seq_model == "None"
-            and model.amb_model == "None"
-            and len(model.network.species) in (2, 3)
-        )
-
-        _rust_opt_active = use_rust_lbfgsb or use_rust_protein_bursty or use_rust_amb or use_rust_custom
+        # Rust L-BFGS-B: the whole fit runs in Rust with rayon parallelism over
+        # genes.  Opt-in via gradient_params["use_rust_lbfgsb"] = True.
+        rust_family = self._rust_optimizer_family(model, search_data)
+        _rust_opt_active = rust_family is not None
 
         def _build_x0_all(n_genes, n_restarts):
             x0_all = []
@@ -1525,172 +1561,10 @@ class GradientInference:
         x0_all_shared = _build_x0_all(search_data.n_genes, self.gradient_params["num_restarts"])
         x0_all_shared = self._presearch_x0(model, search_data, x0_all_shared, n_gene_cores)
 
-        if use_rust_lbfgsb:
-            num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
-            n_genes = search_data.n_genes
-            x0_all = x0_all_shared
-
-            _base_kwargs = dict(
-                bio_model=model.bio_model,
-                x0_list=x0_all,
-                lb=self.phys_lb.tolist(),
-                ub=self.phys_ub.tolist(),
-                fixed_quad_t=float(model.fixed_quad_T),
-                quad_order=int(model.quad_order),
-                fd_eps=1e-6,
-                maxiter=self.gradient_params["max_iterations"],
-                ftol=2.22e-9,
-                gtol=1e-5,
-                eps=1e-15,
-                m_lbfgs=10,
-                num_threads=num_threads,
-                seq_model=model.seq_model,
+        if rust_family is not None:
+            param_estimates, klds = self._optimize_genes_rust(
+                rust_family, model, search_data, x0_all_shared, n_gene_cores
             )
-
-            if _sd_is_rust:
-                # Zero round-trip path: Rust reads coords/freqs/limits from SearchData
-                # and computes per-gene samp inside the rayon loop — no Python marshal.
-                _ul = self.use_lengths if model.seq_model == "Poisson" else None
-                use_lengths_unsp = _ul in ("unspliced", "both")
-                use_lengths_spl  = _ul in ("spliced", "both")
-                use_lengths_any  = use_lengths_unsp or use_lengths_spl
-                if model.seq_model in ("Poisson", "Bernoulli"):
-                    # When using gene lengths, pass raw grid_point so Rust adds per-gene
-                    # log-lengths. Otherwise pass regressor[0] (same for all genes).
-                    base_samp = list(self.grid_point) if use_lengths_any else self.regressor[0].tolist()
-                else:
-                    base_samp = None
-                params_arr, klds_arr, status_arr = _mc.optimize_genes_2d_sd(
-                    search_data,
-                    return_status=True,
-                    base_samp=base_samp,
-                    use_lengths_unspliced=use_lengths_unsp,
-                    use_lengths_spliced=use_lengths_spl,
-                    **_base_kwargs,
-                )
-                _warn_optimizer_status(status_arr, 'optimize_genes_2d_sd')
-            else:
-                # Python SearchData fallback: build per-gene samp_list, unpack hist.
-                samp_list = None
-                if model.seq_model in ("Poisson", "Bernoulli"):
-                    samp_list = [
-                        (self.regressor[gi].tolist() if self.regressor[gi] is not None else None)
-                        for gi in range(n_genes)
-                    ]
-                u_idx_list, s_idx_list, f_list, limits_list = [], [], [], []
-                for gi in range(n_genes):
-                    x_data, f_data = search_data.hist[gi]
-                    x_np = np.asarray(x_data, dtype=np.int64)
-                    u_idx_list.append(x_np[:, 0].tolist())
-                    s_idx_list.append(x_np[:, 1].tolist())
-                    f_list.append(np.asarray(f_data).tolist())
-                    limits_list.append([int(v) for v in search_data.M[:, gi]])
-                params_arr, klds_arr = _mc.optimize_genes_2d(
-                    limits_list=limits_list,
-                    u_idx_list=u_idx_list,
-                    s_idx_list=s_idx_list,
-                    f_list=f_list,
-                    samp_list=samp_list,
-                    **_base_kwargs,
-                )
-            param_estimates = np.asarray(params_arr)
-            klds = np.asarray(klds_arr)
-
-        elif use_rust_protein_bursty:
-            num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
-            n_genes = search_data.n_genes
-            x0_all = x0_all_shared
-            params_arr, klds_arr, status_arr = _mc.optimize_genes_protein_bursty_sd(
-                search_data,
-                return_status=True,
-                x0_list=x0_all,
-                lb=self.phys_lb.tolist(),
-                ub=self.phys_ub.tolist(),
-                fit_unspliced=bool(model.fit_unspliced),
-                protein_limit=float(model.protein_limit),
-                min_fudge=float(model.min_fudge),
-                max_fudge=float(model.max_fudge),
-                fd_eps=1e-6,
-                maxiter=self.gradient_params["max_iterations"],
-                ftol=2.22e-9,
-                gtol=1e-5,
-                eps=1e-15,
-                m_lbfgs=10,
-                num_threads=num_threads,
-            )
-            _warn_optimizer_status(status_arr, 'optimize_genes_protein_bursty_sd')
-            param_estimates = np.asarray(params_arr)
-            klds = np.asarray(klds_arr)
-
-        elif use_rust_amb:
-            num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
-            n_genes = search_data.n_genes
-            x0_all = x0_all_shared
-            samp_list = None
-            if model.seq_model == "Poisson":
-                samp_list = [
-                    (self.regressor[gi].tolist() if self.regressor[gi] is not None else None)
-                    for gi in range(n_genes)
-                ]
-            params_arr, klds_arr, status_arr = _mc.optimize_genes_2d_amb_sd(
-                search_data,
-                return_status=True,
-                bio_model=model.bio_model,
-                amb_model=model.amb_model,
-                x0_list=x0_all,
-                lb=self.phys_lb.tolist(),
-                ub=self.phys_ub.tolist(),
-                fixed_quad_t=float(model.fixed_quad_T),
-                quad_order=int(model.quad_order),
-                fd_eps=1e-6,
-                maxiter=self.gradient_params["max_iterations"],
-                ftol=2.22e-9,
-                gtol=1e-5,
-                samp_list=samp_list,
-                eps=1e-15,
-                m_lbfgs=10,
-                num_threads=num_threads,
-            )
-            _warn_optimizer_status(status_arr, 'optimize_genes_2d_amb_sd')
-            param_estimates = np.asarray(params_arr)
-            klds = np.asarray(klds_arr)
-
-        elif use_rust_custom:
-            num_threads = None if n_gene_cores <= 0 else (n_gene_cores if n_gene_cores != 1 else None)
-            n_genes = search_data.n_genes
-            x0_all = x0_all_shared
-            # Serialise the network topology (constant across all L-BFGS-B evaluations).
-            net = model.network
-            topo = net.rust_topology()
-            params_arr, klds_arr, status_arr = _mc.optimize_genes_custom_sd(
-                search_data,
-                return_status=True,
-                x0_list=x0_all,
-                lb=self.phys_lb.tolist(),
-                ub=self.phys_ub.tolist(),
-                n_species=len(net.species),
-                rxn_kinds=topo["rxn_kinds"],
-                rxn_rate_idxs=topo["rxn_rate_idxs"],
-                rxn_extra1=topo["rxn_extra1"],
-                rxn_extra2=topo["rxn_extra2"],
-                prod_sp=topo["prod_sp"],
-                prod_st=topo["prod_st"],
-                prod_off=topo["prod_off"],
-                has_norm_rate=(net._norm_rate is not None),
-                min_fudge=float(model.min_fudge),
-                max_fudge=float(model.max_fudge),
-                fd_eps=1e-6,
-                maxiter=self.gradient_params["max_iterations"],
-                ftol=2.22e-9,
-                gtol=1e-5,
-                eps=1e-15,
-                m_lbfgs=10,
-                num_threads=num_threads,
-            )
-            _warn_optimizer_status(status_arr, 'optimize_genes_custom_sd')
-            param_estimates = np.asarray(params_arr)
-            klds = np.asarray(klds_arr)
-
         elif n_gene_cores != 1:
             num_threads = None if n_gene_cores < 0 else n_gene_cores
             if use_batch and _HAS_RUST:
@@ -2834,6 +2708,14 @@ class SearchResults:
         )
         return (csq, pval, hellinger)
 
+    def _search_data_for(self, search_data):
+        """The search data these results describe.
+
+        Subclasses whose fit covers a subset of the cells (meK-Means clusters)
+        override this; every method that takes ``search_data`` calls it first.
+        """
+        return search_data
+
     def par_fun_hess(self, inputs):
         """Helper method for the Hessian parallelization procedure.
 
@@ -2855,6 +2737,8 @@ class SearchResults:
         import numdifftools  # this will fail if numdifftools has not been evaluted.
 
         gene_index, search_data = inputs
+
+        search_data = self._search_data_for(search_data)
         Hfun = numdifftools.Hessian(
             lambda x: self.model.eval_model_kld(
                 p=x,
@@ -3086,6 +2970,7 @@ class SearchResults:
         overwrite: bool, optional
             whether to retain the optimum obtained at the end of the procedure.
         """
+        search_data = self._search_data_for(search_data)
         if viz:
             fig1, ax1 = plt.subplots(nrows=szfig[0], ncols=szfig[1], figsize=figsize)
         log.info(
@@ -3309,6 +3194,7 @@ class SearchResults:
         savefig: bool, optional
             whether to save the figure to disk.
         """
+        search_data = self._search_data_for(search_data)
 
         if logscale is None:
             if marg == "joint" or type(marg)==tuple:
@@ -3428,10 +3314,7 @@ class SearchResults:
         Output:
         logL: a vector of size n_genes containing model log-likelihoods.
         """
-        _LOGL_RUST_MODELS = {
-            "Constitutive", "Bursty", "CIR",
-            "Extrinsic", "Delay", "DelayedSplicing",
-        }
+        search_data = self._search_data_for(search_data)
         if n_cells is None:
             n_cells = search_data.n_cells
         model = self.model
@@ -3439,10 +3322,7 @@ class SearchResults:
             _HAS_RUST
             and offs == 0
             and isinstance(search_data, _mc.SearchData)
-            and model.bio_model in _LOGL_RUST_MODELS
-            and model.amb_model == "None"
-            and model.quad_method == "fixed_quad"
-            and (model.seq_model == "None" or model.seq_model in ("Poisson", "Bernoulli"))
+            and model._kernel_family() == "2d"
         ):
             phys_optimum = [p.tolist() for p in self.phys_optimum]
             if model.seq_model == "None":

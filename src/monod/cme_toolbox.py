@@ -3,6 +3,7 @@ This script provides convenience functions for evaluating RNA distributions.
 """
 
 import logging
+import collections as _collections
 import numpy as np
 from numba import jit
 import scipy
@@ -140,133 +141,15 @@ def _gpu_build_mesh_2d(l0, l1, device):
     return g0, g1
 
 
-def _gpu_pgf_bursty(g0, g1, b, beta, gamma, T, quad_order):
-    """Vectorised Bursty log-PGF on GPU (broadcast grid × quadrature)."""
-    from numpy.polynomial.legendre import leggauss
-    device = g0.device
-    xi_np, wi_np = leggauss(quad_order)
-    xi = _torch.tensor(xi_np, dtype=_torch.float64, device=device)
-    wi = _torch.tensor(wi_np, dtype=_torch.float64, device=device)
-    t_half = T / 2.0
-    x = t_half + t_half * xi                             # [Q]
-    close = bool(np.isclose(beta, gamma))
-    eb = _torch.exp(-beta * x).unsqueeze(0)              # [1, Q]
-    eg = _torch.exp(-gamma * x).unsqueeze(0)             # [1, Q]
-    g0_ = g0.unsqueeze(1)                                # [N, 1]
-    g1_ = g1.unsqueeze(1)                                # [N, 1]
-    if close:
-        x_ = x.unsqueeze(0)
-        u = b * (g0_ * eb + g1_ * (beta * x_ * eg))
-    else:
-        f = beta / (beta - gamma)
-        c2 = g1_ * f
-        c1 = g0_ - c2
-        u = b * (c1 * eb + c2 * eg)
-    integrand = u / (1.0 - u)                            # [N, Q]
-    return (integrand * (wi * t_half)).sum(dim=1)         # [N]
-
-
-def _gpu_pgf_cir(g0, g1, b, beta, gamma, T, quad_order):
-    """Vectorised CIR log-PGF on GPU (broadcast grid × quadrature)."""
-    from numpy.polynomial.legendre import leggauss
-    device = g0.device
-    xi_np, wi_np = leggauss(quad_order)
-    xi = _torch.tensor(xi_np, dtype=_torch.float64, device=device)
-    wi = _torch.tensor(wi_np, dtype=_torch.float64, device=device)
-    t_half = T / 2.0
-    x = t_half + t_half * xi                             # [Q]
-    close = bool(np.isclose(beta, gamma))
-    eb = _torch.exp(-beta * x).unsqueeze(0)              # [1, Q]
-    eg = _torch.exp(-gamma * x).unsqueeze(0)             # [1, Q]
-    g0_ = g0.unsqueeze(1)                                # [N, 1]
-    g1_ = g1.unsqueeze(1)                                # [N, 1]
-    if close:
-        x_ = x.unsqueeze(0)
-        u = b * (g0_ * eb + g1_ * (beta * x_ * eg))
-    else:
-        f = beta / (beta - gamma)
-        c2 = g1_ * f
-        c1 = g0_ - c2
-        u = b * (c1 * eb + c2 * eg)
-    integrand = 1.0 - _torch.sqrt(1.0 - 4.0 * u)        # [N, Q]
-    return (integrand * (wi * t_half)).sum(dim=1) / 2.0  # [N]
-
-
 def _eval_model_pss_gpu(bio_model, p_log, limits, fixed_quad_T, quad_order, device,
                         samp=None, seq_model="None"):
-    """Evaluate 2D PSS on GPU for the six supported bio_models.
+    """Single-gene GPU evaluation: the batched evaluator with one gene.
 
-    p_log is an array of log10 parameters (same convention as Python/Rust).
-    ``samp`` holds log10 sampling parameters, one per modality, and is applied
-    to the generating-function mesh exactly as in the CPU paths: Poisson
-    sampling composes g -> exp(lam*g) - 1, Bernoulli sampling g -> lam*g.
-    Returns a numpy array of shape (l0, l1).
-    """
-    p = 10.0 ** np.asarray(p_log)
-    l0, l1 = int(limits[0]), int(limits[1])
-
-    g0, g1 = _gpu_build_mesh_2d(l0, l1, device)
-
-    if seq_model in ("Poisson", "Bernoulli"):
-        if samp is None:
-            raise ValueError(f"seq_model={seq_model!r} requires samp (log10 sampling parameters).")
-        lam = np.power(10.0, np.asarray(samp, dtype=float).ravel())
-        if lam.size < 2:
-            raise ValueError("samp must hold one sampling parameter per modality (2 for 2-D models).")
-        if seq_model == "Poisson":
-            g0 = _torch.exp(float(lam[0]) * g0) - 1.0
-            g1 = _torch.exp(float(lam[1]) * g1) - 1.0
-        else:
-            g0 = g0 * float(lam[0])
-            g1 = g1 * float(lam[1])
-    elif seq_model != "None":
-        raise ValueError(f"Unknown seq_model for GPU path: {seq_model}")
-
-    if bio_model == "Constitutive":
-        beta, gamma = p[0], p[1]
-        gf = g0 / beta + g1 / gamma
-
-    elif bio_model == "Extrinsic":
-        alpha, beta, gamma = p[0], p[1], p[2]
-        one = _torch.ones(1, dtype=_torch.complex128, device=device)
-        gf = -alpha * _torch.log(one - g0 / beta - g1 / gamma)
-
-    elif bio_model == "Delay":
-        b, beta, tauinv = p[0], p[1], p[2]
-        tau = 1.0 / tauinv
-        one = _torch.ones(1, dtype=_torch.complex128, device=device)
-        exp_bt = float(np.exp(-beta * tau))
-        u = g1 + (g0 - g1) * exp_bt
-        term1 = -_torch.log(one - u * b) / beta
-        ratio = (u * b - one) / (g0 * b - one)
-        term2 = _torch.log(ratio) / (beta * (one - g1 * b))
-        term3 = g1 * b * tau / (one - g1 * b)
-        gf = term1 + term2 + term3
-
-    elif bio_model == "DelayedSplicing":
-        b, tauinv, gamma = p[0], p[1], p[2]
-        tau = 1.0 / tauinv
-        one = _torch.ones(1, dtype=_torch.complex128, device=device)
-        gf = g0 * b * tau / (one - g0 * b) - _torch.log(one - g1 * b) / gamma
-
-    elif bio_model == "Bursty":
-        b, beta, gamma = p[0], p[1], p[2]
-        T = fixed_quad_T * (1.0 / beta + 1.0 / gamma + 1.0)
-        gf = _gpu_pgf_bursty(g0, g1, b, beta, gamma, T, quad_order)
-
-    elif bio_model == "CIR":
-        b, beta, gamma = p[0], p[1], p[2]
-        T = fixed_quad_T * (1.0 / beta + 1.0 / gamma + 1.0)
-        gf = _gpu_pgf_cir(g0, g1, b, beta, gamma, T, quad_order)
-
-    else:
-        raise ValueError(f"Unknown bio_model for GPU path: {bio_model}")
-
-    gf = _torch.exp(gf).reshape(l0, l1 // 2 + 1)
-    pss = _torch.fft.irfftn(gf, s=(l0, l1))
-    pss = pss.abs()
-    pss = pss / pss.sum()
-    return _gpu_to_numpy(pss)
+    Returns a numpy array of shape (l0, l1)."""
+    return _eval_model_pss_gpu_batch(
+        bio_model, [p_log], [limits], fixed_quad_T, quad_order, device,
+        samp_list=None if samp is None else [samp], seq_model=seq_model,
+    )[0]
 
 
 # Memory budget for the batched quadrature tensor [genes, grid, quad] on the GPU.
@@ -396,6 +279,10 @@ def _eval_model_pss_gpu_batch(bio_model, params_list, limits_list, fixed_quad_T,
         for k, i in enumerate(idx):
             out[i] = arr[k]
     return out
+
+
+_MODELS_2D = frozenset({"Constitutive", "Bursty", "CIR", "Extrinsic", "Delay", "DelayedSplicing"})
+_Backend = _collections.namedtuple("_Backend", "kind family samp")
 
 
 class CMEModel:
@@ -787,17 +674,8 @@ class CMEModel:
         logL: float
             log-likelihood.
         """
-        _LOGL_RUST_MODELS = {
-            "Constitutive", "Bursty", "CIR",
-            "Extrinsic", "Delay", "DelayedSplicing",
-        }
-        if (
-            _HAS_RUST
-            and self.bio_model in _LOGL_RUST_MODELS
-            and self.amb_model == "None"
-            and self.quad_method == "fixed_quad"
-            and (samp is None or self.seq_model in ("Poisson", "Bernoulli"))
-        ):
+        be = self._backend(samp)
+        if _HAS_RUST and be.family == "2d":
             x, f = data
             x_np = np.asarray(x, dtype=np.int64)
             return _mc.eval_logl_2d(
@@ -810,7 +688,7 @@ class CMEModel:
                 float(n_cells),
                 float(self.fixed_quad_T),
                 int(self.quad_order),
-                samp.tolist() if samp is not None else None,
+                be.samp,
                 float(EPS),
                 self.seq_model,
             )
@@ -842,19 +720,10 @@ class CMEModel:
         kld: float
             Kullback-Leibler divergence.
         """
-        _KLD_RUST_MODELS = {
-            "Constitutive", "Bursty", "CIR",
-            "Extrinsic", "Delay", "DelayedSplicing",
-        }
         # Rust fast-path: compute PSS and KLD in one call, avoiding the
         # Python round-trip for histogram indexing and log/sum operations.
-        if (
-            _HAS_RUST
-            and self.bio_model in _KLD_RUST_MODELS
-            and self.amb_model == "None"
-            and self.quad_method == "fixed_quad"
-            and (samp is None or self.seq_model in ("Poisson", "Bernoulli"))
-        ):
+        be = self._backend(samp)
+        if _HAS_RUST and be.family == "2d":
             x, f = data
             x_np = np.asarray(x, dtype=np.int64)
             return _mc.eval_kld_2d(
@@ -866,7 +735,7 @@ class CMEModel:
                 np.asarray(f, dtype=float).tolist(),
                 float(self.fixed_quad_T),
                 int(self.quad_order),
-                samp.tolist() if samp is not None else None,
+                be.samp,
                 float(EPS),
                 self.seq_model,
             )
@@ -940,17 +809,8 @@ class CMEModel:
 
         # Rust FD gradient path: evaluates base + all perturbed PSS in parallel
         # (rayon, GIL released), eliminating the Python round-trip per perturbation.
-        _RUST_FD_MODELS = {
-            "Constitutive", "Bursty", "CIR",
-            "Extrinsic", "Delay", "DelayedSplicing",
-        }
-        if (
-            _HAS_RUST
-            and self.bio_model in _RUST_FD_MODELS
-            and self.amb_model == "None"
-            and self.quad_method == "fixed_quad"
-            and (samp is None or self.seq_model == "Poisson")
-        ):
+        be = self._backend(samp)
+        if _HAS_RUST and be.family == "2d" and self.seq_model in ("None", "Poisson"):
             x, f_data = data
             x_np = np.asarray(x, dtype=np.int64)
             kld0, grad_list = _mc.eval_kld_grad_2d(
@@ -963,20 +823,14 @@ class CMEModel:
                 float(self.fixed_quad_T),
                 int(self.quad_order),
                 eps,
-                samp.tolist() if samp is not None else None,
+                be.samp,
                 float(EPS),
             )
             return kld0, np.array(grad_list)
 
         # ProteinBursty: Rust forward FD with the integration schedule frozen at
         # the base point (see monod_core::eval_kld_grad_protein_bursty).
-        if (
-            _HAS_RUST
-            and self.bio_model == "ProteinBursty"
-            and self.seq_model == "None"
-            and self.amb_model == "None"
-            and _samp_is_null(samp)
-        ):
+        if _HAS_RUST and be.family == "protein":
             x, f_data = data
             x_np = np.asarray(x, dtype=np.int64)
             if x_np.ndim == 2 and x_np.shape[1] == 3:
@@ -1212,6 +1066,58 @@ class CMEModel:
             )
         return kld, grad
 
+    def _kernel_family(self):
+        """Which accelerated kernel family this model configuration maps to.
+
+        Returns ``"2d"`` (the six two-species models without ambient noise),
+        ``"amb"`` (two-species with Equal/Unequal ambient noise and no or
+        Poisson sequencing noise), ``"protein"``, ``"custom"`` (non-delayed or delayed network
+        without sequencing or ambient noise), or ``None`` when only the
+        Python implementation applies.
+        """
+        if self.bio_model in _MODELS_2D and self.quad_method == "fixed_quad":
+            if self.amb_model == "None":
+                return "2d"
+            if self.amb_model in ("Equal", "Unequal") and self.seq_model in ("None", "Poisson"):
+                return "amb"
+            return None
+        if self.seq_model == "None" and self.amb_model == "None":
+            if self.bio_model == "ProteinBursty":
+                return "protein"
+            if self.bio_model == "Custom":
+                return "custom"
+        return None
+
+    def _backend(self, samp):
+        """Decide where an evaluation runs: ``(kind, family, samp)``.
+
+        ``kind`` is ``"gpu"``, ``"rust"`` or ``"python"``; ``family`` is the
+        kernel family from ``_kernel_family`` (``None`` when the Python path
+        must be used); ``samp`` is the sampling vector to hand to a kernel: a
+        list of log10 sampling parameters for the Poisson and Bernoulli models,
+        ``None`` when no sequencing transform applies.  Inference passes a zero
+        vector rather than ``None`` for noise-free models; both are accepted.
+        Only the Python path handles a missing ``samp`` for a noise model (it
+        raises the informative error) or a non-zero ``samp`` for a noise-free one.
+        """
+        samp_list = None
+        if self.seq_model in ("Poisson", "Bernoulli"):
+            if samp is None:
+                return _Backend("python", None, None)
+            samp_list = np.asarray(samp, dtype=float).ravel().tolist()
+        elif not _samp_is_null(samp):
+            return _Backend("python", None, None)
+        family = self._kernel_family()
+        if family is None:
+            kind = "python"
+        elif family == "2d" and _HAS_GPU:
+            kind = "gpu"
+        elif _HAS_RUST:
+            kind = "rust"
+        else:
+            kind = "python"
+        return _Backend(kind, family, samp_list)
+
     def _check_pss_args(self, p, limits):
         """Validate and normalise the (p, limits) arguments of eval_model_pss.
 
@@ -1277,178 +1183,54 @@ class CMEModel:
         # Fast path: GPU (PyTorch) if available, then Rust (quadrature models only), then Python.
         # Analytical models (Constitutive, Extrinsic, Delay, DelayedSplicing) are faster in
         # Python because their PGF is a single numpy broadcast and scipy/FFTW beats RustFFT.
-        _FAST_MODELS_2D = {
-            "Constitutive", "Bursty", "CIR",
-            "Extrinsic", "Delay", "DelayedSplicing",
-        }
-        _RUST_MODELS_2D = {"Bursty", "CIR"}
-        _fast_cond = (
-            self.bio_model in _FAST_MODELS_2D
-            and self.seq_model == "None"
-            and self.amb_model == "None"
-            and self.quad_method == "fixed_quad"
-            and (samp is None or np.all(np.asarray(samp) == 0))
-        )
-        if _HAS_GPU and _fast_cond:
+        be = self._backend(samp)
+        if be.kind == "gpu":
             pss = _eval_model_pss_gpu(
-                self.bio_model,
-                p.tolist(),
-                limits,
-                float(self.fixed_quad_T),
-                int(self.quad_order),
-                _GPU_DEVICE,
+                self.bio_model, p.tolist(), limits, float(self.fixed_quad_T),
+                int(self.quad_order), _GPU_DEVICE, samp=be.samp, seq_model=self.seq_model,
             )
             return pss.reshape(int(limits[0]), int(limits[1])).squeeze()
-
-        # GPU path with Poisson or Bernoulli technical noise (all six 2-D models).
-        if (
-            _HAS_GPU
-            and self.bio_model in _FAST_MODELS_2D
-            and self.seq_model in ("Poisson", "Bernoulli")
-            and self.amb_model == "None"
-            and self.quad_method == "fixed_quad"
-            and samp is not None
-        ):
-            pss = _eval_model_pss_gpu(
-                self.bio_model,
-                p.tolist(),
-                limits,
-                float(self.fixed_quad_T),
-                int(self.quad_order),
-                _GPU_DEVICE,
-                samp=np.asarray(samp, dtype=float).tolist(),
-                seq_model=self.seq_model,
-            )
-            return pss.reshape(int(limits[0]), int(limits[1])).squeeze()
-
-        if (
-            _HAS_RUST
-            and _fast_cond
-            and self.bio_model in _RUST_MODELS_2D
-        ):
+        if be.kind == "rust" and be.family == "2d":
             pss_flat = _mc.eval_model_pss_2d(
-                self.bio_model,
-                p.tolist(),
-                [int(x) for x in limits],
-                float(self.fixed_quad_T),
-                int(self.quad_order),
+                self.bio_model, p.tolist(), [int(x) for x in limits],
+                float(self.fixed_quad_T), int(self.quad_order), be.samp, seq_model=self.seq_model,
             )
-            pss = np.array(pss_flat).reshape(int(limits[0]), int(limits[1]))
-            return pss.squeeze()
-
-        # Rust fast-path for Poisson or Bernoulli technical noise (all six 2-D models).
-        if (
-            _HAS_RUST
-            and self.bio_model in _FAST_MODELS_2D
-            and self.seq_model in ("Poisson", "Bernoulli")
-            and self.amb_model == "None"
-            and self.quad_method == "fixed_quad"
-            and samp is not None
-        ):
-            pss_flat = _mc.eval_model_pss_2d(
-                self.bio_model,
-                p.tolist(),
-                [int(x) for x in limits],
-                float(self.fixed_quad_T),
-                int(self.quad_order),
-                samp.tolist(),
-                seq_model=self.seq_model,
-            )
-            pss = np.array(pss_flat).reshape(int(limits[0]), int(limits[1]))
-            return pss.squeeze()
-
-        # Rust fast-path for ambient models (Equal/Unequal) + seq_model="None".
-        # All 6 2-D bio_models are supported; p_log must have the amb params stripped.
-        _RUST_AMB_MODELS = {
-            "Constitutive", "Bursty", "CIR",
-            "Extrinsic", "Delay", "DelayedSplicing",
-        }
-        if (
-            _HAS_RUST
-            and self.bio_model in _RUST_AMB_MODELS
-            and self.seq_model == "None"
-            and self.amb_model in ("Equal", "Unequal")
-            and self.quad_method == "fixed_quad"
-            and _samp_is_null(samp)
-        ):
+            return np.array(pss_flat).reshape(int(limits[0]), int(limits[1])).squeeze()
+        if be.kind == "rust" and be.family == "amb":
             n_amb = 1 if self.amb_model == "Equal" else 2
-            p_bio = p[:-n_amb]
-            amb_params = p[-n_amb:].tolist()
             pss_flat = _mc.eval_model_pss_2d(
-                self.bio_model,
-                p_bio.tolist(),
-                [int(x) for x in limits],
-                float(self.fixed_quad_T),
-                int(self.quad_order),
-                None,
-                self.amb_model,
-                amb_params,
+                self.bio_model, p[:-n_amb].tolist(), [int(x) for x in limits],
+                float(self.fixed_quad_T), int(self.quad_order), be.samp, self.amb_model,
+                p[-n_amb:].tolist(), seq_model=self.seq_model,
             )
-            pss = np.array(pss_flat).reshape([int(l) for l in limits])
-            return pss.squeeze()
-
-        # Rust fast-path for ProteinBursty (seq_model="None", amb_model="None").
-        if (
-            _HAS_RUST
-            and self.bio_model == "ProteinBursty"
-            and self.seq_model == "None"
-            and self.amb_model == "None"
-            and _samp_is_null(samp)
-        ):
+            return np.array(pss_flat).reshape([int(l) for l in limits]).squeeze()
+        if be.kind == "rust" and be.family == "protein":
             pss_flat = _mc.eval_model_pss_protein_bursty(
-                p.tolist(),
-                [int(x) for x in limits],
-                bool(self.fit_unspliced),
-                float(self.protein_limit),
-                float(self.min_fudge),
-                float(self.max_fudge),
+                p.tolist(), [int(x) for x in limits], bool(self.fit_unspliced),
+                float(self.protein_limit), float(self.min_fudge), float(self.max_fudge),
             )
-            pss = np.array(pss_flat).reshape(
-                int(limits[0]), int(limits[1]), int(limits[2])
-            )
-            return pss.squeeze()
-
-        # Rust fast-path for Custom networks (seq_model="None", amb_model="None"),
-        # delayed reactions included.  Fixed-step RK4 parallel over grid points.
-        if (
-            _HAS_RUST
-            and self.bio_model == "Custom"
-            and self.seq_model == "None"
-            and self.amb_model == "None"
-            and _samp_is_null(samp)
-        ):
+            return np.array(pss_flat).reshape([int(l) for l in limits]).squeeze()
+        if be.kind == "rust" and be.family == "custom":
             p_lin = np.power(10.0, p)
             dt      = float(np.min(1.0 / p_lin) * self.min_fudge)
             t_max   = float(np.max(1.0 / p_lin) * self.max_fudge)
             n_steps = int(np.ceil(t_max / dt))
             max_while = 10 * n_steps + 10_000
-
             net  = self.network
             topo = net.rust_topology()
             params_d = net._param_map(p)          # name → linear float
             if net._norm_rate is not None:
                 params_d[net._norm_rate] = 1.0
             params_linear = [float(params_d[name]) for name in topo["param_names"]]
-
             re_e, im_e, mx_shape = _mc.eval_custom_network_pgf(
-                len(net.species),
-                [int(x) for x in limits],
-                topo["rxn_kinds"],
-                topo["rxn_rate_idxs"],
-                topo["rxn_extra1"],
-                topo["rxn_extra2"],
-                topo["prod_sp"],
-                topo["prod_st"],
-                topo["prod_off"],
-                params_linear,
-                dt,
-                n_steps,
-                max_while,
+                len(net.species), [int(x) for x in limits],
+                topo["rxn_kinds"], topo["rxn_rate_idxs"], topo["rxn_extra1"], topo["rxn_extra2"],
+                topo["prod_sp"], topo["prod_st"], topo["prod_off"],
+                params_linear, dt, n_steps, max_while,
             )
             exp_phi = (np.array(re_e) + 1j * np.array(im_e)).reshape(mx_shape)
             pss = np.abs(irfftn(exp_phi, s=[int(x) for x in limits]))
-            pss = pss / pss.sum()
-            return pss.squeeze()
+            return (pss / pss.sum()).squeeze()
 
         if (self.amb_model != "None") and (len(limits) == 2):
             raise ValueError("Please specify a limit for the ambiguous species.")
@@ -1547,20 +1329,11 @@ class CMEModel:
         list of np.ndarray, length N
             PSS reshaped to limits_list[i] for each gene.
         """
-        _RUST_BATCH_MODELS = {
-            "Constitutive", "Bursty", "CIR",
-            "Extrinsic", "Delay", "DelayedSplicing",
-        }
         n = len(params_list)
         if samp_list is None:
             samp_list = [None] * n
 
-        _model_ok = (
-            self.bio_model in _RUST_BATCH_MODELS
-            and self.amb_model == "None"
-            and self.quad_method == "fixed_quad"
-            and self.seq_model in ("None", "Poisson", "Bernoulli")
-        )
+        _model_ok = self._kernel_family() == "2d"
         if _HAS_GPU and _model_ok and (self.seq_model == "None" or all(s is not None for s in samp_list)):
             return _eval_model_pss_gpu_batch(
                 self.bio_model, params_list, limits_list, float(self.fixed_quad_T),

@@ -339,65 +339,50 @@ fn np_isclose(a: f64, b: f64) -> bool {
 // ============================================================================
 
 /// Returns (g0, g1) each of length n_grid = l0 * (l1/2+1), row-major.
-fn build_mesh_2d(l0: usize, l1: usize) -> (Vec<Complex64>, Vec<Complex64>) {
-    let mx1 = l1 / 2 + 1;
-    let pi = std::f64::consts::PI;
-
-    let u0: Vec<Complex64> = (0..l0)
-        .map(|k| {
-            let a = -2.0 * pi * k as f64 / l0 as f64;
-            Complex64::new(a.cos() - 1.0, a.sin())
-        })
-        .collect();
-    let u1: Vec<Complex64> = (0..mx1)
-        .map(|k| {
-            let a = -2.0 * pi * k as f64 / l1 as f64;
-            Complex64::new(a.cos() - 1.0, a.sin())
-        })
-        .collect();
-
-    let mut g0 = Vec::with_capacity(l0 * mx1);
-    let mut g1 = Vec::with_capacity(l0 * mx1);
-    for i in 0..l0 {
-        for j in 0..mx1 {
-            g0.push(u0[i]);
-            g1.push(u1[j]);
-        }
-    }
-    (g0, g1)
-}
-
-/// Returns (g0, g1, g2) each of length n_grid = mx0*mx1*mx2, row-major.
-fn build_mesh_3d(
-    mx: &[usize; 3],
-    limits: &[usize; 3],
-) -> (Vec<Complex64>, Vec<Complex64>, Vec<Complex64>) {
-    let pi = std::f64::consts::PI;
-    let u: Vec<Vec<Complex64>> = (0..3)
-        .map(|s| {
-            (0..mx[s])
+/// Mesh of PGF arguments g = exp(-2*pi*i*k/limit) - 1 on a grid of shape `mx`
+/// (the last axis is the rfft half), one flat row-major vector per axis.
+fn build_mesh_axes(mx: &[usize], limits: &[usize]) -> Vec<Vec<Complex64>> {
+    let n = mx.len();
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let freq_vecs: Vec<Vec<Complex64>> = (0..n)
+        .map(|ax| {
+            (0..mx[ax])
                 .map(|k| {
-                    let a = -2.0 * pi * k as f64 / limits[s] as f64;
-                    Complex64::new(a.cos() - 1.0, a.sin())
+                    let theta = -two_pi * k as f64 / limits[ax] as f64;
+                    Complex64::new(theta.cos() - 1.0, theta.sin())
                 })
                 .collect()
         })
         .collect();
-
-    let n = mx[0] * mx[1] * mx[2];
-    let mut g0 = Vec::with_capacity(n);
-    let mut g1 = Vec::with_capacity(n);
-    let mut g2 = Vec::with_capacity(n);
-    for i in 0..mx[0] {
-        for j in 0..mx[1] {
-            for k in 0..mx[2] {
-                g0.push(u[0][i]);
-                g1.push(u[1][j]);
-                g2.push(u[2][k]);
-            }
+    let n_grid: usize = mx.iter().product();
+    let mut strides = vec![1usize; n];
+    for i in (0..n.saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * mx[i + 1];
+    }
+    let mut g = vec![vec![Complex64::new(0.0, 0.0); n_grid]; n];
+    for pt in 0..n_grid {
+        for ax in 0..n {
+            g[ax][pt] = freq_vecs[ax][(pt / strides[ax]) % mx[ax]];
         }
     }
-    (g0, g1, g2)
+    g
+}
+
+fn build_mesh_2d(l0: usize, l1: usize) -> (Vec<Complex64>, Vec<Complex64>) {
+    let mut g = build_mesh_axes(&[l0, l1 / 2 + 1], &[l0, l1]);
+    let g1 = g.pop().unwrap();
+    (g.pop().unwrap(), g1)
+}
+
+/// Returns (g0, g1, g2) each of length mx0*mx1*mx2, row-major.
+fn build_mesh_3d(
+    mx: &[usize; 3],
+    limits: &[usize; 3],
+) -> (Vec<Complex64>, Vec<Complex64>, Vec<Complex64>) {
+    let mut g = build_mesh_axes(mx, limits);
+    let g2 = g.pop().unwrap();
+    let g1 = g.pop().unwrap();
+    (g.pop().unwrap(), g1, g2)
 }
 
 // ============================================================================
@@ -702,7 +687,7 @@ fn eval_kld_and_grad_analytic_seq(
         pgf_bursty_cir_with_dphi(bio_model, g0, g1, &p, t, quad_order);
 
     // G = exp(phi), PSS_unnorm = irfft2d(G), norm = sum(|pss_unnorm|)
-    let n_freq = phi.len();
+    let _n_freq = phi.len();
     let g_exp: Vec<Complex64> = phi.iter().map(|z| z.exp()).collect();
     let pss_unnorm = irfftn_2d(&g_exp, l0, l1);
     let norm: f64 = pss_unnorm.iter().map(|v| v.abs()).sum();
@@ -972,17 +957,6 @@ fn protein_pgf_sched(
     (gf_log, steps)
 }
 
-/// Adaptive-schedule log-PGF (see `protein_pgf_sched`).
-fn protein_pgf(
-    g0: &[Complex64],
-    g1: &[Complex64],
-    g2: &[Complex64],
-    p: &[f64],
-    min_fudge: f64,
-    max_fudge: f64,
-) -> Vec<Complex64> {
-    protein_pgf_sched(g0, g1, g2, p, min_fudge, max_fudge, None).0
-}
 
 // ============================================================================
 // 2-D irfftn — parallel column IFFTs + parallel row irffts, no mid buffer
@@ -1235,6 +1209,31 @@ fn protein_bursty_core_sched(
 // ============================================================================
 
 /// Evaluate log-PGF for any supported 2-D bio_model given g0/g1 mesh slices.
+/// Log-PGF of any two-species model on a (g0, g1) mesh; `p` is linear-scale.
+/// Panics on an unknown model: the Python-facing entry points validate first.
+fn pgf_2d(
+    bio_model: &str,
+    g0: &[Complex64],
+    g1: &[Complex64],
+    p: &[f64],
+    fixed_quad_t: f64,
+    quad_order: usize,
+) -> Vec<Complex64> {
+    match bio_model {
+        "Constitutive" => pgf_constitutive(g0, g1, p),
+        "Extrinsic"    => pgf_extrinsic(g0, g1, p),
+        "Delay"        => pgf_delay(g0, g1, p),
+        "DelayedSplicing" => pgf_delayed_splicing(g0, g1, p),
+        "Bursty" | "CIR" => {
+            let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
+            if bio_model == "Bursty" { pgf_bursty(g0, g1, p, t, quad_order) }
+            else { pgf_cir(g0, g1, p, t, quad_order) }
+        }
+        other => panic!("Unknown bio_model {other:?}"),
+    }
+}
+
+/// `pgf_2d` with a Python error for unknown models.
 fn eval_pgf_2d(
     bio_model: &str,
     g0: &[Complex64],
@@ -1243,23 +1242,17 @@ fn eval_pgf_2d(
     fixed_quad_t: f64,
     quad_order: usize,
 ) -> PyResult<Vec<Complex64>> {
-    Ok(match bio_model {
-        "Constitutive" => pgf_constitutive(g0, g1, p),
-        "Extrinsic"    => pgf_extrinsic(g0, g1, p),
-        "Delay"        => pgf_delay(g0, g1, p),
-        "DelayedSplicing" => pgf_delayed_splicing(g0, g1, p),
-        "Bursty" => {
-            let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
-            pgf_bursty(g0, g1, p, t, quad_order)
-        }
-        "CIR" => {
-            let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
-            pgf_cir(g0, g1, p, t, quad_order)
-        }
-        _ => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown bio_model for eval_model_pss_2d: {bio_model}"
-        ))),
-    })
+    validate_bio_model_2d(bio_model, "eval_model_pss_2d")?;
+    Ok(pgf_2d(bio_model, g0, g1, p, fixed_quad_t, quad_order))
+}
+
+/// |x| / sum|x| over a raw inverse-FFT result.
+fn normalize_abs(pss_raw: Vec<f64>) -> Vec<f64> {
+    let par = pss_raw.len() >= PAR_THRESHOLD;
+    let abs_sum: f64 = if par { pss_raw.par_iter().map(|x| x.abs()).sum() }
+                       else { pss_raw.iter().map(|x| x.abs()).sum() };
+    if par { pss_raw.par_iter().map(|x| x.abs() / abs_sum).collect() }
+    else { pss_raw.iter().map(|x| x.abs() / abs_sum).collect() }
 }
 
 #[pyfunction]
@@ -1383,17 +1376,7 @@ fn eval_model_pss_2d(
     };
     // irfftn_3d(input, mx0, mx2_in, n0, n1, n2): mx0=l0 (no axis-0 coarsening)
     let pss_raw = irfftn_3d(&gf, l0, mx2, l0, l1, l2);
-    let pn = pss_raw.len();
-    let abs_sum: f64 = if pn >= PAR_THRESHOLD {
-        pss_raw.par_iter().map(|x| x.abs()).sum()
-    } else {
-        pss_raw.iter().map(|x| x.abs()).sum()
-    };
-    Ok(if pn >= PAR_THRESHOLD {
-        pss_raw.par_iter().map(|x| x.abs() / abs_sum).collect()
-    } else {
-        pss_raw.iter().map(|x| x.abs() / abs_sum).collect()
-    })
+    Ok(normalize_abs(pss_raw))
 }
 
 // ============================================================================
@@ -1427,21 +1410,7 @@ fn eval_model_pss_2d_seq(
     };
     let (g0, g1) = (&mesh.0, &mesh.1);
 
-    let gf_log = match bio_model {
-        "Constitutive" => pgf_constitutive(g0, g1, &p),
-        "Extrinsic"    => pgf_extrinsic(g0, g1, &p),
-        "Delay"        => pgf_delay(g0, g1, &p),
-        "DelayedSplicing" => pgf_delayed_splicing(g0, g1, &p),
-        "Bursty" => {
-            let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
-            pgf_bursty(g0, g1, &p, t, quad_order)
-        }
-        "CIR" => {
-            let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
-            pgf_cir(g0, g1, &p, t, quad_order)
-        }
-        other => panic!("Unknown bio_model in eval_model_pss_2d_seq: {other}"),
-    };
+    let gf_log = pgf_2d(bio_model, g0, g1, &p, fixed_quad_t, quad_order);
 
     let n = gf_log.len();
     let gf: Vec<Complex64> = if n >= PAR_THRESHOLD {
@@ -1449,18 +1418,7 @@ fn eval_model_pss_2d_seq(
     } else {
         gf_log.iter().map(|z| z.exp()).collect()
     };
-    let pss_raw = irfftn_2d(&gf, l0, l1);
-    let pn = pss_raw.len();
-    let abs_sum: f64 = if pn >= PAR_THRESHOLD {
-        pss_raw.par_iter().map(|x| x.abs()).sum()
-    } else {
-        pss_raw.iter().map(|x| x.abs()).sum()
-    };
-    if pn >= PAR_THRESHOLD {
-        pss_raw.par_iter().map(|x| x.abs() / abs_sum).collect()
-    } else {
-        pss_raw.iter().map(|x| x.abs() / abs_sum).collect()
-    }
+    normalize_abs(irfftn_2d(&gf, l0, l1))
 }
 
 /// Evaluate the 2-D PSS for N (params, limits) pairs in parallel using rayon.
@@ -1563,17 +1521,7 @@ fn eval_model_pss_protein_bursty(
             protein_bursty_core(&p_log, &limits, fit_unspliced, protein_limit, min_fudge, max_fudge);
         irfftn_3d(&gf, mx[0], mx[2], lims[0], lims[1], lims[2])
     });
-    let pn = pss_raw.len();
-    let abs_sum: f64 = if pn >= PAR_THRESHOLD {
-        pss_raw.par_iter().map(|x| x.abs()).sum()
-    } else {
-        pss_raw.iter().map(|x| x.abs()).sum()
-    };
-    Ok(if pn >= PAR_THRESHOLD {
-        pss_raw.par_iter().map(|x| x.abs() / abs_sum).collect()
-    } else {
-        pss_raw.iter().map(|x| x.abs() / abs_sum).collect()
-    })
+    Ok(normalize_abs(pss_raw))
 }
 
 // ============================================================================
@@ -1746,6 +1694,114 @@ fn pack_results(py: Python<'_>, params: Vec<Vec<f64>>, klds: Vec<f64>, status: V
     }
 }
 
+/// L-BFGS-B settings shared by every optimizer entry point.
+#[derive(Clone, Copy)]
+struct LbfgsbSettings {
+    maxiter: usize,
+    ftol: f64,
+    gtol: f64,
+    m_mem: usize,
+}
+
+/// Minimize `obj` (value and gradient at log10 parameters) within [lb, ub]
+/// from `x0`.  Returns (x, f, status code).  Pure Rust: called inside rayon
+/// tasks with the GIL released.
+fn lbfgsb_minimize_objective<O>(
+    obj: &O,
+    x0: &[f64],
+    lb: &[f64],
+    ub: &[f64],
+    settings: LbfgsbSettings,
+) -> (Vec<f64>, f64, u8)
+where
+    O: Fn(&[f64]) -> (f64, Vec<f64>),
+{
+    let mut x: Vec<f64> = (0..x0.len()).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
+    let mut solver = LBFGSB::new(settings.m_mem)
+        .with_max_iter(settings.maxiter)
+        .with_pgtol(settings.gtol)
+        .with_ftol(settings.ftol)
+        .with_verbose(lbfgsb_verbose());
+    let mut f_and_grad = |xx: &[f64]| obj(xx);
+    // ftol and pgtol stopping live inside the solver; the callback only observes.
+    let mut callback = |_info: &lbfgsb_rs_pure::IterationInfo, _x: &[f64]| IterationControl::Continue;
+    match solver.minimize_with_callback(&mut x, lb, ub, &mut f_and_grad, &mut callback) {
+        Ok(sol) => (sol.x, sol.f, solver_status_code(&sol.status)),
+        Err(_) => {
+            // Bounds are validated up front, so this is a numerical failure:
+            // return the projected x0, flagged as an error.
+            let (f0, _) = obj(&x);
+            (x, f0, OPT_STATUS_ERROR)
+        }
+    }
+}
+
+/// Minimize from every start in `x0_list` and keep the best.  A later start
+/// replaces the incumbent only if it improves the KLD by more than 1 %
+/// (`ERR_THRESH`), matching the scipy path in inference.py.
+fn best_of_restarts<O>(
+    obj: &O,
+    x0_list: &[Vec<f64>],
+    lb: &[f64],
+    ub: &[f64],
+    settings: LbfgsbSettings,
+) -> (Vec<f64>, f64, u8)
+where
+    O: Fn(&[f64]) -> (f64, Vec<f64>),
+{
+    let mut best_x: Vec<f64> = (0..lb.len()).map(|i| x0_list[0][i].max(lb[i]).min(ub[i])).collect();
+    let mut best_kld = f64::INFINITY;
+    let mut best_status: u8 = OPT_STATUS_ERROR;
+    for x0 in x0_list {
+        let (x_opt, kld, st) = lbfgsb_minimize_objective(obj, x0, lb, ub, settings);
+        if kld < best_kld * ERR_THRESH {
+            best_x = x_opt;
+            best_kld = kld;
+            best_status = st;
+        }
+    }
+    (best_x, best_kld, best_status)
+}
+
+/// Optimize every gene in parallel.  `objective(gi)` builds gene `gi`'s
+/// objective (KLD and gradient as a function of the log10 parameters); the
+/// restart loop, solver settings and status handling are shared by all model
+/// families.  Call inside `py.allow_threads` and `run_with_pool`.
+fn optimize_genes_parallel<F, O>(
+    x0_list: &[Vec<Vec<f64>>],
+    lb: &[f64],
+    ub: &[f64],
+    settings: LbfgsbSettings,
+    objective: F,
+) -> Vec<(Vec<f64>, f64, u8)>
+where
+    F: Fn(usize) -> O + Sync,
+    O: Fn(&[f64]) -> (f64, Vec<f64>),
+{
+    (0..x0_list.len())
+        .into_par_iter()
+        .map(|gi| {
+            let obj = objective(gi);
+            best_of_restarts(&obj, &x0_list[gi], lb, ub, settings)
+        })
+        .collect()
+}
+
+/// Forward finite-difference gradient of `kld_at` around `x`, given the value
+/// `kld0` at `x`.
+fn fd_gradient<K>(x: &[f64], fd_eps: f64, kld0: f64, kld_at: K) -> Vec<f64>
+where
+    K: Fn(&[f64]) -> f64,
+{
+    (0..x.len())
+        .map(|i| {
+            let mut x_eps = x.to_vec();
+            x_eps[i] += fd_eps;
+            (kld_at(&x_eps) - kld0) / fd_eps
+        })
+        .collect()
+}
+
 // Per-thread scratch buffers reused across genes — avoids one allocation per
 // gene for the sort-based fallback path.
 thread_local! {
@@ -1781,7 +1837,7 @@ fn compute_moments(
             "layers and layer_names must have the same length",
         ));
     }
-    let n_layers = layers.len();
+    let _n_layers = layers.len();
     let n_cells = layers[0].shape()[0];
     let n_genes = layers[0].shape()[1];
     for (l, arr) in layers.iter().enumerate() {
@@ -3904,35 +3960,10 @@ fn delay_param_indices(rxns: &[RxnInfo]) -> Vec<usize> {
 /// Last axis has rfft half-length (l/2+1); all others full.
 fn build_mesh_nd(limits: &[usize]) -> (Vec<Vec<Complex64>>, Vec<usize>, usize) {
     let n = limits.len();
-    let two_pi = 2.0 * std::f64::consts::PI;
-
-    let mx: Vec<usize> = limits.iter().enumerate().map(|(i, &l)| {
-        if i == n - 1 { l / 2 + 1 } else { l }
-    }).collect();
-
+    let mx: Vec<usize> = limits.iter().enumerate()
+        .map(|(i, &l)| if i == n - 1 { l / 2 + 1 } else { l }).collect();
     let n_grid: usize = mx.iter().product();
-
-    let freq_vecs: Vec<Vec<Complex64>> = limits.iter().enumerate().map(|(ax, &l)| {
-        (0..mx[ax]).map(|k| {
-            let theta = -two_pi * k as f64 / l as f64;
-            Complex64::new(theta.cos() - 1.0, theta.sin())
-        }).collect()
-    }).collect();
-
-    let mut strides = vec![1usize; n];
-    for i in (0..n - 1).rev() {
-        strides[i] = strides[i + 1] * mx[i + 1];
-    }
-
-    let mut g = vec![vec![Complex64::new(0.0, 0.0); n_grid]; n];
-    for pt in 0..n_grid {
-        for s in 0..n {
-            let idx = (pt / strides[s]) % mx[s];
-            g[s][pt] = freq_vecs[s][idx];
-        }
-    }
-
-    (g, mx, n_grid)
+    (build_mesh_axes(&mx, limits), mx, n_grid)
 }
 
 /// Compute the custom-network ODE RHS for one grid point.
@@ -4925,19 +4956,12 @@ fn eval_kld_and_grad_seq(
     }
     // All other models: forward finite differences.
     let l1 = limits[1];
-    let n = x.len();
-    let pss0 = eval_model_pss_2d_seq(bio_model, x, limits, fixed_quad_t, quad_order, samp_log, seq_model);
-    let kld0 = compute_kld_sparse(&pss0, l1, u_idx, s_idx, f_data, eps);
-    let grad: Vec<f64> = (0..n)
-        .map(|i| {
-            let mut x_eps = x.to_vec();
-            x_eps[i] += fd_eps;
-            let pss = eval_model_pss_2d_seq(bio_model, &x_eps, limits, fixed_quad_t, quad_order, samp_log, seq_model);
-            let kld = compute_kld_sparse(&pss, l1, u_idx, s_idx, f_data, eps);
-            (kld - kld0) / fd_eps
-        })
-        .collect();
-    (kld0, grad)
+    let kld_at = |xx: &[f64]| {
+        let pss = eval_model_pss_2d_seq(bio_model, xx, limits, fixed_quad_t, quad_order, samp_log, seq_model);
+        compute_kld_sparse(&pss, l1, u_idx, s_idx, f_data, eps)
+    };
+    let kld0 = kld_at(x);
+    (kld0, fd_gradient(x, fd_eps, kld0, kld_at))
 }
 
 /// Minimize KLD(x) s.t. lb ≤ x ≤ ub using L-BFGS-B.
@@ -4946,59 +4970,6 @@ fn eval_kld_and_grad_seq(
 /// line search (same as scipy's Fortran L-BFGS-B), Cauchy point + subspace
 /// minimization, and compact column-major memory storage.
 ///
-/// Called from within rayon tasks — pure Rust, no GIL, no nested rayon.
-fn lbfgsb_minimize(
-    bio_model: &str,
-    x0: &[f64],
-    lb: &[f64],
-    ub: &[f64],
-    limits: &[usize],
-    u_idx: &[u64],
-    s_idx: &[u64],
-    f_data: &[f64],
-    fixed_quad_t: f64,
-    quad_order: usize,
-    fd_eps: f64,
-    maxiter: usize,
-    ftol: f64,
-    gtol: f64,
-    samp_log: Option<&[f64]>,
-    eps: f64,
-    m_mem: usize,
-    seq_model: &str,
-) -> (Vec<f64>, f64, u8) {
-    let n = x0.len();
-    let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
-
-    let mut solver = LBFGSB::new(m_mem)
-        .with_max_iter(maxiter)
-        .with_pgtol(gtol)
-        .with_ftol(ftol)
-        .with_verbose(lbfgsb_verbose());
-
-    let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
-        eval_kld_and_grad_seq(
-            bio_model, xx, limits, u_idx, s_idx, f_data,
-            fixed_quad_t, quad_order, fd_eps, samp_log, eps, seq_model,
-        )
-    };
-
-    // ftol is now handled inside the patched solver (scipy-compatible normalization).
-    // The callback is a no-op; convergence is driven by pgtol and ftol in the solver.
-    let mut callback = |_info: &lbfgsb_rs_pure::IterationInfo, _x: &[f64]| {
-        IterationControl::Continue
-    };
-
-    match solver.minimize_with_callback(&mut x, lb, ub, &mut f_and_grad, &mut callback) {
-        Ok(sol) => (sol.x, sol.f, solver_status_code(&sol.status)),
-        Err(_) => {
-            // Solver-level error (bounds are validated up front, so this is a
-            // numerical failure): return the projected x0, flagged as an error.
-            let (f0, _) = f_and_grad(&x);
-            (x, f0, OPT_STATUS_ERROR)
-        }
-    }
-}
 
 /// Optimize a single gene with L-BFGS-B using multiple restarts.
 ///
@@ -5039,29 +5010,14 @@ fn optimize_gene_2d(
     validate_x0_list(std::slice::from_ref(&x0_list), 1, lb.len(), "optimize_gene_2d")?;
     let seq_model = seq_model.to_owned();
 
-    let result = py.allow_threads(|| {
-        let mut best_x: Vec<f64> = (0..lb.len())
-            .map(|i| x0_list[0][i].max(lb[i]).min(ub[i]))
-            .collect();
-        let mut best_kld = f64::INFINITY;
-        let mut best_status: u8 = OPT_STATUS_ERROR;
-        for x0 in &x0_list {
-            let (x_opt, kld, st) = lbfgsb_minimize(
-                &bio_model, x0, &lb, &ub, &limits,
-                &u_idx, &s_idx, &f,
-                fixed_quad_t, quad_order, fd_eps,
-                maxiter, ftol, gtol,
-                samp_log.as_deref(), eps, m_lbfgs, &seq_model,
-            );
-            if kld < best_kld * ERR_THRESH {
-                best_x = x_opt;
-                best_kld = kld;
-                best_status = st;
-            }
-        }
-        (best_x, best_kld, best_status)
+    let settings = LbfgsbSettings { maxiter, ftol, gtol, m_mem: m_lbfgs };
+    let (best_x, best_kld, _status) = py.allow_threads(|| {
+        let obj = |x: &[f64]| eval_kld_and_grad_seq(
+            &bio_model, x, &limits, &u_idx, &s_idx, &f,
+            fixed_quad_t, quad_order, fd_eps, samp_log.as_deref(), eps, &seq_model,
+        );
+        best_of_restarts(&obj, &x0_list, &lb, &ub, settings)
     });
-    let (best_x, best_kld, _status) = result;
     Ok((best_x, best_kld))
 }
 
@@ -5110,35 +5066,17 @@ fn optimize_genes_2d(
         validate_limits(&limits_list[gi], 2, "optimize_genes_2d")?;
         validate_coords_2d(&u_idx_list[gi], &s_idx_list[gi], limits_list[gi][0], limits_list[gi][1], "optimize_genes_2d")?;
     }
-
-    let results: Vec<(Vec<f64>, f64, u8)> = py.allow_threads(|| {
+    let settings = LbfgsbSettings { maxiter, ftol, gtol, m_mem: m_lbfgs };
+    let results = py.allow_threads(|| {
         run_with_pool(num_threads, || {
-            (0..n_genes)
-                .into_par_iter()
-                .map(|gi| {
-                    let samp = samp_list.as_ref().and_then(|sl| sl[gi].as_deref());
-                    let mut best_x: Vec<f64> = (0..lb.len())
-                        .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
-                        .collect();
-                    let mut best_kld = f64::INFINITY;
-                    let mut best_status: u8 = OPT_STATUS_ERROR;
-                    for x0 in &x0_list[gi] {
-                        let (x_opt, kld, st) = lbfgsb_minimize(
-                            &bio_model, x0, &lb, &ub, &limits_list[gi],
-                            &u_idx_list[gi], &s_idx_list[gi], &f_list[gi],
-                            fixed_quad_t, quad_order, fd_eps,
-                            maxiter, ftol, gtol,
-                            samp, eps, m_lbfgs, &seq_model,
-                        );
-                        if kld < best_kld * ERR_THRESH {
-                            best_x = x_opt;
-                            best_kld = kld;
-                            best_status = st;
-                        }
-                    }
-                    (best_x, best_kld, best_status)
-                })
-                .collect()
+            optimize_genes_parallel(&x0_list, &lb, &ub, settings, |gi| {
+                let (bm, sm) = (bio_model.as_str(), seq_model.as_str());
+                let samp = samp_list.as_ref().and_then(|sl| sl[gi].as_deref());
+                let (lims, u, s_, f) = (&limits_list[gi], &u_idx_list[gi], &s_idx_list[gi], &f_list[gi]);
+                move |x: &[f64]| eval_kld_and_grad_seq(
+                    bm, x, lims, u, s_, f, fixed_quad_t, quad_order, fd_eps, samp, eps, sm,
+                )
+            })
         })
     });
 
@@ -5207,50 +5145,32 @@ fn optimize_genes_2d_sd(
         (u, s, f, lim, n_lm, n, gll, gll_s)
     }; // sd_ref dropped — GIL borrow released before allow_threads
     validate_x0_list(&x0_list, n_genes, lb.len(), "optimize_genes_2d_sd")?;
-
-    let results: Vec<(Vec<f64>, f64, u8)> = py.allow_threads(|| {
+    let settings = LbfgsbSettings { maxiter, ftol, gtol, m_mem: m_lbfgs };
+    let results = py.allow_threads(|| {
         run_with_pool(num_threads, || {
-            (0..n_genes)
-                .into_par_iter()
-                .map(|gi| {
-                    // Compute per-gene samp: add gene_log_lengths[gi] to the
-                    // appropriate channels. Spliced channel uses gene_log_lengths_spliced
-                    // when present, falling back to gene_log_lengths.
-                    let samp_gene: Option<Vec<f64>> = base_samp.as_ref().map(|bs| {
-                        let mut s = bs.clone();
-                        if use_lengths_unspliced && s.len() > 0 {
-                            if let Some(ref gll) = gene_log_lengths { s[0] += gll[gi]; }
-                        }
-                        if use_lengths_spliced && s.len() > 1 {
-                            let spl_lengths = gene_log_lengths_spliced.as_ref()
-                                .or(gene_log_lengths.as_ref());
-                            if let Some(ref gll) = spl_lengths { s[1] += gll[gi]; }
-                        }
-                        s
-                    });
-                    let mut best_x: Vec<f64> = (0..lb.len())
-                        .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
-                        .collect();
-                    let mut best_kld = f64::INFINITY;
-                    let mut best_status: u8 = OPT_STATUS_ERROR;
-                    for x0 in &x0_list[gi] {
-                        let (x_opt, kld, st) = lbfgsb_minimize(
-                            &bio_model, x0, &lb, &ub,
-                            &limits_flat[gi * n_lim .. (gi + 1) * n_lim],
-                            &u_idx_list[gi], &s_idx_list[gi], &f_list[gi],
-                            fixed_quad_t, quad_order, fd_eps,
-                            maxiter, ftol, gtol,
-                            samp_gene.as_deref(), eps, m_lbfgs, &seq_model,
-                        );
-                        if kld < best_kld * ERR_THRESH {
-                            best_x = x_opt;
-                            best_kld = kld;
-                            best_status = st;
-                        }
+            optimize_genes_parallel(&x0_list, &lb, &ub, settings, |gi| {
+                // Per-gene samp: add gene_log_lengths[gi] to the requested
+                // channels.  The spliced channel uses gene_log_lengths_spliced
+                // when present, falling back to gene_log_lengths.
+                let samp_gene: Option<Vec<f64>> = base_samp.as_ref().map(|bs| {
+                    let mut s = bs.clone();
+                    if use_lengths_unspliced && !s.is_empty() {
+                        if let Some(ref gll) = gene_log_lengths { s[0] += gll[gi]; }
                     }
-                    (best_x, best_kld, best_status)
-                })
-                .collect()
+                    if use_lengths_spliced && s.len() > 1 {
+                        let spl = gene_log_lengths_spliced.as_ref().or(gene_log_lengths.as_ref());
+                        if let Some(gll) = spl { s[1] += gll[gi]; }
+                    }
+                    s
+                });
+                let (bm, sm) = (bio_model.as_str(), seq_model.as_str());
+                let lims = &limits_flat[gi * n_lim .. (gi + 1) * n_lim];
+                let (u, s_, f) = (&u_idx_list[gi], &s_idx_list[gi], &f_list[gi]);
+                move |x: &[f64]| eval_kld_and_grad_seq(
+                    bm, x, lims, u, s_, f, fixed_quad_t, quad_order, fd_eps,
+                    samp_gene.as_deref(), eps, sm,
+                )
+            })
         })
     });
 
@@ -5307,17 +5227,6 @@ fn row_major_strides(limits: &[usize]) -> Vec<usize> {
 // ProteinBursty L-BFGS-B optimizer (3-D, no GIL round-trips)
 // ============================================================================
 
-/// Evaluate ProteinBursty PSS in-process (no PyO3 overhead).
-fn eval_model_pss_protein_bursty_seq(
-    p_log:         &[f64],
-    limits:        &[usize],
-    fit_unspliced: bool,
-    protein_limit: f64,
-    min_fudge:     f64,
-    max_fudge:     f64,
-) -> Vec<f64> {
-    eval_model_pss_protein_bursty_seq_sched(p_log, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, None).0
-}
 
 /// Sequential ProteinBursty PSS with an optional fixed integration schedule.
 fn eval_model_pss_protein_bursty_seq_sched(
@@ -5351,7 +5260,6 @@ fn eval_kld_and_grad_seq_protein_bursty(
     fd_eps:        f64,
     eps:           f64,
 ) -> (f64, Vec<f64>) {
-    let n = x.len();
     // Base point with the adaptive schedule; every perturbed point replays that
     // exact step sequence so the difference quotient sees only the smooth
     // dependence on the parameters, not jumps in the discretisation.
@@ -5359,68 +5267,15 @@ fn eval_kld_and_grad_seq_protein_bursty(
         x, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, None,
     );
     let kld0 = compute_kld_sparse_nd(&pss0, strides, coords, f_data, eps);
-    let grad: Vec<f64> = (0..n)
-        .map(|i| {
-            let mut x_eps = x.to_vec();
-            x_eps[i] += fd_eps;
-            let (pss, _) = eval_model_pss_protein_bursty_seq_sched(
-                &x_eps, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, Some(&sched),
-            );
-            let kld = compute_kld_sparse_nd(&pss, strides, coords, f_data, eps);
-            (kld - kld0) / fd_eps
-        })
-        .collect();
+    let grad = fd_gradient(x, fd_eps, kld0, |xx| {
+        let (pss, _) = eval_model_pss_protein_bursty_seq_sched(
+            xx, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, Some(&sched),
+        );
+        compute_kld_sparse_nd(&pss, strides, coords, f_data, eps)
+    });
     (kld0, grad)
 }
 
-/// L-BFGS-B box-constrained minimization for ProteinBursty.
-fn lbfgsb_minimize_protein_bursty(
-    x0:            &[f64],
-    lb:            &[f64],
-    ub:            &[f64],
-    limits:        &[usize],
-    strides:       &[usize],
-    coords:        &[Vec<i64>],
-    f_data:        &[f64],
-    fit_unspliced: bool,
-    protein_limit: f64,
-    min_fudge:     f64,
-    max_fudge:     f64,
-    fd_eps:        f64,
-    maxiter:       usize,
-    ftol:          f64,
-    gtol:          f64,
-    eps:           f64,
-    m_mem:         usize,
-) -> (Vec<f64>, f64, u8) {
-    let n = x0.len();
-    let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
-    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol).with_ftol(ftol)
-        .with_verbose(lbfgsb_verbose());
-    let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
-        eval_kld_and_grad_seq_protein_bursty(
-            xx, limits, strides, coords, f_data,
-            fit_unspliced, protein_limit, min_fudge, max_fudge, fd_eps, eps,
-        )
-    };
-    let mut prev_f = f64::INFINITY;
-    let mut callback = |info: &lbfgsb_rs_pure::IterationInfo, _x: &[f64]| {
-        let improve = (prev_f - info.f).abs() / prev_f.abs().max(1.0);
-        prev_f = info.f;
-        if improve < ftol {
-            IterationControl::StopConverged
-        } else {
-            IterationControl::Continue
-        }
-    };
-    match solver.minimize_with_callback(&mut x, lb, ub, &mut f_and_grad, &mut callback) {
-        Ok(sol) => (sol.x, sol.f, solver_status_code(&sol.status)),
-        Err(_) => {
-            let (f0, _) = f_and_grad(&x);
-            (x, f0, OPT_STATUS_ERROR)
-        }
-    }
-}
 
 /// Optimize all genes with the ProteinBursty model in parallel, reading histogram
 /// data directly from a Rust `SearchData` — no Python marshal loop.
@@ -5459,36 +5314,18 @@ fn optimize_genes_protein_bursty_sd(
     };
     validate_bounds(&lb, &ub, Some(5), "optimize_genes_protein_bursty_sd")?;
     validate_x0_list(&x0_list, n_genes, lb.len(), "optimize_genes_protein_bursty_sd")?;
-
-
-    let results: Vec<(Vec<f64>, f64, u8)> = py.allow_threads(|| {
+    let settings = LbfgsbSettings { maxiter, ftol, gtol, m_mem: m_lbfgs };
+    let results = py.allow_threads(|| {
         run_with_pool(num_threads, || {
-            (0..n_genes)
-                .into_par_iter()
-                .map(|gi| {
-                    let lims = &limits_flat[gi * n_lim .. (gi + 1) * n_lim];
-                    let strides = row_major_strides(lims);
-                    let mut best_x: Vec<f64> = (0..lb.len())
-                        .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
-                        .collect();
-                    let mut best_kld = f64::INFINITY;
-                    let mut best_status: u8 = OPT_STATUS_ERROR;
-                    for x0 in &x0_list[gi] {
-                        let (x_opt, kld, st) = lbfgsb_minimize_protein_bursty(
-                            x0, &lb, &ub, lims, &strides,
-                            &coords_list[gi], &f_list[gi],
-                            fit_unspliced, protein_limit, min_fudge, max_fudge,
-                            fd_eps, maxiter, ftol, gtol, eps, m_lbfgs,
-                        );
-                        if kld < best_kld * ERR_THRESH {
-                            best_x = x_opt;
-                            best_kld = kld;
-                            best_status = st;
-                        }
-                    }
-                    (best_x, best_kld, best_status)
-                })
-                .collect()
+            optimize_genes_parallel(&x0_list, &lb, &ub, settings, |gi| {
+                let lims = &limits_flat[gi * n_lim .. (gi + 1) * n_lim];
+                let strides = row_major_strides(lims);
+                let (coords, f) = (&coords_list[gi], &f_list[gi]);
+                move |x: &[f64]| eval_kld_and_grad_seq_protein_bursty(
+                    x, lims, &strides, coords, f,
+                    fit_unspliced, protein_limit, min_fudge, max_fudge, fd_eps, eps,
+                )
+            })
         })
     });
 
@@ -5557,26 +5394,10 @@ fn eval_model_pss_2d_amb_seq(
         g1_eff.iter_mut().for_each(|z| *z = (*z * lam1).exp() - one);
     }
 
-    let gf_log = match bio_model {
-        "Constitutive"    => pgf_constitutive(&g0_eff, &g1_eff, &p),
-        "Extrinsic"       => pgf_extrinsic(&g0_eff, &g1_eff, &p),
-        "Delay"           => pgf_delay(&g0_eff, &g1_eff, &p),
-        "DelayedSplicing" => pgf_delayed_splicing(&g0_eff, &g1_eff, &p),
-        "Bursty" => {
-            let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
-            pgf_bursty(&g0_eff, &g1_eff, &p, t, quad_order)
-        }
-        "CIR" => {
-            let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
-            pgf_cir(&g0_eff, &g1_eff, &p, t, quad_order)
-        }
-        other => panic!("Unknown bio_model in eval_model_pss_2d_amb_seq: {other}"),
-    };
+    let gf_log = pgf_2d(bio_model, &g0_eff, &g1_eff, &p, fixed_quad_t, quad_order);
 
     let gf: Vec<Complex64> = gf_log.iter().map(|z| z.exp()).collect();
-    let pss_raw = irfftn_3d(&gf, l0, mx2, l0, l1, l2);
-    let abs_sum: f64 = pss_raw.iter().map(|x| x.abs()).sum();
-    pss_raw.iter().map(|x| x.abs() / abs_sum).collect()
+    normalize_abs(irfftn_3d(&gf, l0, mx2, l0, l1, l2))
 }
 
 /// KLD + forward finite-difference gradient for 2-D amb_model (sequential).
@@ -5594,74 +5415,14 @@ fn eval_kld_and_grad_seq_amb(
     fd_eps:       f64,
     eps:          f64,
 ) -> (f64, Vec<f64>) {
-    let n = x.len();
-    let pss0 = eval_model_pss_2d_amb_seq(
-        bio_model, x, limits, fixed_quad_t, quad_order, samp_log, amb_model,
-    );
-    let kld0 = compute_kld_sparse_nd(&pss0, strides, coords, f_data, eps);
-    let grad: Vec<f64> = (0..n)
-        .map(|i| {
-            let mut x_eps = x.to_vec();
-            x_eps[i] += fd_eps;
-            let pss = eval_model_pss_2d_amb_seq(
-                bio_model, &x_eps, limits, fixed_quad_t, quad_order, samp_log, amb_model,
-            );
-            let kld = compute_kld_sparse_nd(&pss, strides, coords, f_data, eps);
-            (kld - kld0) / fd_eps
-        })
-        .collect();
-    (kld0, grad)
+    let kld_at = |xx: &[f64]| {
+        let pss = eval_model_pss_2d_amb_seq(bio_model, xx, limits, fixed_quad_t, quad_order, samp_log, amb_model);
+        compute_kld_sparse_nd(&pss, strides, coords, f_data, eps)
+    };
+    let kld0 = kld_at(x);
+    (kld0, fd_gradient(x, fd_eps, kld0, kld_at))
 }
 
-/// L-BFGS-B box-constrained minimization for 2-D amb_model.
-fn lbfgsb_minimize_amb(
-    bio_model:    &str,
-    amb_model:    &str,
-    x0:           &[f64],
-    lb:           &[f64],
-    ub:           &[f64],
-    limits:       &[usize],
-    strides:      &[usize],
-    coords:       &[Vec<i64>],
-    f_data:       &[f64],
-    fixed_quad_t: f64,
-    quad_order:   usize,
-    samp_log:     Option<&[f64]>,
-    fd_eps:       f64,
-    maxiter:      usize,
-    ftol:         f64,
-    gtol:         f64,
-    eps:          f64,
-    m_mem:        usize,
-) -> (Vec<f64>, f64, u8) {
-    let n = x0.len();
-    let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
-    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol).with_ftol(ftol)
-        .with_verbose(lbfgsb_verbose());
-    let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
-        eval_kld_and_grad_seq_amb(
-            bio_model, xx, limits, strides, coords, f_data,
-            fixed_quad_t, quad_order, samp_log, amb_model, fd_eps, eps,
-        )
-    };
-    let mut prev_f = f64::INFINITY;
-    let mut callback = |info: &lbfgsb_rs_pure::IterationInfo, _x: &[f64]| {
-        let improve = (prev_f - info.f).abs() / prev_f.abs().max(1.0);
-        prev_f = info.f;
-        if improve < ftol {
-            IterationControl::StopConverged
-        } else {
-            IterationControl::Continue
-        }
-    };
-    match solver.minimize_with_callback(&mut x, lb, ub, &mut f_and_grad, &mut callback) {
-        Ok(sol) => (sol.x, sol.f, solver_status_code(&sol.status)),
-        Err(_) => {
-            let (f0, _) = f_and_grad(&x);
-            (x, f0, OPT_STATUS_ERROR)
-        }
-    }
-}
 
 /// Optimize all genes with a 2-D bio_model + ambient noise, reading histogram data
 /// directly from a Rust `SearchData` — no Python marshal loop.
@@ -5712,37 +5473,20 @@ fn optimize_genes_2d_amb_sd(
     };
     validate_bounds(&lb, &ub, None, "optimize_genes_2d_amb_sd")?;
     validate_x0_list(&x0_list, n_genes, lb.len(), "optimize_genes_2d_amb_sd")?;
-
-
-    let results: Vec<(Vec<f64>, f64, u8)> = py.allow_threads(|| {
+    let settings = LbfgsbSettings { maxiter, ftol, gtol, m_mem: m_lbfgs };
+    let results = py.allow_threads(|| {
         run_with_pool(num_threads, || {
-            (0..n_genes)
-                .into_par_iter()
-                .map(|gi| {
-                    let lims = &limits_flat[gi * n_lim .. (gi + 1) * n_lim];
-                    let strides = row_major_strides(lims);
-                    let samp = samp_list.as_ref().and_then(|sl| sl[gi].as_deref());
-                    let mut best_x: Vec<f64> = (0..lb.len())
-                        .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
-                        .collect();
-                    let mut best_kld = f64::INFINITY;
-                    let mut best_status: u8 = OPT_STATUS_ERROR;
-                    for x0 in &x0_list[gi] {
-                        let (x_opt, kld, st) = lbfgsb_minimize_amb(
-                            &bio_model, &amb_model, x0, &lb, &ub,
-                            lims, &strides, &coords_list[gi], &f_list[gi],
-                            fixed_quad_t, quad_order, samp,
-                            fd_eps, maxiter, ftol, gtol, eps, m_lbfgs,
-                        );
-                        if kld < best_kld * ERR_THRESH {
-                            best_x = x_opt;
-                            best_kld = kld;
-                            best_status = st;
-                        }
-                    }
-                    (best_x, best_kld, best_status)
-                })
-                .collect()
+            optimize_genes_parallel(&x0_list, &lb, &ub, settings, |gi| {
+                let (bm, am) = (bio_model.as_str(), amb_model.as_str());
+                let lims = &limits_flat[gi * n_lim .. (gi + 1) * n_lim];
+                let strides = row_major_strides(lims);
+                let samp = samp_list.as_ref().and_then(|sl| sl[gi].as_deref());
+                let (coords, f) = (&coords_list[gi], &f_list[gi]);
+                move |x: &[f64]| eval_kld_and_grad_seq_amb(
+                    bm, x, lims, &strides, coords, f,
+                    fixed_quad_t, quad_order, samp, am, fd_eps, eps,
+                )
+            })
         })
     });
 
@@ -5792,8 +5536,7 @@ fn eval_custom_network_pss_seq(
         _ => panic!("eval_custom_network_pss_seq: only 2- and 3-species networks supported"),
     };
 
-    let abs_sum: f64 = pss_raw.iter().map(|x| x.abs()).sum();
-    (pss_raw.iter().map(|x| x.abs() / abs_sum).collect(), phase2_steps)
+    (normalize_abs(pss_raw), phase2_steps)
 }
 
 /// Derive `params_linear`, `dt`, `n_steps`, and `max_while` from the log10 optimizer
@@ -5833,84 +5576,26 @@ fn eval_kld_and_grad_seq_custom(
     fd_eps:        f64,
     eps:           f64,
 ) -> (f64, Vec<f64>) {
-    let n = x.len();
     let (params, dt, n_steps, max_while) =
         custom_network_integration_params(x, has_norm_rate, min_fudge, max_fudge);
     let (pss0, phase2) = eval_custom_network_pss_seq(
         n_species, limits, rxns, prod_sp, prod_st, &params, dt, n_steps, max_while, None,
     );
     let kld0 = compute_kld_sparse_nd(&pss0, strides, coords, f_data, eps);
-
     // Perturbed points reuse the base point's schedule (dt, n_steps, phase-2
     // steps) so the finite difference is not polluted by discretisation jumps.
-    let grad: Vec<f64> = (0..n)
-        .map(|i| {
-            let mut x_eps = x.to_vec();
-            x_eps[i] += fd_eps;
-            let (params_eps, _, _, _) =
-                custom_network_integration_params(&x_eps, has_norm_rate, min_fudge, max_fudge);
-            let (pss, _) = eval_custom_network_pss_seq(
-                n_species, limits, rxns, prod_sp, prod_st,
-                &params_eps, dt, n_steps, max_while, Some(phase2),
-            );
-            let kld = compute_kld_sparse_nd(&pss, strides, coords, f_data, eps);
-            (kld - kld0) / fd_eps
-        })
-        .collect();
+    let grad = fd_gradient(x, fd_eps, kld0, |xx| {
+        let (params_eps, _, _, _) =
+            custom_network_integration_params(xx, has_norm_rate, min_fudge, max_fudge);
+        let (pss, _) = eval_custom_network_pss_seq(
+            n_species, limits, rxns, prod_sp, prod_st,
+            &params_eps, dt, n_steps, max_while, Some(phase2),
+        );
+        compute_kld_sparse_nd(&pss, strides, coords, f_data, eps)
+    });
     (kld0, grad)
 }
 
-/// L-BFGS-B box-constrained minimization for a custom reaction network.
-fn lbfgsb_minimize_custom(
-    x0:            &[f64],
-    lb:            &[f64],
-    ub:            &[f64],
-    n_species:     usize,
-    limits:        &[usize],
-    strides:       &[usize],
-    rxns:          &[RxnInfo],
-    prod_sp:       &[u32],
-    prod_st:       &[u32],
-    coords:        &[Vec<i64>],
-    f_data:        &[f64],
-    has_norm_rate: bool,
-    min_fudge:     f64,
-    max_fudge:     f64,
-    fd_eps:        f64,
-    maxiter:       usize,
-    ftol:          f64,
-    gtol:          f64,
-    eps:           f64,
-    m_mem:         usize,
-) -> (Vec<f64>, f64, u8) {
-    let n = x0.len();
-    let mut x: Vec<f64> = (0..n).map(|i| x0[i].max(lb[i]).min(ub[i])).collect();
-    let mut solver = LBFGSB::new(m_mem).with_max_iter(maxiter).with_pgtol(gtol).with_ftol(ftol)
-        .with_verbose(lbfgsb_verbose());
-    let mut f_and_grad = |xx: &[f64]| -> (f64, Vec<f64>) {
-        eval_kld_and_grad_seq_custom(
-            xx, n_species, limits, strides, rxns, prod_sp, prod_st,
-            coords, f_data, has_norm_rate, min_fudge, max_fudge, fd_eps, eps,
-        )
-    };
-    let mut prev_f = f64::INFINITY;
-    let mut callback = |info: &lbfgsb_rs_pure::IterationInfo, _x: &[f64]| {
-        let improve = (prev_f - info.f).abs() / prev_f.abs().max(1.0);
-        prev_f = info.f;
-        if improve < ftol {
-            IterationControl::StopConverged
-        } else {
-            IterationControl::Continue
-        }
-    };
-    match solver.minimize_with_callback(&mut x, lb, ub, &mut f_and_grad, &mut callback) {
-        Ok(sol) => (sol.x, sol.f, solver_status_code(&sol.status)),
-        Err(_) => {
-            let (f0, _) = f_and_grad(&x);
-            (x, f0, OPT_STATUS_ERROR)
-        }
-    }
-}
 
 /// Optimize all genes with a custom reaction network in parallel, reading histogram
 /// data directly from a Rust `SearchData` — no Python marshal loop.
@@ -5962,37 +5647,19 @@ fn optimize_genes_custom_sd(
     validate_x0_list(&x0_list, n_genes, lb.len(), "optimize_genes_custom_sd")?;
 
     let rxns = build_rxns(&rxn_kinds, &rxn_rate_idxs, &rxn_extra1, &rxn_extra2, &prod_off);
-
-
-    let results: Vec<(Vec<f64>, f64, u8)> = py.allow_threads(|| {
+    let settings = LbfgsbSettings { maxiter, ftol, gtol, m_mem: m_lbfgs };
+    let results = py.allow_threads(|| {
         run_with_pool(num_threads, || {
-            (0..n_genes)
-                .into_par_iter()
-                .map(|gi| {
-                    let lims = &limits_flat[gi * n_lim .. (gi + 1) * n_lim];
-                    let strides = row_major_strides(lims);
-                    let mut best_x: Vec<f64> = (0..lb.len())
-                        .map(|i| x0_list[gi][0][i].max(lb[i]).min(ub[i]))
-                        .collect();
-                    let mut best_kld = f64::INFINITY;
-                    let mut best_status: u8 = OPT_STATUS_ERROR;
-                    for x0 in &x0_list[gi] {
-                        let (x_opt, kld, st) = lbfgsb_minimize_custom(
-                            x0, &lb, &ub, n_species, lims, &strides,
-                            &rxns, &prod_sp, &prod_st,
-                            &coords_list[gi], &f_list[gi],
-                            has_norm_rate, min_fudge, max_fudge,
-                            fd_eps, maxiter, ftol, gtol, eps, m_lbfgs,
-                        );
-                        if kld < best_kld * ERR_THRESH {
-                            best_x = x_opt;
-                            best_kld = kld;
-                            best_status = st;
-                        }
-                    }
-                    (best_x, best_kld, best_status)
-                })
-                .collect()
+            optimize_genes_parallel(&x0_list, &lb, &ub, settings, |gi| {
+                let lims = &limits_flat[gi * n_lim .. (gi + 1) * n_lim];
+                let strides = row_major_strides(lims);
+                let (rx, ps, pst) = (&rxns[..], &prod_sp[..], &prod_st[..]);
+                let (coords, f) = (&coords_list[gi], &f_list[gi]);
+                move |x: &[f64]| eval_kld_and_grad_seq_custom(
+                    x, n_species, lims, &strides, rx, ps, pst, coords, f,
+                    has_norm_rate, min_fudge, max_fudge, fd_eps, eps,
+                )
+            })
         })
     });
 

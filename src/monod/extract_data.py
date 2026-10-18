@@ -81,6 +81,11 @@ import logging
 from scipy.sparse import csr_matrix
 from scipy.sparse import issparse
 
+
+def to_dense(arr):
+    """Return ``arr`` as a dense numpy array, whether it arrived sparse or dense."""
+    return arr.toarray() if issparse(arr) else np.asarray(arr)
+
 # Library logger.  monod does not configure handlers or touch the root logger;
 # messages propagate to whatever logging setup the application has.  To see
 # progress messages: ``logging.getLogger("monod").setLevel(logging.INFO)`` after
@@ -314,9 +319,7 @@ def extract_data(
     gene_names, n_cells = monod_adata.var.index, len(monod_adata.obs.index)
 
     # Extract layers — densify sparse matrices if necessary.
-    def _to_dense(arr):
-        return arr.toarray() if issparse(arr) else np.asarray(arr)
-    layers = np.array([_to_dense(monod_adata.layers[layer_name]).T
+    layers = np.array([to_dense(monod_adata.layers[layer_name]).T
                        for layer_name in ordered_layer_names])
 
     # Compute maximum expression value across cells for each gene and each layer
@@ -517,11 +520,7 @@ def plot_diagnostic(monod_adata):
 
 def _make_histogram_one_gene(gene_index, layers, hist_type, M, n_cells):
     """Compute the histogram for a single gene (parallelisable worker)."""
-    from scipy.sparse import issparse as _issparse
-    gene_cols = [
-        (x[:, gene_index].toarray().ravel() if _issparse(x) else np.asarray(x[:, gene_index]).ravel())
-        for x in layers
-    ]
+    gene_cols = [to_dense(x[:, gene_index]).ravel() for x in layers]
     stacked = np.column_stack(gene_cols)  # (n_cells, n_modalities) — built once
 
     unique, unique_counts = np.unique(stacked, axis=0, return_counts=True)

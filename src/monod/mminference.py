@@ -5,7 +5,7 @@ import scipy
 from scipy import optimize, stats
 from scipy.special import logsumexp, softmax
 from .extract_data import make_dir, log, _build_sampling_grid
-from .cme_toolbox import CMEModel  # may be unnecessary
+from .cme_toolbox import CMEModel, _MODELS_2D
 from .inference import (
     _normalize_use_lengths,
     _validate_bounds,
@@ -16,6 +16,7 @@ from .inference import (
     InferenceParameters as _BaseInferenceParameters,
     GridPointResults as _BaseGridPointResults,
     SearchResults as _BaseSearchResults,
+    DEFAULT_GRADIENT_PARAMS,
 )
 import multiprocessing
 import multiprocessing.pool
@@ -31,7 +32,6 @@ from .plot_aesthetics import aesthetics
 from ._core import _mc          # None when the compiled extension is not installed
 _HAS_RUST = _mc is not None
 
-_RUST_MODELS_2D = {"Constitutive", "Bursty", "CIR", "Extrinsic", "Delay", "DelayedSplicing"}
 
 # True when monod_core was compiled with --features kmeans (linfa KMeans available).
 _HAS_KMEANS = _HAS_RUST and hasattr(_mc, "initialize_q_kmeans")
@@ -100,12 +100,7 @@ class MEKMeansParameters(_BaseInferenceParameters):
         dataset_string,
         model,
         use_lengths="auto",
-        gradient_params={
-            "max_iterations": 10,
-            "init_pattern": "moments",
-            "num_restarts": 1,
-            "use_rust_lbfgsb": _HAS_RUST,
-        },
+        gradient_params=None,
         run_meta="",
         phys_lb=None,
         phys_ub=None,
@@ -196,7 +191,11 @@ class MEKMeansParameters(_BaseInferenceParameters):
         if gridsize is None:
             gridsize = model.seq_bounds['gridsize']
         
-        self.gradient_params = gradient_params
+        # meK-Means defaults: one start per gene and the Rust optimizer when available.
+        self.gradient_params = {
+            **DEFAULT_GRADIENT_PARAMS, "num_restarts": 1, "use_rust_lbfgsb": _HAS_RUST,
+            **(gradient_params or {}),
+        }
         self.use_lengths, self.use_lengths_explicit = _normalize_use_lengths(use_lengths, model)
         if model.seq_model == "None":
             samp_lb, samp_ub, gridsize = [0, 0], [0, 0], [1, 1]
@@ -803,7 +802,7 @@ class GradientInference(_BaseGradientInference):
         if (
             _HAS_RUST
             and ks_present
-            and model.bio_model in _RUST_MODELS_2D
+            and model.bio_model in _MODELS_2D
             and model.seq_model in ("None", "Poisson")
             and model.amb_model == "None"
             and model.quad_method == "fixed_quad"
@@ -1535,271 +1534,13 @@ class SearchResults(_BaseSearchResults):
     # get_bool_filt, plot_param_marg, plot_KL, chisquare_testing, compute_sigma,
     # resample_opt_viz, resample_opt_mc_viz, plot_param_L_dep, get_noise_decomp.
 
-    def par_fun_hess(self, inputs):
-        """Helper method for the Hessian parallelization procedure.
+    def _search_data_for(self, search_data):
+        """Restrict the search data to this cluster's cells (see ``_subset_search_data``)."""
+        return self._subset_search_data(search_data)
 
-        Parameters
-        ----------
-        inputs: tuple
-            entry 0: int
-                gene index within [0, n_genes) to evaluate at.
-            entry 1: monod.extract_data.SearchData
-                SearchData object with the fit data.
-
-        Returns
-        -------
-        hess: float np.ndarray
-            Hessian of the current gene's KLD at the sampling parameter optimum and the
-            corresponding biological parameters, evaluated with respect to the
-            biological parameters.
-        """
-        import numdifftools  # this will fail if numdifftools has not been evaluted.
-
-        gene_index, search_data = inputs
-        search_data = self._subset_search_data(search_data)
-        Hfun = numdifftools.Hessian(
-            lambda x: self.model.eval_model_kld(
-                p=x,
-                limits=search_data.M[:, gene_index],
-                samp=self.regressor_optimum[gene_index],
-                data=search_data.hist[gene_index],
-            )
-        )
-        hess = Hfun(self.phys_optimum[gene_index])
-        return hess
-
-    # compute_sigma, resample_opt_viz, resample_opt_mc_viz are inherited from _BaseSearchResults.
-    # compute_sigma calls self.par_fun_hess which is overridden above to apply _subset_search_data.
-
-    def chisq_best_param_correction(
-        self,
-        search_data,
-        threshold=0.05,
-        Ntries=10,
-        viz=True,
-        szfig=(2, 5),
-        figsize=(10, 4),
-        overwrite=True,
-    ):
-        """Test the sensitivity of technical noise parameter optima after gene rejection.
-
-        This method demonstrates the sensitivity of the sampling parameter landscape
-        and optimum to the specific genes retained after chi-squared testing.
-        It performs fixed-point iteration to illustrate whether the optimum converges.
-
-        This can be used with viz=True to inspect the qualitative behavior of the optimum,
-        or with viz=False as a sanity check to make sure the optimum is not strongly skewed
-        by a small number of very poorly fit genes.
-
-        The procedure does not typically move the optimum.
-
-        Parameters
-        ----------
-        search_data: monod.extract_data.SearchData
-            SearchData object with the fit data.
-        threshold: float, optional
-            chi-square rejection criterion; everything below this critical p-value
-            is rejected as unlikely to have been generated by the model.
-        Ntries: int, optional
-            number of steps of chi-squared testing to perform.
-        viz: bool, optional
-            whether to visualize the results.
-        szfig: tuple of ints, optional
-            dimensions of the figure subplot grid.
-        figsize: tuple of floats, optional
-            figure dimensions.
-        overwrite: bool, optional
-            whether to retain the optimum obtained at the end of the procedure.
-        """
-        search_data = self._subset_search_data(search_data)
-
-        if viz:
-            fig1, ax1 = plt.subplots(nrows=szfig[0], ncols=szfig[1], figsize=figsize)
-        log.info(
-            "Original optimum: {:.2f}, {:.2f}.".format(
-                self.samp_optimum[0], self.samp_optimum[1]
-            )
-        )
-        for i_ in range(Ntries):
-            self.chisquare_testing(search_data, threshold=threshold)
-            # gene_filter = ~self.rejected_genes
-            well_fit_samp_optimum = self.find_sampling_optimum(discard_rejected=True)
-            log.info(
-                "New optimum: {:.2f}, {:.2f}.".format(
-                    self.samp_optimum[0], self.samp_optimum[1]
-                )
-            )
-
-            if viz:
-                axloc = (
-                    np.unravel_index(i_, szfig)
-                    if (szfig[0] > 1 and szfig[1] > 1)
-                    else i_
-                )
-                self.plot_landscape(ax1[axloc], discard_rejected=True, hideticks=True)
-        if viz:
-            self._savefig("chisquare_stability.png")
-
-        if overwrite:
-            self.chisquare_testing(search_data, threshold=threshold)
-            log.info(
-                "Optimum retained at {:.2f}, {:.2f}.".format(
-                    self.samp_optimum[0], self.samp_optimum[1]
-                )
-            )
-        else:
-            self.find_sampling_optimum()
-            self.chisquare_testing(search_data, threshold=threshold)
-            log.info(
-                "Optimum restored to {:.2f}, {:.2f}.".format(
-                    self.samp_optimum[0], self.samp_optimum[1]
-                )
-            )
-
-    # plot_param_L_dep is inherited from _BaseSearchResults.
-
-    def plot_gene_distributions(
-        self,
-        search_data,
-        sz=(5, 5),
-        figsize=(10, 10),
-        marg="joint",
-        logscale=None,
-        title=True,
-        genes_to_plot=None,
-        savefig=True,
-    ):
-        """Plot the gene count distributions and their fits at the sampling parameter optimum.
-
-        Parameters
-        ----------
-        search_data: monod.extract_data.SearchData
-            SearchData object with the fit data.
-        szfig: tuple of ints, optional
-            dimensions of the figure subplot grid.
-        figsize: tuple of floats, optional
-            figure dimensions.
-        marg: str, optional
-            if 'nascent': plot unspliced RNA marginal.
-            if 'mature': plot spliced RNA marginal.
-            if 'joint': plot the bivariate distribution.
-        logscale: None or bool, optional
-            whether to plot probabilities or log-probabilities.
-            by default, True for 'joint', False for marginals.
-        title: bool, optional
-            whether to report the gene name in each subplot title.
-        genes_to_plot: bool or int np.ndarray or None, optional
-            if array, which genes to plot.
-            if None, plot by internal order.
-        savefig: bool, optional
-            whether to save the figure to disk.
-        """
-
-        if logscale is None:
-            if marg == "joint":
-                logscale = True
-            else:
-                logscale = False
-
-        search_data = self._subset_search_data(search_data)
-
-        (nrows, ncols) = sz
-        fig1, ax1 = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize)
-        axes = np.atleast_1d(ax1).ravel()
-
-        nax = np.prod(sz)
-        if genes_to_plot is None:
-            genes_to_plot = np.arange(nax)
-
-        genes_to_plot = np.asarray(genes_to_plot)
-        if genes_to_plot.dtype == bool:
-            gtp_temp = np.arange(self.n_genes)
-            genes_to_plot = gtp_temp[genes_to_plot]
-
-        number_of_genes_to_plot = len(genes_to_plot)
-        if number_of_genes_to_plot > self.n_genes:
-            number_of_genes_to_plot = self.n_genes
-            genes_to_plot = genes_to_plot[: self.n_genes]
-        if number_of_genes_to_plot > nax:  # This should no longer break...
-            number_of_genes_to_plot = nax
-            genes_to_plot = genes_to_plot[:nax]
-
-        j_ = 0
-        for i_ in genes_to_plot:
-            lm = np.copy(search_data.M[:, i_])
-            if marg == "mature":
-                lm[0] = 1
-            if marg == "nascent":
-                lm[1] = 1
-            ax = axes[j_]
-
-            samp = self.regressor_optimum[i_]
-            Pa = np.squeeze(self.model.eval_model_pss(self.phys_optimum[i_], lm, samp))
-
-            if marg == "joint":
-                if logscale:
-                    Pa[Pa < 1e-10] = 1e-10
-                    Pa = np.log10(Pa)
-
-                ax.imshow(Pa.T, aspect="auto", cmap="summer")
-                ax.invert_yaxis()
-
-                jitter_magn = 0.1
-                jitter = np.random.randn(2, self.n_cells) * jitter_magn
-                ax.scatter(
-                    *search_data.layers[:2, :,i_] + jitter, c="k", s=1, alpha=0.1
-                )
-
-                ax.set_xlim([-0.5, search_data.M[0, i_] - 1.5])
-                ax.set_ylim([-0.5, search_data.M[1, i_] - 1.5])
-            else:
-                plot_hist_and_fit(ax, search_data, i_, Pa, marg, modalities=self.model.model_modalities)
-                if logscale:
-                    ax.set_yscale("log")
-            if title:
-                titlestr = self.gene_names[i_]
-                if hasattr(self, "rejected_genes") and self.rejected_genes[i_]:
-                    titlestr += " (rej.)"
-                ax.set_title(titlestr, fontdict={"fontsize": 9})
-            ax.set_xticks([])
-            ax.set_yticks([])
-            j_ += 1
-        fig1.tight_layout(pad=0.02)
-
-        if savefig:
-            self._savefig("gene_distributions_{}.png".format(marg))
-
-    # the next two functions are useful for model selection, but are not currently in use.
-    def get_logL(self, search_data, EPS=1e-20, offs=0):
-        """
-        This method calculates the log-likelihood for all genes at the sampling parameter optimum.
-
-        Parameters
-        ----------
-        search_data: a SearchData instance.
-        EPS: probability rounding parameter -- anything below this is rounded to EPS.
-
-        Output:
-        logL: a vector of size n_genes containing model log-likelihoods.
-        """
-        search_data = self._subset_search_data(search_data)
-        logL = np.zeros(self.n_genes)
-        for gene_index in range(self.n_genes):
-            logL[gene_index] = self.model.eval_model_logL(
-                p=self.phys_optimum[gene_index],
-                limits=search_data.M[:, gene_index] + offs,
-                samp=self.regressor_optimum[gene_index],
-                data=search_data.hist[gene_index],
-                n_cells=search_data.n_cells,
-                EPS=EPS,
-            )
-            # Pss = self.model.eval_model_pss(self.phys_optimum[gene_index],lm,samp)
-            # if np.any(Pss<EPS):
-            #     Pss[Pss<EPS] = EPS
-            # expected_log_lik = np.log(Pss)
-            # eval_model_kld(self, p, limits, samp, data, hist_type="unique", EPS=EPS)
-            # logL[gene_index] = expected_log_lik[search_data.U[gene_index].astype(int),search_data.S[gene_index].astype(int)].sum()
-        return logL
+    # par_fun_hess, compute_sigma, chisq_best_param_correction, plot_gene_distributions,
+    # plot_param_L_dep, resample_opt_viz and get_logL are inherited; each calls
+    # _search_data_for first, which is where the cluster subset is applied.
 
     # get_noise_decomp is inherited from _BaseSearchResults.
 
