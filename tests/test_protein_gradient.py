@@ -1,12 +1,12 @@
 """ProteinBursty finite-difference gradients with a frozen integration schedule.
 
-The ProteinBursty PGF is an RK4 integration whose time step and step count are
-derived from the parameters, so they jump discretely as the parameters move.
-Forward finite differences across such a jump are noise.  Both the Rust
-gradient (``eval_kld_grad_protein_bursty``) and the Python fallback integrate
-every stencil point with the base point's schedule; these tests check the
-resulting gradients against a central-difference reference computed the same
-way.
+The ProteinBursty PGF is integrated with error-controlled steps whose sequence
+is chosen from the parameters and the grid, so it changes discretely as the
+parameters move.  Forward finite differences across such a change are noise.
+Both the Rust gradient and the Python fallback therefore replay the base
+point's step sequence at every stencil point; these tests check that the
+pinning happens and that both gradients agree with a pinned central-difference
+reference.
 """
 import numpy as np
 import pytest
@@ -60,18 +60,18 @@ class TestPythonPinnedGradient:
     def test_pinned_schedule_is_used_and_restored(self, model, data, monkeypatch):
         monkeypatch.setattr(ct, "_HAS_RUST", False)
         coords, freqs = data
-        model.eval_model_kld(X, LIMITS, None, (coords, freqs))
-        dt, n_steps = model._last_protein_schedule
-        assert dt > 0 and n_steps > 0
-        # pinned evaluation must take exactly the pinned number of steps
-        model._fixed_protein_schedule = (dt, n_steps + 7)
-        model.eval_model_kld(X + 0.01, LIMITS, None, (coords, freqs))
         model._fixed_protein_schedule = None
-        assert model._last_protein_schedule == (dt, n_steps + 7)
-        # and the gradient routine leaves no pin behind
-        model.eval_model_kld_and_grad(X, LIMITS, None, (coords, freqs), eps=1e-6)
+        model.eval_model_kld(X, LIMITS, None, (coords, freqs))
+        sched = np.array(model._last_protein_schedule)
+        assert sched.ndim == 1 and len(sched) > 10 and np.all(sched > 0)
+        # replaying a truncated schedule must use exactly that sequence
+        model._fixed_protein_schedule = sched[:-7]
+        model.eval_model_kld(X, LIMITS, None, (coords, freqs))
+        model._fixed_protein_schedule = None
+        np.testing.assert_array_equal(model._last_protein_schedule, sched[:-7])
+        # the gradient path pins and then clears the schedule
+        model.eval_model_kld_and_grad(X, LIMITS, None, (coords, freqs))
         assert model._fixed_protein_schedule is None
-
     def test_python_fd_gradient_matches_reference(self, model, data, monkeypatch):
         monkeypatch.setattr(ct, "_HAS_RUST", False)
         ref, _ = _python_reference(model, data, monkeypatch)

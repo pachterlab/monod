@@ -63,6 +63,12 @@ _HAS_RUST = _mc is not None
 # implementation that broadcasts the grid × quadrature computation onto the
 # GPU.  Results match the Python/Rust baseline within rtol=1e-5.
 # ---------------------------------------------------------------------------
+# ProteinBursty integrator settings; keep in sync with monod_core (PROTEIN_ODE_*).
+_PROTEIN_ODE_TOL = 1e-6        # per-step error target on the generating-function scale
+_PROTEIN_ODE_C0 = 0.05         # first step as a fraction of the fastest time scale
+_PROTEIN_ODE_MAX_STEPS = 20_000
+
+
 def _samp_is_null(samp):
     """True when no sampling transform applies: samp is None or all zeros.
 
@@ -1242,7 +1248,7 @@ class CMEModel:
             return pss.squeeze()
 
         # Rust fast-path for Custom networks (non-delayed, seq_model="None",
-        # amb_model="None").  Parallelises RK4 over grid points via rayon.
+        # amb_model="None").  Error-controlled exponential integrator, parallel over grid points via rayon.
         if (
             _HAS_RUST
             and self.bio_model == "Custom"
@@ -1547,14 +1553,31 @@ class CMEModel:
         return gf  # this is the log-generating function
     
     def protein_pgf(self, g, p):
-        """Evaluates the log generating function.
+        """Evaluate the log generating function of the protein model.
 
-        It is a helper function for the protein biological model.
+        Characteristics in the PGF variables v = u0 + 1 (unspliced) and
+        w = u1 + 1 (spliced), with the protein characteristic u2 = g2 e^{-gamma_p t}
+        solved analytically::
+
+            v' = beta (w - v)
+            w' = a(t) w + gamma,     a(t) = -gamma + k_p g2 e^{-gamma_p t}
+            phi = int_0^inf b u0 / (1 - b u0) dt,   u0 = v - 1
+
+        The system is linear and the integral of a(t) is known in closed form,
+        so every step propagates the homogeneous part of w exactly and treats the
+        forcing and the v-coupling with the step-average coefficient (exact for
+        constant coefficients): the stiff rates never limit the step.  Simpson's
+        rule on two half-steps accumulates phi; the step size is controlled by
+        comparing one full step with the two half-steps, taking the maximum error
+        over all grid points so the whole grid shares one schedule.  The accepted
+        steps are recorded in ``_last_protein_schedule``; setting
+        ``_fixed_protein_schedule`` replays a given sequence (finite-difference
+        stencils use the base point's).  Mirrors ``monod_core::protein_pgf_sched``.
 
         Parameters
         ----------
         g: np.ndarray
-            complex PGF arguments, adjusted for sampling.
+            complex PGF arguments (3, n_points), adjusted for sampling.
         p: float array of length 5
             (b, beta, gamma, k_p, gamma_p)
 
@@ -1563,96 +1586,90 @@ class CMEModel:
         phi: np.ndarray
             log gf.
         """
-        epsilon = 1e-10 
-        
-        def u_tilda_ode(u, du, beta, gamma, k_p, gamma_p):
-            """
-            Solve the characteristics ODE
-            """
-            # u (n_species, n_grids)
-            du = np.zeros_like(u)
-            du[0] = beta * (u[1]-u[0]) # Unspliced
-            du[1] = - gamma * u[1] + k_p * u[2] * (u[1]+1) # Spliced
-            du[2] = - gamma_p * u[2] # Proteins
-            return du
-        
-        def RK2(x, dx, f, dt, beta, gamma, k_p, gamma_p):
-            """
-            2nd Order Runge-Kutta integration for updating x.
-        
-            Parameters:
-            - x: Current state of the system
-            - dx: Current derivative
-            - f: Function defining the differential equation
-            - dt: Time step
-            - beta, gamma, k_p, gamma_p: Parameters for the ODE
-        
-            Returns:
-            - x_new: Updated state after one step
-            """
-            # Calculate k1: the slope at the current position
-            k1 = f(x, dx, beta, gamma, k_p, gamma_p)
-        
-            # Calculate k2: the slope at the midpoint
-            k2 = f(x + (dt / 2) * k1, dx, beta, gamma, k_p, gamma_p)
-        
-            # Update x using the second-order approximation
-            x_new = x + dt * k2
-        
-            return x_new
-    
-        def RK4(x, dx, f, dt, beta, gamma, k_p, gamma_p):
-            
-            j1 = f(x, dx, beta, gamma, k_p, gamma_p)
-            j2 = f(x + (dt / 2) * j1, dx, beta, gamma, k_p, gamma_p)
-            j3 = f(x + (dt / 2) * j2, dx, beta, gamma, k_p, gamma_p)
-            j4 = f(x + dt * j3, dx, beta, gamma, k_p, gamma_p)
-            
-            x_new = x + (dt / 6) * (j1 + 2 * j2 + 2 * j3 + j4)
-            return x_new
-            
-        b, beta, gamma, k_p, gamma_p = p
+        b, beta, gamma, k_p, gamma_p = (float(x) for x in p)
+        g = np.asarray(g, dtype=np.complex128)
+        g0, g1, g2 = g[0], g[1], g[2]
 
-        # Integration schedule: dt from the fastest rate, a fixed number of steps
-        # from the slowest, then extra steps until every grid point has decayed.
-        # All of these depend discontinuously on p, so finite-difference gradients
-        # pin the schedule of the base point (``_fixed_protein_schedule``) for the
-        # perturbed evaluations; the schedule actually used is recorded in
-        # ``_last_protein_schedule``.  Mirrors monod_core's protein_pgf_sched.
+        def phi1r(z):
+            return np.expm1(z) / z if abs(z) > 1e-4 else 1.0 + z * 0.5 + z * z * (1.0 / 6.0)
+
+        def f_int(v):
+            u = v - 1.0
+            return u * b / (1.0 - u * b)
+
+        def consts(t, h):
+            # per-step scalars shared by all grid points (mirrors ProteinStepConsts)
+            return (h, -gamma * h,
+                    (k_p / gamma_p) * np.exp(-gamma_p * t) * (-np.expm1(-gamma_p * h)),
+                    np.exp(-beta * h), h * phi1r(-beta * h))
+
+        def step(c, v, w):
+            h, dar, dac, eb, i0 = c
+            da = dar + g2 * dac          # exact integral of a(t) over the step
+            abar = da / h
+            e = np.exp(da)
+            big = np.abs(da) > 1e-4
+            p1 = np.empty_like(da)
+            p1[big] = (e[big] - 1.0) / da[big]
+            zs = da[~big]
+            p1[~big] = 1.0 + zs * 0.5 + zs * zs * (1.0 / 6.0)
+            w_new = e * w + p1 * (gamma * h)
+            s_ = abar + beta
+            z = s_ * h
+            big = np.abs(z) > 1e-3
+            i1 = np.empty_like(z)
+            i1[big] = (e[big] - eb) / s_[big]
+            zs = z[~big]
+            i1[~big] = (1.0 + zs * 0.5 + zs * zs * (1.0 / 6.0)) * (h * eb)
+            goa = gamma / abar
+            v_new = v * eb + ((w + goa) * i1 - goa * i0) * beta
+            return v_new, w_new
+
+        lam_fast = max(beta, gamma + 2.0 * k_p, gamma_p)
+        lam_slow = min(beta, gamma, gamma_p)
+        t_end = np.log(1.0 / _PROTEIN_ODE_TOL) / lam_slow + max(0.0, np.log(2.0 * k_p / gamma)) / gamma_p
+
         fixed = getattr(self, "_fixed_protein_schedule", None)
-        if fixed is not None:
-            # np.float64 (not a Python float) so dtype promotion of phi matches
-            # the adaptive branch exactly; otherwise base and stencil points
-            # would be integrated at different precisions.
-            dt, num_tsteps = np.float64(fixed[0]), int(fixed[1])
-            adaptive = False
-        else:
-            dt = np.min(1 / np.array(p)) * self.min_fudge
-            t_max = np.max(1 / np.array(p)) * self.max_fudge
-            num_tsteps = min(int(np.ceil(t_max / dt)), 50_000)
-            adaptive = True
+        v = g0 + 1.0
+        w = g1 + 1.0
+        phi = np.zeros_like(v)
+        t = 0.0
+        h = _PROTEIN_ODE_C0 / lam_fast
+        h_min = 1e-12 / lam_fast
+        steps = []
+        while True:
+            if fixed is not None:
+                if len(steps) >= len(fixed):
+                    break
+                h = float(fixed[len(steps)])
+            else:
+                if t >= t_end or len(steps) >= _PROTEIN_ODE_MAX_STEPS:
+                    break
+                h = min(h, t_end - t)
+            f0 = f_int(v)
+            c_half1 = consts(t, 0.5 * h)
+            c_half2 = consts(t + 0.5 * h, 0.5 * h)
+            vm, wm = step(c_half1, v, w)
+            v2, w2 = step(c_half2, vm, wm)
+            fm = f_int(vm)
+            f2 = f_int(v2)
+            simpson = (f0 + fm * 4.0 + f2) * (h / 6.0)
+            fac = 1.0
+            if fixed is None:
+                trap = (f0 + fm * 2.0 + f2) * (h / 4.0)
+                v1, _ = step(consts(t, h), v, w)
+                err = float(np.max(np.exp(phi.real) * (np.abs(simpson - trap) + b * h * np.abs(v2 - v1) / 3.0)))
+                if err > _PROTEIN_ODE_TOL and h > h_min:
+                    h *= max(0.2, 0.9 * (_PROTEIN_ODE_TOL / err) ** (1.0 / 3.0))
+                    continue
+                fac = min(2.0, max(0.2, 0.9 * (_PROTEIN_ODE_TOL / max(err, 1e-300)) ** (1.0 / 3.0)))
+            v, w = v2, w2
+            phi = phi + simpson
+            t += h
+            steps.append(h)
+            h *= fac
 
-        u_tilde = np.array(g, dtype=np.complex64)
-        du_tilde = np.array(g, dtype=np.complex64)
-
-        phi = b * u_tilde[0] / (1 - b * u_tilde[0]) * dt / 2
-
-        # Solve ODE using RK4 method
-        for step in range(num_tsteps):
-            u_tilde = RK4(u_tilde, du_tilde, u_tilda_ode, dt, beta, gamma, k_p, gamma_p)
-            phi += b * u_tilde[0] / (1 - b * u_tilde[0]) * dt
-
-        extra = 0
-        max_extra = 10 * num_tsteps + 10_000
-        while adaptive and np.max(np.abs(u_tilde[0])) > 1e-3 and extra < max_extra:
-            u_tilde = RK4(u_tilde, du_tilde, u_tilda_ode, dt, beta, gamma, k_p, gamma_p)
-            phi += b * u_tilde[0] / (1 - b * u_tilde[0]) * dt
-            extra += 1
-
-        u_tilde = RK4(u_tilde, du_tilde, u_tilda_ode,dt, beta, gamma, k_p, gamma_p)
-        phi += b * u_tilde[0] / (1 - b * u_tilde[0]) * dt / 2
-
-        self._last_protein_schedule = (dt, num_tsteps + extra)
+        self._last_protein_schedule = np.asarray(steps, dtype=float)
         return phi
 
     def cir_intfun(self, x, g, b, beta, gamma):
