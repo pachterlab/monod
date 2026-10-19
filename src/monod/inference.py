@@ -6,7 +6,8 @@ import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
 from .extract_data import make_dir, log, extract_data, make_histogram, _uns_unpack, _build_sampling_grid, model_from_uns, to_dense
-from .cme_toolbox import CMEModel, _HAS_RUST, _MODELS_2D
+from .cme_toolbox import CMEModel, _HAS_RUST, _MODELS_2D, _format_direction
+from .reaction_network import ReactionNetworkWarning, IdentifiabilityWarning
 from ._core import _mc          # None when the compiled extension is not installed
 
 
@@ -18,7 +19,9 @@ from ._core import _mc          # None when the compiled extension is not instal
 #:   n_jac_jobs       joblib parallelism over finite-difference perturbations (Python path)
 #: Optional keys: use_rust_lbfgsb (run the whole fit in Rust), use_batch_optimizer
 #: (batched Adam), presearch / presearch_maxiter (derivative-free pre-search, on by
-#: default for ProteinBursty).
+#: default for ProteinBursty), check_identifiability ("auto": numerical rank check
+#: of the model at the first grid point for Custom networks; True for every model;
+#: False to skip).
 DEFAULT_GRADIENT_PARAMS = {
     "max_iterations": 10,
     "init_pattern": "moments",
@@ -258,6 +261,7 @@ def perform_inference(h5ad_filepath,
                 without_log = param_name.replace(r"\log_{10} ", "")
                 # monod_adata.var[r'$\sigma$_' + param_name] = sigmas#[:,i]
                 monod_adata.var['error_' + without_log] = sigmas#[:,i]
+            monod_adata.var['error_unreliable'] = np.asarray(search_result.sigma_fail, dtype=bool)
 
         else:
             # Save uncertainties from Hessian.
@@ -273,6 +277,7 @@ def perform_inference(h5ad_filepath,
 
                     sigmas = all_sigmas[:,i]
                     monod_adata.var[r"c{}_error_".format(j) + without_log] = sigmas#[:,i]
+                monod_adata.var[f"c{j}_error_unreliable"] = np.asarray(sr.sigma_fail, dtype=bool)
 
         if not mek_means_params:
             # NB log.
@@ -771,6 +776,9 @@ class InferenceParameters:
             "presearch" selects a derivative-free search run from the first starting point before
                 gradient descent: "auto" (default; Nelder-Mead for ProteinBursty, nothing otherwise),
                 "nelder-mead", or None. "presearch_maxiter" caps its iterations (default 300).
+            "check_identifiability" runs CMEModel.check_identifiability once, at the first grid
+                point and the first gene's starting point, and warns about flat directions:
+                "auto" (default; Custom networks only), True (every model) or False.
             "num_gene_cores" controls gene-level parallelism per grid point (-1 = all cores). Uses ThreadPoolExecutor + scipy by default; set "use_batch_optimizer"=True to use batch Adam with rayon instead.
             "n_jac_jobs" controls joblib parallelism over FD perturbations (-1 = all cores); only
             effective when num_gene_cores=1 to avoid nested parallelism.
@@ -816,6 +824,16 @@ class InferenceParameters:
 
         self.construct_grid()
         self.model = model
+
+        if model.bio_model == "Custom":
+            # The constructor already warned about the other structural issues;
+            # the time-unit degeneracy only matters once the network is fitted.
+            for issue in model.network.structural_issues():
+                if issue["code"] == "timescale":
+                    warnings.warn(
+                        f"ReactionNetwork({model.network.network_str!r}): {issue['message']}",
+                        ReactionNetworkWarning, stacklevel=2,
+                    )
 
         self.n_phys_pars = model.get_num_params()
         self.n_samp_pars = len(self.samp_ub)  # this will always be 2 for now
@@ -1231,7 +1249,12 @@ class GradientInference:
 
         if self.gradient_params["init_pattern"] == "moments":
             _sd_is_rust_sd = _mc is not None and isinstance(search_data, _mc.SearchData)
-            if _sd_is_rust_sd:
+            if model.bio_model == "Custom":
+                # No moment estimator for an arbitrary network: every gene starts
+                # from the middle of the parameter box (see CMEModel.get_MoM).
+                mid = 0.5 * (np.asarray(global_parameters.phys_lb, float) + np.asarray(global_parameters.phys_ub, float))
+                self.param_MoM = np.tile(mid, (search_data.n_genes, 1))
+            elif _sd_is_rust_sd:
                 # Zero-Python-loop path: Rust computes MoM for all genes at once.
                 samp_list_mom = None
                 if model.seq_model in ("Poisson", "Bernoulli"):
@@ -1264,6 +1287,52 @@ class GradientInference:
                     ]
                 )
                 warnings.filters[:] = _saved_filters   # restore the caller's filters
+
+        if point_index == 0:
+            global_parameters.identifiability = self._check_identifiability(model, search_data)
+
+    def _check_identifiability(self, model, search_data):
+        """Numerical rank check of the model, once per inference.
+
+        Runs :meth:`CMEModel.check_identifiability` at the first gene's
+        starting point (the moments estimate when there is one, otherwise the
+        middle of the parameter box) on that gene's grid, and warns about any
+        flat direction. Controlled by ``gradient_params["check_identifiability"]``:
+        ``"auto"`` runs it for Custom networks only, ``True`` for every model
+        and ``False`` never. Returns the result dict or None when skipped.
+        """
+        mode = self.gradient_params.get("check_identifiability", "auto")
+        if mode == "auto":
+            mode = model.bio_model == "Custom"
+        if not mode:
+            return None
+        x0 = None
+        if hasattr(self, "param_MoM") and np.all(np.isfinite(self.param_MoM[0])):
+            x0 = np.asarray(self.param_MoM[0], dtype=float)
+        if x0 is None:
+            x0 = 0.5 * (np.asarray(self.phys_lb, float) + np.asarray(self.phys_ub, float))
+        x0 = np.clip(x0, self.phys_lb, self.phys_ub)
+        try:
+            result = model.check_identifiability(
+                x0, np.asarray(search_data.M[:, 0]), samp=self.regressor[0], warn=False
+            )
+        except Exception as exc:  # the fit itself will surface a real evaluation problem
+            log.info("Identifiability check skipped: %s", exc)
+            return None
+        log.info(
+            "Identifiability check at %s: relative singular values %s",
+            np.array2string(x0, precision=2),
+            np.array2string(result["singular_values"], precision=2),
+        )
+        for rel_sv, direction in result["flat"]:
+            warnings.warn(
+                f"{model.bio_model} model: the steady state is insensitive to the parameter direction "
+                f"{_format_direction(direction)} (relative singular value {rel_sv:.1e} at the first "
+                "gene's starting point); this combination of parameters cannot be inferred from the "
+                "data. Set gradient_params['check_identifiability']=False to silence this check.",
+                IdentifiabilityWarning, stacklevel=3,
+            )
+        return result
 
     def optimize_gene(self, gene_index, model, search_data, x0=None):
         """Fit the data for a single gene using KL divergence gradient descent.
@@ -2075,6 +2144,7 @@ class SearchResults:
         "param_estimates", "klds", "obj_func", "d_time", "regressor",
         "samp_optimum_ind", "samp_optimum", "phys_optimum", "regressor_optimum",
         "rejected_genes", "pval", "csq", "hellinger", "sigma",
+        "sigma_fail", "sigma_flat_direction",
         "analysis_figure_string", "full_result_string",
     )
 
@@ -2739,19 +2809,24 @@ class SearchResults:
         gene_index, search_data = inputs
 
         search_data = self._search_data_for(search_data)
+        # numdifftools' default step sequence starts about two decades from the
+        # optimum, where custom-network evaluations can take minutes. Richardson
+        # extrapolation over 0.1 / 2**k (k = 0..7) decades keeps every probe
+        # within a fifth of a decade and gives the same Hessian for smooth KLDs.
         Hfun = numdifftools.Hessian(
             lambda x: self.model.eval_model_kld(
                 p=x,
                 limits=search_data.M[:, gene_index],
                 samp=self.regressor_optimum[gene_index],
                 data=search_data.hist[gene_index],
-            )
+            ),
+            step=numdifftools.MaxStepGenerator(base_step=0.1, num_steps=8, step_ratio=2.0),
         )
         hess = Hfun(self.phys_optimum[gene_index])
         
         return hess
 
-    def compute_sigma(self, search_data, num_cores=1):
+    def compute_sigma(self, search_data, num_cores=1, max_relative_sigma=0.5):
         """Estimate uncertainty in biological parameter values.
 
         This method iterates over genes, computes the Fisher information matrix by inverting
@@ -2760,8 +2835,13 @@ class SearchResults:
 
         This method is fairly computationally demanding, so parallelization is recommended.
 
-        If inversion fails, the gene-specific standard errors are replaced with their mean over
-        all genes that did not fail.
+        A gene is flagged in ``sigma_fail`` when its Hessian is not finite, is not positive
+        definite (the fit is not at a minimum, or the likelihood is exactly flat in some
+        direction), or gives a standard error wider than ``max_relative_sigma`` times the
+        width of the parameter box (the data do not constrain that parameter). The standard
+        errors of flagged genes are replaced with the mean over the other genes so that
+        downstream steps keep working, and an :class:`IdentifiabilityWarning` reports how
+        many genes were flagged and along which direction their likelihood is flattest.
 
         Parameters
         ----------
@@ -2769,6 +2849,9 @@ class SearchResults:
             SearchData object with the fit data.
         num_cores: int, optional
             number of cores to use for parallelization over genes.
+        max_relative_sigma: float, optional
+            flag a gene when any standard error exceeds this fraction of the parameter's
+            bound width.
 
         Sets
         ----
@@ -2776,6 +2859,12 @@ class SearchResults:
             the standard error of the parameter maximum likelihood estimate at the sampling
             parameter optimum.
             a n_genes x n_phys_pars array.
+        sigma_fail: bool np.ndarray
+            per-gene flag; True where ``sigma`` is a fallback rather than an estimate.
+        sigma_flat_direction: float np.ndarray
+            the eigenvector of the smallest Hessian eigenvalue per gene (n_genes x
+            n_phys_pars, unit length): the direction the data constrain least. NaN where
+            the Hessian was not finite.
         sigma_index: int
             the grid point at which the Fisher information procedure was performed to generate
             the sigma attribute.
@@ -2802,36 +2891,50 @@ class SearchResults:
                 for x in zip(range(self.n_genes), itertools.repeat(search_data, self.n_genes))
             ]
             log.info("Non-parallelized Hessian computation complete.")
-        hess = np.asarray(hess)
+        hess = np.asarray(hess, dtype=float)
 
+        n_par = self.sp.n_phys_pars
         fail = np.zeros(self.n_genes, dtype=bool)
-        sigma = np.zeros((self.n_genes, self.sp.n_phys_pars))
+        reason = [""] * self.n_genes
+        sigma = np.zeros((self.n_genes, n_par))
+        flat_dir = np.full((self.n_genes, n_par), np.nan)
+        width = np.asarray(self.sp.phys_ub, float) - np.asarray(self.sp.phys_lb, float)
 
         for gene_index in range(self.n_genes):
-            try:
+            H = hess[gene_index]
+            if not np.all(np.isfinite(H)):
+                fail[gene_index] = True
+                reason[gene_index] = "non-finite Hessian"
+                continue
+            evals, evecs = np.linalg.eigh(0.5 * (H + H.T))
+            flat_dir[gene_index] = evecs[:, 0]
+            if evals[0] <= 0:
+                fail[gene_index] = True
+                reason[gene_index] = "Hessian not positive definite"
+                continue
+            hess_inv = np.linalg.inv(H)
+            sig = np.sqrt(np.maximum(np.diag(hess_inv), 0.0)) / np.sqrt(self.n_cells)
+            sigma[gene_index] = sig
+            if np.any(~np.isfinite(sig)):
+                fail[gene_index] = True
+                reason[gene_index] = "non-finite standard error"
+            elif np.any(sig > max_relative_sigma * width):
+                fail[gene_index] = True
+                reason[gene_index] = "standard error wider than the parameter box"
 
-                hess_inv = np.linalg.inv(hess[gene_index, :, :])
-                sigma[gene_index, :] = np.sqrt(np.diag(hess_inv)) / np.sqrt(
-                    self.n_cells
-                )
-            except:
-                fail[gene_index] = True
-                log.info(
-                    "Gene {:.0f} ran into singularity; replaced with mean. (Search converged to local minimum?) ".format(
-                        gene_index
-                    )
-                )
-                # errorbars[i,:] = np.mean(errorbars[:i,:])
-            if np.any(~np.isfinite(sigma[gene_index, :])):
-                fail[gene_index] = True
-                log.info(
-                    "Gene {:.0f} gives negative stdev; replaced with mean. (Search converged to local minimum?)".format(
-                        gene_index
-                    )
-                )
-                # errorbars[i,:] = np.mean(errorbars[:i,:])
-        sigma[fail, :] = sigma[~fail, :].mean(0)
+        if np.any(fail):
+            for gene_index in np.flatnonzero(fail):
+                log.info("Gene %d: %s; standard errors replaced with the mean over the other genes.",
+                         gene_index, reason[gene_index])
+            if np.all(fail):
+                sigma[:] = np.nan
+            else:
+                sigma[fail, :] = sigma[~fail, :].mean(0)
+            self._warn_sigma_fail(fail, flat_dir, reason)
+
         self.sigma = sigma
+        self.sigma_fail = fail
+        self.sigma_flat_direction = flat_dir
         self.sigma_index = self.samp_optimum_ind  # mostly for debug
 
         t2 = time.time()
@@ -2840,6 +2943,25 @@ class SearchResults:
                 t2 - t1
             )
         )
+
+    def _warn_sigma_fail(self, fail, flat_dir, reason):
+        """One IdentifiabilityWarning summarising the genes flagged by compute_sigma."""
+        from collections import Counter
+        names = self.model.param_names()
+        n_fail = int(np.sum(fail))
+        counts = Counter(reason[i] for i in np.flatnonzero(fail))
+        why = "; ".join(f"{c} {r}" for r, c in counts.most_common())
+        msg = (f"{n_fail} of {self.n_genes} genes have unreliable standard errors ({why}). "
+               "Their entries in sigma are the mean over the other genes; see sigma_fail and "
+               "sigma_flat_direction.")
+        dirs = flat_dir[fail]
+        dirs = dirs[np.all(np.isfinite(dirs), axis=1)]
+        if len(dirs):
+            # sign-invariant average direction: top eigenvector of the scatter matrix
+            w, v = np.linalg.eigh(dirs.T @ dirs)
+            msg += (f" Their likelihood is flattest along {_format_direction(dict(zip(names, v[:, -1])))}"
+                    f"{' (this is the protein k_p/gamma_p valley)' if self.model.bio_model == 'ProteinBursty' else ''}.")
+        warnings.warn(msg, IdentifiabilityWarning, stacklevel=3)
 
     def resample_opt_viz(
         self, resamp_vec=(5, 10, 20, 40, 60), Ntries=4, figsize=(10, 10)

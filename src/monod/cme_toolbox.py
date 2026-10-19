@@ -3,6 +3,7 @@ This script provides convenience functions for evaluating RNA distributions.
 """
 
 import logging
+import warnings
 import collections as _collections
 import numpy as np
 from numba import jit
@@ -13,7 +14,7 @@ from scipy.fft import irfftn
 
 # from .nn_toolbox import basic_ml_bivariate, ml_microstate_logP
 from .extract_data import log
-from .reaction_network import ReactionNetwork
+from .reaction_network import ReactionNetwork, IdentifiabilityWarning
 
 _MESH_CACHE: dict = {}
 _MESH_CACHE_ENTRIES = [0]          # total complex128 entries currently cached
@@ -285,6 +286,15 @@ _MODELS_2D = frozenset({"Constitutive", "Bursty", "CIR", "Extrinsic", "Delay", "
 _Backend = _collections.namedtuple("_Backend", "kind family samp")
 
 
+def _format_direction(direction, min_weight=0.15):
+    """'+0.58 k0 +0.58 k1 +0.58 k2' for a {name: component} unit vector."""
+    items = [(n, c) for n, c in direction.items() if abs(c) >= min_weight]
+    if not items:
+        items = [max(direction.items(), key=lambda kv: abs(kv[1]))]
+    sign = 1.0 if items[0][1] >= 0 else -1.0     # canonical sign: first named entry positive
+    return " ".join(f"{sign * c:+.2f} {n}" for n, c in items)
+
+
 class CMEModel:
     """Stores and evaluates biological and technical variation models.
 
@@ -447,7 +457,15 @@ class CMEModel:
             self.filter_bounds = CMEModel.available_filter_bounds[self.bio_model]
             
         except KeyError:
-            log.info("Biophysical bounds unknown for model: {}".format(self.bio_model))
+            if self.bio_model == "Custom":
+                # One entry per species, with the mRNA defaults; override with
+                # filt_param= in extract_data / perform_inference when a species
+                # (a protein, say) lives on a different scale.
+                n_sp = len(self.network.species)
+                self.filter_bounds = {'min_means': [0.01] * n_sp, 'max_maxes': [350] * n_sp,
+                                      'min_maxes': [4] * n_sp}
+            else:
+                log.info("Biophysical bounds unknown for model: {}".format(self.bio_model))
             
             
         # Define the parameter bounds used for each biophysical model.
@@ -464,7 +482,18 @@ class CMEModel:
             self.bio_bounds = CMEModel.available_bio_bounds[self.bio_model]
             
         except KeyError:
-            log.info("Biophysical bounds unknown for model: {}".format(self.bio_model))
+            if self.bio_model == "Custom":
+                # Burst sizes get the Bursty b range. Rates and inverse delays get
+                # three decades rather than the Bursty five: the network integrator
+                # takes a fixed step set by the fastest rate over a horizon set by
+                # the slowest, so its cost grows with the ratio between them.
+                net = self.network
+                n_rates = len(net.delay_params) + len(net.rate_names)
+                lb = [-1.0] * len(net.named_params) + [-1.0] * n_rates
+                ub = [4.2] * len(net.named_params) + [2.0] * n_rates
+                self.bio_bounds = {'phys_lb': lb, 'phys_ub': ub}
+            else:
+                log.info("Biophysical bounds unknown for model: {}".format(self.bio_model))
 
         if amb_model in ["None", None, "Null"]:
             amb_model = "None"
@@ -1149,6 +1178,99 @@ class CMEModel:
             raise ValueError(f"limits must be positive integers, got {list(limits_arr)}")
         return p, [int(x) for x in limits_arr]
 
+    def param_names(self):
+        """Plain-text parameter names, one per entry of the parameter vector.
+
+        ``param_str`` holds TeX labels for plotting; this strips the log prefix
+        and the math delimiters (``b``, ``beta``, ``gamma``, or the network's
+        own names for ``Custom``).
+        """
+        out = []
+        for s in self.param_str:
+            s = s.replace(r"\log_{10}", "").replace("$", "").replace("\\,", "").replace("\\", "")
+            out.append(s.strip())
+        return out
+
+    def check_identifiability(self, p, limits, samp=None, h=1e-4, rtol=1e-3, warn=True):
+        """Test whether every parameter direction changes the steady state.
+
+        Builds the Jacobian of the distribution over the grid with respect to
+        the log10 parameters by central finite differences, takes its singular
+        value decomposition and reports the directions whose singular value is
+        below ``rtol`` times the largest. A direction with singular value zero
+        is structurally non-identifiable: moving along it leaves the
+        distribution, and therefore the likelihood of any data, unchanged. A
+        small but nonzero value marks a direction the data will constrain
+        poorly at this point in parameter space.
+
+        This is a local test at one parameter vector. It catches exact
+        degeneracies (all rates scaled together, duplicate reactions, a delay
+        with nothing to delay) wherever it is evaluated, and value-dependent
+        ones (the protein model's ``k_p``/``gamma_p`` valley) only when
+        evaluated in the regime where they occur.
+
+        Parameters
+        ----------
+        p : array-like
+            log10 parameters at which to test.
+        limits : array-like of int
+            grid size per species, as for :meth:`eval_model_pss`.
+        samp : array-like or None, optional
+            log10 sampling parameters when the sequencing model needs them.
+        h : float, optional
+            finite-difference step in log10 units.
+        rtol : float, optional
+            relative singular-value threshold below which a direction is
+            reported as flat.
+        warn : bool, optional
+            emit an :class:`monod.reaction_network.IdentifiabilityWarning`
+            naming each flat direction.
+
+        Returns
+        -------
+        dict
+            ``identifiable`` (bool), ``param_names``, ``singular_values``
+            (relative to the largest, descending), ``directions`` (rows are the
+            right singular vectors in the same order) and ``flat`` (a list of
+            ``(relative singular value, {name: component})`` for each direction
+            below the threshold).
+        """
+        p = np.asarray(p, dtype=float)
+        names = self.param_names()
+        if p.shape != (len(names),):
+            raise ValueError(f"expected {len(names)} parameters {names}, got shape {p.shape}")
+
+        def f(x):
+            return np.asarray(self.eval_model_pss(x, limits, samp), dtype=float).ravel()
+
+        cols = []
+        for i in range(p.size):
+            e = np.zeros_like(p)
+            e[i] = h
+            cols.append((f(p + e) - f(p - e)) / (2 * h))
+        J = np.column_stack(cols)
+        if not np.all(np.isfinite(J)):
+            raise ValueError("the steady state is not finite at this point; cannot assess identifiability")
+        _, S, Vt = np.linalg.svd(J, full_matrices=False)
+        rel = S / S[0] if S[0] > 0 else np.zeros_like(S)
+        flat = []
+        for k in range(len(rel) - 1, -1, -1):
+            if rel[k] < rtol:
+                flat.append((float(rel[k]), dict(zip(names, Vt[k].tolist()))))
+            else:
+                break
+        result = dict(identifiable=not flat, param_names=names,
+                      singular_values=rel, directions=Vt, flat=flat)
+        if warn and flat:
+            for rel_sv, direction in flat:
+                warnings.warn(
+                    f"{self.bio_model} model: the steady state is insensitive to the parameter direction "
+                    f"{_format_direction(direction)} (relative singular value {rel_sv:.1e}, threshold {rtol:.0e}); "
+                    "this combination of parameters cannot be inferred from the data.",
+                    IdentifiabilityWarning, stacklevel=2,
+                )
+        return result
+
     def eval_model_pss(self, p, limits, samp=None):
         """Evaluate the PMF of the model over a grid at a set of parameters.
 
@@ -1672,6 +1794,11 @@ class CMEModel:
         x0: np.ndarray
             log10 biological parameter estimates.
         """
+        if self.bio_model == "Custom":
+            # No moment estimator for an arbitrary network: start every fit from
+            # the middle of the parameter box (log scale).
+            return 0.5 * (np.asarray(lb_log, float) + np.asarray(ub_log, float))[: self.get_num_params()]
+
         lb = 10**lb_log
         ub = 10**ub_log
         if self.seq_model in ("Poisson", "Bernoulli"):

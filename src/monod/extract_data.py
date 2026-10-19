@@ -923,7 +923,10 @@ def process_adata(adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes
         log.info(f"{len(gene_select_ind)} random genes selected.")
     else:
         gene_select_ind = sampling_gene_set
-        log.warning(f"{len(sampling_gene_set)} random genes selected: cannot satisfy query of {n_genes} genes.")
+        if n_genes > len(sampling_gene_set):
+            log.warning(f"Only {len(sampling_gene_set)} genes pass the filters; cannot satisfy query of {n_genes} genes.")
+        else:
+            log.info(f"All {len(sampling_gene_set)} genes passing the filters selected.")
     
     # Set both randomly selected and enforced genes to True
     selected_genes_filter[gene_select_ind] = True
@@ -1115,7 +1118,10 @@ def select_genes_across_datasets(adata_list, filt_param, exp_filter_threshold, g
             log.info(f"{n_genes} random genes selected.")
         else:
             gene_select_ind = sampling_gene_set
-            log.warning(f"{len(sampling_gene_set)} random genes selected: cannot satisfy query of {n_genes} genes.")
+            if n_genes > len(sampling_gene_set):
+                log.warning(f"Only {len(sampling_gene_set)} genes pass the filters; cannot satisfy query of {n_genes} genes.")
+            else:
+                log.info(f"All {len(sampling_gene_set)} genes passing the filters selected.")
         
         selected_genes_filter = np.zeros(exp_filter.shape, dtype=bool)
         selected_genes_filter[gene_select_ind] = True

@@ -80,11 +80,29 @@ Examples
 from __future__ import annotations
 
 import re
+import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
+
+
+class ReactionNetworkWarning(UserWarning):
+    """A network is parseable but cannot be fitted as written.
+
+    Raised by :meth:`ReactionNetwork.validate` for structural problems:
+    parameters the steady state cannot distinguish, species that are never
+    produced or never removed. See :meth:`ReactionNetwork.structural_issues`.
+    """
+
+
+class IdentifiabilityWarning(UserWarning):
+    """A fitted or evaluated model has a direction the data cannot constrain.
+
+    Raised by :meth:`monod.cme_toolbox.CMEModel.check_identifiability` and by
+    :meth:`monod.inference.SearchResults.compute_sigma`.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +344,193 @@ class ReactionNetwork:
         self.all_params: List[str] = self.named_params + self.delay_params + self.rate_names
 
         self._has_delays: bool = bool(self.delay_params)
+
+        # Warn about structural problems now, except the time-unit degeneracy
+        # of a network with every rate free: that only matters for fitting and
+        # is reported by InferenceParameters (see ``validate(for_inference=True)``).
+        self.validate(for_inference=False, stacklevel=3)
+
+    # ------------------------------------------------------------------
+    # Structural checks
+    # ------------------------------------------------------------------
+
+    def _reaction_str(self, rxn: _Reaction) -> str:
+        src = " + ".join(f"{n} x {s}" if n > 1 else s for s, n in rxn.reactants.items()) or "0"
+        tgt = " + ".join(f"{n} x {s}" if n > 1 else s for s, n in rxn.products.items()) or "0"
+        if rxn.burst_param:
+            tgt = f"{rxn.burst_param} x {rxn.burst_species}"
+        return f"{src} {'=>' if rxn.is_delayed else '->'} {tgt}"
+
+    def structural_issues(self) -> List[Dict[str, object]]:
+        """Problems that can be read off the network without evaluating it.
+
+        Each issue is a dict with ``code``, ``params`` (the parameter names
+        involved, possibly empty) and a human-readable ``message``. Codes:
+
+        ``timescale``
+            Every rate constant (and inverse delay) is a free parameter. The
+            steady state is unchanged when all of them are scaled together, so
+            the fit has an exactly flat direction. Pass
+            ``normalize_production_rate=True`` or fix a rate by other means.
+        ``delay_no_product``
+            A ``=>`` reaction with no product: the delay changes nothing
+            observable, so its ``tauinv`` parameter has no effect at all.
+        ``duplicate_reaction``
+            Two reactions with the same reactant and products. The steady state
+            depends only on their combined effect, so their parameters are not
+            separately identifiable.
+        ``no_source``
+            A species that can never be produced. Its steady state is
+            identically zero and the rates of reactions consuming it are
+            unconstrained.
+        ``no_sink``
+            A species that no reaction removes (as a reactant that is not also a
+            product). Its count grows without bound and no steady state exists.
+        ``autocatalytic``
+            A reaction that turns one molecule of a species into two or more of
+            the same species. The count grows without bound.
+
+        Returns
+        -------
+        list of dict
+            Empty when the network passes every check.
+        """
+        issues: List[Dict[str, object]] = []
+        rxns = self.reactions
+
+        # -- time units -----------------------------------------------------
+        free_rates = list(self.rate_names) + list(self.delay_params)
+        if self._norm_rate is None and self.rate_names:
+            issues.append(dict(
+                code="timescale", params=free_rates,
+                message=(
+                    "every rate constant is free, so the steady state only depends on their "
+                    f"ratios: scaling {', '.join(free_rates)} together leaves the distribution "
+                    "unchanged and the fit has an exactly flat direction. Pass "
+                    "normalize_production_rate=True (fixes the first production rate to 1) "
+                    "or fix one rate yourself."
+                ),
+            ))
+
+        # -- delayed reaction with nothing to delay ------------------------------
+        for rxn in rxns:
+            if rxn.is_delayed and not rxn.products:
+                issues.append(dict(
+                    code="delay_no_product", params=[rxn.tau_name],
+                    message=(
+                        f"'{self._reaction_str(rxn)}' is delayed but has no product, so the "
+                        f"delay is unobservable and {rxn.tau_name} has no effect on the "
+                        "steady state. Write it as an immediate reaction (->)."
+                    ),
+                ))
+
+        # -- duplicate reactions ---------------------------------------------
+        seen: Dict[tuple, int] = {}
+        for i, rxn in enumerate(rxns):
+            key = (
+                tuple(sorted(rxn.reactants.items())),
+                tuple(sorted(rxn.products.items())),
+                rxn.is_delayed,
+                rxn.burst_species,
+            )
+            if key in seen:
+                j = seen[key]
+                other = rxns[j]
+                names = [n for n in (other.rate_name, rxn.rate_name, other.burst_param,
+                                     rxn.burst_param, other.tau_name, rxn.tau_name) if n]
+                issues.append(dict(
+                    code="duplicate_reaction", params=names,
+                    message=(
+                        f"reactions {j} ('{self._reaction_str(other)}') and {i} "
+                        f"('{self._reaction_str(rxn)}') have the same reactant and products; the "
+                        f"steady state only depends on their combined effect, so {', '.join(names)} "
+                        "are not separately identifiable. Merge them into one reaction."
+                    ),
+                ))
+            else:
+                seen[key] = i
+
+        # -- reachability from the empty set --------------------------------
+        reachable = set()
+        for rxn in rxns:
+            if not rxn.reactants:
+                reachable.update(rxn.products)
+        changed = True
+        while changed:
+            changed = False
+            for rxn in rxns:
+                if rxn.reactants and set(rxn.reactants) <= reachable:
+                    new = set(rxn.products) - reachable
+                    if new:
+                        reachable |= new
+                        changed = True
+        for sp in self.species:
+            if sp not in reachable:
+                consuming = [r.rate_name for r in rxns if sp in r.reactants]
+                issues.append(dict(
+                    code="no_source", params=consuming,
+                    message=(
+                        f"species {sp} is never produced, so its steady state is identically "
+                        f"zero and {', '.join(consuming) or 'the reactions consuming it'} "
+                        "cannot be inferred."
+                    ),
+                ))
+
+        # -- removal routes ------------------------------------------------------
+        for sp in self.species:
+            removed = any(sp in r.reactants and sp not in r.products for r in rxns)
+            if not removed:
+                issues.append(dict(
+                    code="no_sink", params=[],
+                    message=(
+                        f"species {sp} is never removed (no reaction has it as a reactant "
+                        "without also producing it), so its count grows without bound and "
+                        "the network has no steady state."
+                    ),
+                ))
+        for rxn in rxns:
+            for sp in rxn.reactants:
+                if rxn.products.get(sp, 0) >= 2:
+                    issues.append(dict(
+                        code="autocatalytic", params=[rxn.rate_name],
+                        message=(
+                            f"'{self._reaction_str(rxn)}' turns one {sp} into "
+                            f"{rxn.products[sp]}, so the count grows without bound and the "
+                            "network has no steady state."
+                        ),
+                    ))
+        return issues
+
+    def validate(self, for_inference: bool = True, warn: bool = True, stacklevel: int = 2
+                 ) -> List[Dict[str, object]]:
+        """Run :meth:`structural_issues` and warn about what it finds.
+
+        Parameters
+        ----------
+        for_inference : bool, optional
+            Include the ``timescale`` issue. It is harmless when a network is
+            only evaluated at given parameters, so the constructor leaves it
+            out and the inference entry points include it.
+        warn : bool, optional
+            Emit one :class:`ReactionNetworkWarning` per issue.
+        stacklevel : int, optional
+            Passed to :func:`warnings.warn` so the warning points at the caller.
+
+        Returns
+        -------
+        list of dict
+            The issues found (see :meth:`structural_issues`).
+        """
+        issues = self.structural_issues()
+        if not for_inference:
+            issues = [it for it in issues if it["code"] != "timescale"]
+        if warn:
+            for it in issues:
+                warnings.warn(
+                    f"ReactionNetwork({self.network_str!r}): {it['message']}",
+                    ReactionNetworkWarning, stacklevel=stacklevel,
+                )
+        return issues
 
     # ------------------------------------------------------------------
     # Parsing
