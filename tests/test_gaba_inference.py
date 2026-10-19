@@ -191,30 +191,31 @@ class TestGabaInferencePipeline:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(scope="module")
+def kld_comparison(ref_adata, gaba_fit):
+    """Return per-gene (kld_ref, kld_fit) evaluated at REF_SAMP_IND."""
+    sr = gaba_fit["sr"]
+    sd = gaba_fit["sd"]
+    model = gaba_fit["model"]
+    gene_idx = gaba_fit["gene_idx"]
+
+    ref_params = ref_adata.var.loc[GENES, REF_PARAM_COLS]
+
+    sr.set_sampling_optimum(REF_SAMP_IND)
+
+    results = {}
+    for g in GENES:
+        idx = gene_idx[g]
+        samp = sr.regressor_optimum[idx]
+        fitted_p = sr.param_estimates[REF_SAMP_IND, idx]
+        ref_p = ref_params.loc[g].values
+        kld_fit = model.eval_model_kld(fitted_p, sd.M[:, idx], samp, sd.hist[idx])
+        kld_ref = model.eval_model_kld(ref_p,    sd.M[:, idx], samp, sd.hist[idx])
+        results[g] = (kld_ref, kld_fit)
+    return results
+
+
 class TestGabaParameterQuality:
-    @pytest.fixture(scope="class")
-    def kld_comparison(self, ref_adata, gaba_fit):
-        """Return per-gene (kld_ref, kld_fit) evaluated at REF_SAMP_IND."""
-        sr = gaba_fit["sr"]
-        sd = gaba_fit["sd"]
-        model = gaba_fit["model"]
-        gene_idx = gaba_fit["gene_idx"]
-
-        ref_params = ref_adata.var.loc[GENES, REF_PARAM_COLS]
-
-        sr.set_sampling_optimum(REF_SAMP_IND)
-
-        results = {}
-        for g in GENES:
-            idx = gene_idx[g]
-            samp = sr.regressor_optimum[idx]
-            fitted_p = sr.param_estimates[REF_SAMP_IND, idx]
-            ref_p = ref_params.loc[g].values
-            kld_fit = model.eval_model_kld(fitted_p, sd.M[:, idx], samp, sd.hist[idx])
-            kld_ref = model.eval_model_kld(ref_p,    sd.M[:, idx], samp, sd.hist[idx])
-            results[g] = (kld_ref, kld_fit)
-        return results
-
     @pytest.mark.parametrize("gene", GENES)
     def test_fitted_kld_le_reference(self, kld_comparison, gene):
         kld_ref, kld_fit = kld_comparison[gene]
@@ -235,14 +236,15 @@ class TestGabaParameterQuality:
 # ---------------------------------------------------------------------------
 
 
-class TestGabaParamSnapshot:
-    @pytest.fixture(scope="class")
-    def params_at_ref(self, gaba_fit):
-        sr = gaba_fit["sr"]
-        gene_idx = gaba_fit["gene_idx"]
-        sr.set_sampling_optimum(REF_SAMP_IND)
-        return np.array([sr.phys_optimum[gene_idx[g]] for g in GENES])
+@pytest.fixture(scope="module")
+def params_at_ref(gaba_fit):
+    sr = gaba_fit["sr"]
+    gene_idx = gaba_fit["gene_idx"]
+    sr.set_sampling_optimum(REF_SAMP_IND)
+    return np.array([sr.phys_optimum[gene_idx[g]] for g in GENES])
 
+
+class TestGabaParamSnapshot:
     def test_params_shape(self, params_at_ref):
         assert params_at_ref.shape == (len(GENES), 3)
 

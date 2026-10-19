@@ -105,7 +105,8 @@ class TestOptimizeGenesProteinBurstySd:
     UB = np.array([ 2.0,  2.0,  2.0,  2.0,  2.0])
 
     @pytest.fixture(scope="class")
-    def synthetic_sd(self):
+    @classmethod
+    def synthetic_sd(cls):
         # Use a tiny grid (8×6×5 = 240 points) to keep each PSS call fast
         # (~240 pts × ~1000 tsteps at x0=[0,0,0,0,0]).  Parity is tested via
         # self-consistency, not numerical accuracy, so small grids are fine.
@@ -264,7 +265,8 @@ class TestOptimizeGenes2dAmbSd:
     UB_UNEQUAL = np.array([ 2.0,  2.0,  0.0,  0.0])
 
     @pytest.fixture(scope="class")
-    def synthetic_sd_equal(self):
+    @classmethod
+    def synthetic_sd_equal(cls):
         """1-gene, tiny-grid (8×6×5=240 pts) SearchData for amb_model=Equal."""
         n_cells, n_genes = 100, 1
         layers = _make_layers(n_cells, n_genes, 3, high=4)
@@ -274,7 +276,8 @@ class TestOptimizeGenes2dAmbSd:
         return sd, coords_list, freqs_list, limits_arr
 
     @pytest.fixture(scope="class")
-    def synthetic_sd_unequal(self):
+    @classmethod
+    def synthetic_sd_unequal(cls):
         """Same as equal but used for Unequal tests."""
         n_cells, n_genes = 100, 1
         layers = _make_layers(n_cells, n_genes, 3, high=4)
@@ -472,7 +475,8 @@ class TestOptimizeGenesCustomSd:
     N_SPECIES      = 2
 
     @pytest.fixture(scope="class")
-    def synthetic_sd(self):
+    @classmethod
+    def synthetic_sd(cls):
         # Tiny 2D grid (10×8=80 pts) keeps each PSS call fast.
         n_cells, n_genes = 100, 1
         layers = _make_layers(n_cells, n_genes, 2, high=4)

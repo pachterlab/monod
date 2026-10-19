@@ -187,3 +187,41 @@ def test_reject_genes_round_trip(two_adatas):
     reject_genes(a2, reject_at_bounds=False)
     gn, gf, offs, resid = analysis.DE_parameters(a1, a2, viz=False, use_sigma=False, discard_rejected=True, nit=2)
     assert gf.shape[1] == a1.n_vars
+
+
+@pytest.mark.parametrize("fit_slope", [False, True])
+@pytest.mark.parametrize("use_err", [False, True])
+def test_fit_line_eiv_matches_scipy_odr(fit_slope, use_err):
+    """The closed-form / York fit reproduces scipy.odr (deprecated in SciPy 1.17, removed in 1.19)."""
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        try:
+            from scipy import odr
+        except ImportError:
+            pytest.skip("scipy.odr no longer available")
+    rng = np.random.default_rng(3)
+    x = rng.normal(size=300)
+    sx = rng.uniform(0.05, 0.3, size=300)
+    sy = rng.uniform(0.05, 0.3, size=300)
+    slope = 1.3 if fit_slope else 1.0
+    y = 0.4 + slope * x + rng.normal(size=300) * sy
+    x = x + rng.normal(size=300) * sx
+    ours = analysis._fit_line_eiv(x, y, sx if use_err else None, sy if use_err else None, fit_slope=fit_slope)
+    modeltype = "lin" if fit_slope else "id"
+    data = odr.RealData(x, y, sx=sx, sy=sy) if use_err else odr.Data(x, y)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ref = odr.ODR(data, odr.Model(lambda B, t: analysis.linoffset(B, t, modeltype=modeltype)),
+                      beta0=[0, 1] if fit_slope else [0]).run().beta
+    np.testing.assert_allclose(ours, ref, rtol=1e-4, atol=1e-6)
+    assert ours.shape == (2 if fit_slope else 1,)
+
+
+def test_fit_line_eiv_degenerate_inputs():
+    # one point: slope stays at 1, offset is the difference; identical inputs give an exact zero offset
+    np.testing.assert_allclose(analysis._fit_line_eiv([1.0], [1.5], fit_slope=True), [0.5, 1.0])
+    m = np.random.default_rng(0).normal(size=20)
+    np.testing.assert_array_equal(analysis._fit_line_eiv(m, m.copy(), fit_slope=True), [0.0, 1.0])
+    gf, beta, resid, pval = analysis.diffexp_fpi(m, m.copy(), "x", modeltype="lin", viz=False, nit=3)
+    assert not gf.any() and np.isfinite(beta).all()

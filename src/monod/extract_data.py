@@ -473,50 +473,6 @@ def add_moments(adata, modality_name_dict=None, cov_matrix_key='layer_covariance
 
     return adata
 
-# TODO make work.
-def plot_vs_lengths(adata):
-    
-    mods = layers # usually unspliced, spliced
-    
-    mod_names = dataset_attr_names[0] # default 'unspliced', 'spliced'
-    
-    # Use first letter of names as labels (make sure modalities have different first letters.
-    mod_labels = [mod_name[0].upper() for mod_name in mod_names]
-    
-    var_name = tuple(mod_labels[::-1])
-    var_arr = tuple([mod.mean(1) for mod in mods][::-1])
-    
-    fig1, ax1 = plt.subplots(nrows=1, ncols=len(mods), figsize=(12, 4))
-    for i in range(len(mods)):
-        ax1[i].scatter(
-            np.log10(len_arr),
-            np.log10(var_arr[i] + 0.001),
-            s=3,
-            c="silver",
-            alpha=0.15,
-        )
-        ax1[i].set_xlabel("log10 gene length")
-        ax1[i].set_ylabel("log10 (mean " + var_name[i] + " + 0.001)")
-
-# TODO make work.
-def plot_diagnostic(monod_adata):
-    dataset_diagnostics_dir_string = dataset_string + "/diagnostic_figures"
-    make_dir(dataset_diagnostics_dir_string)
-
-    if transcriptome_filepath:
-        for i in range(len(mods)):
-            var_arr = tuple([mod.mean(1) for mod in mods][::-1])
-            ax1[i].scatter(
-                np.log10(len_arr),
-                np.log10(var_arr[i] + 0.001),
-                s=5,
-                c="firebrick",
-                alpha=0.9,
-            )
-        
-        plt.savefig(
-            dataset_diagnostics_dir_string + "/{}.png".format(dataset_name), dpi=450
-        )
 
 def _make_histogram_one_gene(gene_index, layers, hist_type, M, n_cells):
     """Compute the histogram for a single gene (parallelisable worker)."""
@@ -639,60 +595,6 @@ def var_fun(adata, measure):
         variance = adata.X.var(axis=1).A1
         return variance / mean
 
-
-########################
-## Main code
-########################
-
-# From construct batch.
-    
-        
-    if dataset_index == 0:  # this presupposes the data are well-structured
-        gene_name_reference = np.copy(gene_names)
-        expression_filter_array = np.zeros(
-            (n_datasets, len(gene_name_reference)), dtype=bool
-        )
-    else:
-        if not np.all(gene_name_reference == gene_names):
-            raise ValueError(
-                "Gene names do not match: the data may not be consistently structured."
-            )
-
-    
-
-
-# TODO make work.
-def preprocess_viz(monod_adata, transcriptome_filepath):
-
-    if transcriptome_filepath:
-        # Use first letters of the modalities as names in visualization.
-        # mod1_name, mod2_name = attribute_names[0]
-        
-        mod_names = attribute_names[0][0]
-        # var_name = (mod2_name[0].upper(), mod1_name[0].upper()) # e.g. ("S", "U")
-        # NB reversed order here.
-        var_name = tuple([name[0].upper() for name in mod_names[::-1]])
-        # var_arr = (mod2.mean(1), mod1.mean(1))
-        var_arr = tuple([mod.mean(1) for mod in mods][::-1])
-
-        fig1, ax1 = plt.subplots(nrows=1, ncols=len(mods), figsize=(12, 4))
-        for i in range(len(mods)):
-            ax1[i].scatter(
-                np.log10(len_arr)[~gene_exp_filter],
-                np.log10(var_arr[i][~gene_exp_filter] + 0.001),
-                s=3,
-                c="silver",
-                alpha=0.15,
-            )
-            ax1[i].scatter(
-                np.log10(len_arr[gene_exp_filter]),
-                np.log10(var_arr[i][gene_exp_filter] + 0.001),
-                s=3,
-                c="indigo",
-                alpha=0.3,
-            )
-            ax1[i].set_xlabel("log10 gene length")
-            ax1[i].set_ylabel("log10 (mean " + var_name[i] + " + 0.001)")
 
 ########################
 ## Helper functions
@@ -990,7 +892,7 @@ def process_adata(adata, filt_param, genes_to_fit, exp_filter_threshold, n_genes
     selected_genes_filter = np.zeros(n_vars, dtype=bool)
 
     enforced_genes = np.zeros(n_vars, dtype=bool)
-    gene_exp_filter = gene_exp_filter.copy()  # Make a copy to avoid modifying the original
+    gene_exp_filter = np.asarray(gene_exp_filter, dtype=bool).copy()  # plain array: positional indexing below
     
     # First mark the enforced genes
     for gene in genes_to_fit:

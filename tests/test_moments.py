@@ -204,19 +204,20 @@ class TestComputeMoments:
             assert abs(rust[g]["MOM_cov_a_b"] - expected) < 1e-10
 
 
+@pytest.fixture(scope="module")
+def adata():
+    ad = pytest.importorskip("anndata")
+    if not os.path.exists(TestComputeMomentsRealData.EXAMPLE_PATH):
+        pytest.skip("example_adata.h5ad not found")
+    return ad.read_h5ad(TestComputeMomentsRealData.EXAMPLE_PATH)
+
+
 class TestComputeMomentsRealData:
     """Round-trip test against example_adata.h5ad."""
 
     EXAMPLE_PATH = os.path.join(
         os.path.dirname(__file__), "..", "example_h5ad", "example_adata.h5ad"
     )
-
-    @pytest.fixture(scope="class")
-    def adata(self):
-        ad = pytest.importorskip("anndata")
-        if not os.path.exists(self.EXAMPLE_PATH):
-            pytest.skip("example_adata.h5ad not found")
-        return ad.read_h5ad(self.EXAMPLE_PATH)
 
     def test_real_data_two_layers(self, adata):
         from scipy.sparse import issparse

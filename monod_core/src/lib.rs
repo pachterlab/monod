@@ -5755,8 +5755,8 @@ fn e_step_2d(
 
     let result = py.allow_threads(|| {
         let run = || -> (Vec<Vec<f64>>, f64, f64) {
-            // logL[c][k] accumulated across genes
-            let mut logL = vec![vec![0.0_f64; n_k]; n_cells];
+            // log_l[c][k] accumulated across genes
+            let mut log_l = vec![vec![0.0_f64; n_k]; n_cells];
 
             for k in 0..n_k {
                 // Parallel over genes: each produces a per-cell log-prob vector
@@ -5782,11 +5782,11 @@ fn e_step_2d(
                     })
                     .collect();
 
-                // Sum over genes into logL[c][k] and add log(weight)
+                // Sum over genes into log_l[c][k] and add log(weight)
                 let log_w = weights[k].max(f64::MIN_POSITIVE).ln();
                 for c in 0..n_cells {
                     let gene_sum: f64 = gene_log_probs.iter().map(|lp| lp[c]).sum();
-                    logL[c][k] = gene_sum + log_w;
+                    log_l[c][k] = gene_sum + log_w;
                 }
             }
 
@@ -5794,18 +5794,18 @@ fn e_step_2d(
             let mut q_mat = vec![vec![0.0_f64; n_k]; n_cells];
             let mut total_lse = 0.0_f64;
             for c in 0..n_cells {
-                let max_val = logL[c].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let sum_exp: f64 = logL[c].iter().map(|&v| (v - max_val).exp()).sum();
+                let max_val = log_l[c].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let sum_exp: f64 = log_l[c].iter().map(|&v| (v - max_val).exp()).sum();
                 let lse = max_val + sum_exp.ln();
                 total_lse += lse;
                 for k in 0..n_k {
-                    q_mat[c][k] = (logL[c][k] - max_val).exp() / sum_exp;
+                    q_mat[c][k] = (log_l[c][k] - max_val).exp() / sum_exp;
                 }
             }
             let lower_bound = if n_cells > 0 { total_lse / n_cells as f64 } else { 0.0 };
 
-            // q_func = sum(Q * logL)
-            let q_func: f64 = q_mat.iter().zip(logL.iter()).map(|(q_row, l_row)| {
+            // q_func = sum(Q * log_l)
+            let q_func: f64 = q_mat.iter().zip(log_l.iter()).map(|(q_row, l_row)| {
                 q_row.iter().zip(l_row.iter()).map(|(&q, &l)| q * l).sum::<f64>()
             }).sum();
 
@@ -5848,7 +5848,7 @@ fn e_step_2d_from_grids(
 
     let result = py.allow_threads(|| {
         let run = || -> (Vec<Vec<f64>>, f64, f64) {
-            let mut logL = vec![vec![0.0_f64; n_k]; n_cells];
+            let mut log_l = vec![vec![0.0_f64; n_k]; n_cells];
 
             for k in 0..n_k {
                 let gene_log_probs: Vec<Vec<f64>> = (0..n_genes)
@@ -5867,24 +5867,24 @@ fn e_step_2d_from_grids(
                 let log_w = weights[k].max(f64::MIN_POSITIVE).ln();
                 for c in 0..n_cells {
                     let gene_sum: f64 = gene_log_probs.iter().map(|lp| lp[c]).sum();
-                    logL[c][k] = gene_sum + log_w;
+                    log_l[c][k] = gene_sum + log_w;
                 }
             }
 
-            // Softmax row-wise → Q; logsumexp → lower_bound; Q·logL → q_func
+            // Softmax row-wise → Q; logsumexp → lower_bound; Q·log_l → q_func
             let mut q_mat = vec![vec![0.0_f64; n_k]; n_cells];
             let mut total_lse = 0.0_f64;
             for c in 0..n_cells {
-                let max_val = logL[c].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let sum_exp: f64 = logL[c].iter().map(|&v| (v - max_val).exp()).sum();
+                let max_val = log_l[c].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let sum_exp: f64 = log_l[c].iter().map(|&v| (v - max_val).exp()).sum();
                 let lse = max_val + sum_exp.ln();
                 total_lse += lse;
                 for k in 0..n_k {
-                    q_mat[c][k] = (logL[c][k] - max_val).exp() / sum_exp;
+                    q_mat[c][k] = (log_l[c][k] - max_val).exp() / sum_exp;
                 }
             }
             let lower_bound = if n_cells > 0 { total_lse / n_cells as f64 } else { 0.0 };
-            let q_func: f64 = q_mat.iter().zip(logL.iter()).map(|(q_row, l_row)| {
+            let q_func: f64 = q_mat.iter().zip(log_l.iter()).map(|(q_row, l_row)| {
                 q_row.iter().zip(l_row.iter()).map(|(&q, &l)| q * l).sum::<f64>()
             }).sum();
 

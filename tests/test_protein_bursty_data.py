@@ -372,6 +372,32 @@ class TestGetMoMRealData:
 # ===========================================================================
 
 
+@pytest.fixture(scope="module")
+def processed_usp(example_adata, model_usp):
+    return extract_data(
+        example_adata,
+        model_usp,
+        dataset_name="test_usp",
+        n_genes=1,
+        viz=False,
+        genes_to_fit=["PTPRC"],
+        hist_type="unique",
+    )
+
+
+@pytest.fixture(scope="module")
+def processed_sp(example_adata, model_sp):
+    return extract_data(
+        example_adata,
+        model_sp,
+        dataset_name="test_sp",
+        n_genes=1,
+        viz=False,
+        genes_to_fit=["PTPRC"],
+        hist_type="unique",
+    )
+
+
 class TestExtractDataPipeline:
     """Run extract_data on example_adata.h5ad and verify the output structure.
 
@@ -379,30 +405,6 @@ class TestExtractDataPipeline:
     min_mean threshold of 1.0 for the protein layer.  The gene is therefore
     passed explicitly via genes_to_fit so it is included regardless of the filter.
     """
-
-    @pytest.fixture(scope="class")
-    def processed_usp(self, example_adata, model_usp):
-        return extract_data(
-            example_adata,
-            model_usp,
-            dataset_name="test_usp",
-            n_genes=1,
-            viz=False,
-            genes_to_fit=["PTPRC"],
-            hist_type="unique",
-        )
-
-    @pytest.fixture(scope="class")
-    def processed_sp(self, example_adata, model_sp):
-        return extract_data(
-            example_adata,
-            model_sp,
-            dataset_name="test_sp",
-            n_genes=1,
-            viz=False,
-            genes_to_fit=["PTPRC"],
-            hist_type="unique",
-        )
 
     def test_usp_output_has_one_gene(self, processed_usp):
         assert processed_usp.n_vars == 1

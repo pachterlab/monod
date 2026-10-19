@@ -104,18 +104,19 @@ class TestInferenceParameters:
         assert os.path.isfile(os.path.join("ds", "Bursty_None_1x1", "parameters.h5"))
 
 
-class TestSearchResults:
-    @pytest.fixture(scope="class")
-    def run(self, tmp_path_factory):
-        warnings.filterwarnings("ignore")
-        cwd = os.getcwd(); os.chdir(tmp_path_factory.mktemp("run"))
-        try:
-            out = perform_inference(EXAMPLE, CMEModel("Bursty", "None"), n_genes=3, viz=False, gradient_params=GP,
-                                    save=True, dataset_string="savetest")
-            return out, os.getcwd()
-        finally:
-            os.chdir(cwd)
+@pytest.fixture(scope="module")
+def run(tmp_path_factory):
+    warnings.filterwarnings("ignore")
+    cwd = os.getcwd(); os.chdir(tmp_path_factory.mktemp("run"))
+    try:
+        out = perform_inference(EXAMPLE, CMEModel("Bursty", "None"), n_genes=3, viz=False, gradient_params=GP,
+                                save=True, dataset_string="savetest")
+        return out, os.getcwd()
+    finally:
+        os.chdir(cwd)
 
+
+class TestSearchResults:
     def test_uns_is_structured_and_survives_h5ad(self, run, tmp_path):
         out, _ = run
         assert isinstance(out.uns["search_result"], dict)

@@ -5,7 +5,6 @@ from .plot_aesthetics import aesthetics
 import pickle
 import scipy
 from scipy import stats
-from scipy import odr
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -759,6 +758,54 @@ def linoffset(B, x, modeltype="id"):
         return B[1] * x + B[0]
 
 
+def _fit_line_eiv(x, y, sx=None, sy=None, fit_slope=True, b0=1.0, tol=1e-12, maxiter=500):
+    """Straight-line fit with errors in both coordinates (errors-in-variables).
+
+    Minimises sum_i [(y_i - a - b x_i)^2 / (sy_i^2 + b^2 sx_i^2)], the weighted
+    orthogonal-distance objective for uncorrelated per-point errors. With
+    ``fit_slope=False`` the slope is fixed at 1 and the offset has the closed form
+    of an inverse-variance weighted mean of ``y - x``; otherwise the slope is found
+    by York's fixed-point iteration (York et al. 2004), which for unit errors reduces
+    to total least squares. Absent errors are taken as unit (``None`` for both) or
+    zero (``None`` for one of them); zero errors are floored at 1e-12. With fewer
+    than two points, or when all ``x`` coincide, the slope is not determined and
+    stays at ``b0``.
+
+    Returns ``[a]`` or ``[a, b]``.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if sx is None and sy is None:
+        vx = np.ones_like(x)
+        vy = np.ones_like(y)
+    else:
+        tiny = 1e-12
+        vx = np.maximum(np.zeros_like(x) if sx is None else np.asarray(sx, dtype=float), tiny) ** 2
+        vy = np.maximum(np.zeros_like(y) if sy is None else np.asarray(sy, dtype=float), tiny) ** 2
+    if not fit_slope:
+        w = 1.0 / (vx + vy)
+        return np.array([np.sum(w * (y - x)) / np.sum(w)])
+    b = float(b0)
+    for _ in range(maxiter):
+        W = 1.0 / (vy + b * b * vx)
+        xbar = np.sum(W * x) / np.sum(W)
+        ybar = np.sum(W * y) / np.sum(W)
+        U = x - xbar
+        V = y - ybar
+        beta = W * (U * vy + b * V * vx)
+        denom = np.sum(W * beta * U)
+        if not (np.isfinite(denom) and denom != 0.0):
+            break                      # slope undetermined (fewer than two distinct x)
+        b_new = np.sum(W * beta * V) / denom
+        done = abs(b_new - b) <= tol * max(1.0, abs(b))
+        b = b_new
+        if done:
+            break
+    W = 1.0 / (vy + b * b * vx)
+    a = np.sum(W * y) / np.sum(W) - b * np.sum(W * x) / np.sum(W)
+    return np.array([a, b])
+
+
 def diffexp_fpi(
     m1,
     m2,
@@ -815,9 +862,9 @@ def diffexp_fpi(
     -------
     gf: bool np.ndarray
         if True, the gene has been identified as DE with respect to the current parameter.
-    out.beta: float np.ndarray
-        an array of size n_model_pars. contains (b) or (b,a) for each physical parameter.
-        b should typically be fairly small (under 0.5).
+    beta: float np.ndarray
+        statistical model parameters: the offset (a), followed by the slope (b) when
+        modeltype is "lin". The offset should typically be fairly small (under 0.5).
     resid: float np.ndarray
         residuals for each gene under the final fit statistical model.
     pval: float np.ndarray
@@ -828,33 +875,18 @@ def diffexp_fpi(
     # x = np.linspace(xl[0], xl[1], 100)
     fitlaw = scipy.stats.norm
 
-    if modeltype == "id":
-        beta0 = [0]
-    elif modeltype == "lin":
-        beta0 = [0, 1]
+    if modeltype not in ("id", "lin"):
+        raise ValueError(f"modeltype must be 'id' or 'lin', got {modeltype!r}.")
 
     for j in range(nit):
-        if s1 is None and s2 is None:
-            d = odr.Data(m1[gf], m2[gf])
-        else:
-            # RealData takes standard deviations (sx, sy) and converts them to
-            # inverse-variance weights; odr.Data's positional arguments are
-            # weights, which would have *up*-weighted uncertain points.
-            # A zero standard error (parameter pinned at a bound) would become an
-            # infinite weight; floor it at a tiny positive value.
-            tiny = 1e-12
-            d = odr.RealData(m1[gf], m2[gf], sx=np.maximum(s1[gf], tiny), sy=np.maximum(s2[gf], tiny))
-
-        md = lambda B, x: linoffset(B, x, modeltype=modeltype)
-        odrmodel = scipy.odr.Model(md)
-
-        myodr = odr.ODR(d, odrmodel, beta0=beta0)
-        out = myodr.run()
-
+        beta = _fit_line_eiv(m1[gf], m2[gf],
+                             None if s1 is None else s1[gf],
+                             None if s2 is None else s2[gf],
+                             fit_slope=(modeltype == "lin"))
         if modeltype == "id":
-            resid = m2 - m1 - out.beta[0]
-        elif modeltype == "lin":
-            resid = m2 - m1 * out.beta[1] - out.beta[0]
+            resid = m2 - m1 - beta[0]
+        else:
+            resid = m2 - m1 * beta[1] - beta[0]
 
         fitparams = fitlaw.fit(resid[gf])
 
@@ -906,7 +938,7 @@ def diffexp_fpi(
         ax1.set_xlabel(parname + " residual", fontsize=fs)
         ax1.set_ylabel("Density", fontsize=fs)
     gf = np.logical_not(gf)
-    return gf, out.beta, resid, pval
+    return gf, beta, resid, pval
 
 
 def compare_gene_distributions(

@@ -73,26 +73,27 @@ class TestDefaults:
                 assert not isinstance(prm.default, (list, dict, set)), f"{fn.__name__}.{name}"
 
 
-class TestWarningsAndFigures:
-    @pytest.fixture(scope="class")
-    def fit(self, tmp_path_factory):
-        import os, anndata as ad
-        from monod.inference import InferenceParameters, searchdata_from_adata
-        warnings.filterwarnings("ignore")
-        cwd = os.getcwd(); os.chdir(tmp_path_factory.mktemp("fit"))
-        try:
-            here = os.path.dirname(__file__)
-            model = CMEModel("Bursty", "None")
-            madata = ed.extract_data(ad.read_h5ad(os.path.join(here, "..", "example_h5ad", "example_adata.h5ad")),
-                                     model, dataset_name="x", n_genes=3, viz=False)
-            sd = searchdata_from_adata(madata)
-            ip = InferenceParameters("x", model, gradient_params={"max_iterations": 5, "num_restarts": 1})
-            sr = ip.fit_all_grid_points(sd)
-            sr.find_sampling_optimum()
-            return sd, sr
-        finally:
-            os.chdir(cwd)
+@pytest.fixture(scope="module")
+def fit(tmp_path_factory):
+    import os, anndata as ad
+    from monod.inference import InferenceParameters, searchdata_from_adata
+    warnings.filterwarnings("ignore")
+    cwd = os.getcwd(); os.chdir(tmp_path_factory.mktemp("fit"))
+    try:
+        here = os.path.dirname(__file__)
+        model = CMEModel("Bursty", "None")
+        madata = ed.extract_data(ad.read_h5ad(os.path.join(here, "..", "example_h5ad", "example_adata.h5ad")),
+                                 model, dataset_name="x", n_genes=3, viz=False)
+        sd = searchdata_from_adata(madata)
+        ip = InferenceParameters("x", model, gradient_params={"max_iterations": 5, "num_restarts": 1})
+        sr = ip.fit_all_grid_points(sd)
+        sr.find_sampling_optimum()
+        return sd, sr
+    finally:
+        os.chdir(cwd)
 
+
+class TestWarningsAndFigures:
     def test_user_warning_filters_survive(self, fit):
         sd, sr = fit
         with warnings.catch_warnings():

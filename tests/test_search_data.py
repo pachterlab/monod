@@ -336,7 +336,8 @@ class TestPickle:
 
 class TestEndToEnd:
     @pytest.fixture(scope="class")
-    def adata(self):
+    @classmethod
+    def adata(cls):
         ad = pytest.importorskip("anndata")
         if not os.path.exists(EXAMPLE_PATH):
             pytest.skip("example_adata.h5ad not found")
@@ -407,7 +408,8 @@ class TestOptimizeGenes2dSd:
     MODELS = ["Bursty", "Constitutive", "Extrinsic", "Delay", "CIR", "DelayedSplicing"]
 
     @pytest.fixture(scope="class")
-    def synthetic_sd(self):
+    @classmethod
+    def synthetic_sd(cls):
         """Small reproducible SearchData (3 genes, 300 cells, 2 layers)."""
         rng = np.random.default_rng(99)
         n_cells, n_genes = 300, 3
