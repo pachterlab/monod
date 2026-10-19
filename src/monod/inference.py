@@ -2143,8 +2143,8 @@ class SearchResults:
         "inference_string", "n_genes", "n_cells", "gene_names", "gene_log_lengths",
         "param_estimates", "klds", "obj_func", "d_time", "regressor",
         "samp_optimum_ind", "samp_optimum", "phys_optimum", "regressor_optimum",
-        "rejected_genes", "pval", "csq", "hellinger", "sigma",
-        "sigma_fail", "sigma_flat_direction",
+        "rejected_genes", "pval", "csq", "hellinger", "rejection_index", "sigma",
+        "sigma_fail", "sigma_flat_direction", "sigma_index",
         "analysis_figure_string", "full_result_string",
     )
 

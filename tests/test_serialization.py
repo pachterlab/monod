@@ -208,3 +208,27 @@ class TestMEKMeansResults:
         assert sorted(os.listdir(run_dir)) == ["grid_scan_results.h5"]
         loaded = analysis.load_search_results(os.path.join(run_dir, "grid_scan_results.h5"))
         assert isinstance(loaded, list) and len(loaded) == len(srs_saved)
+
+
+
+def test_rejection_index_survives_round_trip():
+    """discard_rejected=True must still work on results reloaded from .uns / h5ad.
+
+    get_bool_filt keys on ``rejection_index``; it was not serialised, so every
+    reloaded result silently ignored discard_rejected and logged that no
+    rejection statistics existed.
+    """
+    import numpy as np
+    from monod.cme_toolbox import CMEModel
+    from monod.inference import InferenceParameters, SearchResults
+    model = CMEModel("Bursty", "None")
+    sr = SearchResults.__new__(SearchResults)
+    sr.sp = InferenceParameters("rt", model)
+    sr.model = model
+    sr.n_genes = 4; sr.n_cells = 10; sr.gene_names = np.array(["a", "b", "c", "d"])
+    sr.samp_optimum_ind = 0; sr.rejection_index = 0; sr.sigma_index = 0
+    sr.rejected_genes = np.array([False, True, False, True])
+    back = SearchResults.from_dict(sr.to_dict())
+    assert back.rejection_index == 0 and back.sigma_index == 0
+    kept = back.get_bool_filt(None, discard_rejected=True)
+    assert kept.tolist() == [True, False, True, False]

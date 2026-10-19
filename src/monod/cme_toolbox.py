@@ -434,11 +434,7 @@ class CMEModel:
             else:
                 log.error("Modalities unknown for model: {}".format(self.bio_model))
 
-        log.info(
-            "Expected modalities for %s: %s. If your AnnData layers use other names, pass "
-            "modality_name_dict={'spliced': <layer>, 'unspliced': <layer>}.",
-            self.bio_model, self.model_modalities,
-        )
+        log.debug("Modalities for %s: %s", self.bio_model, self.model_modalities)
 
         # TODO: make nascent and mature also detected automatically
 

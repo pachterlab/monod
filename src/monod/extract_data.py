@@ -196,6 +196,10 @@ def extract_data(
     # e.g. 'spliced', 'unspliced'
     if not modality_name_dict:
         modality_name_dict = {v:v for v in model.model_modalities}
+        log.info(
+            "Reading layers %s. If your AnnData layers use other names, pass "
+            "modality_name_dict={<modality>: <layer>, ...}.", model.model_modalities,
+        )
 
     ordered_modalities = model.model_modalities
     ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]

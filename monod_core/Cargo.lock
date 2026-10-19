@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "monod_core"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "hdf5-metno-src",
  "hdf5-metno-sys",
