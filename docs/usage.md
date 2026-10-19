@@ -56,7 +56,7 @@ model = CMEModel.from_dict(adata.uns["model"])
 result = search_result_from_uns(adata.uns["search_result"])
 ```
 
-Plots, gene rejection, noise decomposition and differential-parameter tests are methods on the result object and functions in `monod.analysis`; the `monod_walkthrough` notebook in `demos/` shows the typical sequence.
+Plots, gene rejection, noise decomposition and differential-parameter tests are methods on the result object and functions in `monod.analysis`; the `analysis_workflow` notebook in `demos/` walks through them on two PBMC cell types, and `monod_walkthrough` shows the same sequence end to end.
 
 ## What is written to disk
 

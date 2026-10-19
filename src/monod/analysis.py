@@ -958,8 +958,8 @@ def compare_gene_distributions(
     The intended use case is to identify a set of DE genes of interest, pass them in as
     genes_to_plot, and inspect the difference between the distributions.
 
-    By default, dataset 1 is plotted in red and dataset 2 is plotted in blue. The colors are
-    defined in monod.plot_aesthetics.aesthetics.
+    By default, dataset 1 is plotted in blue and dataset 2 in red (``hist_*_color_1`` and
+    ``hist_*_color_2`` in monod.plot_aesthetics.aesthetics).
 
     Parameters
     ----------

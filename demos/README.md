@@ -8,6 +8,7 @@ which is not in the repository.
 | Notebook | What it shows | Runtime |
 |---|---|---|
 | [`monod_walkthrough.ipynb`](monod_walkthrough.ipynb) | End-to-end analysis on a small dataset; opens in Colab | minutes |
+| [`analysis_workflow.ipynb`](analysis_workflow.ipynb) | After the fit: gene rejection, standard errors, parameter-level differential expression between two PBMC cell types, saving results | under a minute |
 | [`models.ipynb`](models.ipynb) | The six two-species transcription models, their parameters and distributions, and a fit to real data | minutes |
 | [`reaction_networks.ipynb`](reaction_networks.ipynb) | Defining custom reaction networks with the reaction-string syntax | minutes |
 | [`protein_bursty.ipynb`](protein_bursty.ipynb) | The three-species protein model: moments, 3-D distribution, L-BFGS-B vs Nelder-Mead fits | about a minute |
