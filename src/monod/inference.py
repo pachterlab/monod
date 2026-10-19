@@ -992,15 +992,19 @@ class InferenceParameters:
         def _run_points(point_indices, init_warm_start=None):
             """Run optimization for the given grid point indices.
 
-            In serial mode, each grid point warm-starts from the previous point's
-            optimal parameters. In parallel mode, warm-starting is disabled (no
-            shared state across workers).
+            Every grid point starts from the moments estimate (or the random
+            box). Grid points are not warm-started from their neighbours: the
+            biological optimum shifts systematically with the sampling
+            parameters (burst size trades off against capture), so a
+            neighbour's optimum is a worse start than the moments estimate and
+            a poor solution at one point used to cascade across the whole grid.
 
             Parameters
             ----------
             init_warm_start: dict or None
-                Optional mapping point_index -> param array to seed the first
-                warm-start for each point (used in coarse-to-fine Phase 2).
+                Optional mapping point_index -> GridPointResults whose
+                param_estimates seed the fit at the *same* point (used in
+                coarse-to-fine Phase 2).
             """
             if grid_cores > 1:
                 log.info("Starting parallelized grid scan (%d points).", len(point_indices))
@@ -1016,17 +1020,13 @@ class InferenceParameters:
                 log.info("Parallelized grid scan complete.")
             else:
                 log.info("Starting non-parallelized grid scan (%d points).", len(point_indices))
-                prev_params = None
                 for idx in tqdm(point_indices, desc="Grid scan"):
-                    # Pick warm-start: point-specific seed first, then previous point
+                    ws = None
                     if init_warm_start is not None and idx in init_warm_start:
                         ws = init_warm_start[idx].param_estimates
-                    else:
-                        ws = prev_params
                     r = self.par_fun(idx, search_data, self.model, warm_start=ws)
                     if r is not None:
                         gp_results[r.point_index] = r
-                        prev_params = r.param_estimates
                 log.info("Non-parallelized grid scan complete.")
 
         all_indices = list(range(self.n_grid_points))
