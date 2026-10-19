@@ -25,6 +25,11 @@ figures/
 example_h5ad/gaba_example.h5ad
 example_h5ad/gaba_results.h5ad
 example_h5ad/processed_pbmc_10k_raw.h5ad
+example_h5ad/glu_example.h5ad
+example_h5ad/pbmc_10k_gene_lengths.tsv
+
+# Clone of pachterlab/monod_examples (polyA references, sample data)
+monod_examples/
 
 # Snapshot tied to large data
 tests/snapshots/gaba_bursty_poisson_params.npy

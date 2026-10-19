@@ -34,13 +34,13 @@ From there you can:
 
 - compare parameters between conditions with `monod.analysis`,
 - cluster cells by their transcriptional kinetics with meK-Means (`monod.mminference`),
-- swap in other models of transcription, sequencing noise, or ambient contamination,
+- swap in other models of transcription, sequencing noise, or ambiguous read assignment,
 - add a protein layer or define your own reaction network.
 
 ## Learning more
 
 - [`demos/monod_walkthrough.ipynb`](https://github.com/pachterlab/monod/blob/main/demos/monod_walkthrough.ipynb): an end-to-end walkthrough on a small dataset, runnable in Colab.
-- The other notebooks in [`demos/`](https://github.com/pachterlab/monod/tree/main/demos): one topic each, covering the available models, reaction networks, the protein model, the analysis steps after a fit, meK-Means, and the Rust and GPU paths.
+- The other notebooks in [`demos/`](https://github.com/pachterlab/monod/tree/main/demos): one topic each, covering the available models, reaction networks, the protein model, sequencing noise and the sampling landscape, the analysis steps after a fit, meK-Means, and the Rust and GPU paths.
 - The [example repository](https://github.com/pachterlab/monod_examples) and the [documentation site](https://monod-examples.readthedocs.io/en/latest/index.html).
 - The [documentation pages](https://github.com/pachterlab/monod/tree/main/docs) in this repository: installation and the Rust accelerator, running an analysis and reading the results, and meK-Means.
 

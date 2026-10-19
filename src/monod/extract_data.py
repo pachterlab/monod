@@ -657,7 +657,8 @@ def add_gene_lengths(adata, length_dict, attribute_name='length_given', lengths_
 
     
     adata.var[lengths_name] = adata.var_names.map(length_dict).fillna(0).astype(float)
-    adata.var['log_lengths'] = np.log10(adata.var['lengths'])
+    with np.errstate(divide='ignore'):   # genes absent from the reference have length 0 and are dropped later
+        adata.var['log_lengths'] = np.log10(adata.var[lengths_name])
 
     log.info('Added lengths')
     return adata
