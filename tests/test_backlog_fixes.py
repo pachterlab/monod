@@ -138,7 +138,6 @@ class TestGridScanStarts:
             return _R(point_index)
 
         monkeypatch.setattr(ip, "par_fun", fake_par_fun)
-        monkeypatch.setattr(ip, "_collect_results", lambda *a, **k: None, raising=False)
         try:
             ip.fit_all_grid_points(search_data=None, num_cores=1)
         except Exception:
