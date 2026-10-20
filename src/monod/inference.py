@@ -17,17 +17,20 @@ from ._core import _mc          # None when the compiled extension is not instal
 #:   num_restarts     number of starts per gene; later starts are drawn uniformly in the restart box
 #:   num_gene_cores   gene-level parallelism per grid point (-1 = all cores)
 #:   n_jac_jobs       joblib parallelism over finite-difference perturbations (Python path)
-#: Optional keys: use_rust_lbfgsb (run the whole fit in Rust), use_batch_optimizer
-#: (batched Adam), presearch / presearch_maxiter (derivative-free pre-search, on by
-#: default for ProteinBursty), check_identifiability ("auto": numerical rank check
-#: of the model at the first grid point for Custom networks; True for every model;
-#: False to skip).
+#:   use_rust_lbfgsb  "auto" (default): run the whole fit in the Rust L-BFGS-B kernel
+#:                    whenever the extension is installed and the model has a kernel;
+#:                    False uses the scipy optimizer
+#: Optional keys: use_batch_optimizer (batched Adam), presearch / presearch_maxiter
+#: (derivative-free pre-search, on by default for ProteinBursty), check_identifiability
+#: ("auto": numerical rank check of the model at the first grid point for Custom
+#: networks; True for every model; False to skip).
 DEFAULT_GRADIENT_PARAMS = {
     "max_iterations": 10,
     "init_pattern": "moments",
     "num_restarts": 3,
     "num_gene_cores": 1,
     "n_jac_jobs": 1,
+    "use_rust_lbfgsb": "auto",
 }
 
 import multiprocessing
@@ -252,7 +255,7 @@ def perform_inference(h5ad_filepath,
     if not exclude_sigma:
         if not mek_means_params:
             # Save uncertainties from Hessian.
-            search_result.compute_sigma(search_data,num_cores=1)
+            search_result.compute_sigma(search_data, num_cores=num_cores)
             all_sigmas = search_result.sigma
             
             for i in range(num_params):
@@ -268,7 +271,7 @@ def perform_inference(h5ad_filepath,
             for j, sr in enumerate(search_result_list):
                 
                 # compute_sigma subsets the search data to this cluster's cells itself.
-                sr.compute_sigma(search_data, num_cores=1)
+                sr.compute_sigma(search_data, num_cores=num_cores)
                 all_sigmas = sr.sigma
                 
                 for i in range(num_params):
@@ -779,6 +782,10 @@ class InferenceParameters:
             "check_identifiability" runs CMEModel.check_identifiability once, at the first grid
                 point and the first gene's starting point, and warns about flat directions:
                 "auto" (default; Custom networks only), True (every model) or False.
+            "use_rust_lbfgsb" selects the optimizer: "auto" (default) runs the whole fit in the
+                Rust L-BFGS-B kernel whenever the extension is installed and the model has a
+                kernel, about ten times faster than the scipy loop with the same results;
+                False uses scipy.
             "num_gene_cores" controls gene-level parallelism per grid point (-1 = all cores). Uses ThreadPoolExecutor + scipy by default; set "use_batch_optimizer"=True to use batch Adam with rayon instead.
             "n_jac_jobs" controls joblib parallelism over FD perturbations (-1 = all cores); only
             effective when num_gene_cores=1 to avoid nested parallelism.
@@ -1488,13 +1495,16 @@ class GradientInference:
     def _rust_optimizer_family(self, model, search_data):
         """Kernel family of the Rust optimizer that applies, or None.
 
-        Requires the compiled extension, a Rust ``SearchData``, the opt-in flag
-        ``gradient_params["use_rust_lbfgsb"]`` and no batch optimizer; the
-        family itself comes from ``CMEModel._kernel_family``.
+        Requires the compiled extension, a Rust ``SearchData`` and no batch
+        optimizer. ``gradient_params["use_rust_lbfgsb"]`` is ``"auto"`` by
+        default, which uses the Rust kernel whenever those hold; ``False``
+        selects the scipy optimizer. The family itself comes from
+        ``CMEModel._kernel_family``.
         """
+        flag = self.gradient_params.get("use_rust_lbfgsb", "auto")
         if (
             _mc is None
-            or not self.gradient_params.get("use_rust_lbfgsb", False)
+            or flag is False
             or self.gradient_params.get("use_batch_optimizer", False)
             or not isinstance(search_data, _mc.SearchData)
         ):
@@ -1602,7 +1612,7 @@ class GradientInference:
         use_batch = self.gradient_params.get("use_batch_optimizer", False)
 
         # Rust L-BFGS-B: the whole fit runs in Rust with rayon parallelism over
-        # genes.  Opt-in via gradient_params["use_rust_lbfgsb"] = True.
+        # genes; the default whenever it applies (gradient_params["use_rust_lbfgsb"]).
         rust_family = self._rust_optimizer_family(model, search_data)
         _rust_opt_active = rust_family is not None
 
@@ -2803,30 +2813,46 @@ class SearchResults:
             Hessian of the current gene's KLD at the sampling parameter optimum and the
             corresponding biological parameters, evaluated with respect to the
             biological parameters.
+
+        Two methods, chosen by ``compute_sigma``: ``"gradient"`` (default) takes
+        central differences of the gradient returned by
+        ``CMEModel.eval_model_kld_and_grad`` and symmetrises, 2 n gradient
+        evaluations per gene; ``"numdifftools"`` uses Richardson extrapolation
+        on the KLD itself, about 150 evaluations per gene, with every probe kept
+        within a fifth of a decade of the optimum.
         """
-        import numdifftools  # this will fail if numdifftools has not been evaluted.
-
         gene_index, search_data = inputs
-
         search_data = self._search_data_for(search_data)
+        method = getattr(self, "_hess_method", "gradient")
+        limits = search_data.M[:, gene_index]
+        samp = self.regressor_optimum[gene_index]
+        data = search_data.hist[gene_index]
+        x0 = np.asarray(self.phys_optimum[gene_index], dtype=float)
+
+        if method == "gradient":
+            h = float(getattr(self, "_hess_step", 1e-2))
+            n = x0.size
+            J = np.empty((n, n))
+            for j in range(n):
+                e = np.zeros(n); e[j] = h
+                _, g_plus = self.model.eval_model_kld_and_grad(x0 + e, limits, samp, data)
+                _, g_minus = self.model.eval_model_kld_and_grad(x0 - e, limits, samp, data)
+                J[:, j] = (np.asarray(g_plus) - np.asarray(g_minus)) / (2 * h)
+            return 0.5 * (J + J.T)
+
+        import numdifftools  # this will fail if numdifftools has not been evaluted.
         # numdifftools' default step sequence starts about two decades from the
         # optimum, where custom-network evaluations can take minutes. Richardson
         # extrapolation over 0.1 / 2**k (k = 0..7) decades keeps every probe
         # within a fifth of a decade and gives the same Hessian for smooth KLDs.
         Hfun = numdifftools.Hessian(
-            lambda x: self.model.eval_model_kld(
-                p=x,
-                limits=search_data.M[:, gene_index],
-                samp=self.regressor_optimum[gene_index],
-                data=search_data.hist[gene_index],
-            ),
+            lambda x: self.model.eval_model_kld(p=x, limits=limits, samp=samp, data=data),
             step=numdifftools.MaxStepGenerator(base_step=0.1, num_steps=8, step_ratio=2.0),
         )
-        hess = Hfun(self.phys_optimum[gene_index])
-        
-        return hess
+        return Hfun(x0)
 
-    def compute_sigma(self, search_data, num_cores=1, max_relative_sigma=0.5):
+    def compute_sigma(self, search_data, num_cores=1, max_relative_sigma=0.5,
+                      method="gradient", step=1e-2):
         """Estimate uncertainty in biological parameter values.
 
         This method iterates over genes, computes the Fisher information matrix by inverting
@@ -2852,6 +2878,12 @@ class SearchResults:
         max_relative_sigma: float, optional
             flag a gene when any standard error exceeds this fraction of the parameter's
             bound width.
+        method: str, optional
+            ``"gradient"`` (default): Hessian by central differences of the model's
+            gradient, 2 n gradient evaluations per gene. ``"numdifftools"``: Richardson
+            extrapolation on the KLD, about 150 evaluations per gene; the previous default.
+        step: float, optional
+            log10 step for the gradient-difference method.
 
         Sets
         ----
@@ -2870,7 +2902,11 @@ class SearchResults:
             the sigma attribute.
 
         """
-        log.info("Computing local Hessian.")
+        if method not in ("gradient", "numdifftools"):
+            raise ValueError(f"method must be 'gradient' or 'numdifftools', got {method!r}")
+        self._hess_method = method
+        self._hess_step = float(step)
+        log.info("Computing local Hessian (%s).", method)
         t1 = time.time()
         if num_cores > 1:
             log.info("Starting parallelized Hessian computation.")

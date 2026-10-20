@@ -144,3 +144,38 @@ class TestGridScanStarts:
             pass   # assembling SearchResults from the stubs is not the point
         assert [idx for idx, _ in seen] == [0, 1, 2, 3]
         assert all(ws is None for _, ws in seen)
+
+
+class TestRustOptimizerDefault:
+    def test_auto_selects_rust_kernel_when_available(self, fit):
+        import monod.inference as inf
+        from monod._core import _mc
+        if _mc is None:
+            pytest.skip("monod_core not installed")
+        sd, sr = fit
+        gi = inf.GradientInference(sr.sp, sr.model, sd, 0)
+        assert gi._rust_optimizer_family(sr.model, sd) == "2d"
+        gi.gradient_params = {**gi.gradient_params, "use_rust_lbfgsb": False}
+        assert gi._rust_optimizer_family(sr.model, sd) is None
+        assert inf.DEFAULT_GRADIENT_PARAMS["use_rust_lbfgsb"] == "auto"
+
+
+class TestGradientHessian:
+    def test_gradient_hessian_matches_numdifftools(self, fit):
+        """The default standard errors (gradient differencing) agree with the
+        Richardson-extrapolated ones to well under a percent."""
+        sd, sr = fit
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            sr.compute_sigma(sd, num_cores=1, method="numdifftools")
+            ref = sr.sigma.copy()
+            sr.compute_sigma(sd, num_cores=1)            # default: gradient
+        assert sr._hess_method == "gradient"
+        assert np.all(np.isfinite(sr.sigma))
+        np.testing.assert_allclose(sr.sigma, ref, rtol=5e-3)
+
+    def test_unknown_method_raises(self, fit):
+        sd, sr = fit
+        with pytest.raises(ValueError, match="method must be"):
+            sr.compute_sigma(sd, method="exact")
+
