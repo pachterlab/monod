@@ -450,9 +450,6 @@ class TestOptimizeGenesCustomSd:
     """optimize_genes_custom_sd must agree with eval_custom_network_pgf
     (same ODE, same params → same PSS → same KLD)."""
 
-    MIN_FUDGE = 0.1
-    MAX_FUDGE = 10.0
-
     # Bursty network topology: 0 -> B x U -> S -> 0
     # params: [b, s_u, s_s] (all log10)
     LB = np.array([-2.0, -2.0, -2.0])
@@ -489,18 +486,13 @@ class TestOptimizeGenesCustomSd:
         """KLD using eval_custom_network_pgf + manual irfftn via Python scipy."""
         from scipy.fft import irfftn
         p_lin = 10.0 ** np.asarray(x)
-        dt    = float(np.min(1.0 / p_lin) * self.MIN_FUDGE)
-        t_max = float(np.max(1.0 / p_lin) * self.MAX_FUDGE)
-        n_steps = int(np.ceil(t_max / dt))
-        max_while = 10 * n_steps + 10_000
-
-        re_e, im_e, mx_shape = _mc.eval_custom_network_pgf(
+        re_e, im_e, mx_shape, _steps = _mc.eval_custom_network_pgf(
             self.N_SPECIES,
             [int(l) for l in limits],
             self.RXN_KINDS, self.RXN_RATE_IDXS,
             self.RXN_EXTRA1, self.RXN_EXTRA2,
             self.PROD_SP, self.PROD_ST, self.PROD_OFF,
-            p_lin.tolist(), dt, n_steps, max_while,
+            p_lin.tolist(),
         )
         exp_phi = (np.array(re_e) + 1j * np.array(im_e)).reshape(mx_shape)
         pss_raw = np.abs(irfftn(exp_phi, s=[int(l) for l in limits]))
@@ -521,7 +513,6 @@ class TestOptimizeGenesCustomSd:
             rxn_extra1=self.RXN_EXTRA1, rxn_extra2=self.RXN_EXTRA2,
             prod_sp=self.PROD_SP, prod_st=self.PROD_ST, prod_off=self.PROD_OFF,
             has_norm_rate=self.HAS_NORM_RATE,
-            min_fudge=self.MIN_FUDGE, max_fudge=self.MAX_FUDGE,
             fd_eps=1e-6, maxiter=5, ftol=1e-10, gtol=1e-6, eps=1e-15,
         )
 
@@ -547,7 +538,6 @@ class TestOptimizeGenesCustomSd:
             rxn_extra1=self.RXN_EXTRA1, rxn_extra2=self.RXN_EXTRA2,
             prod_sp=self.PROD_SP, prod_st=self.PROD_ST, prod_off=self.PROD_OFF,
             has_norm_rate=self.HAS_NORM_RATE,
-            min_fudge=self.MIN_FUDGE, max_fudge=self.MAX_FUDGE,
             fd_eps=1e-6, maxiter=20, ftol=1e-10, gtol=1e-6, eps=1e-15,
         )
 
@@ -576,7 +566,6 @@ class TestOptimizeGenesCustomSd:
             rxn_extra1=self.RXN_EXTRA1, rxn_extra2=self.RXN_EXTRA2,
             prod_sp=self.PROD_SP, prod_st=self.PROD_ST, prod_off=self.PROD_OFF,
             has_norm_rate=self.HAS_NORM_RATE,
-            min_fudge=self.MIN_FUDGE, max_fudge=self.MAX_FUDGE,
             fd_eps=1e-6, maxiter=200, ftol=1e-10, gtol=1e-6, eps=1e-15,
         )
 
@@ -608,5 +597,4 @@ class TestOptimizeGenesCustomSd:
                 rxn_extra1=self.RXN_EXTRA1, rxn_extra2=self.RXN_EXTRA2,
                 prod_sp=self.PROD_SP, prod_st=self.PROD_ST, prod_off=self.PROD_OFF,
                 has_norm_rate=self.HAS_NORM_RATE,
-                min_fudge=self.MIN_FUDGE, max_fudge=self.MAX_FUDGE,
             )

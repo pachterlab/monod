@@ -1576,7 +1576,6 @@ class GradientInference:
                 rxn_extra1=topo["rxn_extra1"], rxn_extra2=topo["rxn_extra2"],
                 prod_sp=topo["prod_sp"], prod_st=topo["prod_st"], prod_off=topo["prod_off"],
                 has_norm_rate=(net._norm_rate is not None),
-                min_fudge=float(model.min_fudge), max_fudge=float(model.max_fudge),
                 **common,
             )
         else:
@@ -2829,27 +2828,31 @@ class SearchResults:
         data = search_data.hist[gene_index]
         x0 = np.asarray(self.phys_optimum[gene_index], dtype=float)
 
-        if method == "gradient":
-            h = float(getattr(self, "_hess_step", 1e-2))
-            n = x0.size
-            J = np.empty((n, n))
-            for j in range(n):
-                e = np.zeros(n); e[j] = h
-                _, g_plus = self.model.eval_model_kld_and_grad(x0 + e, limits, samp, data)
-                _, g_minus = self.model.eval_model_kld_and_grad(x0 - e, limits, samp, data)
-                J[:, j] = (np.asarray(g_plus) - np.asarray(g_minus)) / (2 * h)
-            return 0.5 * (J + J.T)
+        # The protein and custom-network integrators adapt their steps; every
+        # stencil point replays the optimum's schedule so the integrator's
+        # tolerance does not enter the differences divided by the small step.
+        with self.model.pinned_schedule(x0, limits, samp):
+            if method == "gradient":
+                h = float(getattr(self, "_hess_step", 1e-2))
+                n = x0.size
+                J = np.empty((n, n))
+                for j in range(n):
+                    e = np.zeros(n); e[j] = h
+                    _, g_plus = self.model.eval_model_kld_and_grad(x0 + e, limits, samp, data)
+                    _, g_minus = self.model.eval_model_kld_and_grad(x0 - e, limits, samp, data)
+                    J[:, j] = (np.asarray(g_plus) - np.asarray(g_minus)) / (2 * h)
+                return 0.5 * (J + J.T)
 
-        import numdifftools  # this will fail if numdifftools has not been evaluted.
-        # numdifftools' default step sequence starts about two decades from the
-        # optimum, where custom-network evaluations can take minutes. Richardson
-        # extrapolation over 0.1 / 2**k (k = 0..7) decades keeps every probe
-        # within a fifth of a decade and gives the same Hessian for smooth KLDs.
-        Hfun = numdifftools.Hessian(
-            lambda x: self.model.eval_model_kld(p=x, limits=limits, samp=samp, data=data),
-            step=numdifftools.MaxStepGenerator(base_step=0.1, num_steps=8, step_ratio=2.0),
-        )
-        return Hfun(x0)
+            import numdifftools  # this will fail if numdifftools has not been evaluted.
+            # numdifftools' default step sequence starts about two decades from the
+            # optimum, where custom-network evaluations can take minutes. Richardson
+            # extrapolation over 0.1 / 2**k (k = 0..7) decades keeps every probe
+            # within a fifth of a decade and gives the same Hessian for smooth KLDs.
+            Hfun = numdifftools.Hessian(
+                lambda x: self.model.eval_model_kld(p=x, limits=limits, samp=samp, data=data),
+                step=numdifftools.MaxStepGenerator(base_step=0.1, num_steps=8, step_ratio=2.0),
+            )
+            return Hfun(x0)
 
     def compute_sigma(self, search_data, num_cores=1, max_relative_sigma=0.5,
                       method="gradient", step=1e-2):

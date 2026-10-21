@@ -5,6 +5,8 @@ This script provides convenience functions for evaluating RNA distributions.
 import logging
 import warnings
 import collections as _collections
+import contextlib
+import threading
 import numpy as np
 from numba import jit
 import scipy
@@ -14,7 +16,7 @@ from scipy.fft import irfftn
 
 # from .nn_toolbox import basic_ml_bivariate, ml_microstate_logP
 from .extract_data import log
-from .reaction_network import ReactionNetwork, IdentifiabilityWarning
+from .reaction_network import ReactionNetwork, IdentifiabilityWarning, StepSchedule
 
 _MESH_CACHE: dict = {}
 _MESH_CACHE_ENTRIES = [0]          # total complex128 entries currently cached
@@ -69,6 +71,7 @@ _HAS_RUST = _mc is not None
 _PROTEIN_ODE_TOL = 1e-6        # per-step error target on the generating-function scale
 _PROTEIN_ODE_C0 = 0.05         # first step as a fraction of the fastest time scale
 _PROTEIN_ODE_MAX_STEPS = 20_000
+_CUSTOM_FD_EPS = 1e-4          # central finite-difference step for custom-network gradients (log10 units)
 
 
 def _samp_is_null(samp):
@@ -295,6 +298,34 @@ def _format_direction(direction, min_weight=0.15):
     return " ".join(f"{sign * c:+.2f} {n}" for n, c in items)
 
 
+# Step schedules of the adaptive integrators are per-thread state: the
+# Hessian and gradient stencils pin a schedule on the model while other threads
+# may be evaluating other genes on the same model object.  Properties backed by
+# thread-local storage keep the plain attribute syntax; the storage is not
+# pickled, so worker processes start unpinned.
+_SCHEDULE_TLS = threading.local()
+
+
+def _tls_get(obj, key):
+    d = getattr(_SCHEDULE_TLS, "d", None)
+    return None if d is None else d.get((id(obj), key))
+
+
+def _tls_set(obj, key, value):
+    d = getattr(_SCHEDULE_TLS, "d", None)
+    if d is None:
+        d = _SCHEDULE_TLS.d = {}
+    if value is None:
+        d.pop((id(obj), key), None)
+    else:
+        d[(id(obj), key)] = value
+
+
+def _tls_property(key):
+    return property(lambda self: _tls_get(self, key),
+                    lambda self, value: _tls_set(self, key, value))
+
+
 class CMEModel:
     """Stores and evaluates biological and technical variation models.
 
@@ -338,12 +369,19 @@ class CMEModel:
     fit_unspliced: bool
         ProteinBursty only: whether the unspliced layer is part of the fit.
     min_fudge, max_fudge: float
-        Custom networks only: the fixed integration step is min_fudge times
-        the fastest time scale and the horizon max_fudge times the slowest.
+        Accepted for backward compatibility and ignored: since 0.4.0 the
+        custom-network and protein integrators choose their steps by error
+        control (see ``ReactionNetwork.eval_pgf`` and ``protein_pgf``).
         (The protein model chooses its steps by error control and ignores them.)
     network: ReactionNetwork or None
         the user-defined network for bio_model="Custom".
     """
+
+    # per-thread schedule state of the adaptive integrators (see _SCHEDULE_TLS)
+    _fixed_protein_schedule = _tls_property("fixed_protein")
+    _last_protein_schedule = _tls_property("last_protein")
+    _fixed_custom_schedule = _tls_property("fixed_custom")
+    _last_custom_schedule = _tls_property("last_custom")
     def __init__(
         self,
         bio_model,
@@ -479,14 +517,13 @@ class CMEModel:
             
         except KeyError:
             if self.bio_model == "Custom":
-                # Burst sizes get the Bursty b range. Rates and inverse delays get
-                # three decades rather than the Bursty five: the network integrator
-                # takes a fixed step set by the fastest rate over a horizon set by
-                # the slowest, so its cost grows with the ratio between them.
+                # Burst sizes get the Bursty b range; rates and inverse delays
+                # span the union of the Bursty beta and gamma ranges.  The
+                # exponential integrator's cost does not depend on the spread.
                 net = self.network
                 n_rates = len(net.delay_params) + len(net.rate_names)
-                lb = [-1.0] * len(net.named_params) + [-1.0] * n_rates
-                ub = [4.2] * len(net.named_params) + [2.0] * n_rates
+                lb = [-1.0] * len(net.named_params) + [-1.8] * n_rates
+                ub = [4.2] * len(net.named_params) + [3.5] * n_rates
                 self.bio_bounds = {'phys_lb': lb, 'phys_ub': ub}
             else:
                 log.info("Biophysical bounds unknown for model: {}".format(self.bio_model))
@@ -800,7 +837,8 @@ class CMEModel:
         EPS: float
             minimum allowed probability mass.
         eps: float
-            finite-difference step size (used only for FD fallback).
+            finite-difference step size (used only for FD fallback); custom
+            networks use central differences with at least 1e-4.
         n_jobs: int
             number of parallel joblib workers for FD gradient evaluation.
             1 = serial (default); -1 = all available cores.
@@ -874,19 +912,38 @@ class CMEModel:
                 return kld0, np.array(grad_list)
 
         # Python fallback: forward finite differences.
-        self._fixed_protein_schedule = None
+        outer_pin = self._schedule_is_pinned()
+        if not outer_pin:
+            self._fixed_protein_schedule = None
+            self._fixed_custom_schedule = None
         kld0 = self.eval_model_kld(p, limits, samp, data, EPS)
+
+        # Custom networks: central differences with a wide step.  Histogram
+        # bins deep in the tail sit near the FFT's absolute precision and put a
+        # noise floor of about 1e-9 on the KLD, which a 1e-6 forward difference
+        # would turn into gradient errors of order 1e-2.
+        central = self.bio_model == "Custom"
+        if central:
+            eps = max(float(eps), _CUSTOM_FD_EPS)
 
         def _perturbed(i):
             p_eps = p.copy()
             p_eps[i] += eps
-            return self.eval_model_kld(p_eps, limits, samp, data, EPS)
+            k_plus = self.eval_model_kld(p_eps, limits, samp, data, EPS)
+            if not central:
+                return k_plus
+            p_eps[i] -= 2 * eps
+            return k_plus, self.eval_model_kld(p_eps, limits, samp, data, EPS)
 
         n_params = len(p)
-        # ProteinBursty: integrate every stencil point with the base point's
-        # schedule so the quotient is not polluted by step-count jumps.
-        if self.bio_model == "ProteinBursty":
-            self._fixed_protein_schedule = getattr(self, "_last_protein_schedule", None)
+        # ProteinBursty and Custom: integrate every stencil point with the base
+        # point's schedule so the quotient is not polluted by step-size jumps
+        # (an enclosing ``pinned_schedule`` block already provides one).
+        if not outer_pin:
+            if self.bio_model == "ProteinBursty":
+                self._fixed_protein_schedule = getattr(self, "_last_protein_schedule", None)
+            elif self.bio_model == "Custom":
+                self._fixed_custom_schedule = getattr(self, "_last_custom_schedule", None)
         try:
             if n_jobs == 1:
                 klds_eps = [_perturbed(i) for i in range(n_params)]
@@ -895,8 +952,13 @@ class CMEModel:
                     delayed(_perturbed)(i) for i in range(n_params)
                 )
         finally:
-            self._fixed_protein_schedule = None
-        grad = (np.array(klds_eps) - kld0) / eps
+            if not outer_pin:
+                self._fixed_protein_schedule = None
+                self._fixed_custom_schedule = None
+        if central:
+            grad = np.array([(kp - km) / (2 * eps) for kp, km in klds_eps])
+        else:
+            grad = (np.array(klds_eps) - kld0) / eps
         return kld0, grad
 
     def _eval_kld_analytic_grad(self, p, limits, samp, data, EPS):
@@ -1187,6 +1249,37 @@ class CMEModel:
             out.append(s.strip())
         return out
 
+    def _schedule_is_pinned(self):
+        return (getattr(self, "_fixed_protein_schedule", None) is not None
+                or getattr(self, "_fixed_custom_schedule", None) is not None)
+
+    @contextlib.contextmanager
+    def pinned_schedule(self, p, limits, samp=None):
+        """Replay the step schedule adapted at ``p`` for every evaluation in the block.
+
+        The protein and custom-network integrators choose their steps by error
+        control, so two evaluations at nearby parameters use different
+        discretisations and differ by up to the integrator's tolerance.  A
+        finite difference across such evaluations is polluted by that; this
+        evaluates the base point once and replays its schedule at every stencil
+        point, which makes the differences clean to rounding.  Nested blocks
+        and the finite-difference gradient keep an outer pin.  No-op for the
+        other models.
+        """
+        if self.bio_model not in ("ProteinBursty", "Custom") or self._schedule_is_pinned():
+            yield
+            return
+        try:
+            self.eval_model_pss(np.asarray(p, dtype=float), limits, samp)
+            if self.bio_model == "ProteinBursty":
+                self._fixed_protein_schedule = getattr(self, "_last_protein_schedule", None)
+            else:
+                self._fixed_custom_schedule = getattr(self, "_last_custom_schedule", None)
+            yield
+        finally:
+            self._fixed_protein_schedule = None
+            self._fixed_custom_schedule = None
+
     def check_identifiability(self, p, limits, samp=None, h=1e-4, rtol=1e-3, warn=True):
         """Test whether every parameter direction changes the steady state.
 
@@ -1239,11 +1332,14 @@ class CMEModel:
         def f(x):
             return np.asarray(self.eval_model_pss(x, limits, samp), dtype=float).ravel()
 
+        # Replay the base point's integration schedule at every stencil point:
+        # otherwise step-size changes swamp the small differences being measured.
         cols = []
-        for i in range(p.size):
-            e = np.zeros_like(p)
-            e[i] = h
-            cols.append((f(p + e) - f(p - e)) / (2 * h))
+        with self.pinned_schedule(p, limits, samp):
+            for i in range(p.size):
+                e = np.zeros_like(p)
+                e[i] = h
+                cols.append((f(p + e) - f(p - e)) / (2 * h))
         J = np.column_stack(cols)
         if not np.all(np.isfinite(J)):
             raise ValueError("the steady state is not finite at this point; cannot assess identifiability")
@@ -1329,23 +1425,23 @@ class CMEModel:
             )
             return np.array(pss_flat).reshape([int(l) for l in limits]).squeeze()
         if be.kind == "rust" and be.family == "custom":
-            p_lin = np.power(10.0, p)
-            dt      = float(np.min(1.0 / p_lin) * self.min_fudge)
-            t_max   = float(np.max(1.0 / p_lin) * self.max_fudge)
-            n_steps = int(np.ceil(t_max / dt))
-            max_while = 10 * n_steps + 10_000
             net  = self.network
             topo = net.rust_topology()
             params_d = net._param_map(p)          # name → linear float
             if net._norm_rate is not None:
                 params_d[net._norm_rate] = 1.0
             params_linear = [float(params_d[name]) for name in topo["param_names"]]
-            re_e, im_e, mx_shape = _mc.eval_custom_network_pgf(
+            fixed = getattr(self, "_fixed_custom_schedule", None)
+            taus = [1.0 / float(params_d[name]) for name in net.delay_params]
+            re_e, im_e, mx_shape, steps = _mc.eval_custom_network_pgf(
                 len(net.species), [int(x) for x in limits],
                 topo["rxn_kinds"], topo["rxn_rate_idxs"], topo["rxn_extra1"], topo["rxn_extra2"],
                 topo["prod_sp"], topo["prod_st"], topo["prod_off"],
-                params_linear, dt, n_steps, max_while,
+                params_linear,
+                None if fixed is None else [float(x) for x in np.asarray(fixed, dtype=float)],
+                None if fixed is None else list(getattr(fixed, "breakpoints", ())),
             )
+            self._last_custom_schedule = StepSchedule(steps, taus)
             exp_phi = (np.array(re_e) + 1j * np.array(im_e)).reshape(mx_shape)
             pss = np.abs(irfftn(exp_phi, s=[int(x) for x in limits]))
             return (pss / pss.sum()).squeeze()
@@ -1557,15 +1653,12 @@ class CMEModel:
             gf = self.protein_pgf(g, p)
 
         elif self.bio_model == "Custom":
-            dt    = np.min(1.0 / p) * self.min_fudge
-            t_max = np.max(1.0 / p) * self.max_fudge
-            n_steps = int(np.ceil(t_max / dt))
             gf = self.network.eval_pgf(
                 p_,
                 [g[i] for i in range(len(self.network.species))],
-                t_max,
-                n_steps,
+                fixed_schedule=getattr(self, "_fixed_custom_schedule", None),
             )
+            self._last_custom_schedule = self.network.last_schedule
 
         else:
             raise ValueError(

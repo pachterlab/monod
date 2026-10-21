@@ -13,7 +13,7 @@ cortex data and the poly(A) length reference from the
 | [`analysis_workflow.ipynb`](analysis_workflow.ipynb) | After the fit: gene rejection, standard errors, parameter-level differential expression between two PBMC cell types, saving results | under a minute |
 | [`sequencing_noise.ipynb`](sequencing_noise.ipynb) | The Poisson and Bernoulli sequencing models, gene-length bias, the sampling landscape and the burst-size trade-off, noise decomposition, shared optima for two cell types, ambiguous assignments | about 15 minutes |
 | [`models.ipynb`](models.ipynb) | The six two-species transcription models, their parameters and distributions, and a fit to real data | minutes |
-| [`reaction_networks.ipynb`](reaction_networks.ipynb) | Defining custom reaction networks with the reaction-string syntax, fitting one to data, checking that a network is identifiable, and time-delayed reactions | about 10 minutes |
+| [`reaction_networks.ipynb`](reaction_networks.ipynb) | Defining custom reaction networks with the reaction-string syntax, fitting one to data, checking that a network is identifiable, and time-delayed reactions, compared with the immediate network across a panel of 40 genes | about 10 minutes |
 | [`protein_bursty.ipynb`](protein_bursty.ipynb) | The three-species protein model: moments, 3-D distribution, L-BFGS-B vs Nelder-Mead fits | about a minute |
 | [`mek_means.ipynb`](mek_means.ipynb) | meK-Means clustering on PBMC 10k with a confusion matrix against known cell types | about a minute |
 | [`mek_means_rust.ipynb`](mek_means_rust.ipynb) | The Rust fast paths inside meK-Means, step by step, with timings | minutes |

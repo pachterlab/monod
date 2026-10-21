@@ -26,9 +26,9 @@ Arrow types
 
           ``du_A/dt += k · (u_B(t−τ) − u_A(t))``
 
-        Numerically integrated by fixed-step RK4 (method of steps) with the
-        delayed state read from a history buffer by linear interpolation
-        between stored steps, so the result depends smoothly on τ.  Before
+        Integrated by the exponential integrator of ``eval_pgf`` (method of
+        steps) with the delayed state read from the accepted history by
+        linear interpolation, so the result depends smoothly on τ.  Before
         t = τ the delayed state is zero: a product that would only appear
         after the observation time contributes nothing (z = 1).
 
@@ -79,13 +79,20 @@ Examples
 
 from __future__ import annotations
 
+import bisect
 import re
 import warnings
-from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
+# Exponential-integrator controls (shared with monod_core::custom_pgf_sched).
+_CUSTOM_ODE_TOL = 1e-6        # per-step error target on the generating-function scale
+_CUSTOM_ODE_C0 = 0.05         # first step as a fraction of the fastest time scale
+_CUSTOM_ODE_U_END = 1e-8      # stop once exp(Re φ)·|u| is below this everywhere (for a delay's length, if any)
+_CUSTOM_ODE_MAX_STEPS = 20_000
+_CUSTOM_ODE_H_MAX = 1e4       # step cap in units of the slowest time scale
 
 
 class ReactionNetworkWarning(UserWarning):
@@ -567,275 +574,250 @@ class ReactionNetwork:
         return m
 
     # ------------------------------------------------------------------
-    # ODE/DDE right-hand side
+    # Characteristic equations: linear part, remainder and source
     # ------------------------------------------------------------------
 
-    def _rhs(
-        self,
-        u: List[np.ndarray],
-        params: Dict[str, float],
-        sp_idx: Dict[str, int],
-        u_delayed_by_tau: Optional[Dict[str, List[np.ndarray]]] = None,
-    ) -> Tuple[List[np.ndarray], np.ndarray]:
-        """Characteristic ODE/DDE RHS for the log-PGF.
+    def _linear_system(
+        self, params: Dict[str, float], sp_idx: Dict[str, int],
+    ) -> Tuple[np.ndarray, List[bool], List[float], float, float]:
+        """Split the characteristic equations into ``du/dt = A u + N(u)``.
 
-        For delayed reactions (``is_delayed=True``) the product term
-        ``z^products`` is evaluated at the historically delayed state
-        ``u_delayed_by_tau[tau_name]`` instead of the current ``u``.
-        Pass ``None`` to fall back to the non-delayed formula (used during
-        the initialisation half-step where no history exists yet).
-
-        Returns
-        -------
-        du : list of arrays (one per species)
-            Derivative of the characteristic variables.
-        dphi : array
-            Source term for the log-PGF accumulation.
+        Returns ``(A, nonlin, taus, lam_fast, lam_slow)``: the real first-order
+        rate matrix, one flag per reaction marking those that contribute to the
+        remainder ``N`` (several products from one reaction, as in
+        ``S -> S + P``, or a delayed product term), the delay lengths in
+        ``delay_params`` order, and the fastest and slowest first-order time
+        scales.  Mirrors ``monod_core::custom_system``.
         """
         n = len(self.species)
-        shape = u[0].shape
-        dtype = u[0].dtype
-
-        du   = [np.zeros(shape, dtype=dtype) for _ in range(n)]
-        dphi =  np.zeros(shape, dtype=dtype)
-
+        A = np.zeros((n, n))
+        nonlin: List[bool] = []
+        rates: List[float] = []
         for rxn in self.reactions:
-            k = params[rxn.rate_name]
-
-            # ── production (zero-reactant) ──────────────────────────────────
             if not rxn.reactants:
-                if rxn.burst_param is not None:
-                    # Geometric burst: dφ/dt += k · B·u_A / (1 − B·u_A)
-                    b = params[rxn.burst_param]
-                    i = sp_idx[rxn.burst_species]
-                    dphi += k * b * u[i] / (1.0 - b * u[i])
-                else:
-                    # Deterministic stoichiometry: dφ/dt += k · (z^products − 1)
-                    z_prod = _product_z(u, rxn.products, sp_idx, shape, dtype)
-                    dphi  += k * (z_prod - 1.0)
-
-            # ── single-reactant (first-order propensity) ────────────────────
-            elif len(rxn.reactants) == 1:
-                (src_sp, src_n), = rxn.reactants.items()
-                if src_n != 1:
-                    raise NotImplementedError(
-                        f"Reactant stoichiometry > 1 not yet supported: {rxn}"
-                    )
-                i = sp_idx[src_sp]
-                # For delayed reactions use the historical u for the product term.
-                # If no history is available yet (u_delayed_by_tau is None or the
-                # key is missing), fall back to current u — equivalent to assuming
-                # constant history equal to the initial condition.
-                if (
-                    rxn.is_delayed
-                    and u_delayed_by_tau is not None
-                    and rxn.tau_name in u_delayed_by_tau
-                ):
-                    u_for_prod = u_delayed_by_tau[rxn.tau_name]
-                else:
-                    u_for_prod = u
-                z_prod  = _product_z(u_for_prod, rxn.products, sp_idx, shape, dtype)
-                du[i]  += k * (z_prod - (1.0 + u[i]))
-
-            # ── bimolecular (two distinct reactants) ────────────────────────
-            else:
+                nonlin.append(False)
+                continue
+            if len(rxn.reactants) > 1:
                 raise NotImplementedError(
                     "Bimolecular reactions (two distinct reactants) are not yet "
                     "supported in the characteristic-ODE framework.  "
                     f"Offending reaction: {rxn}"
                 )
+            (src_sp, src_n), = rxn.reactants.items()
+            if src_n != 1:
+                raise NotImplementedError(
+                    f"Reactant stoichiometry > 1 not yet supported: {rxn}"
+                )
+            k = params[rxn.rate_name]
+            i = sp_idx[src_sp]
+            A[i, i] -= k
+            rates.append(k)
+            if rxn.is_delayed:
+                nonlin.append(True)
+            else:
+                for sp, st in rxn.products.items():
+                    A[i, sp_idx[sp]] += k * st
+                prods = list(rxn.products.values())
+                nonlin.append(not (len(prods) == 0 or (len(prods) == 1 and prods[0] == 1)))
+        taus = [1.0 / params[name] for name in self.delay_params]
+        if not rates:
+            rates = [params[r.rate_name] for r in self.reactions]
+        rates = [k for k in rates if k > 0]
+        diag = [-A[i, i] for i in range(n) if -A[i, i] > 0]
+        lam_fast = max(max(rates, default=0.0), 1e-300)
+        lam_slow = min(diag) if diag else (min(rates) if rates else lam_fast)
+        return A, nonlin, taus, lam_fast, lam_slow
 
-        return du, dphi
-
-    # ------------------------------------------------------------------
-    # RK4 step
-    # ------------------------------------------------------------------
-
-    def _rk4_step(
+    def _nonlin(
         self,
-        u: List[np.ndarray],
-        phi: np.ndarray,
+        u: np.ndarray,
+        udel: List[np.ndarray],
         params: Dict[str, float],
         sp_idx: Dict[str, int],
-        dt: float,
-        u_delayed_by_tau: Optional[Dict[str, List[np.ndarray]]] = None,
-    ) -> Tuple[List[np.ndarray], np.ndarray]:
-        """One RK4 update of the full (u, φ) state.
+        nonlin: List[bool],
+    ) -> np.ndarray:
+        """Remainder ``N(u)``: ``k (Z(u) − 1 − Σ s_j u_j)`` for multi-product
+        first-order reactions and ``k (Z(u_del) − 1)`` for delayed ones.
 
-        ``u_delayed_by_tau`` is frozen across all four stages (method-of-steps
-        convention for DDE-RK4 integration).
+        ``u`` has shape ``(n_species, n_grid)``; ``udel[d]`` is the delayed
+        state for the ``d``-th entry of ``delay_params``.
         """
-        n = len(u)
-        du1, dp1 = self._rhs(u, params, sp_idx, u_delayed_by_tau)
-        u2  = [u[i] + 0.5 * dt * du1[i] for i in range(n)]
-        du2, dp2 = self._rhs(u2, params, sp_idx, u_delayed_by_tau)
-        u3  = [u[i] + 0.5 * dt * du2[i] for i in range(n)]
-        du3, dp3 = self._rhs(u3, params, sp_idx, u_delayed_by_tau)
-        u4  = [u[i] + dt * du3[i] for i in range(n)]
-        du4, dp4 = self._rhs(u4, params, sp_idx, u_delayed_by_tau)
+        shape = u[0].shape
+        out = np.zeros(u.shape, dtype=np.complex128)
+        for rxn, flag in zip(self.reactions, nonlin):
+            if not flag:
+                continue
+            k = params[rxn.rate_name]
+            i = sp_idx[next(iter(rxn.reactants))]
+            if rxn.is_delayed:
+                ud = udel[self.delay_params.index(rxn.tau_name)]
+                z = _product_z(ud, rxn.products, sp_idx, shape, np.complex128)
+                out[i] += k * (z - 1.0)
+            else:
+                z = _product_z(u, rxn.products, sp_idx, shape, np.complex128)
+                lin = np.zeros(shape, dtype=np.complex128)
+                for sp, st in rxn.products.items():
+                    lin += u[sp_idx[sp]] * float(st)
+                out[i] += k * (z - 1.0 - lin)
+        return out
 
-        u_new   = [u[i] + (dt / 6.0) * (du1[i] + 2*du2[i] + 2*du3[i] + du4[i])
-                   for i in range(n)]
-        phi_new = phi + (dt / 6.0) * (dp1 + 2*dp2 + 2*dp3 + dp4)
-        return u_new, phi_new
-
-    # ------------------------------------------------------------------
-    # Delayed-state helpers
-    # ------------------------------------------------------------------
-
-    def _build_history(
-        self,
-        u_init: List[np.ndarray],
-        params: Dict[str, float],
-        dt: float,
-    ) -> Tuple[Deque, Dict[str, Tuple[int, float]]]:
-        """Allocate the history ring and the interpolation weights per delay.
-
-        For each delay τ = 1/tauinv, ``τ/dt = j + α`` with integer ``j`` and
-        ``0 <= α < 1``; the delayed state is ``(1 − α)·u_{n−j} + α·u_{n−j−1}``,
-        with ``u_m = 0`` for ``m < 0``: a product that would appear after the
-        observation time contributes nothing.  Mirrors ``monod_core``'s
-        ``DelaySpec``.
-
-        Returns
-        -------
-        u_hist : deque of List[np.ndarray]
-            Ring of the last ``max_j + 2`` states, newest last; zeros for the
-            pre-history and ``u_init`` in the last slot.
-        specs : dict  tau_name → (j, α)
-        """
-        specs: Dict[str, Tuple[int, float]] = {}
+    def _source(
+        self, u: np.ndarray, params: Dict[str, float], sp_idx: Dict[str, int],
+    ) -> np.ndarray:
+        """Source ``S(u) = dφ/dt`` from the production reactions."""
+        shape = u[0].shape
+        s = np.zeros(shape, dtype=np.complex128)
         for rxn in self.reactions:
-            if rxn.is_delayed and rxn.tau_name not in specs:
-                s = (1.0 / params[rxn.tau_name]) / dt
-                j = int(np.floor(s))
-                specs[rxn.tau_name] = (j, float(s - j))
+            if rxn.reactants:
+                continue
+            k = params[rxn.rate_name]
+            if rxn.burst_param is not None:
+                b = params[rxn.burst_param]
+                ui = u[sp_idx[rxn.burst_species]]
+                s += ui * (k * b) / (1.0 - ui * b)
+            else:
+                z = _product_z(u, rxn.products, sp_idx, shape, np.complex128)
+                s += k * (z - 1.0)
+        return s
 
-        max_j = max((j for j, _ in specs.values()), default=0)
-        u_hist: Deque = deque(
-            [[np.zeros_like(arr) for arr in u_init] for _ in range(max_j + 1)]
-            + [[arr.copy() for arr in u_init]],
-            maxlen=max_j + 2,
-        )
-        return u_hist, specs
+    # ------------------------------------------------------------------
+    # Exponential integrator
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def _delayed_state(
-        u_hist: Deque,
-        specs: Dict[str, Tuple[int, float]],
-    ) -> Dict[str, List[np.ndarray]]:
-        """Interpolated delayed state for each delay parameter.
+    def _expm(m: np.ndarray) -> np.ndarray:
+        """exp(m) by scaling and squaring around a degree-18 Taylor polynomial
+        (the scaled 1-norm is at most 1/2).  Mirrors ``SmallMat::expm``."""
+        nrm = float(np.abs(m).sum(axis=0).max())
+        s = int(np.ceil(np.log2(nrm / 0.5))) if nrm > 0.5 else 0
+        x = m * (0.5 ** s)
+        n = m.shape[0]
+        eye = np.eye(n)
+        r = eye.copy()
+        for k in range(18, 0, -1):
+            r = eye + (x @ r) * (1.0 / k)
+        for _ in range(s):
+            r = r @ r
+        return r
 
-        ``u_hist[-1]`` is the current state ``u_n`` and ``u_hist[-1-m]`` is
-        ``u_{n-m}``.
-        """
-        result: Dict[str, List[np.ndarray]] = {}
-        for tau_name, (j, alpha) in specs.items():
-            a = u_hist[-1 - j]
-            b = u_hist[-2 - j]
-            result[tau_name] = [x * (1.0 - alpha) + y * alpha for x, y in zip(a, b)]
-        return result
+    @classmethod
+    def _step_ops(cls, A: np.ndarray, h: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """``(E, P1, P2) = (exp(A h), h φ₁(A h), h φ₂(A h))`` read off the
+        exponential of the block matrix ``[[A h, I, 0], [0, 0, I], [0, 0, 0]]``."""
+        n = A.shape[0]
+        m = np.zeros((3 * n, 3 * n))
+        m[:n, :n] = A * h
+        m[:n, n:2 * n] = np.eye(n)
+        m[n:2 * n, 2 * n:] = np.eye(n)
+        x = cls._expm(m)
+        return x[:n, :n], h * x[:n, n:2 * n], h * x[:n, 2 * n:]
+
+    def _etd_step(
+        self,
+        u: np.ndarray,
+        h: float,
+        ops: Tuple[np.ndarray, np.ndarray, np.ndarray],
+        del_start: List[np.ndarray],
+        del_end: List[Optional[np.ndarray]],
+        ctx: tuple,
+    ) -> np.ndarray:
+        """One ETD2RK step of size ``h``: ``a = E u + P1 N(u)``,
+        ``u' = a + P2 (N(a) − N(u))``.  A delayed state at the end of the step
+        that falls inside the step (delay shorter than ``h``) is read off the
+        line through ``(t, u)`` and ``(t + h, a)``."""
+        params, sp_idx, nonlin, taus, linear = ctx
+        E, P1, P2 = ops
+        if linear:
+            return E @ u
+        n0 = self._nonlin(u, del_start, params, sp_idx, nonlin)
+        a = E @ u + P1 @ n0
+        del_a = [
+            d if d is not None else u + (a - u) * ((h - tau) / h)
+            for d, tau in zip(del_end, taus)
+        ]
+        n1 = self._nonlin(a, del_a, params, sp_idx, nonlin)
+        return a + P2 @ (n1 - n0)
+
+    def _trial(
+        self,
+        u: np.ndarray,
+        phi: np.ndarray,
+        h: float,
+        ops_h: tuple,
+        ops_h2: tuple,
+        dl: list,
+        estimate: bool,
+        ctx: tuple,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        """Two half-steps (Simpson's rule for φ) and, when ``estimate``, one
+        full step for the error estimate.  ``dl[d] = (state at t − τ,
+        at t + h/2 − τ, at t + h − τ)`` from the accepted history, the latter
+        two ``None`` when they fall inside the current step."""
+        params, sp_idx, nonlin, taus, linear = ctx
+        hh = 0.5 * h
+        d0 = [d[0] for d in dl]
+        dm = [d[1] for d in dl]
+        um = self._etd_step(u, hh, ops_h2, d0, dm, ctx)
+        dm_from_um = [
+            d[1] if d[1] is not None else u + (um - u) * ((hh - tau) / hh)
+            for d, tau in zip(dl, taus)
+        ]
+        d1_second: List[Optional[np.ndarray]] = []
+        for d, tau in zip(dl, taus):
+            if d[2] is not None:
+                d1_second.append(d[2])
+            elif tau >= hh:
+                d1_second.append(u + (um - u) * ((h - tau) / hh))
+            else:
+                d1_second.append(None)
+        u2 = self._etd_step(um, hh, ops_h2, dm_from_um, d1_second, ctx)
+        s0 = self._source(u, params, sp_idx)
+        sm = self._source(um, params, sp_idx)
+        s2 = self._source(u2, params, sp_idx)
+        dphi = (s0 + sm * 4.0 + s2) * (h / 6.0)
+        du = 0.0
+        if not linear:
+            # one full step: its difference from the two half-steps estimates
+            # the error, and Richardson extrapolation removes the leading term
+            d1 = [d[2] for d in dl]
+            u1 = self._etd_step(u, h, ops_h, d0, d1, ctx)
+            du = np.abs(u2 - u1).max(axis=0)
+            u2 = u2 + (u2 - u1) / 3.0
+        err = 0.0
+        if estimate:
+            trap = (s0 + sm * 2.0 + s2) * (h / 4.0)
+            err = float(np.max(np.exp(phi.real) * (np.abs(dphi - trap) + du)))
+        return um, u2, dphi, err
 
     # ------------------------------------------------------------------
     # Public PGF evaluator
     # ------------------------------------------------------------------
 
-    def _dopri5_step(
-        self,
-        u: List[np.ndarray],
-        phi: np.ndarray,
-        params: Dict[str, float],
-        sp_idx: Dict[str, int],
-        h: float,
-        u_delayed_by_tau: Optional[Dict[str, List[np.ndarray]]] = None,
-    ) -> Tuple[List[np.ndarray], np.ndarray, float]:
-        """One Dormand-Prince RK45 step.
-
-        Returns ``(u_new, phi_new, err)`` where *err* is the scalar error
-        norm (step is accepted when ``err <= 1.0``).  Both the 5th-order
-        solution and the embedded error estimate use the same 7 RHS
-        evaluations (6 stages + 1 FSAL evaluation of the new state).
-        """
-        # Dormand-Prince Butcher tableau (DOPRI5)
-        a21 = 1 / 5
-        a31, a32 = 3 / 40, 9 / 40
-        a41, a42, a43 = 44 / 45, -56 / 15, 32 / 9
-        a51, a52, a53, a54 = 19372 / 6561, -25360 / 2187, 64448 / 6561, -212 / 729
-        a61, a62, a63, a64, a65 = (
-            9017 / 3168, -355 / 33, 46732 / 5247, 49 / 176, -5103 / 18656
-        )
-        b1, b3, b4, b5, b6 = 35 / 384, 500 / 1113, 125 / 192, -2187 / 6784, 11 / 84
-        # Error coefficients e = b5th − b4th
-        e1 = 71 / 57600
-        e3 = -71 / 16695
-        e4 = 71 / 1920
-        e5 = -17253 / 339200
-        e6 = 22 / 525
-        e7 = -1 / 40
-
-        n = len(u)
-        d = u_delayed_by_tau  # shorthand
-
-        du1, dp1 = self._rhs(u, params, sp_idx, d)
-
-        u2 = [u[i] + h * a21 * du1[i] for i in range(n)]
-        du2, dp2 = self._rhs(u2, params, sp_idx, d)
-
-        u3 = [u[i] + h * (a31 * du1[i] + a32 * du2[i]) for i in range(n)]
-        du3, dp3 = self._rhs(u3, params, sp_idx, d)
-
-        u4 = [u[i] + h * (a41 * du1[i] + a42 * du2[i] + a43 * du3[i]) for i in range(n)]
-        du4, dp4 = self._rhs(u4, params, sp_idx, d)
-
-        u5 = [u[i] + h * (a51 * du1[i] + a52 * du2[i] + a53 * du3[i] + a54 * du4[i]) for i in range(n)]
-        du5, dp5 = self._rhs(u5, params, sp_idx, d)
-
-        u6 = [
-            u[i] + h * (a61 * du1[i] + a62 * du2[i] + a63 * du3[i] + a64 * du4[i] + a65 * du5[i])
-            for i in range(n)
-        ]
-        du6, dp6 = self._rhs(u6, params, sp_idx, d)
-
-        # 5th-order solution
-        u_new = [u[i] + h * (b1 * du1[i] + b3 * du3[i] + b4 * du4[i] + b5 * du5[i] + b6 * du6[i]) for i in range(n)]
-        phi_new = phi + h * (b1 * dp1 + b3 * dp3 + b4 * dp4 + b5 * dp5 + b6 * dp6)
-
-        # 7th stage at u_new — used only for error estimate (FSAL)
-        du7, _ = self._rhs(u_new, params, sp_idx, d)
-
-        # Componentwise error norm  max_i max_j |e_{ij}| / sc_{ij}
-        atol, rtol = 1e-6, 1e-4
-        err = 0.0
-        for i in range(n):
-            e_i = np.abs(
-                h * (e1 * du1[i] + e3 * du3[i] + e4 * du4[i]
-                     + e5 * du5[i] + e6 * du6[i] + e7 * du7[i])
-            )
-            sc = atol + rtol * np.maximum(np.abs(u[i]), np.abs(u_new[i]))
-            local = float(np.max(e_i / sc))
-            if local > err:
-                err = local
-
-        return u_new, phi_new, err
-
     def eval_pgf(
         self,
         p_log: np.ndarray,
         g: List[np.ndarray],
-        T: float,
-        n_steps: int,
+        fixed_schedule: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Evaluate the steady-state log-PGF φ at complex grid points.
 
-        For non-delayed networks uses an adaptive Dormand-Prince RK45
-        scheme that automatically tightens the step size where needed and
-        expands it in smooth regions.  The initial step size is
-        ``T / n_steps`` (derived from the parameter fudge factors), so
-        the caller's ``T`` / ``n_steps`` still control the starting scale.
-
-        For delayed networks (``=>``) the fixed-step RK4 integrator is
-        used instead, because the history buffer requires a uniform step
-        size; the delayed state is interpolated between stored steps.
+        The characteristic equations ``du/dt = A u + N(u)``, ``dφ/dt = S(u)``
+        are integrated with an exponential integrator: the first-order rate
+        matrix ``A`` is propagated exactly through ``exp(A h)``, so the stiff
+        rates never limit the step, and the remainder ``N`` (several products
+        from one reaction, delayed product terms) is handled by the
+        second-order exponential Runge-Kutta scheme ETD2RK.  φ is accumulated
+        with Simpson's rule on two half-steps.  The step size is controlled by
+        comparing one full step with the two half-steps (whose difference also
+        feeds a Richardson extrapolation of ``u``), taking the maximum error
+        over all grid points so the whole grid shares one schedule.  The
+        accepted steps are recorded in ``last_schedule``; ``fixed_schedule``
+        replays a given sequence (finite-difference stencils use the base
+        point's, warped onto their own delays).  Delayed states come from the
+        accepted history by cubic
+        Hermite interpolation (every knot stores its derivative); a delay
+        shorter than the step is read off the step's own predictor.  Mirrors
+        ``monod_core::custom_pgf_sched``.
 
         Parameters
         ----------
@@ -843,94 +825,123 @@ class ReactionNetwork:
             Log₁₀ parameters in the order ``all_params``.
         g : list of np.ndarray
             Complex initial conditions, one per species, all the same shape.
-        T : float
-            Sets the initial step size as ``h0 = T / n_steps``.
-        n_steps : int
-            Sets the initial step size as ``h0 = T / n_steps``.
+        fixed_schedule : StepSchedule or array-like of float, optional
+            Step sizes to replay instead of adapting; a ``StepSchedule`` is
+            warped onto the current delays (see ``_warp_schedule``).
 
         Returns
         -------
-        phi : np.ndarray (complex64)
-            Log-PGF values at every grid point.
+        phi : np.ndarray (complex128)
+            Log-PGF values at every grid point, in the shape of ``g[0]``.
         """
         if len(g) != len(self.species):
             raise ValueError(
                 f"Expected {len(self.species)} grid arrays (species {self.species}), "
                 f"got {len(g)}"
             )
-
-        # Delayed networks require uniform step-size for the history buffer.
-        if self._has_delays:
-            return self._eval_pgf_rk4_fixed(p_log, g, T, n_steps)
-
         params = self._param_map(p_log)
         sp_idx = {s: i for i, s in enumerate(self.species)}
+        A, nonlin, taus, lam_fast, lam_slow = self._linear_system(params, sp_idx)
+        linear = not any(nonlin)
+        ctx = (params, sp_idx, nonlin, taus, linear)
 
-        u   = [np.array(g[i], dtype=np.complex64) for i in range(len(self.species))]
-        phi = np.zeros_like(u[0])
+        shape = np.shape(g[0])
+        u = np.stack([np.asarray(gi, dtype=np.complex128).ravel() for gi in g])
+        phi = np.zeros(u.shape[1], dtype=np.complex128)
+        tau_max = max(taus, default=0.0)
 
-        h     = T / n_steps if n_steps > 0 else 1e-3
-        h_max = 10.0 * h
-        h_min = h * 1e-8
+        def knot_deriv(hist, tk, uk):
+            udel = [hist.at(tk - tau) for tau in taus]
+            return A @ uk + self._nonlin(uk, udel, params, sp_idx, nonlin)
 
-        # phi starts at 0 and is integrated inside each RK stage; no extra
-        # end-point corrections are needed (they would double count).
+        h0 = _CUSTOM_ODE_C0 / lam_fast
+        hist = None
+        if taus:
+            hist = _History(0.0, u, h0)
+            hist.f[0] = knot_deriv(hist, 0.0, u)
 
-        # Adaptive integration until |u[0]| < 1e-3.
-        max_steps = 50 * n_steps + 50_000
-        step_count = 0
-        while np.max(np.abs(u[0])) > 1e-3 and step_count < max_steps:
-            u_new, phi_new, err = self._dopri5_step(u, phi, params, sp_idx, h)
-            # PI-controller step-size update (5th-order exponent 0.2).
-            factor = float(np.clip(0.9 * (1.0 / max(err, 1e-10)) ** 0.2, 0.1, 5.0))
-            if err <= 1.0:
-                u, phi = u_new, phi_new
-                step_count += 1
-            h = float(np.clip(h * factor, h_min, h_max))
+        adaptive = fixed_schedule is None
+        if not adaptive:
+            # warp the recorded schedule onto the current delays
+            fixed_steps = _warp_schedule(
+                np.asarray(fixed_schedule, dtype=float),
+                getattr(fixed_schedule, "breakpoints", ()), taus,
+            )
+        steps: List[float] = []
+        t = 0.0
+        h = h0
+        # the controller's proposal; ``h`` is what is actually taken after the
+        # history cap and the clipping to a delay breakpoint
+        h_prop = h0
+        clipped = False
+        h_min = 1e-12 / lam_fast
+        h_max = _CUSTOM_ODE_H_MAX / lam_slow
+        # A delayed network is finished only once the state has been negligible
+        # for a full delay: the history still feeds the system until then.
+        quiet_since: Optional[float] = None
+        while True:
+            if not adaptive:
+                if len(steps) >= len(fixed_steps):
+                    break
+                h = float(fixed_steps[len(steps)])
+            else:
+                if len(steps) >= _CUSTOM_ODE_MAX_STEPS:
+                    break
+                h = min(h_prop, h_max)
+                if hist is not None:
+                    for tau in taus:
+                        h = hist.max_step(t - tau, h)
+                # land exactly on the time a delayed product first switches on
+                clipped = False
+                for tau in taus:
+                    if t < tau and t + h > tau and tau - t > 1e-6 * h:
+                        h = tau - t
+                        clipped = True
+            t_mid = t + 0.5 * h
+            t_end = t + h
+            ops_h2 = self._step_ops(A, 0.5 * h)
+            ops_h = ops_h2 if linear else self._step_ops(A, h)
+            dl = []
+            if hist is not None:
+                for tau in taus:
+                    d0 = hist.at(t - tau)
+                    dm = hist.at(t_mid - tau) if tau >= 0.5 * h else None
+                    d1 = hist.at(t_end - tau, left=True) if tau >= h else None
+                    dl.append((d0, dm, d1))
+            um, u2, dphi, err = self._trial(u, phi, h, ops_h, ops_h2, dl, adaptive, ctx)
+            fac = 1.0
+            if adaptive:
+                if err > _CUSTOM_ODE_TOL and h > h_min:
+                    h_prop = h * max(0.2, 0.9 * (_CUSTOM_ODE_TOL / err) ** (1.0 / 3.0))
+                    continue
+                fac = min(2.0, max(0.2, 0.9 * (_CUSTOM_ODE_TOL / max(err, 1e-300)) ** (1.0 / 3.0)))
+            u = u2
+            phi = phi + dphi
+            t = t_end
+            steps.append(h)
+            remaining = float(np.max(np.exp(phi.real) * np.abs(u).max(axis=0))) if adaptive else 0.0
+            if hist is not None:
+                h_ctrl = h_prop if clipped else h
+                hist.push(t_mid, um, h_ctrl, remaining)
+                hist.push(t_end, u, h_ctrl, remaining)
+                hist.f[-2] = knot_deriv(hist, t_mid, um)
+                hist.f[-1] = knot_deriv(hist, t_end, u)
+                hist.prune(t - tau_max)
+            if adaptive:
+                if remaining < _CUSTOM_ODE_U_END:
+                    if not taus:
+                        break
+                    if quiet_since is None:
+                        quiet_since = t
+                    if t - quiet_since >= tau_max:
+                        break
+                else:
+                    quiet_since = None
+                # after landing on a breakpoint resume from the unclipped proposal
+                h_prop = (h_prop if clipped else h) * fac
 
-        return phi
-
-    def _eval_pgf_rk4_fixed(
-        self,
-        p_log: np.ndarray,
-        g: List[np.ndarray],
-        T: float,
-        n_steps: int,
-    ) -> np.ndarray:
-        """Fixed-step RK4 integrator (used for delayed networks).
-
-        Maintains a history ring for the ``=>`` DDE reactions; the delayed
-        state is linearly interpolated between stored steps (see
-        ``_build_history``).  The step size is fixed throughout so the ring
-        index arithmetic stays exact.  Mirrors ``monod_core``'s
-        ``custom_pgf_delayed_parallel``.
-        """
-        params = self._param_map(p_log)
-        sp_idx = {s: i for i, s in enumerate(self.species)}
-
-        u   = [np.array(g[i], dtype=np.complex128) for i in range(len(self.species))]
-        phi = np.zeros_like(u[0])
-        dt  = T / n_steps if n_steps > 0 else T
-
-        u_hist, specs = self._build_history(u, params, dt)
-
-        def _step(u, phi):
-            u_del = self._delayed_state(u_hist, specs)
-            u_new, phi_new = self._rk4_step(u, phi, params, sp_idx, dt, u_del)
-            u_hist.append([arr.copy() for arr in u_new])
-            return u_new, phi_new
-
-        for _ in range(n_steps):
-            u, phi = _step(u, phi)
-
-        max_while_steps = 10 * n_steps + 10_000
-        while_steps = 0
-        while np.max(np.abs(u[0])) > 1e-3 and while_steps < max_while_steps:
-            u, phi = _step(u, phi)
-            while_steps += 1
-
-        return phi
-
+        self.last_schedule = StepSchedule(steps, taus)
+        return phi.reshape(shape)
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
@@ -1002,6 +1013,159 @@ class ReactionNetwork:
 # ---------------------------------------------------------------------------
 # Module-level helper (used by the ODE RHS)
 # ---------------------------------------------------------------------------
+
+class StepSchedule:
+    """Accepted step sizes of one custom-network integration, with the delay
+    lengths (breakpoints) they were recorded at.  Behaves as the 1-D array of
+    steps; replaying it at other delays warps the time axis so every knot keeps
+    its position relative to the delays (see ``_warp_schedule``)."""
+
+    __slots__ = ("steps", "breakpoints")
+
+    def __init__(self, steps, breakpoints=()) -> None:
+        self.steps = np.asarray(steps, dtype=float)
+        self.breakpoints = tuple(float(b) for b in breakpoints)
+
+    @property
+    def size(self) -> int:
+        return int(self.steps.size)
+
+    def __len__(self) -> int:
+        return int(self.steps.size)
+
+    def __iter__(self):
+        return iter(self.steps)
+
+    def __getitem__(self, i):
+        return self.steps[i]
+
+    def __array__(self, dtype=None, copy=None):
+        return self.steps if dtype is None else self.steps.astype(dtype)
+
+    def copy(self) -> "StepSchedule":
+        return StepSchedule(self.steps.copy(), self.breakpoints)
+
+    @property
+    def times(self) -> np.ndarray:
+        """Knot times (end of every step)."""
+        return np.cumsum(self.steps)
+
+    def __repr__(self) -> str:
+        return f"StepSchedule({self.size} steps, breakpoints={self.breakpoints})"
+
+
+def _warp_schedule(steps: np.ndarray, base, new) -> np.ndarray:
+    """Map a recorded schedule onto new delay breakpoints: the time axis is
+    stretched piecewise-linearly so every knot keeps its position relative to
+    the delays, which makes a replayed result a smooth function of the delays.
+    Identity when there are no delays, when they are unchanged, or when their
+    order would change.  Mirrors ``monod_core::warp_schedule``."""
+    steps = np.asarray(steps, dtype=float)
+    base, new = list(base), list(new)
+    if not base or len(base) != len(new) or base == new:
+        return steps
+    order = sorted(range(len(base)), key=lambda i: base[i])
+    bx, by = [0.0], [0.0]
+    for i in order:
+        b, nb = base[i], new[i]
+        if b <= bx[-1]:
+            if nb != by[-1]:
+                return steps
+            continue
+        if nb <= by[-1]:
+            return steps
+        bx.append(b)
+        by.append(nb)
+
+    def f(t):
+        k = bisect.bisect_right(bx, t)
+        if k >= len(bx):
+            return by[-1] + (t - bx[-1])
+        return by[k - 1] + (t - bx[k - 1]) * ((by[k] - by[k - 1]) / (bx[k] - bx[k - 1]))
+
+    out = []
+    t = 0.0
+    for h in steps:
+        t1 = t + h
+        out.append(f(t1) - f(t))
+        t = t1
+    return np.asarray(out, dtype=float)
+
+
+class _History:
+    """Accepted knots of a delayed network: time, state ``(n_species, n_grid)``,
+    its derivative once known, and the step size the error controller chose
+    for the step that produced the knot (before clipping to a breakpoint)."""
+
+    def __init__(self, t0: float, u0: np.ndarray, h0: float) -> None:
+        self.t: List[float] = [t0]
+        self.u: List[np.ndarray] = [u0.copy()]
+        self.f: List[Optional[np.ndarray]] = [None]
+        self.h_ctrl: List[float] = [h0]
+        self.amp: List[float] = [1.0]
+
+    def at(self, s: float, left: bool = False) -> np.ndarray:
+        """State at time ``s``: zero before the observation time; cubic
+        Hermite interpolation between knots when both derivatives are known,
+        linear otherwise.  The state jumps from zero to the initial condition
+        at the observation time: a stage at the end of a step reads the left
+        limit (``left``), one at the start the right limit, so a step that
+        lands on a delay sees no forcing and the next one sees it from its
+        first stage."""
+        # a landing on the onset is exact only up to rounding
+        t0 = self.t[0]
+        if abs(s - t0) <= 1e-10 * max(self.t[-1], 1.0):
+            s = t0
+        if s < t0 or (left and s <= t0):
+            return np.zeros_like(self.u[0])
+        lo = bisect.bisect_right(self.t, s)
+        if lo >= len(self.t):
+            return self.u[-1]
+        ta, ua, fa = self.t[lo - 1], self.u[lo - 1], self.f[lo - 1]
+        tb, ub, fb = self.t[lo], self.u[lo], self.f[lo]
+        d = tb - ta
+        th = (s - ta) / d
+        if fa is not None and fb is not None:
+            h00 = (2.0 * th - 3.0) * th * th + 1.0
+            h10 = ((th - 2.0) * th + 1.0) * th
+            h01 = (3.0 - 2.0 * th) * th * th
+            h11 = (th - 1.0) * th * th
+            return ua * h00 + fa * (h10 * d) + ub * h01 + fb * (h11 * d)
+        return ua + (ub - ua) * th
+
+    def push(self, t: float, u: np.ndarray, h_ctrl: float, amp: float) -> None:
+        self.t.append(t)
+        self.u.append(u)
+        self.f.append(None)
+        self.h_ctrl.append(h_ctrl)
+        self.amp.append(amp)
+
+    def max_step(self, s0: float, h: float) -> float:
+        """Largest step from ``s0`` that does not out-run the resolution of
+        the history it reads: within ``[s0, s0 + h]`` the step is capped at
+        twice the step the controller chose there, wherever the history is
+        large enough to matter (``amp`` at least the tolerance).  Without this
+        a step that has grown long during a quiet stretch reads a delayed pulse
+        narrower than itself only at its stage times, both the full step and
+        the half-steps miss it, and the pulse is skipped."""
+        m = len(self.t)
+        k = max(bisect.bisect_right(self.t, s0), 1)
+        while k < m:
+            if self.t[k - 1] >= s0 + h:
+                break
+            if self.amp[k] >= _CUSTOM_ODE_TOL:
+                h = min(h, 2.0 * self.h_ctrl[k])
+            k += 1
+        return h
+
+    def prune(self, t_oldest_needed: float) -> None:
+        while len(self.t) >= 2 and self.t[1] <= t_oldest_needed:
+            self.t.pop(0)
+            self.u.pop(0)
+            self.f.pop(0)
+            self.h_ctrl.pop(0)
+            self.amp.pop(0)
+
 
 def _product_z(
     u: List[np.ndarray],

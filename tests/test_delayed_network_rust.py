@@ -49,12 +49,16 @@ class TestParity:
     @pytest.mark.parametrize("net,p,limits", [
         (NET2, np.log10([2.0, 2.0, 0.5, 0.5]), [16, 14]),
         (NET2, np.log10([3.0, 0.7, 1.5, 0.4]), [16, 14]),
+        (NET2, np.log10([5.0, 1000.0, 1.0, 0.5]), [16, 14]),   # delay shorter than the steps
         (NET3, np.log10([2.0, 2.0, 1.0, 0.6, 0.5, 0.8]), [10, 8, 8]),
     ])
     def test_rust_matches_python(self, net, p, limits, monkeypatch):
+        # The two kernels round complex divisions differently, so their
+        # error-controlled schedules can part at an accept/reject decision;
+        # the results then agree to the integrator's tolerance, not to rounding.
         rust, py = _pss_both(_model(net), p, limits, monkeypatch)
         assert rust.shape == py.shape
-        np.testing.assert_allclose(rust, py, rtol=1e-9, atol=1e-12)
+        np.testing.assert_allclose(rust, py, rtol=1e-6, atol=1e-12)
         assert rust.sum() == pytest.approx(1.0, abs=1e-6)
 
 
@@ -104,7 +108,7 @@ class TestOptimizer:
             rxn_kinds=topo["rxn_kinds"], rxn_rate_idxs=topo["rxn_rate_idxs"],
             rxn_extra1=topo["rxn_extra1"], rxn_extra2=topo["rxn_extra2"],
             prod_sp=topo["prod_sp"], prod_st=topo["prod_st"], prod_off=topo["prod_off"],
-            has_norm_rate=True, min_fudge=0.05, max_fudge=15.0, fd_eps=1e-6, maxiter=15,
+            has_norm_rate=True, fd_eps=1e-6, maxiter=15,
             ftol=1e-9, gtol=1e-6, eps=1e-15, m_lbfgs=10, num_threads=None, return_status=True,
         )
         assert status[0] in (0, 1, 2)

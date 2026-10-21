@@ -102,7 +102,7 @@ class TestODE:
         net = ReactionNetwork("0 -> U -> S -> 0")
         g = self._simple_grid()
         params = np.log10([1.0, 0.5, 0.8])  # k0=1, k1=0.5 (β), k2=0.8 (γ)
-        phi = net.eval_pgf(params, g, T=50.0, n_steps=500)
+        phi = net.eval_pgf(params, g)
         assert phi.shape == g[0].shape
         assert np.all(np.isfinite(phi))
         assert phi[0].real == pytest.approx(0.0, abs=1e-4)  # φ(0,0) = 0
@@ -113,7 +113,7 @@ class TestODE:
         g = self._simple_grid()
         # g[i][0] == 0 at origin
         params = np.log10([2.0, 1.0, 0.5, 0.8, 0.3])  # B, k0, k1, k2, k3
-        phi = net.eval_pgf(params, g, T=30.0, n_steps=300)
+        phi = net.eval_pgf(params, g)
         assert phi[0].real == pytest.approx(0.0, abs=1e-4)
 
     def test_phi_real_part_non_positive(self):
@@ -121,7 +121,7 @@ class TestODE:
         net = ReactionNetwork("0 -> B x U -> S -> 0")
         g = self._simple_grid()
         params = np.log10([2.0, 1.0, 0.5, 0.8])
-        phi = net.eval_pgf(params, g, T=30.0, n_steps=300)
+        phi = net.eval_pgf(params, g)
         assert np.all(phi.real <= 1e-6)
 
 
@@ -324,14 +324,14 @@ class TestDelayedReaction:
         g = self._grid_2sp()
         # B=2, tauinv0=0.5, k0=1 (burst rate), k1=0.5 (β), k2=0.5 (γ)
         p = np.log10([2.0, 0.5, 1.0, 0.5, 0.5])
-        phi = net.eval_pgf(p, g, T=50.0, n_steps=500)
+        phi = net.eval_pgf(p, g)
         assert phi[0].real == pytest.approx(0.0, abs=1e-3)
 
     def test_phi_real_nonpositive(self):
         net = ReactionNetwork("0 -> B x U => S -> 0")
         g = self._grid_2sp()
         p = np.log10([2.0, 0.5, 1.0, 0.5, 0.5])
-        phi = net.eval_pgf(p, g, T=50.0, n_steps=500)
+        phi = net.eval_pgf(p, g)
         assert np.all(phi.real <= 1e-5)
 
     def test_pss_is_probability(self):
@@ -723,7 +723,7 @@ class TestCustomInferenceDefaults:
 
     def test_default_bounds_follow_parameter_kinds(self):
         m = self._model("0 -> B x U => S -> 0")          # params: B, tauinv0, k1, k2
-        assert m.bio_bounds == {"phys_lb": [-1.0, -1.0, -1.0, -1.0], "phys_ub": [4.2, 2.0, 2.0, 2.0]}
+        assert m.bio_bounds == {"phys_lb": [-1.0, -1.8, -1.8, -1.8], "phys_ub": [4.2, 3.5, 3.5, 3.5]}
         m3 = self._model("0 -> B x U -> S; S -> S + P; P -> 0; S -> 0")
         assert m3.filter_bounds == {"min_means": [0.01] * 3, "max_maxes": [350] * 3, "min_maxes": [4] * 3}
 
@@ -744,5 +744,5 @@ class TestCustomInferenceDefaults:
         m = self._model("0 -> B x U -> S -> 0")
         ip = InferenceParameters("custom_defaults", m, gradient_params={"num_restarts": 1})
         gi = GradientInference(ip, m, _SD(), 0)
-        np.testing.assert_allclose(gi.param_MoM, np.tile([1.6, 0.5, 0.5], (2, 1)))
+        np.testing.assert_allclose(gi.param_MoM, np.tile([1.6, 0.85, 0.85], (2, 1)))
         assert ip.identifiability["identifiable"]

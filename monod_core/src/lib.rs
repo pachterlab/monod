@@ -1802,6 +1802,25 @@ where
         .collect()
 }
 
+/// Central finite-difference gradient of `kld_at` around `x`.  Used where the
+/// objective carries a small noise floor (far-tail histogram bins near the
+/// FFT's absolute precision): a wider, symmetric stencil keeps the noise out
+/// of the gradient at the cost of 2n evaluations.
+fn fd_gradient_central<K>(x: &[f64], fd_eps: f64, kld_at: K) -> Vec<f64>
+where
+    K: Fn(&[f64]) -> f64,
+{
+    (0..x.len())
+        .map(|i| {
+            let mut xp = x.to_vec();
+            let mut xm = x.to_vec();
+            xp[i] += fd_eps;
+            xm[i] -= fd_eps;
+            (kld_at(&xp) - kld_at(&xm)) / (2.0 * fd_eps)
+        })
+        .collect()
+}
+
 // Per-thread scratch buffers reused across genes — avoids one allocation per
 // gene for the sort-based fallback path.
 thread_local! {
@@ -3943,18 +3962,6 @@ fn build_rxn_infos(
         .collect()
 }
 
-/// Indices (into `params`) of the distinct inverse-delay parameters, in slot order.
-fn delay_param_indices(rxns: &[RxnInfo]) -> Vec<usize> {
-    let mut out: Vec<usize> = Vec::new();
-    for r in rxns {
-        if r.kind == 3 {
-            let idx = r.extra2 as usize;
-            if !out.contains(&idx) { out.push(idx); }
-        }
-    }
-    out
-}
-
 /// Build an N-dimensional complex mesh for irfftn.
 /// Returns (g, mx_sizes, n_grid) where g[s] is the flat grid for species s.
 /// Last axis has rfft half-length (l/2+1); all others full.
@@ -3966,309 +3973,732 @@ fn build_mesh_nd(limits: &[usize]) -> (Vec<Vec<Complex64>>, Vec<usize>, usize) {
     (build_mesh_axes(&mx, limits), mx, n_grid)
 }
 
-/// Compute the custom-network ODE RHS for one grid point.
-#[inline(always)]
-fn custom_rhs_point(
-    u:       &[Complex64],
-    params:  &[f64],
-    rxns:    &[RxnInfo],
-    prod_sp: &[u32],
-    prod_st: &[u32],
-    u_del:   &[Vec<Complex64>],
-) -> (Vec<Complex64>, Complex64) {
-    let n   = u.len();
-    let one = Complex64::new(1.0, 0.0);
-    let mut du   = vec![Complex64::new(0.0, 0.0); n];
-    let mut dphi = Complex64::new(0.0, 0.0);
+// ============================================================================
+// Custom reaction networks: exponential integrator
+// ============================================================================
+//
+// The characteristic equations of a first-order network are
+//
+//     du/dt = A u + N(u, u_delayed),      dphi/dt = S(u),
+//
+// where A is the real, constant first-order rate matrix, N collects the terms
+// a linear system does not have (several products from one reaction, as in
+// S -> S + P, and the product terms of delayed `=>` reactions, which read the
+// state tau ago) and S is the production source.  Every step propagates the
+// linear part exactly through exp(A h) and treats N with the second-order
+// exponential Runge-Kutta scheme (ETD2RK):
+//
+//     a       = E u + P1 N(u, t)
+//     u_{n+1} = a + P2 (N(a, t+h) - N(u, t)),
+//     E = exp(A h),  P1 = h phi_1(A h),  P2 = h phi_2(A h),
+//
+// so the stiff rates never limit the step.  phi is accumulated with Simpson's
+// rule on two half-steps.  The step size is controlled by comparing one full
+// step with the two half-steps (whose difference also feeds a Richardson
+// extrapolation of u), taking the maximum error over all grid points so the
+// whole grid shares one schedule; the accepted steps are returned and can be
+// replayed (finite-difference stencils use the base point's schedule).
+// Delayed states come from the accepted history by cubic Hermite
+// interpolation (every knot stores its derivative); a delay shorter than the
+// step is read off the step's own predictor.  Mirrors `ReactionNetwork.eval_pgf`.
 
-    for rxn in rxns {
-        let k  = Complex64::new(params[rxn.rate_idx as usize], 0.0);
-        let ps = rxn.prod_start as usize;
-        let pe = rxn.prod_end   as usize;
+const CUSTOM_ODE_TOL: f64 = 1e-6;        // per-step error target on the generating-function scale
+const CUSTOM_ODE_C0: f64 = 0.05;         // first step as a fraction of the fastest time scale
+const CUSTOM_ODE_U_END: f64 = 1e-8;      // stop once exp(Re phi)·|u| is below this everywhere (for a delay's length, if any)
+const CUSTOM_ODE_MAX_STEPS: usize = 20_000;
+const CUSTOM_ODE_H_MAX: f64 = 1e4;       // step cap in units of the slowest time scale
+const CUSTOM_MAX_SPECIES: usize = 8;
+const CUSTOM_FD_EPS: f64 = 1e-4;         // central finite-difference step for custom-network gradients (log10 units)
 
-        match rxn.kind {
-            0 => {
-                // Geometric-burst production: dφ += k·b·u[sp]/(1−b·u[sp])
-                let b  = Complex64::new(params[rxn.extra1 as usize], 0.0);
-                let ui = u[rxn.extra2 as usize];
-                dphi += k * b * ui / (one - b * ui);
-            }
-            1 => {
-                // Deterministic production: dφ += k·(z_prod − 1)
-                let mut z = one;
-                for i in ps..pe {
-                    z *= (one + u[prod_sp[i] as usize]).powu(prod_st[i]);
+/// Small dense real matrix, row-major.
+#[derive(Clone)]
+struct SmallMat {
+    n: usize,
+    a: Vec<f64>,
+}
+
+impl SmallMat {
+    fn zeros(n: usize) -> Self { SmallMat { n, a: vec![0.0; n * n] } }
+    fn eye(n: usize) -> Self {
+        let mut m = SmallMat::zeros(n);
+        for i in 0..n { m.a[i * n + i] = 1.0; }
+        m
+    }
+    #[inline(always)]
+    fn get(&self, i: usize, j: usize) -> f64 { self.a[i * self.n + j] }
+    #[inline(always)]
+    fn set(&mut self, i: usize, j: usize, v: f64) { self.a[i * self.n + j] = v; }
+    fn mul(&self, o: &SmallMat) -> SmallMat {
+        let n = self.n;
+        let mut r = SmallMat::zeros(n);
+        for i in 0..n {
+            for k in 0..n {
+                let aik = self.a[i * n + k];
+                for j in 0..n {
+                    r.a[i * n + j] += aik * o.a[k * n + j];
                 }
-                dphi += k * (z - one);
+            }
+        }
+        r
+    }
+    fn norm1(&self) -> f64 {
+        let n = self.n;
+        (0..n)
+            .map(|j| (0..n).map(|i| self.a[i * n + j].abs()).sum::<f64>())
+            .fold(0.0_f64, f64::max)
+    }
+    /// exp(self): scaling and squaring around a degree-18 Taylor polynomial
+    /// (the scaled norm is at most 1/2, so the truncation error is below 1e-22).
+    fn expm(&self) -> SmallMat {
+        let n = self.n;
+        let nrm = self.norm1();
+        let s = if nrm > 0.5 { (nrm / 0.5).log2().ceil() as i32 } else { 0 };
+        let scale = 0.5_f64.powi(s);
+        let mut x = self.clone();
+        for v in x.a.iter_mut() { *v *= scale; }
+        let mut r = SmallMat::eye(n);
+        for k in (1..=18).rev() {
+            let t = x.mul(&r);
+            r = SmallMat::eye(n);
+            let inv = 1.0 / (k as f64);
+            for (ri, ti) in r.a.iter_mut().zip(t.a.iter()) { *ri += ti * inv; }
+        }
+        for _ in 0..s { r = r.mul(&r); }
+        r
+    }
+    /// out = self · v for a complex vector.
+    #[inline(always)]
+    fn apply(&self, v: &[Complex64], out: &mut [Complex64]) {
+        let n = self.n;
+        for i in 0..n {
+            let mut s = Complex64::new(0.0, 0.0);
+            for j in 0..n { s += v[j] * self.a[i * n + j]; }
+            out[i] = s;
+        }
+    }
+}
+
+/// Step operators for one step size: E = exp(A h), P1 = h phi_1(A h), P2 = h phi_2(A h),
+/// read off exp([[A h, I, 0], [0, 0, I], [0, 0, 0]]).
+struct CustomStepOps { e: SmallMat, p1: SmallMat, p2: SmallMat }
+
+fn custom_step_ops(a: &SmallMat, h: f64) -> CustomStepOps {
+    let n = a.n;
+    let mut m = SmallMat::zeros(3 * n);
+    for i in 0..n {
+        for j in 0..n { m.set(i, j, a.get(i, j) * h); }
+        m.set(i, n + i, 1.0);
+        m.set(n + i, 2 * n + i, 1.0);
+    }
+    let x = m.expm();
+    let mut e = SmallMat::zeros(n);
+    let mut p1 = SmallMat::zeros(n);
+    let mut p2 = SmallMat::zeros(n);
+    for i in 0..n {
+        for j in 0..n {
+            e.set(i, j, x.get(i, j));
+            p1.set(i, j, h * x.get(i, n + j));
+            p2.set(i, j, h * x.get(i, 2 * n + j));
+        }
+    }
+    CustomStepOps { e, p1, p2 }
+}
+
+/// A network at fixed (linear-scale) parameters, split into its linear part
+/// and the remainder the exponential integrator treats explicitly.
+struct CustomSystem<'a> {
+    n:        usize,
+    a:        SmallMat,
+    /// per reaction: contributes to N (multi-product first-order or delayed)
+    nonlin:   Vec<bool>,
+    /// N vanishes identically: u is propagated by exp(A h) alone
+    linear:   bool,
+    rxns:     &'a [RxnInfo],
+    prod_sp:  &'a [u32],
+    prod_st:  &'a [u32],
+    params:   &'a [f64],
+    /// delay lengths by tau slot
+    taus:     Vec<f64>,
+    lam_fast: f64,
+    lam_slow: f64,
+}
+
+fn custom_system<'a>(
+    n: usize, rxns: &'a [RxnInfo], prod_sp: &'a [u32], prod_st: &'a [u32], params: &'a [f64],
+) -> CustomSystem<'a> {
+    let mut a = SmallMat::zeros(n);
+    let mut nonlin = vec![false; rxns.len()];
+    let mut taus: Vec<f64> = Vec::new();
+    let mut rates: Vec<f64> = Vec::new();
+    for (ri, r) in rxns.iter().enumerate() {
+        let k = params[r.rate_idx as usize];
+        let (ps, pe) = (r.prod_start as usize, r.prod_end as usize);
+        match r.kind {
+            2 => {
+                let i = r.extra1 as usize;
+                a.a[i * n + i] -= k;
+                for q in ps..pe {
+                    let j = prod_sp[q] as usize;
+                    a.a[i * n + j] += k * prod_st[q] as f64;
+                }
+                nonlin[ri] = !(pe == ps || (pe == ps + 1 && prod_st[ps] == 1));
+                rates.push(k);
             }
             3 => {
-                // Delayed first-order: the product term sees the state τ ago.
-                let ri = rxn.extra1 as usize;
-                let ud = &u_del[rxn.tau_slot as usize];
-                let mut z = one;
-                for i in ps..pe {
-                    z *= (one + ud[prod_sp[i] as usize]).powu(prod_st[i]);
-                }
-                du[ri] += k * (z - (one + u[ri]));
+                let i = r.extra1 as usize;
+                a.a[i * n + i] -= k;
+                nonlin[ri] = true;
+                let slot = r.tau_slot as usize;
+                if taus.len() <= slot { taus.resize(slot + 1, 0.0); }
+                taus[slot] = 1.0 / params[r.extra2 as usize];
+                rates.push(k);
             }
-            _ => {
-                // First-order: du[ri] += k·(z_prod − (1 + u[ri]))
-                let ri    = rxn.extra1 as usize;
-                let mut z = one;
-                for i in ps..pe {
-                    z *= (one + u[prod_sp[i] as usize]).powu(prod_st[i]);
-                }
-                du[ri] += k * (z - (one + u[ri]));
-            }
+            _ => {}
         }
     }
-    (du, dphi)
-}
-
-/// One RK4 step for one grid point (in-place).
-/// φ is accumulated via RK4 weights, matching the Python `_rk4_step` convention.
-#[inline(always)]
-fn custom_rk4_point(
-    u:       &mut Vec<Complex64>,
-    phi:     &mut Complex64,
-    params:  &[f64],
-    rxns:    &[RxnInfo],
-    prod_sp: &[u32],
-    prod_st: &[u32],
-    dt:      f64,
-    u_del:   &[Vec<Complex64>],
-) {
-    let n = u.len();
-    let h = dt / 2.0;
-    let s = dt / 6.0;
-
-    // `u_del` (delayed states) is frozen across the four stages: method of steps.
-    let (k1u, k1p) = custom_rhs_point(u, params, rxns, prod_sp, prod_st, u_del);
-
-    let u2: Vec<_> = (0..n).map(|i| u[i] + k1u[i] * h).collect();
-    let (k2u, k2p) = custom_rhs_point(&u2, params, rxns, prod_sp, prod_st, u_del);
-
-    let u3: Vec<_> = (0..n).map(|i| u[i] + k2u[i] * h).collect();
-    let (k3u, k3p) = custom_rhs_point(&u3, params, rxns, prod_sp, prod_st, u_del);
-
-    let u4: Vec<_> = (0..n).map(|i| u[i] + k3u[i] * dt).collect();
-    let (k4u, k4p) = custom_rhs_point(&u4, params, rxns, prod_sp, prod_st, u_del);
-
-    for i in 0..n {
-        u[i] += (k1u[i] + k2u[i] * 2.0 + k3u[i] * 2.0 + k4u[i]) * s;
+    if rates.is_empty() {
+        rates = rxns.iter().map(|r| params[r.rate_idx as usize]).collect();
     }
-    *phi += (k1p + k2p * 2.0 + k3p * 2.0 + k4p) * s;
+    let rates: Vec<f64> = rates.into_iter().filter(|&k| k > 0.0).collect();
+    let diag: Vec<f64> = (0..n).map(|i| -a.a[i * n + i]).filter(|&d| d > 0.0).collect();
+    let lam_fast = rates.iter().cloned().fold(0.0_f64, f64::max).max(1e-300);
+    let lam_slow = if diag.is_empty() {
+        rates.iter().cloned().fold(f64::INFINITY, f64::min)
+    } else {
+        diag.iter().cloned().fold(f64::INFINITY, f64::min)
+    };
+    let lam_slow = if lam_slow.is_finite() { lam_slow } else { lam_fast };
+    let linear = !nonlin.iter().any(|&b| b);
+    CustomSystem { n, a, nonlin, linear, rxns, prod_sp, prod_st, params, taus, lam_fast, lam_slow }
 }
 
-/// Interpolation weights for one delay: τ/dt = j + α, so the delayed state is
-/// (1 − α)·u_{n−j} + α·u_{n−j−1}, with u_m = 0 for m < 0: a product that would
-/// appear after the observation time contributes nothing (z = 1, u = 0).
-#[derive(Clone, Copy)]
-struct DelaySpec {
-    j: usize,
-    alpha: f64,
-}
+const CUSTOM_MAX_DELAYS: usize = 4;
+type CVec = [Complex64; CUSTOM_MAX_SPECIES];
+type DelSet = [CVec; CUSTOM_MAX_DELAYS];
 
-fn custom_delay_specs(params: &[f64], rxns: &[RxnInfo], dt: f64) -> Vec<DelaySpec> {
-    delay_param_indices(rxns)
-        .iter()
-        .map(|&idx| {
-            let s = (1.0 / params[idx]) / dt;
-            let j = s.floor() as usize;
-            DelaySpec { j, alpha: s - j as f64 }
-        })
-        .collect()
-}
-
-/// One RK4 step of a delayed network for one grid point.  `ring` holds the
-/// last `len` states (n_species values each); `head` is the slot of the
-/// current state u_n.
 #[inline(always)]
-fn custom_delayed_step(
-    u:       &mut Vec<Complex64>,
-    phi:     &mut Complex64,
-    ring:    &mut [Complex64],
-    head:    &mut usize,
-    len:     usize,
-    u_del:   &mut [Vec<Complex64>],
-    specs:   &[DelaySpec],
-    params:  &[f64],
-    rxns:    &[RxnInfo],
-    prod_sp: &[u32],
-    prod_st: &[u32],
-    dt:      f64,
-) {
-    let n = u.len();
-    for (slot, sp) in specs.iter().enumerate() {
-        let a = (*head + len - sp.j) % len;          // u_{n-j}
-        let b = (*head + len - sp.j - 1) % len;      // u_{n-j-1}
-        for s in 0..n {
-            u_del[slot][s] = ring[a * n + s] * (1.0 - sp.alpha) + ring[b * n + s] * sp.alpha;
+fn czero_vec() -> CVec { [Complex64::new(0.0, 0.0); CUSTOM_MAX_SPECIES] }
+#[inline(always)]
+fn dzero() -> DelSet { [czero_vec(); CUSTOM_MAX_DELAYS] }
+
+/// Remainder N(u): multi-product first-order terms k (Z(u) − 1 − Σ s_j u_j) and
+/// delayed product terms k (Z(u_del) − 1).  `udel[slot]` holds the delayed
+/// state for each distinct delay.
+#[inline(always)]
+fn custom_nonlin(sys: &CustomSystem, u: &CVec, udel: &DelSet, out: &mut CVec) {
+    let one = Complex64::new(1.0, 0.0);
+    for v in out.iter_mut().take(sys.n) { *v = Complex64::new(0.0, 0.0); }
+    for (ri, r) in sys.rxns.iter().enumerate() {
+        if !sys.nonlin[ri] { continue; }
+        let k = sys.params[r.rate_idx as usize];
+        let i = r.extra1 as usize;
+        let (ps, pe) = (r.prod_start as usize, r.prod_end as usize);
+        if r.kind == 2 {
+            let mut z = one;
+            let mut lin = Complex64::new(0.0, 0.0);
+            for q in ps..pe {
+                let uj = u[sys.prod_sp[q] as usize];
+                z *= (one + uj).powu(sys.prod_st[q]);
+                lin += uj * (sys.prod_st[q] as f64);
+            }
+            out[i] += (z - one - lin) * k;
+        } else {
+            let ud = &udel[r.tau_slot as usize];
+            let mut z = one;
+            for q in ps..pe {
+                z *= (one + ud[sys.prod_sp[q] as usize]).powu(sys.prod_st[q]);
+            }
+            out[i] += (z - one) * k;
         }
     }
-    custom_rk4_point(u, phi, params, rxns, prod_sp, prod_st, dt, u_del);
-    *head = (*head + 1) % len;
-    ring[*head * n..(*head + 1) * n].copy_from_slice(u);
 }
 
-/// Integrate one grid point of a delayed network: `n_steps` fixed steps, then
-/// either exactly `extra = Some(k)` more steps or (`None`) until |u0| < 1e-3.
-/// Returns (φ, extra steps taken).
-fn custom_delayed_point(
-    u0:        Vec<Complex64>,
+/// Source S(u) = dphi/dt from the production reactions.
+#[inline(always)]
+fn custom_source(sys: &CustomSystem, u: &CVec) -> Complex64 {
+    let one = Complex64::new(1.0, 0.0);
+    let mut s = Complex64::new(0.0, 0.0);
+    for r in sys.rxns.iter() {
+        let k = sys.params[r.rate_idx as usize];
+        match r.kind {
+            0 => {
+                let b = sys.params[r.extra1 as usize];
+                let ui = u[r.extra2 as usize];
+                s += ui * (k * b) / (one - ui * b);
+            }
+            1 => {
+                let mut z = one;
+                for q in r.prod_start as usize..r.prod_end as usize {
+                    z *= (one + u[sys.prod_sp[q] as usize]).powu(sys.prod_st[q]);
+                }
+                s += (z - one) * k;
+            }
+            _ => {}
+        }
+    }
+    s
+}
+
+/// Full right-hand side A u + N(u, u_del) at one point (history derivatives).
+#[inline(always)]
+fn custom_rhs(sys: &CustomSystem, u: &CVec, udel: &DelSet) -> CVec {
+    let n = sys.n;
+    let mut out = czero_vec();
+    sys.a.apply(&u[..n], &mut out[..n]);
+    if !sys.linear {
+        let mut tmp = czero_vec();
+        custom_nonlin(sys, u, udel, &mut tmp);
+        for i in 0..n { out[i] += tmp[i]; }
+    }
+    out
+}
+
+#[inline(always)]
+fn cvec_lerp(a: &CVec, b: &CVec, w: f64, n: usize) -> CVec {
+    let mut out = czero_vec();
+    for i in 0..n { out[i] = a[i] + (b[i] - a[i]) * w; }
+    out
+}
+
+/// One ETD2RK step of size `h` from `u` at time `t`.  `del_start[slot]` is the
+/// delayed state at the start of the step; `del_end[slot]` the one at its end
+/// where `end_known[slot]` (the history reaches that far, delay ≥ h), otherwise
+/// it is read off the line through (t, u) and (t + h, predictor).
+#[inline(always)]
+fn custom_etd_step(
+    sys: &CustomSystem, u: &CVec, h: f64, ops: &CustomStepOps,
+    del_start: &DelSet, del_end: &DelSet, end_known: &[bool; CUSTOM_MAX_DELAYS],
+) -> CVec {
+    let n = sys.n;
+    let mut out = czero_vec();
+    if sys.linear {
+        ops.e.apply(&u[..n], &mut out[..n]);
+        return out;
+    }
+    let mut n0 = czero_vec();
+    custom_nonlin(sys, u, del_start, &mut n0);
+    let mut a = czero_vec();
+    let mut tmp = czero_vec();
+    ops.e.apply(&u[..n], &mut a[..n]);
+    ops.p1.apply(&n0[..n], &mut tmp[..n]);
+    for i in 0..n { a[i] += tmp[i]; }
+    let mut del_a = *del_end;
+    for s in 0..sys.taus.len() {
+        if !end_known[s] { del_a[s] = cvec_lerp(u, &a, (h - sys.taus[s]) / h, n); }
+    }
+    let mut n1 = czero_vec();
+    custom_nonlin(sys, &a, &del_a, &mut n1);
+    for i in 0..n { n1[i] -= n0[i]; }
+    ops.p2.apply(&n1[..n], &mut tmp[..n]);
+    for i in 0..n { out[i] = a[i] + tmp[i]; }
+    out
+}
+
+/// Delayed states of one grid point for the three stage times of a step:
+/// t − τ (always in the history), t + h/2 − τ and t + h − τ (in the history
+/// only when the delay reaches back that far).
+struct PointDel {
+    d0: DelSet,
+    dm: DelSet,
+    d1: DelSet,
+    has_m: [bool; CUSTOM_MAX_DELAYS],
+    has_1: [bool; CUSTOM_MAX_DELAYS],
+}
+
+struct CustomTrial { um: CVec, u2: CVec, dphi: Complex64, err: f64 }
+
+/// Two half-steps (Simpson for phi) and, when `estimate`, one full step for the
+/// error estimate.
+#[inline(always)]
+fn custom_trial(
+    sys: &CustomSystem, u: &CVec, phi: Complex64, h: f64,
+    ops_h: &CustomStepOps, ops_h2: &CustomStepOps, pd: &PointDel, estimate: bool,
+) -> CustomTrial {
+    let n = sys.n;
+    let n_del = sys.taus.len();
+    let hh = 0.5 * h;
+    // first half-step
+    let um = custom_etd_step(sys, u, hh, ops_h2, &pd.d0, &pd.dm, &pd.has_m);
+    // second half-step: starts at t + h/2 with history knots (t, u), (t + h/2, um)
+    let mut dm2 = pd.dm;
+    for s in 0..n_del {
+        if !pd.has_m[s] { dm2[s] = cvec_lerp(u, &um, (hh - sys.taus[s]) / hh, n); }
+    }
+    let mut d1b = pd.d1;
+    let mut k1b = pd.has_1;
+    for s in 0..n_del {
+        if !pd.has_1[s] && sys.taus[s] >= hh {
+            d1b[s] = cvec_lerp(u, &um, (h - sys.taus[s]) / hh, n);
+            k1b[s] = true;
+        }
+    }
+    let mut u2 = custom_etd_step(sys, &um, hh, ops_h2, &dm2, &d1b, &k1b);
+    let s0 = custom_source(sys, u);
+    let sm = custom_source(sys, &um);
+    let s2 = custom_source(sys, &u2);
+    let dphi = (s0 + sm * 4.0 + s2) * (h / 6.0);
+    let mut du = 0.0_f64;
+    if !sys.linear {
+        // one full step: its difference from the two half-steps estimates the
+        // error, and Richardson extrapolation removes the leading error term
+        let u1 = custom_etd_step(sys, u, h, ops_h, &pd.d0, &pd.d1, &pd.has_1);
+        for i in 0..n {
+            du = du.max((u2[i] - u1[i]).norm());
+            u2[i] = u2[i] + (u2[i] - u1[i]) / 3.0;
+        }
+    }
+    let mut err = 0.0;
+    if estimate {
+        let trap = (s0 + sm * 2.0 + s2) * (h / 4.0);
+        err = phi.re.exp() * ((dphi - trap).norm() + du);
+    }
+    CustomTrial { um, u2, dphi, err }
+}
+
+/// Accepted history of a delayed network: per knot the time, the state of
+/// every grid point (point-major n_grid × n) and, once known, its derivative.
+/// `h_ctrl` is the step size the error controller chose for the step that
+/// produced the knot (before any clipping to a delay breakpoint); `amp` is
+/// max over the grid of exp(Re phi)·|u| there, the weight the error control uses.
+struct HistKnot { t: f64, u: Vec<Complex64>, f: Option<Vec<Complex64>>, h_ctrl: f64, amp: f64 }
+
+struct CustomHistory { n: usize, n_grid: usize, knots: std::collections::VecDeque<HistKnot> }
+
+impl CustomHistory {
+    /// State at time `s` for every grid point: zero before the observation
+    /// time; cubic Hermite interpolation between accepted knots when both
+    /// derivatives are known, linear otherwise.  The state jumps from zero to
+    /// the initial condition at the observation time: a stage at the end of
+    /// a step reads the left limit (`left`), one at the start the right limit,
+    /// so a step that lands on a delay sees no forcing and the next one sees
+    /// it from its first stage.
+    fn at(&self, s: f64, left: bool) -> Vec<Complex64> {
+        let len = self.n * self.n_grid;
+        // a landing on the onset is exact only up to rounding
+        let t0 = self.knots[0].t;
+        let tol = 1e-10 * self.knots.back().map_or(1.0, |k| k.t.max(1.0));
+        let s = if (s - t0).abs() <= tol { t0 } else { s };
+        if s < t0 || (left && s <= t0) {
+            return vec![Complex64::new(0.0, 0.0); len];
+        }
+        let m = self.knots.len();
+        let mut lo = 0usize;
+        let mut hi = m;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.knots[mid].t > s { hi = mid; } else { lo = mid + 1; }
+        }
+        if lo >= m { return self.knots[m - 1].u.clone(); }
+        let a = &self.knots[lo - 1];
+        let b = &self.knots[lo];
+        let d = b.t - a.t;
+        let th = (s - a.t) / d;
+        match (&a.f, &b.f) {
+            (Some(fa), Some(fb)) => {
+                let h00 = (2.0 * th - 3.0) * th * th + 1.0;
+                let h10 = ((th - 2.0) * th + 1.0) * th;
+                let h01 = (3.0 - 2.0 * th) * th * th;
+                let h11 = (th - 1.0) * th * th;
+                (0..len).map(|i| a.u[i] * h00 + fa[i] * (h10 * d) + b.u[i] * h01 + fb[i] * (h11 * d)).collect()
+            }
+            _ => a.u.iter().zip(b.u.iter()).map(|(x, y)| x + (y - x) * th).collect(),
+        }
+    }
+    fn push(&mut self, t: f64, u: Vec<Complex64>, h_ctrl: f64, amp: f64) {
+        self.knots.push_back(HistKnot { t, u, f: None, h_ctrl, amp });
+    }
+    /// Largest step from `s0` that does not out-run the resolution of the
+    /// history it reads: within the window [s0, s0 + h] the step is capped at
+    /// twice the step the controller chose there, wherever the history is
+    /// large enough to matter (amp ≥ tolerance).  Without this a step that
+    /// has grown long during a quiet stretch reads a delayed pulse narrower
+    /// than itself only at its stage times, both the full step and the
+    /// half-steps miss it, and the pulse is skipped.
+    fn max_step(&self, s0: f64, h: f64) -> f64 {
+        let m = self.knots.len();
+        let mut k = self.knots.partition_point(|kn| kn.t <= s0).max(1);
+        let mut h = h;
+        while k < m {
+            if self.knots[k - 1].t >= s0 + h { break; }
+            if self.knots[k].amp >= CUSTOM_ODE_TOL { h = h.min(2.0 * self.knots[k].h_ctrl); }
+            k += 1;
+        }
+        h
+    }
+    fn prune(&mut self, t_oldest_needed: f64) {
+        while self.knots.len() >= 2 && self.knots[1].t <= t_oldest_needed {
+            self.knots.pop_front();
+        }
+    }
+}
+
+/// Integrate the characteristics of a custom network over all grid points.
+/// Returns (phi per grid point, accepted step sizes).
+/// Map a recorded schedule onto new delay breakpoints.  The time axis is
+/// stretched piecewise-linearly so that every knot keeps its position relative
+/// to the delays (the knot that landed on τ lands on τ'), which makes a
+/// replayed result a smooth function of the delays; without it a stencil point
+/// would see the delayed forcing switch on inside a step.  Identity when there
+/// are no delays, when they are unchanged, or when their order would change.
+fn warp_schedule(steps: &[f64], base: &[f64], new: &[f64]) -> Vec<f64> {
+    if base.is_empty() || base.len() != new.len() || base == new { return steps.to_vec(); }
+    let mut order: Vec<usize> = (0..base.len()).collect();
+    order.sort_by(|&a, &b| base[a].partial_cmp(&base[b]).unwrap_or(std::cmp::Ordering::Equal));
+    let mut bx = vec![0.0_f64];
+    let mut by = vec![0.0_f64];
+    for &i in &order {
+        let (b, nb) = (base[i], new[i]);
+        if b <= *bx.last().unwrap() {
+            if nb != *by.last().unwrap() { return steps.to_vec(); }
+            continue;
+        }
+        if nb <= *by.last().unwrap() { return steps.to_vec(); }
+        bx.push(b);
+        by.push(nb);
+    }
+    let last = bx.len() - 1;
+    let f = |t: f64| -> f64 {
+        let k = bx.partition_point(|&b| b <= t);
+        if k > last { by[last] + (t - bx[last]) }
+        else { by[k - 1] + (t - bx[k - 1]) * ((by[k] - by[k - 1]) / (bx[k] - bx[k - 1])) }
+    };
+    let mut t = 0.0_f64;
+    let mut out = Vec::with_capacity(steps.len());
+    for &h in steps {
+        let t1 = t + h;
+        out.push(f(t1) - f(t));
+        t = t1;
+    }
+    out
+}
+
+/// Delay lengths in slot order at the given parameters.
+fn custom_breakpoints(rxns: &[RxnInfo], params: &[f64]) -> Vec<f64> {
+    let mut taus: Vec<f64> = Vec::new();
+    for r in rxns {
+        if r.kind == 3 {
+            let slot = r.tau_slot as usize;
+            if taus.len() <= slot { taus.resize(slot + 1, 0.0); }
+            taus[slot] = 1.0 / params[r.extra2 as usize];
+        }
+    }
+    taus
+}
+
+/// Integrate the characteristics of a custom network over all grid points.
+/// `fixed` = (step sizes, delay breakpoints they were recorded with) replays a
+/// schedule instead of adapting.  Returns (phi per grid point, accepted steps).
+fn custom_pgf_sched(
+    g: &[Vec<Complex64>],
+    sys: &CustomSystem,
+    n_grid: usize,
+    fixed: Option<(&[f64], &[f64])>,
+) -> (Vec<Complex64>, Vec<f64>) {
+    let n = sys.n;
+    assert!(n <= CUSTOM_MAX_SPECIES, "custom networks support at most 8 species");
+    let n_del = sys.taus.len();
+    assert!(n_del <= CUSTOM_MAX_DELAYS, "custom networks support at most 4 distinct delays");
+    let tau_max = sys.taus.iter().cloned().fold(0.0_f64, f64::max);
+    // nonlinear and delayed networks do enough work per point to parallelise small grids
+    let par = n_grid >= if sys.linear { PAR_THRESHOLD } else { 256 };
+    let adaptive = fixed.is_none();
+
+    let mut u: Vec<CVec> = (0..n_grid).map(|k| {
+        let mut v = czero_vec();
+        for s in 0..n { v[s] = g[s][k]; }
+        v
+    }).collect();
+    let mut phi: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); n_grid];
+    let mut trial: Vec<CustomTrial> = (0..n_grid)
+        .map(|_| CustomTrial { um: czero_vec(), u2: czero_vec(), dphi: Complex64::new(0.0, 0.0), err: 0.0 })
+        .collect();
+    let flat = |u: &[CVec]| -> Vec<Complex64> {
+        let mut out = Vec::with_capacity(n_grid * n);
+        for v in u { out.extend_from_slice(&v[..n]); }
+        out
+    };
+    // delayed states of point k, gathered from per-slot global arrays
+    let gather = |k: usize, global: &[Vec<Complex64>]| -> DelSet {
+        let mut out = dzero();
+        for (s, v) in global.iter().enumerate() {
+            out[s][..n].copy_from_slice(&v[k * n..(k + 1) * n]);
+        }
+        out
+    };
+    // derivative of every grid point for a knot at time `tk` with states `st`
+    let knot_deriv = |hs: &CustomHistory, tk: f64, st: &[CVec]| -> Vec<Complex64> {
+        let del: Vec<Vec<Complex64>> = sys.taus.iter().map(|&tau| hs.at(tk - tau, false)).collect();
+        let f: Vec<CVec> = if par {
+            st.par_iter().enumerate().map(|(k, uk)| custom_rhs(sys, uk, &gather(k, &del))).collect()
+        } else {
+            st.iter().enumerate().map(|(k, uk)| custom_rhs(sys, uk, &gather(k, &del))).collect()
+        };
+        flat(&f)
+    };
+    let h0 = CUSTOM_ODE_C0 / sys.lam_fast;
+    let mut hist = if n_del > 0 {
+        let mut hs = CustomHistory { n, n_grid, knots: std::collections::VecDeque::new() };
+        hs.push(0.0, flat(&u), h0, 1.0);
+        let f0 = knot_deriv(&hs, 0.0, &u);
+        hs.knots[0].f = Some(f0);
+        Some(hs)
+    } else { None };
+
+    let mut steps: Vec<f64> = Vec::with_capacity(fixed.map_or(256, |f| f.0.len()));
+    let mut t = 0.0_f64;
+    let mut h = h0;
+    // the controller's proposal; `h` is what is actually taken after the
+    // history cap and the clipping to a delay breakpoint
+    let mut h_prop = h0;
+    let mut clipped = false;
+    let h_min = 1e-12 / sys.lam_fast;
+    let h_max = CUSTOM_ODE_H_MAX / sys.lam_slow;
+    // A delayed network is finished only once the state has been negligible
+    // for a full delay: the history still feeds the system until then.
+    let mut quiet_since: Option<f64> = None;
+    // A replayed schedule is warped onto the current delays so every knot keeps
+    // its position relative to them (see `warp_schedule`).
+    let warped: Option<Vec<f64>> = fixed.map(|(st, bp)| warp_schedule(st, bp, &sys.taus));
+    let fixed: Option<&[f64]> = warped.as_deref();
+
+    loop {
+        match fixed {
+            Some(f) => {
+                if steps.len() >= f.len() { break; }
+                h = f[steps.len()];
+            }
+            None => {
+                if steps.len() >= CUSTOM_ODE_MAX_STEPS { break; }
+                h = h_prop.min(h_max);
+                if let Some(hs) = &hist {
+                    for &tau in &sys.taus { h = hs.max_step(t - tau, h); }
+                }
+                // land exactly on the time a delayed product first switches on
+                clipped = false;
+                for &tau in &sys.taus {
+                    if t < tau && t + h > tau && tau - t > 1e-6 * h { h = tau - t; clipped = true; }
+                }
+            }
+        }
+        let t_mid = t + 0.5 * h;
+        let t_end = t + h;
+        let ops_h2 = custom_step_ops(&sys.a, 0.5 * h);
+        let ops_h = if sys.linear { None } else { Some(custom_step_ops(&sys.a, h)) };
+
+        // delayed states from the accepted history, per slot and stage time
+        let (g0, gm, g1, has_m, has_1) = match &hist {
+            Some(hs) => {
+                let mut g0 = Vec::new(); let mut gm = Vec::new(); let mut g1 = Vec::new();
+                let mut has_m = [false; CUSTOM_MAX_DELAYS];
+                let mut has_1 = [false; CUSTOM_MAX_DELAYS];
+                for (s, &tau) in sys.taus.iter().enumerate() {
+                    g0.push(hs.at(t - tau, false));
+                    if tau >= 0.5 * h { gm.push(hs.at(t_mid - tau, false)); has_m[s] = true; } else { gm.push(Vec::new()); }
+                    if tau >= h { g1.push(hs.at(t_end - tau, true)); has_1[s] = true; } else { g1.push(Vec::new()); }
+                }
+                (g0, gm, g1, has_m, has_1)
+            }
+            None => (Vec::new(), Vec::new(), Vec::new(), [false; CUSTOM_MAX_DELAYS], [false; CUSTOM_MAX_DELAYS]),
+        };
+        let pick = |k: usize| -> PointDel {
+            let mut pd = PointDel { d0: dzero(), dm: dzero(), d1: dzero(), has_m, has_1 };
+            for s in 0..n_del {
+                pd.d0[s][..n].copy_from_slice(&g0[s][k * n..(k + 1) * n]);
+                if has_m[s] { pd.dm[s][..n].copy_from_slice(&gm[s][k * n..(k + 1) * n]); }
+                if has_1[s] { pd.d1[s][..n].copy_from_slice(&g1[s][k * n..(k + 1) * n]); }
+            }
+            pd
+        };
+        let run = |k: usize, uk: &CVec, pk: Complex64| -> CustomTrial {
+            let pd = pick(k);
+            custom_trial(sys, uk, pk, h, ops_h.as_ref().unwrap_or(&ops_h2), &ops_h2, &pd, adaptive)
+        };
+        if par {
+            trial.par_iter_mut().enumerate().for_each(|(k, out)| { *out = run(k, &u[k], phi[k]); });
+        } else {
+            for k in 0..n_grid { trial[k] = run(k, &u[k], phi[k]); }
+        }
+
+        let mut fac = 1.0;
+        if adaptive {
+            let err = if par {
+                trial.par_iter().map(|x| x.err).reduce(|| 0.0_f64, f64::max)
+            } else {
+                trial.iter().map(|x| x.err).fold(0.0_f64, f64::max)
+            };
+            if err > CUSTOM_ODE_TOL && h > h_min {
+                h_prop = h * (0.9 * (CUSTOM_ODE_TOL / err).powf(1.0 / 3.0)).max(0.2);
+                continue;
+            }
+            fac = (0.9 * (CUSTOM_ODE_TOL / err.max(1e-300)).powf(1.0 / 3.0)).clamp(0.2, 2.0);
+        }
+        // accept
+        for k in 0..n_grid {
+            u[k] = trial[k].u2;
+            phi[k] += trial[k].dphi;
+        }
+        t = t_end;
+        steps.push(h);
+        let remaining = if !adaptive { 0.0 } else if par {
+            u.par_iter().zip(phi.par_iter()).map(|(uk, pk)| {
+                let mut m = 0.0_f64;
+                for i in 0..n { m = m.max(uk[i].norm()); }
+                pk.re.exp() * m
+            }).reduce(|| 0.0_f64, f64::max)
+        } else {
+            u.iter().zip(phi.iter()).map(|(uk, pk)| {
+                let mut m = 0.0_f64;
+                for i in 0..n { m = m.max(uk[i].norm()); }
+                pk.re.exp() * m
+            }).fold(0.0_f64, f64::max)
+        };
+        if let Some(hs) = hist.as_mut() {
+            let um: Vec<CVec> = trial.iter().map(|x| x.um).collect();
+            let h_ctrl = if clipped { h_prop } else { h };
+            hs.push(t_mid, flat(&um), h_ctrl, remaining);
+            hs.push(t_end, flat(&u), h_ctrl, remaining);
+            let m = hs.knots.len();
+            let fm = knot_deriv(hs, t_mid, &um);
+            hs.knots[m - 2].f = Some(fm);
+            let fe = knot_deriv(hs, t_end, &u);
+            hs.knots[m - 1].f = Some(fe);
+            hs.prune(t - tau_max);
+        }
+        if adaptive {
+            if remaining < CUSTOM_ODE_U_END {
+                if n_del == 0 { break; }
+                let since = *quiet_since.get_or_insert(t);
+                if t - since >= tau_max { break; }
+            } else {
+                quiet_since = None;
+            }
+            // after landing on a breakpoint resume from the unclipped proposal
+            h_prop = (if clipped { h_prop } else { h }) * fac;
+        }
+    }
+    (phi, steps)
+}
+
+/// Integrate the custom network over all grid points (rayon) and return
+/// (exp(phi) per grid point, accepted step sizes).
+fn custom_pgf_parallel(
+    g:         &[Vec<Complex64>],
     params:    &[f64],
     rxns:      &[RxnInfo],
     prod_sp:   &[u32],
     prod_st:   &[u32],
-    specs:     &[DelaySpec],
-    dt:        f64,
-    n_steps:   usize,
-    max_while: usize,
-    extra:     Option<usize>,
-) -> (Complex64, usize) {
-    let n = u0.len();
-    let max_j = specs.iter().map(|s| s.j).max().unwrap_or(0);
-    let len = max_j + 2;
-    // Pre-history is zero; slot 0 holds the current state u_0.
-    let mut ring: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); len * n];
-    ring[..n].copy_from_slice(&u0);
-    let mut head = 0usize;
-    let mut u = u0;
-    let mut phi = Complex64::new(0.0, 0.0);
-    let mut u_del: Vec<Vec<Complex64>> = vec![vec![Complex64::new(0.0, 0.0); n]; specs.len()];
-    for _ in 0..n_steps {
-        custom_delayed_step(&mut u, &mut phi, &mut ring, &mut head, len, &mut u_del, specs,
-                            params, rxns, prod_sp, prod_st, dt);
-    }
-    let mut k = 0usize;
-    match extra {
-        Some(e) => {
-            for _ in 0..e {
-                custom_delayed_step(&mut u, &mut phi, &mut ring, &mut head, len, &mut u_del, specs,
-                                    params, rxns, prod_sp, prod_st, dt);
-            }
-            k = e;
-        }
-        None => {
-            while u[0].norm() > 1e-3 && k < max_while {
-                custom_delayed_step(&mut u, &mut phi, &mut ring, &mut head, len, &mut u_del, specs,
-                                    params, rxns, prod_sp, prod_st, dt);
-                k += 1;
-            }
-        }
-    }
-    (phi, k)
-}
-
-/// Delayed networks: every grid point carries its own history ring, so the
-/// points are integrated independently.  To keep the global-max termination
-/// of the non-delayed path (all points integrate for the same number of
-/// steps), a first pass lets each point run until it has decayed, and the
-/// points that finished early are re-integrated for the common step count.
-fn custom_pgf_delayed_parallel(
-    g:               &[Vec<Complex64>],
-    params:          &[f64],
-    rxns:            &[RxnInfo],
-    prod_sp:         &[u32],
-    prod_st:         &[u32],
-    n_species:       usize,
-    n_grid:          usize,
-    dt:              f64,
-    n_steps:         usize,
-    max_while_steps: usize,
-    fixed_phase2:    Option<usize>,
-) -> (Vec<Complex64>, usize) {
-    let specs = custom_delay_specs(params, rxns, dt);
-    let init = |k: usize| -> Vec<Complex64> { (0..n_species).map(|s| g[s][k]).collect() };
-    let first: Vec<(Complex64, usize)> = (0..n_grid)
-        .into_par_iter()
-        .map(|k| custom_delayed_point(init(k), params, rxns, prod_sp, prod_st, &specs,
-                                      dt, n_steps, max_while_steps, fixed_phase2))
-        .collect();
-    let n_extra = match fixed_phase2 {
-        Some(e) => e,
-        None => first.iter().map(|x| x.1).max().unwrap_or(0),
+    n_species: usize,
+    n_grid:    usize,
+    fixed:     Option<(&[f64], &[f64])>,
+) -> (Vec<Complex64>, Vec<f64>) {
+    let sys = custom_system(n_species, rxns, prod_sp, prod_st, params);
+    let (phi, steps) = custom_pgf_sched(g, &sys, n_grid, fixed);
+    let exp_phi: Vec<Complex64> = if n_grid >= PAR_THRESHOLD {
+        phi.into_par_iter().map(|p| p.exp()).collect()
+    } else {
+        phi.into_iter().map(|p| p.exp()).collect()
     };
-    let exp_phi: Vec<Complex64> = (0..n_grid)
-        .into_par_iter()
-        .map(|k| {
-            let phi = if first[k].1 == n_extra {
-                first[k].0
-            } else {
-                custom_delayed_point(init(k), params, rxns, prod_sp, prod_st, &specs,
-                                     dt, n_steps, max_while_steps, Some(n_extra)).0
-            };
-            phi.exp()
-        })
-        .collect();
-    (exp_phi, n_extra)
-}
-
-/// Integrate the custom network over all grid points in parallel (rayon).
-/// Returns exp(φ) at each grid point.
-fn custom_pgf_parallel(
-    g:               &[Vec<Complex64>],
-    params:          &[f64],
-    rxns:            &[RxnInfo],
-    prod_sp:         &[u32],
-    prod_st:         &[u32],
-    n_species:       usize,
-    n_grid:          usize,
-    dt:              f64,
-    n_steps:         usize,
-    max_while_steps: usize,
-    fixed_phase2:    Option<usize>,
-) -> (Vec<Complex64>, usize) {
-    if rxns.iter().any(|r| r.kind == 3) {
-        return custom_pgf_delayed_parallel(
-            g, params, rxns, prod_sp, prod_st, n_species, n_grid, dt, n_steps,
-            max_while_steps, fixed_phase2,
-        );
-    }
-    let no_delay: [Vec<Complex64>; 0] = [];
-    // Phase 1: fixed steps, fully parallel.
-    let mut states: Vec<(Vec<Complex64>, Complex64)> = (0..n_grid)
-        .into_par_iter()
-        .map(|k| {
-            // Truncate to f32 precision to match Python's complex64 cast.
-            let mut u: Vec<Complex64> = (0..n_species)
-                .map(|s| Complex64::new(
-                    g[s][k].re as f32 as f64,
-                    g[s][k].im as f32 as f64,
-                ))
-                .collect();
-            // phi starts at 0 and is integrated inside each RK4 step; the
-            // former leading/trailing half-steps double counted the end points.
-            let mut phi = Complex64::new(0.0, 0.0);
-            for _ in 0..n_steps {
-                custom_rk4_point(&mut u, &mut phi, params, rxns, prod_sp, prod_st, dt, &no_delay);
-            }
-            (u, phi)
-        })
-        .collect();
-
-    // Phase 2: global-max termination — matches Python `while np.max(|u[0]|) > 1e-3`.
-    // With `fixed_phase2 = Some(k)` exactly k steps are taken instead (gradient stencils).
-    let mut while_steps = 0usize;
-    loop {
-        let stop = match fixed_phase2 {
-            Some(k) => while_steps >= k,
-            None => {
-                let max_norm = states.par_iter().map(|(u, _)| u[0].norm()).reduce(|| 0.0_f64, f64::max);
-                max_norm < 1e-3 || while_steps >= max_while_steps
-            }
-        };
-        if stop {
-            break;
-        }
-        states.par_iter_mut().for_each(|(u, phi)| {
-            custom_rk4_point(u, phi, params, rxns, prod_sp, prod_st, dt, &no_delay);
-        });
-        while_steps += 1;
-    }
-
-    // Phase 3: exp(φ).
-    (states.into_par_iter().map(|(_u, phi)| phi.exp()).collect(), while_steps)
+    (exp_phi, steps)
 }
 
 /// Evaluate the custom reaction-network log-PGF over all grid points in
@@ -4283,11 +4713,16 @@ fn custom_pgf_parallel(
 /// * `prod_sp`/`prod_st`/`prod_off` — CSR products (species idx, stoich, offsets)
 /// * `params`        — **linear-scale** values (including the normalised rate if any)
 /// * `limits`        — grid size per species (length = n_species)
-/// * `dt`, `n_steps`, `max_while_steps` — integration control
+/// * `fixed_schedule` — step sizes to replay instead of adapting (finite-difference
+///                     stencils pass the base point's schedule), with
+///                     `fixed_breakpoints` the delay lengths it was recorded at
 ///
-/// Returns `(re_exphi, im_exphi, shape)` in row-major flat order.
+/// Returns `(re_exphi, im_exphi, shape, schedule)`: exp(phi) in row-major flat
+/// order and the accepted step sizes.
 #[pyfunction]
+#[pyo3(signature = (n_species, limits, rxn_kinds, rxn_rate_idxs, rxn_extra1, rxn_extra2, prod_sp, prod_st, prod_off, params, fixed_schedule=None, fixed_breakpoints=None))]
 fn eval_custom_network_pgf(
+    py:              Python<'_>,
     n_species:       usize,
     limits:          Vec<usize>,
     rxn_kinds:       Vec<u8>,
@@ -4298,23 +4733,32 @@ fn eval_custom_network_pgf(
     prod_st:         Vec<u32>,
     prod_off:        Vec<u32>,
     params:          Vec<f64>,
-    dt:              f64,
-    n_steps:         usize,
-    max_while_steps: usize,
-) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>)> {
+    fixed_schedule:  Option<Vec<f64>>,
+    fixed_breakpoints: Option<Vec<f64>>,
+) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>, Vec<f64>)> {
+    if n_species > CUSTOM_MAX_SPECIES {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "custom networks support at most 8 species",
+        ));
+    }
     let rxns = build_rxn_infos(&rxn_kinds, &rxn_rate_idxs, &rxn_extra1, &rxn_extra2, &prod_off);
-
-    let (g, mx, n_grid) = build_mesh_nd(&limits);
-
-    let (exp_phi, _) = custom_pgf_parallel(
-        &g, &params, &rxns, &prod_sp, &prod_st,
-        n_species, n_grid, dt, n_steps, max_while_steps,
-        None,
-    );
-
+    if rxns.iter().filter(|r| r.kind == 3).map(|r| r.tau_slot as usize + 1).max().unwrap_or(0) > CUSTOM_MAX_DELAYS {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "custom networks support at most 4 distinct delays",
+        ));
+    }
+    let (exp_phi, mx, steps) = py.allow_threads(|| {
+        let (g, mx, n_grid) = build_mesh_nd(&limits);
+        let bp: &[f64] = fixed_breakpoints.as_deref().unwrap_or(&[]);
+        let (exp_phi, steps) = custom_pgf_parallel(
+            &g, &params, &rxns, &prod_sp, &prod_st, n_species, n_grid,
+            fixed_schedule.as_deref().map(|s| (s, bp)),
+        );
+        (exp_phi, mx, steps)
+    });
     let re: Vec<f64> = exp_phi.iter().map(|z| z.re).collect();
     let im: Vec<f64> = exp_phi.iter().map(|z| z.im).collect();
-    Ok((re, im, mx))
+    Ok((re, im, mx, steps))
 }
 
 // ============================================================================
@@ -5519,15 +5963,11 @@ fn eval_custom_network_pss_seq(
     prod_sp:          &[u32],
     prod_st:          &[u32],
     params_linear:    &[f64],
-    dt:               f64,
-    n_steps:          usize,
-    max_while_steps:  usize,
-    fixed_phase2:     Option<usize>,
-) -> (Vec<f64>, usize) {
+    fixed:            Option<(&[f64], &[f64])>,
+) -> (Vec<f64>, Vec<f64>) {
     let (g, mx, n_grid) = build_mesh_nd(limits);
-    let (exp_phi, phase2_steps) = custom_pgf_parallel(
-        &g, params_linear, rxns, prod_sp, prod_st,
-        n_species, n_grid, dt, n_steps, max_while_steps, fixed_phase2,
+    let (exp_phi, steps) = custom_pgf_parallel(
+        &g, params_linear, rxns, prod_sp, prod_st, n_species, n_grid, fixed,
     );
 
     let pss_raw: Vec<f64> = match n_species {
@@ -5536,27 +5976,17 @@ fn eval_custom_network_pss_seq(
         _ => panic!("eval_custom_network_pss_seq: only 2- and 3-species networks supported"),
     };
 
-    (normalize_abs(pss_raw), phase2_steps)
+    (normalize_abs(pss_raw), steps)
 }
 
-/// Derive `params_linear`, `dt`, `n_steps`, and `max_while` from the log10 optimizer
-/// state `x`.  `x` covers all rate parameters; `norm_rate = 1.0` is appended if present.
-fn custom_network_integration_params(
-    x:             &[f64],
-    has_norm_rate: bool,
-    min_fudge:     f64,
-    max_fudge:     f64,
-) -> (Vec<f64>, f64, usize, usize) {
-    let p_lin: Vec<f64> = x.iter().map(|&v| 10.0_f64.powf(v)).collect();
-    let dt_f  = p_lin.iter().map(|&v| 1.0 / v).fold(f64::INFINITY, f64::min) * min_fudge;
-    let t_max = p_lin.iter().map(|&v| 1.0 / v).fold(0.0_f64, f64::max) * max_fudge;
-    let n_steps   = (t_max / dt_f).ceil() as usize;
-    let max_while = 10 * n_steps + 10_000;
-    let mut params_linear = p_lin;
+/// Linear-scale parameters from the log10 optimizer state `x`; `norm_rate = 1.0`
+/// is appended if present.
+fn custom_network_params(x: &[f64], has_norm_rate: bool) -> Vec<f64> {
+    let mut params_linear: Vec<f64> = x.iter().map(|&v| 10.0_f64.powf(v)).collect();
     if has_norm_rate {
         params_linear.push(1.0);
     }
-    (params_linear, dt_f, n_steps, max_while)
+    params_linear
 }
 
 /// KLD + forward finite-difference gradient for a custom network (sequential).
@@ -5571,25 +6001,22 @@ fn eval_kld_and_grad_seq_custom(
     coords:        &[Vec<i64>],
     f_data:        &[f64],
     has_norm_rate: bool,
-    min_fudge:     f64,
-    max_fudge:     f64,
     fd_eps:        f64,
     eps:           f64,
 ) -> (f64, Vec<f64>) {
-    let (params, dt, n_steps, max_while) =
-        custom_network_integration_params(x, has_norm_rate, min_fudge, max_fudge);
-    let (pss0, phase2) = eval_custom_network_pss_seq(
-        n_species, limits, rxns, prod_sp, prod_st, &params, dt, n_steps, max_while, None,
+    let params = custom_network_params(x, has_norm_rate);
+    let (pss0, steps) = eval_custom_network_pss_seq(
+        n_species, limits, rxns, prod_sp, prod_st, &params, None,
     );
+    let breakpoints = custom_breakpoints(rxns, &params);
     let kld0 = compute_kld_sparse_nd(&pss0, strides, coords, f_data, eps);
-    // Perturbed points reuse the base point's schedule (dt, n_steps, phase-2
-    // steps) so the finite difference is not polluted by discretisation jumps.
-    let grad = fd_gradient(x, fd_eps, kld0, |xx| {
-        let (params_eps, _, _, _) =
-            custom_network_integration_params(xx, has_norm_rate, min_fudge, max_fudge);
+    // Perturbed points replay the base point's step schedule so the finite
+    // difference is not polluted by step-size jumps; the stencil is central
+    // and wide because far-tail bins put a ~1e-9 noise floor on the KLD.
+    let grad = fd_gradient_central(x, fd_eps.max(CUSTOM_FD_EPS), |xx| {
+        let params_eps = custom_network_params(xx, has_norm_rate);
         let (pss, _) = eval_custom_network_pss_seq(
-            n_species, limits, rxns, prod_sp, prod_st,
-            &params_eps, dt, n_steps, max_while, Some(phase2),
+            n_species, limits, rxns, prod_sp, prod_st, &params_eps, Some((&steps, &breakpoints)),
         );
         compute_kld_sparse_nd(&pss, strides, coords, f_data, eps)
     });
@@ -5606,7 +6033,7 @@ fn eval_kld_and_grad_seq_custom(
 #[pyo3(signature = (sd, x0_list, lb, ub, n_species,
                     rxn_kinds, rxn_rate_idxs, rxn_extra1, rxn_extra2,
                     prod_sp, prod_st, prod_off,
-                    has_norm_rate, min_fudge, max_fudge,
+                    has_norm_rate,
                     fd_eps=1e-6, maxiter=1000, ftol=1e-10, gtol=1e-6,
                     eps=1e-15, m_lbfgs=10, num_threads=None, return_status=false))]
 #[allow(clippy::too_many_arguments)]
@@ -5625,8 +6052,6 @@ fn optimize_genes_custom_sd(
     prod_st:       Vec<u32>,
     prod_off:      Vec<u32>,
     has_norm_rate: bool,
-    min_fudge:     f64,
-    max_fudge:     f64,
     fd_eps:        f64,
     maxiter:       usize,
     ftol:          f64,
@@ -5657,7 +6082,7 @@ fn optimize_genes_custom_sd(
                 let (coords, f) = (&coords_list[gi], &f_list[gi]);
                 move |x: &[f64]| eval_kld_and_grad_seq_custom(
                     x, n_species, lims, &strides, rx, ps, pst, coords, f,
-                    has_norm_rate, min_fudge, max_fudge, fd_eps, eps,
+                    has_norm_rate, fd_eps, eps,
                 )
             })
         })
