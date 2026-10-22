@@ -5206,7 +5206,7 @@ fn chromatin_pgf(
 /// per site) that H is the Kronecker sum of independent sites.  Returns
 /// `(re, im, mesh_shape, steps)` with G point-major: index `p * n_states + c`.
 #[pyfunction]
-#[pyo3(signature = (n_states, n_species, h, a, c, limits, w, t_horizon, h_first, h_min, tol, fixed_schedule=None, site_weights=None, independent=None))]
+#[pyo3(signature = (n_states, n_species, h, a, c, limits, w, t_horizon, h_first, h_min, tol, fixed_schedule=None, site_weights=None, independent=None, u_re=None, u_im=None))]
 fn eval_chromatin_pgf(
     py:             Python<'_>,
     n_states:       usize,
@@ -5223,8 +5223,17 @@ fn eval_chromatin_pgf(
     fixed_schedule: Option<Vec<f64>>,
     site_weights:   Option<Vec<f64>>,
     independent:    Option<Vec<f64>>,
+    u_re:           Option<Vec<f64>>,
+    u_im:           Option<Vec<f64>>,
 ) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>, Vec<f64>)> {
     let (n, m) = (n_states, n_species);
+    if let (Some(ur), Some(ui)) = (&u_re, &u_im) {
+        if ur.len() != ui.len() || ur.len() % m != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: u_re/u_im must be n_species × n_grid"));
+        }
+    } else if u_re.is_some() != u_im.is_some() {
+        return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: give both u_re and u_im or neither"));
+    }
     if h.len() != n * n || a.len() != n * m || c.len() != m * m || w.len() != n || limits.len() != m {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "eval_chromatin_pgf: inconsistent shapes of h, a, c, w or limits",
@@ -5243,7 +5252,18 @@ fn eval_chromatin_pgf(
         }
     }
     let (re, im, mx, steps) = py.allow_threads(|| {
-        let (u, mx, n_grid) = build_mesh_nd(&limits);
+        // the PGF arguments: the half-spectrum mesh of `limits`, or the caller's
+        // (already transformed by a sequencing-noise model)
+        let (u, mx, n_grid) = match (&u_re, &u_im) {
+            (Some(ur), Some(ui)) => {
+                let n_grid = ur.len() / m;
+                let u: Vec<Vec<Complex64>> = (0..m)
+                    .map(|j| (0..n_grid).map(|p| Complex64::new(ur[j * n_grid + p], ui[j * n_grid + p])).collect())
+                    .collect();
+                (u, vec![n_grid], n_grid)
+            }
+            _ => build_mesh_nd(&limits),
+        };
         let bw = CHROMATIN_BLOCK;
         let n_blocks = (n_grid + bw - 1) / bw;
         let ur: Vec<Vec<f64>> = u.iter().map(|uj| (0..n_blocks * bw).map(|p| if p < n_grid { uj[p].re } else { 0.0 }).collect()).collect();

@@ -382,6 +382,8 @@ class CMEModel:
     _last_protein_schedule = _tls_property("last_protein")
     _fixed_custom_schedule = _tls_property("fixed_custom")
     _last_custom_schedule = _tls_property("last_custom")
+    _fixed_chromatin_schedule = _tls_property("fixed_chromatin")
+    _last_chromatin_schedule = _tls_property("last_chromatin")
     def __init__(
         self,
         bio_model,
@@ -397,6 +399,12 @@ class CMEModel:
         max_fudge = 10,
         network = None,
         normalize_production_rate = False,
+        n_sites = 2,
+        rule = "additive",
+        periodic = False,
+        chromatin_tol = 1e-5,
+        chromatin_search_tol = 1e-4,
+        dropout_bounds = (-2.0, -0.05, 3),
     ):
         """Initialize the CMEModel instance.
 
@@ -427,6 +435,23 @@ class CMEModel:
             time horizon used for adaptive integration.
         protein_limit: int
             coarse grid for pgf only relevant for protein model.
+        n_sites, rule, periodic: int, str, bool
+            ``bio_model="Chromatin"`` only: the number of binary chromatin sites
+            of a gene's locus, the transcription rule (``"additive"``,
+            ``"switch"`` or ``"table"``, see :mod:`monod.chromatin`) and whether
+            the sites form a ring.  Parameters are ``k_on`` per site, ``epsilon``,
+            the rule's rates, ``beta`` and ``gamma``, in units of the shared
+            closing rate ``k_off = 1``.  Modalities are ``unspliced``, ``spliced``
+            and ``configuration`` (the integer 0..2**n_sites-1 encoding which
+            sites are open, site 0 the least significant bit).
+        chromatin_tol, chromatin_search_tol: float
+            step tolerance of the chromatin integrator for reported values and
+            during the search (see :meth:`search_tolerance`).
+        dropout_bounds: (float, float, int)
+            ATAC dropout is a sampling parameter on the configuration axis,
+            scanned on the grid like the sequencing parameters: log10 bounds and
+            grid size of the per-open-site dropout probability.  A value of 0
+            (the null sampling vector) means no dropout.
         """
         self.bio_model = bio_model
         self.available_biomodels = (
@@ -438,6 +463,7 @@ class CMEModel:
             "DelayedSplicing",
             "ProteinBursty",
             "Custom",
+            "Chromatin",
         )
         self.available_seqmodels = ("None", "Bernoulli", "Poisson")
         self.available_ambmodels = ("None", "Equal", "Unequal")
@@ -454,6 +480,19 @@ class CMEModel:
         else:
             self.network = None
 
+        if bio_model == "Chromatin":
+            from . import chromatin as _chromatin
+            if rule not in _chromatin.RULES:
+                raise ValueError(f"rule must be one of {_chromatin.RULES}, got {rule!r}")
+            if int(n_sites) < 1:
+                raise ValueError("n_sites must be at least 1")
+            self.n_sites = int(n_sites)
+            self.rule = rule
+            self.periodic = bool(periodic)
+            self.chromatin_tol = float(chromatin_tol)
+            self.chromatin_search_tol = float(chromatin_search_tol)
+            self.dropout_bounds = tuple(dropout_bounds)
+
         # Define the modalities used for each model, and their order.
         CMEModel.available_model_modalities = {"Delay":['unspliced', 'spliced'],
             "Bursty":['unspliced', 'spliced'],
@@ -461,7 +500,8 @@ class CMEModel:
             "Constitutive":['unspliced', 'spliced'],
             "CIR":['unspliced', 'spliced'],
             "DelayedSplicing":['unspliced', 'spliced'],
-            "ProteinBursty":['unspliced', 'spliced', 'protein']}
+            "ProteinBursty":['unspliced', 'spliced', 'protein'],
+            "Chromatin":['unspliced', 'spliced', 'configuration']}
 
         try:
             self.model_modalities = CMEModel.available_model_modalities[self.bio_model]
@@ -491,7 +531,10 @@ class CMEModel:
             self.filter_bounds = CMEModel.available_filter_bounds[self.bio_model]
             
         except KeyError:
-            if self.bio_model == "Custom":
+            if self.bio_model == "Chromatin":
+                self.filter_bounds = {'min_means': [0.01, 0.01, 0.0], 'max_maxes': [350, 350, 2 ** self.n_sites],
+                                      'min_maxes': [4, 4, 0]}
+            elif self.bio_model == "Custom":
                 # One entry per species, with the mRNA defaults; override with
                 # filt_param= in extract_data / perform_inference when a species
                 # (a protein, say) lives on a different scale.
@@ -516,7 +559,13 @@ class CMEModel:
             self.bio_bounds = CMEModel.available_bio_bounds[self.bio_model]
             
         except KeyError:
-            if self.bio_model == "Custom":
+            if self.bio_model == "Chromatin":
+                # k_on per site and the rule's rates in units of k_off; beta and gamma as Bursty
+                from . import chromatin as _chromatin
+                k = _chromatin.n_rule_params(self.rule, self.n_sites)
+                self.bio_bounds = {'phys_lb': [-2.0] * self.n_sites + [-1.5] + [-2.0] * k + [-1.8, -1.8],
+                                   'phys_ub': [2.0] * self.n_sites + [0.5] + [2.0] * k + [2.5, 3.5]}
+            elif self.bio_model == "Custom":
                 # Burst sizes get the Bursty b range; rates and inverse delays
                 # span the union of the Bursty beta and gamma ranges.  The
                 # exponential integrator's cost does not depend on the spread.
@@ -562,6 +611,13 @@ class CMEModel:
             self.seq_bounds = CMEModel.available_seq_bounds[self.seq_model]
         except KeyError:
             log.info("Technical sequencing bounds unknown for model: {}".format(self.seq_model))
+        if self.bio_model == "Chromatin":
+            # a third sampling parameter: log10 ATAC dropout per open site on the configuration axis
+            lo, hi, ng = self.dropout_bounds
+            base = self.seq_bounds if self.seq_model != "None" else {'samp_lb': [0, 0], 'samp_ub': [0, 0], 'gridsize': [1, 1]}
+            self.seq_bounds = {'samp_lb': list(base['samp_lb']) + [float(lo)],
+                               'samp_ub': list(base['samp_ub']) + [float(hi)],
+                               'gridsize': list(base['gridsize']) + [int(ng)]}
         
         # Get all biological and technical parameters.
         self.param_str = self.get_log_name_str()
@@ -630,6 +686,17 @@ class CMEModel:
         elif self.bio_model == "Custom":
             param_str += self.network.get_log_name_str()
 
+        elif self.bio_model == "Chromatin":
+            param_str += [rf"$\log_{{10}} k_{{on,{j}}}$" for j in range(self.n_sites)]
+            param_str += [r"$\log_{10} \epsilon$"]
+            if self.rule == "switch":
+                param_str += [r"$\log_{10} a$"]
+            elif self.rule == "additive":
+                param_str += [rf"$\log_{{10}} a_{{{j}}}$" for j in range(self.n_sites)]
+            else:
+                param_str += [rf"$\log_{{10}} a_{{{c}}}$" for c in range(2 ** self.n_sites)]
+            param_str += [r"$\log_{10} \beta$", r"$\log_{10} \gamma$"]
+
         else:
             raise ValueError(
                 "Please select a biological noise model from {}.".format(
@@ -650,6 +717,7 @@ class CMEModel:
         "bio_model", "seq_model", "amb_model", "quad_method", "fixed_quad_T", "quad_order",
         "quad_vec_T", "protein_limit", "fit_unspliced", "min_fudge", "max_fudge",
         "network", "normalize_production_rate",
+        "n_sites", "rule", "periodic", "chromatin_tol", "chromatin_search_tol", "dropout_bounds",
     )
 
     def to_dict(self):
@@ -675,6 +743,10 @@ class CMEModel:
         if getattr(self, "network", None) is not None:
             d["network"] = self.network.network_str
             d["normalize_production_rate"] = bool(self.network.normalize_production_rate)
+        if self.bio_model == "Chromatin":
+            d.update(n_sites=int(self.n_sites), rule=self.rule, periodic=bool(self.periodic),
+                     chromatin_tol=float(self.chromatin_tol), chromatin_search_tol=float(self.chromatin_search_tol),
+                     dropout_bounds=[float(self.dropout_bounds[0]), float(self.dropout_bounds[1]), int(self.dropout_bounds[2])])
         return d
 
     @classmethod
@@ -687,6 +759,8 @@ class CMEModel:
                 kwargs[k] = v.item() if isinstance(v, np.generic) else v
         if kwargs.get("network", None) == "":
             kwargs["network"] = None
+        if "dropout_bounds" in kwargs:
+            kwargs["dropout_bounds"] = tuple(np.asarray(kwargs["dropout_bounds"]).tolist())
         return cls(**kwargs)
 
     def get_num_params(self):
@@ -706,6 +780,9 @@ class CMEModel:
             numpars += 5
         elif self.bio_model == "Custom":
             numpars += len(self.network.all_params)
+        elif self.bio_model == "Chromatin":
+            from . import chromatin as _chromatin
+            numpars += self.n_sites + 1 + _chromatin.n_rule_params(self.rule, self.n_sites) + 2
         else:
             numpars += 3
             
@@ -918,13 +995,14 @@ class CMEModel:
         if not outer_pin:
             self._fixed_protein_schedule = None
             self._fixed_custom_schedule = None
+            self._fixed_chromatin_schedule = None
         kld0 = self.eval_model_kld(p, limits, samp, data, EPS)
 
         # Custom networks: central differences with a wide step.  Histogram
         # bins deep in the tail sit near the FFT's absolute precision and put a
         # noise floor of about 1e-9 on the KLD, which a 1e-6 forward difference
         # would turn into gradient errors of order 1e-2.
-        central = self.bio_model == "Custom"
+        central = self.bio_model in ("Custom", "Chromatin")
         if central:
             eps = max(float(eps), _CUSTOM_FD_EPS)
 
@@ -946,6 +1024,8 @@ class CMEModel:
                 self._fixed_protein_schedule = getattr(self, "_last_protein_schedule", None)
             elif self.bio_model == "Custom":
                 self._fixed_custom_schedule = getattr(self, "_last_custom_schedule", None)
+            elif self.bio_model == "Chromatin":
+                self._fixed_chromatin_schedule = getattr(self, "_last_chromatin_schedule", None)
         try:
             if n_jobs == 1:
                 klds_eps = [_perturbed(i) for i in range(n_params)]
@@ -957,6 +1037,7 @@ class CMEModel:
             if not outer_pin:
                 self._fixed_protein_schedule = None
                 self._fixed_custom_schedule = None
+                self._fixed_chromatin_schedule = None
         if central:
             grad = np.array([(kp - km) / (2 * eps) for kp, km in klds_eps])
         else:
@@ -1253,7 +1334,35 @@ class CMEModel:
 
     def _schedule_is_pinned(self):
         return (getattr(self, "_fixed_protein_schedule", None) is not None
-                or getattr(self, "_fixed_custom_schedule", None) is not None)
+                or getattr(self, "_fixed_custom_schedule", None) is not None
+                or getattr(self, "_fixed_chromatin_schedule", None) is not None)
+
+    @contextlib.contextmanager
+    def search_tolerance(self):
+        """Run the block at the integrator's search tolerance (Chromatin:
+        ``chromatin_search_tol`` instead of ``chromatin_tol``).  The optimiser
+        searches here and reports its optimum at the fine tolerance; with the
+        Richardson extrapolation the coarse setting is still accurate to about
+        1e-6 on the distribution at half the steps.  No-op for other models."""
+        if self.bio_model != "Chromatin":
+            yield
+            return
+        fine = self.chromatin_tol
+        self.chromatin_tol = self.chromatin_search_tol
+        try:
+            yield
+        finally:
+            self.chromatin_tol = fine
+
+    def has_search_tolerance(self):
+        return self.bio_model == "Chromatin" and self.chromatin_search_tol != self.chromatin_tol
+
+    def null_sampling_grid(self):
+        """``(samp_lb, samp_ub, gridsize)`` for ``seq_model="None"``: zeros, plus
+        the dropout grid for the Chromatin model's configuration axis."""
+        if self.bio_model == "Chromatin":
+            return list(self.seq_bounds['samp_lb']), list(self.seq_bounds['samp_ub']), list(self.seq_bounds['gridsize'])
+        return [0, 0], [0, 0], [1, 1]
 
     @contextlib.contextmanager
     def pinned_schedule(self, p, limits, samp=None):
@@ -1268,19 +1377,22 @@ class CMEModel:
         and the finite-difference gradient keep an outer pin.  No-op for the
         other models.
         """
-        if self.bio_model not in ("ProteinBursty", "Custom") or self._schedule_is_pinned():
+        if self.bio_model not in ("ProteinBursty", "Custom", "Chromatin") or self._schedule_is_pinned():
             yield
             return
         try:
             self.eval_model_pss(np.asarray(p, dtype=float), limits, samp)
             if self.bio_model == "ProteinBursty":
                 self._fixed_protein_schedule = getattr(self, "_last_protein_schedule", None)
+            elif self.bio_model == "Chromatin":
+                self._fixed_chromatin_schedule = getattr(self, "_last_chromatin_schedule", None)
             else:
                 self._fixed_custom_schedule = getattr(self, "_last_custom_schedule", None)
             yield
         finally:
             self._fixed_protein_schedule = None
             self._fixed_custom_schedule = None
+            self._fixed_chromatin_schedule = None
 
     def check_identifiability(self, p, limits, samp=None, h=1e-4, rtol=1e-3, warn=True):
         """Test whether every parameter direction changes the steady state.
@@ -1385,6 +1497,9 @@ class CMEModel:
 
         p, limits = self._check_pss_args(p, limits)
 
+        if self.bio_model == "Chromatin":
+            return self._eval_model_pss_chromatin(p, limits, samp)
+
         # This was formerly the interface with nn_toolbox neural likelihood approximation methods.
         # It will be implemented in a future version.
 
@@ -1484,9 +1599,22 @@ class CMEModel:
             g = g_
             p = np.copy(p[:-1])
 
-        # Technical-noise transform.  samp holds one log10 sampling parameter per
-        # sequenced modality; modalities beyond len(samp) (e.g. protein in
-        # ProteinBursty) are left untouched.  The mesh is cached, so transform a copy.
+        g = self._apply_seq_transform(g, samp)
+            
+        gf = self.eval_model_pgf(p, g) # this gf is actually phi
+        gf = np.exp(gf)
+        gf = gf.reshape(tuple(mx))
+        Pss = irfftn(gf, s=tuple(limits))
+        Pss = np.abs(Pss) / np.sum(np.abs(Pss))
+        Pss = Pss.squeeze()
+        return Pss
+
+    def _apply_seq_transform(self, g, samp):
+        """Technical-noise transform of the PGF arguments.  ``samp`` holds one
+        log10 sampling parameter per sequenced modality; modalities beyond
+        ``len(samp)`` (protein in ProteinBursty) are left untouched, as is a
+        modality whose entry is 0 (the null vector inference passes for
+        ``seq_model="None"``).  The mesh is cached, so a copy is transformed."""
         if self.seq_model in ("Poisson", "Bernoulli"):
             if samp is None:
                 raise ValueError(
@@ -1509,14 +1637,49 @@ class CMEModel:
                     self.available_seqmodels
                 )
             )
-            
-        gf = self.eval_model_pgf(p, g) # this gf is actually phi
-        gf = np.exp(gf)
-        gf = gf.reshape(tuple(mx))
-        Pss = irfftn(gf, s=tuple(limits))
-        Pss = np.abs(Pss) / np.sum(np.abs(Pss))
-        Pss = Pss.squeeze()
-        return Pss
+        return g
+
+    def chromatin_system(self, p):
+        """``(H, A, C)`` of the Chromatin model at log10 parameters ``p``."""
+        from . import chromatin as _chromatin
+        n = self.n_sites
+        k = _chromatin.n_rule_params(self.rule, n)
+        lin = np.power(10.0, np.asarray(p, dtype=float))
+        k_on, eps, rates, beta, gamma = lin[:n], float(lin[n]), lin[n + 1:n + 1 + k], float(lin[n + 1 + k]), float(lin[n + 2 + k])
+        return _chromatin.nascent_mature_system(k_on, 1.0, eps, self.rule, beta, gamma, periodic=self.periodic, rule_params=rates)
+
+    def chromatin_dropout(self, samp):
+        """Per-open-site dropout probability from the sampling vector (its third
+        entry, log10), or None when absent or null."""
+        if samp is None:
+            return None
+        samp = np.asarray(samp, dtype=float).ravel()
+        if samp.size < 3 or samp[2] == 0:
+            return None
+        return float(10.0 ** samp[2])
+
+    def _eval_model_pss_chromatin(self, p, limits, samp):
+        """Joint distribution over (unspliced, spliced, configuration): the
+        chromatin kernel on the RNA mesh, transformed by the sequencing model,
+        then dropout on the configuration axis."""
+        from . import chromatin as _chromatin
+        n = self.n_sites
+        N = 2 ** n
+        if int(limits[2]) != N:
+            raise ValueError(f"Chromatin: the configuration axis must have {N} = 2**n_sites states, got limits {limits}")
+        lu, ls = int(limits[0]), int(limits[1])
+        mx = (lu, ls // 2 + 1)
+        g = _build_mesh((lu, ls), mx)
+        g = self._apply_seq_transform(g, samp)
+        H, A, C = self.chromatin_system(p)
+        G, sched = _chromatin.eval_joint_pgf(H, A, C, g, tol=self.chromatin_tol,
+                                             fixed_schedule=getattr(self, "_fixed_chromatin_schedule", None))
+        self._last_chromatin_schedule = sched
+        pss = _chromatin.invert_joint_pgf(G, mx, (lu, ls))              # (N, lu, ls)
+        p_drop = self.chromatin_dropout(samp)
+        if p_drop is not None:
+            pss = _chromatin.apply_dropout(pss, n, p_drop)
+        return np.moveaxis(pss, 0, -1)                                  # (lu, ls, N)
 
     def eval_model_pss_batch(self, params_list, limits_list, samp_list=None, num_threads=None):
         """Evaluate PSS for N genes in one batched call.
@@ -1865,7 +2028,7 @@ class CMEModel:
         U = b * (np.exp(-beta * x) * c_1 + np.exp(-gamma * x) * c_2)
         return U / (1 - U)
 
-    def get_MoM(self, moments, lb_log, ub_log, samp=None):
+    def get_MoM(self, moments, lb_log, ub_log, samp=None, hist=None, limits=None):
         """Compute method of moments parameter estimates.
 
         This method evaluates the method of moments biological parameter estimates
@@ -1882,12 +2045,28 @@ class CMEModel:
             log10 upper bounds on biological parameters.
         samp: None or np.ndarray, optional
             sampling parameters, if applicable.
+        hist, limits: optional
+            the gene's histogram ``(coords, freqs)`` and grid, which the
+            Chromatin model needs: its chain parameters come from the
+            configuration marginal and its rates from the conditional nascent
+            means per configuration (see :mod:`monod.chromatin_fit`).
 
         Returns
         -------
         x0: np.ndarray
             log10 biological parameter estimates.
         """
+        if self.bio_model == "Chromatin":
+            mid = 0.5 * (np.asarray(lb_log, float) + np.asarray(ub_log, float))[: self.get_num_params()]
+            if hist is None or limits is None:
+                return mid
+            from . import chromatin_fit as _cf
+            try:
+                x0 = _cf.chromatin_start(self, hist, limits, samp, lb_log, ub_log)
+            except Exception as exc:                      # a start is a convenience, never a failure
+                log.info("Chromatin moments start failed (%s); starting from the middle of the box", exc)
+                return mid
+            return np.clip(x0, np.asarray(lb_log, float), np.asarray(ub_log, float))
         if self.bio_model == "Custom":
             # No moment estimator for an arbitrary network: start every fit from
             # the middle of the parameter box (log scale).

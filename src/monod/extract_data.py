@@ -338,6 +338,10 @@ def extract_data(
 
     # Add padding to the maximum values
     M = max_values + padding
+    if model.bio_model == "Chromatin":
+        # the configuration axis is categorical with exactly 2**n_sites states
+        idx = model.model_modalities.index('configuration')
+        M[idx, :] = 2 ** model.n_sites                      # M is (n_layers, n_genes)
     monod_adata.uns['M'] = M.astype(int)
     
     # Load the AnnData object into memory if it is in backed mode

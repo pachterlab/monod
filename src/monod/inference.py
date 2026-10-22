@@ -809,7 +809,7 @@ class InferenceParameters:
         self.gradient_params = {**DEFAULT_GRADIENT_PARAMS, **(gradient_params or {})}
         self.use_lengths, self.use_lengths_explicit = _normalize_use_lengths(use_lengths, model)
         if model.seq_model == "None":
-            samp_lb, samp_ub, gridsize = [0, 0], [0, 0], [1, 1]
+            samp_lb, samp_ub, gridsize = model.null_sampling_grid()
         _validate_bounds(model, phys_lb, phys_ub, samp_lb, samp_ub, gridsize)
         self.phys_lb = np.array(phys_lb)
         self.phys_ub = np.array(phys_ub)
@@ -821,9 +821,7 @@ class InferenceParameters:
             log.info(
                 "Sequencing model set to None. All sampling parameters set to null."
             )
-            samp_lb = [0, 0]
-            samp_ub = [0, 0]
-            gridsize = [1, 1]
+            samp_lb, samp_ub, gridsize = model.null_sampling_grid()
 
         self.samp_lb = np.array(samp_lb)
         self.samp_ub = np.array(samp_ub)
@@ -1261,6 +1259,13 @@ class GradientInference:
                 # from the middle of the parameter box (see CMEModel.get_MoM).
                 mid = 0.5 * (np.asarray(global_parameters.phys_lb, float) + np.asarray(global_parameters.phys_ub, float))
                 self.param_MoM = np.tile(mid, (search_data.n_genes, 1))
+            elif model.bio_model == "Chromatin":
+                # chain from the configuration marginal, rates from conditional means: needs the histogram
+                self.param_MoM = np.asarray([
+                    model.get_MoM(None, global_parameters.phys_lb, global_parameters.phys_ub, regressor[i],
+                                  hist=search_data.hist[i], limits=np.asarray(search_data.M[:, i]))
+                    for i in range(search_data.n_genes)
+                ])
             elif _sd_is_rust_sd:
                 # Zero-Python-loop path: Rust computes MoM for all genes at once.
                 samp_list_mom = None
@@ -1310,7 +1315,7 @@ class GradientInference:
         """
         mode = self.gradient_params.get("check_identifiability", "auto")
         if mode == "auto":
-            mode = model.bio_model == "Custom"
+            mode = model.bio_model in ("Custom", "Chromatin")
         if not mode:
             return None
         x0 = None
@@ -1397,23 +1402,30 @@ class GradientInference:
                     n_jobs=n_jac_jobs,
                 )
 
-            res_arr = scipy.optimize.minimize(
-                _obj_and_grad,
-                x0=x0[restart],
-                method='L-BFGS-B',
-                jac=True,
-                bounds=self.grad_bnd,
-                options={
-                    "maxiter": self.gradient_params["max_iterations"],
-                    "ftol": 2.22e-9,
-                    "gtol": 1e-5,
-                },
-            )
+            # Adaptive integrators search at their coarse tolerance (a no-op for
+            # the other models) and report the optimum at the fine one.
+            with model.search_tolerance():
+                res_arr = scipy.optimize.minimize(
+                    _obj_and_grad,
+                    x0=x0[restart],
+                    method='L-BFGS-B',
+                    jac=True,
+                    bounds=self.grad_bnd,
+                    options={
+                        "maxiter": self.gradient_params["max_iterations"],
+                        "ftol": 2.22e-9,
+                        "gtol": 1e-5,
+                    },
+                )
+            fun = res_arr.fun
+            if model.has_search_tolerance():
+                fun = model.eval_model_kld(res_arr.x, search_data.M[:, gene_index], self.regressor[gene_index],
+                                           search_data.hist[gene_index])
             if (
-                res_arr.fun < err * ERR_THRESH
+                fun < err * ERR_THRESH
             ):  # do not replace old best estimate if there is little marginal benefit
                 x = res_arr.x
-                err = res_arr.fun
+                err = fun
         if not (np.isfinite(x).all()):
             log.warning("Gene index: " + str(gene_index))
             raise ValueError("Search failed. Please check input data.")

@@ -13,6 +13,87 @@ import matplotlib.pyplot as plt
 ## Helper functions
 ########################
 
+def compare_nested_models(model_small, model_big, embed, x_small, limits, samp, data, n_cells,
+                          alpha=0.05, table="score", hess_step=1e-2, maxiter=200, bounds=None):
+    """Test a fitted model against one that nests it, for one gene.
+
+    ``embed`` maps the small model's log10 parameters into the big model's
+    space (for the Chromatin rules, :func:`monod.chromatin_fit.embed_in_table`;
+    for a network with one extra reaction, append that rate at its lower
+    bound).  Both models see the same ``data`` ``(coords, freqs)`` on ``limits``
+    with sampling vector ``samp``.
+
+    With ``table="score"`` a Rao score test at the embedded optimum decides
+    whether the big model is fitted at all: the gradient and observed
+    information of the divergence (times ``n_cells``, so in nats) are taken
+    on the embedded point's pinned step schedule, coordinates pinned at a
+    bound are held fixed, and the statistic is compared with chi-square on
+    the remaining extra parameters.  ``"always"`` fits the big model
+    regardless; ``"never"`` only reports the score test.  The big model is
+    warm-started from the embedding and can therefore never end worse than
+    the small one (the nested-model check); the likelihood ratio
+    ``2 n_cells (KLD_small - KLD_big)`` and its p-value are reported.
+
+    Returns a dict with ``x_small``, ``kld_small``, ``score`` (statistic, df,
+    p), ``fitted`` (bool), ``x_big``, ``kld_big``, ``lr``, ``df``, ``p_lr``
+    and ``prefer_big`` (the likelihood ratio rejects the small model at
+    ``alpha``).
+    """
+    import scipy.optimize
+    from scipy.stats import chi2
+
+    x_small = np.asarray(x_small, dtype=float)
+    kld_small = float(model_small.eval_model_kld(x_small, limits, samp, data))
+    x0 = np.asarray(embed(x_small), dtype=float)
+    lb = np.asarray(bounds[0] if bounds is not None else model_big.bio_bounds["phys_lb"], float)
+    ub = np.asarray(bounds[1] if bounds is not None else model_big.bio_bounds["phys_ub"], float)
+    x0 = np.clip(x0, lb, ub)
+    d = x0.size
+    df_total = d - x_small.size
+
+    # score test at the embedded optimum
+    free = np.where((x0 > lb + 1e-9) & (x0 < ub - 1e-9))[0]
+    df = max(df_total - (d - free.size), 1)
+    with model_big.pinned_schedule(x0, limits, samp):
+        kld0, g = model_big.eval_model_kld_and_grad(x0, limits, samp, data)
+        cols = []
+        for j in range(d):
+            e = np.zeros(d); e[j] = hess_step
+            _, gp = model_big.eval_model_kld_and_grad(x0 + e, limits, samp, data)
+            _, gm = model_big.eval_model_kld_and_grad(x0 - e, limits, samp, data)
+            cols.append((np.asarray(gp) - np.asarray(gm)) / (2 * hess_step))
+    I = 0.5 * (np.column_stack(cols) + np.column_stack(cols).T) * n_cells
+    g = np.asarray(g) * n_cells
+    gf, If = g[free], I[np.ix_(free, free)]
+    try:
+        y = np.linalg.solve(np.linalg.cholesky(If), gf)
+        stat = float(y @ y)
+    except np.linalg.LinAlgError:
+        vals, vecs = np.linalg.eigh(If)
+        vals = np.maximum(vals, 1e-8 * max(vals.max(), 1e-300))
+        stat = float((vecs.T @ gf) ** 2 @ (1.0 / vals))
+    p_score = float(chi2.sf(stat, df))
+    out = dict(x_small=x_small, kld_small=kld_small, score=(stat, df, p_score), fitted=False,
+               x_big=x0, kld_big=float(kld0), lr=0.0, df=df_total, p_lr=1.0, prefer_big=False)
+
+    run = table == "always" or (table == "score" and p_score < alpha)
+    if run:
+        def fg(x):
+            return model_big.eval_model_kld_and_grad(x, limits, samp, data)
+        with model_big.search_tolerance():
+            res = scipy.optimize.minimize(fg, x0, jac=True, method="L-BFGS-B",
+                                          bounds=scipy.optimize.Bounds(lb, ub),
+                                          options=dict(maxiter=maxiter, ftol=1e-8, gtol=1e-2))
+        x_big = res.x
+        kld_big = float(model_big.eval_model_kld(x_big, limits, samp, data))
+        if kld_big > kld0:                         # a nesting model never fits worse than its start
+            x_big, kld_big = x0, float(kld0)
+        out.update(fitted=True, x_big=x_big, kld_big=kld_big)
+    lr = max(2.0 * n_cells * (kld_small - out["kld_big"]), 0.0)
+    out.update(lr=lr, p_lr=float(chi2.sf(lr, df_total)), prefer_big=bool(out["fitted"] and chi2.sf(lr, df_total) < alpha))
+    return out
+
+
 def run_qc(monod_adata, mek_means_params=None,cluster=0, discard_rejected=True, marg='joint',
            gene_dist_size=(5, 5), show_axes=False):
     # The SearchData is never stored in the AnnData; rebuild it in memory.

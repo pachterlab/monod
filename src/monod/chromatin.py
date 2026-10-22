@@ -293,6 +293,63 @@ def locus_structure(H: np.ndarray, A: np.ndarray, rtol: float = 1e-12):
     return site_weights, independent
 
 
+def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
+                   tol: float = _TOL, fixed_schedule: Optional[StepSchedule] = None,
+                   backend: Optional[str] = None):
+    """Vector generating function ``G[c, p] = E[prod_j (1+u_j)^{x_j}; state c]``
+    at the PGF arguments ``u`` (shape ``(m, P)``), returned with the accepted
+    :class:`StepSchedule`.  This is the kernel proper; :func:`eval_joint_pss`
+    builds the FFT mesh and inverts, and :class:`monod.cme_toolbox.CMEModel`
+    passes arguments already transformed by its sequencing-noise model."""
+    H = np.asarray(H, dtype=float); A = np.asarray(A, dtype=float); C = np.asarray(C, dtype=float)
+    u = np.asarray(u, dtype=np.complex128)
+    N, m = A.shape
+    if u.shape[0] != m:
+        raise ValueError(f"u must have one row per RNA species ({m}), got shape {u.shape}")
+    P = u.shape[1]
+    w = stationary_distribution(H)
+    lam = np.abs(np.linalg.eigvals(C).real)
+    lam_slow = float(lam[lam > 0].min()) if np.any(lam > 0) else 1.0
+    lam_fast = max(float(lam.max()), float(np.abs(np.diag(H)).max()), float(2.0 * np.abs(A).max()), 1e-300)
+    T = (np.log(1.0 / tol) + np.log1p(2.0 * float(np.abs(A).max()) / lam_slow)) / lam_slow
+    if fixed_schedule is not None:
+        T = float(np.sum(np.asarray(fixed_schedule, dtype=float)))   # replay over the schedule's own horizon
+    h_first = _C0 / lam_fast
+    h_min = 1e-12 / lam_fast
+    if backend is None:
+        backend = "rust" if _rust_available() else "python"
+    if backend == "rust":
+        if not _rust_available():
+            raise RuntimeError("monod_core with eval_chromatin_pgf is not installed")
+        site_weights, independent = locus_structure(H, A)
+        re, im, _, steps = _mc.eval_chromatin_pgf(
+            N, m, H.ravel().tolist(), A.ravel().tolist(), C.ravel().tolist(),
+            [1] * m, w.tolist(), float(T), float(h_first), float(h_min), float(tol),
+            None if fixed_schedule is None else [float(x) for x in np.asarray(fixed_schedule, dtype=float)],
+            None if site_weights is None else np.asarray(site_weights, dtype=float).ravel().tolist(),
+            independent,
+            u.real.ravel().tolist(), u.imag.ravel().tolist())
+        G = (np.asarray(re) + 1j * np.asarray(im)).reshape(P, N).T
+        steps = list(steps)
+    elif backend == "python":
+        HT = H.T
+        G = np.repeat(w[:, None].astype(np.complex128), P, axis=1)
+        G, steps = _integrate_numpy(HT, A, C, u, G, T, h_first, h_min, tol, fixed_schedule)
+    else:
+        raise ValueError(f"backend must be 'rust', 'python' or None, got {backend!r}")
+    return G, StepSchedule(steps)
+
+
+def invert_joint_pgf(G: np.ndarray, mesh_shape: Sequence[int], limits: Sequence[int]) -> np.ndarray:
+    """``P[c, x]`` from the half-spectrum generating function of each configuration."""
+    N = G.shape[0]
+    pss = np.empty((N,) + tuple(int(l) for l in limits))
+    for c in range(N):
+        pss[c] = irfftn(G[c].reshape(tuple(mesh_shape)), s=[int(l) for l in limits])
+    pss = np.abs(pss)
+    return pss / pss.sum()
+
+
 def eval_joint_pss(H: np.ndarray, A: np.ndarray, C: np.ndarray, limits: Sequence[int],
                    tol: float = _TOL, fixed_schedule: Optional[StepSchedule] = None,
                    return_schedule: bool = False, backend: Optional[str] = None):
@@ -312,50 +369,11 @@ def eval_joint_pss(H: np.ndarray, A: np.ndarray, C: np.ndarray, limits: Sequence
     return_schedule : also return the accepted :class:`StepSchedule`.
     backend : ``"rust"``, ``"python"`` or ``None`` (Rust when installed).
     """
-    H = np.asarray(H, dtype=float); A = np.asarray(A, dtype=float); C = np.asarray(C, dtype=float)
-    N, m = A.shape
-    HT = H.T
-    u, mx = _mesh(limits)                      # (m, P)
-    P = u.shape[1]
-    w = stationary_distribution(H)
-    G = np.repeat(w[:, None].astype(np.complex128), P, axis=1)   # (N, P) at the far past
-
-    # time scales: horizon from the slowest RNA mode, first step from the fastest rate anywhere
-    lam = np.abs(np.linalg.eigvals(C).real)
-    lam_slow = float(lam[lam > 0].min()) if np.any(lam > 0) else 1.0
-    lam_fast = max(float(lam.max()), float(np.abs(np.diag(H)).max()), float(2.0 * np.abs(A).max()), 1e-300)
-    T = (np.log(1.0 / tol) + np.log1p(2.0 * float(np.abs(A).max()) / lam_slow)) / lam_slow
-    if fixed_schedule is not None:
-        T = float(np.sum(np.asarray(fixed_schedule, dtype=float)))   # replay over the schedule's own horizon
-
-    h_first = _C0 / lam_fast
-    h_min = 1e-12 / lam_fast
-    if backend is None:
-        backend = "rust" if _rust_available() else "python"
-    if backend == "rust":
-        if not _rust_available():
-            raise RuntimeError("monod_core with eval_chromatin_pgf is not installed")
-        site_weights, independent = locus_structure(H, A)
-        re, im, _, steps = _mc.eval_chromatin_pgf(
-            N, m, H.ravel().tolist(), A.ravel().tolist(), C.ravel().tolist(),
-            [int(l) for l in limits], w.tolist(), float(T), float(h_first), float(h_min), float(tol),
-            None if fixed_schedule is None else [float(x) for x in np.asarray(fixed_schedule, dtype=float)],
-            None if site_weights is None else np.asarray(site_weights, dtype=float).ravel().tolist(),
-            independent)
-        G = (np.asarray(re) + 1j * np.asarray(im)).reshape(P, N).T
-        steps = list(steps)
-    elif backend == "python":
-        G, steps = _integrate_numpy(HT, A, C, u, G, T, h_first, h_min, tol, fixed_schedule)
-    else:
-        raise ValueError(f"backend must be 'rust', 'python' or None, got {backend!r}")
-
-    pss = np.empty((N,) + tuple(int(l) for l in limits))
-    for c in range(N):
-        pss[c] = irfftn(G[c].reshape(mx), s=[int(l) for l in limits])
-    pss = np.abs(pss)
-    pss /= pss.sum()
+    u, mx = _mesh(limits)
+    G, sched = eval_joint_pgf(H, A, C, u, tol=tol, fixed_schedule=fixed_schedule, backend=backend)
+    pss = invert_joint_pgf(G, mx, limits)
     if return_schedule:
-        return pss, StepSchedule(steps)
+        return pss, sched
     return pss
 
 

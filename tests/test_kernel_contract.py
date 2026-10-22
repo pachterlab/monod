@@ -1,7 +1,7 @@
 """The contract every error-controlled kernel owes its consumers.
 
 The kernels with adaptive step schedules (custom reaction networks,
-ProteinBursty, chromatin) are each validated against references at single
+ProteinBursty, Chromatin) are each validated against references at single
 points elsewhere.  The defects that reached the optimiser were never in a
 single value; they were in relations between evaluations: a replayed
 schedule at perturbed parameters, a gradient taken across schedule changes,
@@ -29,7 +29,6 @@ import numpy as np
 import pytest
 from scipy.optimize import minimize
 
-from monod import chromatin as ch
 from monod import chromatin_fit as cf
 from monod.cme_toolbox import CMEModel
 
@@ -56,15 +55,17 @@ class CMEKernel:
 
     nested = None            # (nested adapter, embed) when a nested pair exists
 
-    def __init__(self, name, model, theta, limits, step=0.2, nested=None):
+    def __init__(self, name, model, theta, limits, step=0.2, nested=None, bounds=None):
         self.name, self.m, self.theta, self.limits, self.step = name, model, np.asarray(theta, float), limits, step
         self.nested = nested
+        self._bounds = bounds
 
     def pss(self, theta):
         return self.m.eval_model_pss(np.asarray(theta, float), self.limits)
 
     def _last(self):
-        attr = "_last_custom_schedule" if self.m.bio_model == "Custom" else "_last_protein_schedule"
+        attr = {"Custom": "_last_custom_schedule", "ProteinBursty": "_last_protein_schedule",
+                "Chromatin": "_last_chromatin_schedule"}[self.m.bio_model]
         last = getattr(self.m, attr, None)
         return None if last is None else np.asarray(last, float)
 
@@ -97,80 +98,19 @@ class CMEKernel:
         return g
 
     def bounds(self):
+        if self._bounds is not None:
+            return list(self._bounds)
         return [(t - 1.5, t + 1.5) for t in self.theta]
 
     def fit(self, data, theta0, bounds=None):
         res = minimize(lambda x: self.pinned_gradient(x, data), np.asarray(theta0, float), jac=True,
-                       method="L-BFGS-B", bounds=bounds or self.bounds(), options=dict(maxiter=150, ftol=1e-8, gtol=1e-2))
+                       method="L-BFGS-B", bounds=bounds or self.bounds(), options=dict(maxiter=60, ftol=1e-5, gtol=1e-2))
         return res.x, float(res.fun)
 
     def start(self):
-        return self.theta + self.step * np.array([1, -1, 1, -1, 1][:self.theta.size])
-
-
-class ChromatinKernel:
-    """The chromatin kernel through the per-locus likelihood."""
-
-    def __init__(self, rule, theta, nested=None):
-        self.name, self.rule, self.theta, self.nested = f"chromatin-{rule}", rule, np.asarray(theta, float), nested
-        self.lik = None
-        self.tol = 1e-5
-
-    def _system(self, theta):
-        k_on, eps, rates, beta, gamma = cf.split_theta(theta, self.rule, 2)
-        return ch.nascent_mature_system(k_on, 1.0, eps, self.rule, beta, gamma, rule_params=rates)
-
-    def _limits(self):
-        return [40, 60] if self.lik is None else self.lik.limits
-
-    def pss(self, theta, tol=None):
-        H, A, C = self._system(theta)
-        return ch.eval_joint_pss(H, A, C, self._limits(), tol=tol or self.tol)
-
-    def pss_pinned(self, theta_base, theta_eval):
-        H, A, C = self._system(theta_base)
-        _, sched = ch.eval_joint_pss(H, A, C, self._limits(), tol=self.tol, return_schedule=True)
-        H, A, C = self._system(theta_eval)
-        out, used = ch.eval_joint_pss(H, A, C, self._limits(), fixed_schedule=sched, return_schedule=True)
-        return out, np.asarray(used, float)
-
-    def schedule(self, theta):
-        H, A, C = self._system(theta)
-        return np.asarray(ch.eval_joint_pss(H, A, C, self._limits(), tol=self.tol, return_schedule=True)[1], float)
-
-    def make_data(self, theta, rng):
-        cells = _sample_counts(self.pss(theta), N_CELLS, rng)
-        lim = [int(cells[:, 1].max() * 1.3) + 3, int(cells[:, 2].max() * 1.3) + 3]
-        hist = np.zeros((4, lim[0], lim[1]))
-        np.add.at(hist, (cells[:, 0], cells[:, 1], cells[:, 2]), 1.0)
-        self.lik = cf.LocusLikelihood(hist, self.rule)
-        return hist
-
-    def objective(self, theta, data, tol=None):
-        return self.lik.nll(np.asarray(theta, float), tol or self.tol) / self.lik.n_cells
-
-    def pinned_gradient(self, theta, data):
-        f, g = self.lik.nll_grad(np.asarray(theta, float), self.tol)
-        return f / self.lik.n_cells, g / self.lik.n_cells
-
-    def free_gradient(self, theta, data, h=1e-3):
-        theta = np.asarray(theta, float)
-        g = np.zeros(theta.size)
-        for i in range(theta.size):
-            e = np.zeros(theta.size); e[i] = h
-            g[i] = (self.objective(theta + e, data, 1e-8) - self.objective(theta - e, data, 1e-8)) / (2 * h)
-        return g
-
-    def bounds(self):
-        return cf.bounds(self.rule, 2)
-
-    def fit(self, data, theta0, bounds=None):
-        res = minimize(lambda x: self.pinned_gradient(x, data), np.asarray(theta0, float), jac=True,
-                       method="L-BFGS-B", bounds=bounds or self.bounds(), options=dict(maxiter=150, ftol=1e-8, gtol=1e-2))
-        return res.x, float(res.fun)
-
-    def start(self):
-        return self.theta + 0.15 * np.array([1, -1, 1, -1, 1, -1, 1, -1, 1][:self.theta.size])
+        signs = np.resize(np.array([1.0, -1.0]), self.theta.size)
+        lo = np.array([b[0] for b in self.bounds()]); hi = np.array([b[1] for b in self.bounds()])
+        return np.clip(self.theta + self.step * signs, lo, hi)
 
 
 def _custom(net):
@@ -186,9 +126,15 @@ def _kernels():
     udeg.bounds = lambda: udeg_bounds()[:3] + [(np.log10(0.15) - 1.5, np.log10(0.15) + 1.5)]
     protein = CMEKernel("protein", CMEModel("ProteinBursty", "None", fit_unspliced=True, protein_limit=float("inf")),
                         [0.5, -0.3, -0.6, 0.2, -0.7], [14, 12, 20], step=0.15)
-    switch = ChromatinKernel("switch", cf.join_theta([0.5, 0.8], 0.6, [5.0], 0.8, 0.3))
-    table = ChromatinKernel("table", cf.join_theta([0.5, 0.8], 0.6, [0.01, 5.0, 5.0, 5.0], 0.8, 0.3),
-                            nested=(switch, lambda th: cf.embed_in_table(th, "switch", 2)))
+    # chromatin through CMEModel: modalities (unspliced, spliced, configuration), no dropout grid
+    def chrom(rule):
+        return CMEModel("Chromatin", "None", n_sites=2, rule=rule, dropout_bounds=(0.0, 0.0, 1))
+    m_switch, m_table = chrom("switch"), chrom("table")
+    switch = CMEKernel("chromatin-switch", m_switch, cf.join_theta([0.5, 0.8], 0.6, [5.0], 0.8, 0.3), [30, 40, 4], step=0.15,
+                       bounds=list(zip(m_switch.bio_bounds["phys_lb"], m_switch.bio_bounds["phys_ub"])))
+    table = CMEKernel("chromatin-table", m_table, cf.join_theta([0.5, 0.8], 0.6, [cf.RATE_FLOOR, 5.0, 5.0, 5.0], 0.8, 0.3), [30, 40, 4],
+                      step=0.15, nested=(switch, lambda th: cf.embed_in_table(th, "switch", 2)),
+                      bounds=list(zip(m_table.bio_bounds["phys_lb"], m_table.bio_bounds["phys_ub"])))
     return [udeg, protein, switch, table]
 
 
@@ -253,8 +199,6 @@ class TestOuterPin:
         """Hessians by differences of gradients (identifiability checks, standard
         errors) wrap the stencil in one ``pinned_schedule`` block; every gradient
         inside it must be taken on that block's schedule, whichever backend runs."""
-        if not isinstance(kernel, CMEKernel):
-            pytest.skip("schedules are passed explicitly for this kernel")
         m, lim, theta = kernel.m, kernel.limits, kernel.theta
         e = np.zeros(theta.size); e[0] = 1e-2
         h = 1e-4
@@ -287,16 +231,9 @@ class TestOptimiserContracts:
         nested_data = nested.make_data(nested.theta, rng)
         theta_n, f_n = nested.fit(nested_data, nested.start())
         f_n = nested.objective(theta_n, nested_data)
-        # the nesting model sees the same cells
-        if isinstance(kernel, ChromatinKernel):
-            kernel.lik = cf.LocusLikelihood(nested_data, kernel.rule)
-            data_for_kernel = nested_data
-        else:
-            data_for_kernel = nested_data
+        data_for_kernel = nested_data                                   # the nesting model sees the same cells
         f_embedded = kernel.objective(embed(theta_n), data_for_kernel)
         assert f_embedded <= f_n + 1e-3 * max(1.0, abs(f_n)), (f_embedded, f_n)
         theta_k, f_k = kernel.fit(data_for_kernel, embed(theta_n))
         f_k = kernel.objective(theta_k, data_for_kernel)
         assert f_k <= f_embedded + 1e-6 * max(1.0, abs(f_embedded)), (f_k, f_embedded)
-        if isinstance(kernel, ChromatinKernel):
-            kernel.lik = cf.LocusLikelihood(data, kernel.rule)
