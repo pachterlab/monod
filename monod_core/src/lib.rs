@@ -1524,6 +1524,39 @@ fn eval_model_pss_protein_bursty(
     Ok(normalize_abs(pss_raw))
 }
 
+/// `eval_model_pss_protein_bursty` that also returns the integration schedule
+/// used and replays `fixed_schedule` when given, so `CMEModel.pinned_schedule`
+/// pins the Rust path exactly as it pins the Python one.
+#[pyfunction]
+#[pyo3(signature = (p_log, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, fixed_schedule=None))]
+#[allow(clippy::too_many_arguments)]
+fn eval_model_pss_protein_bursty_sched(
+    py: Python<'_>,
+    p_log: Vec<f64>,
+    limits: Vec<usize>,
+    fit_unspliced: bool,
+    protein_limit: f64,
+    min_fudge: f64,
+    max_fudge: f64,
+    fixed_schedule: Option<Vec<f64>>,
+) -> PyResult<(Vec<f64>, Vec<f64>)> {
+    validate_limits(&limits, 3, "eval_model_pss_protein_bursty_sched")?;
+    if p_log.len() != 5 {
+        return verr(format!("eval_model_pss_protein_bursty_sched: expected 5 parameters, got {}", p_log.len()));
+    }
+    if protein_limit.is_nan() || protein_limit <= 0.0 {
+        return verr(format!("eval_model_pss_protein_bursty_sched: protein_limit must be > 0, got {protein_limit}"));
+    }
+    if !(min_fudge > 0.0) || !(max_fudge > 0.0) {
+        return verr(format!("eval_model_pss_protein_bursty_sched: min_fudge/max_fudge must be > 0"));
+    }
+    Ok(py.allow_threads(|| {
+        eval_model_pss_protein_bursty_seq_sched(
+            &p_log, &limits, fit_unspliced, protein_limit, min_fudge, max_fudge, fixed_schedule.as_deref(),
+        )
+    }))
+}
+
 // ============================================================================
 // protein_bursty_pgf — return gf array to Python for scipy irfftn
 // ============================================================================
@@ -4762,6 +4795,511 @@ fn eval_custom_network_pgf(
 }
 
 // ============================================================================
+// Chromatin (Markov-modulated transcription) kernel
+// ============================================================================
+//
+// Mirrors `monod.chromatin.eval_joint_pss`.  A locus of binary sites is a
+// Markov chain with generator H over N configurations; in configuration c it
+// transcribes RNA species j at rate A[c, j], and the RNA follows the linear
+// scheme with characteristic generator C.  The vector generating function
+// G_c(u) obeys, along the characteristics u(tau) = exp(C tau) u0 (tau = time
+// to go),
+//
+//     dG/dsigma = H^T G + diag(A u(tau)) G,      sigma = T - tau,
+//
+// integrated forward from the horizon T, starting from the chain's stationary
+// distribution.  Each step is a Strang splitting of two exact sub-flows: the
+// diagonal transcription term, whose integral over the step is analytic
+// (exp(C tau_a) · delta phi_1(C delta)), and exp(H^T h), shared by the whole
+// grid.  The step is chosen by comparing a full step with two half steps
+// (maximum error over the grid, so the grid shares one schedule) and the
+// difference feeds a Richardson extrapolation.  The full step's exp(H^T h)
+// is the square of the half step's, and when the step doubles the previous
+// full-step exponential is the new half-step one, so a smooth stretch costs
+// one matrix product per step and no matrix exponential.
+//
+// Structure in the inputs is used when present (the Python side detects it):
+//   - one transcribed species: the exponent of every configuration is its
+//     rate times one shared number, so exponentials are taken once per
+//     distinct nonzero rate (one per grid point for a switch);
+//   - rates that factorise over sites, A = S W with S the 0/1 site matrix
+//     (the additive rule, or one transcript per site): n exponentials and
+//     one complex product per configuration instead of 2^n exponentials;
+//   - independent sites (H a Kronecker sum): exp(H^T h) is a product of 2 x 2
+//     factors applied bit by bit, 2 n N operations per point instead of N^2.
+//
+// The grid is stored in blocks of CHROMATIN_BLOCK points, each block
+// state-major with separate real and imaginary planes (index c * B + i), so
+// the dense apply and the diagonal exponentials run over contiguous points;
+// blocks are independent given the step operators and run in parallel.
+
+const CHROMATIN_MAX_STEPS: usize = 20_000;
+const CHROMATIN_BLOCK: usize = 64;          // grid points per block
+const CHROMATIN_PAR_MIN: usize = 4096;      // n_states * n_grid above which blocks run in parallel
+
+/// How the transcription rates depend on the configuration.
+enum ChromatinDiag {
+    /// exp(K u) with K = A M: one exponential per configuration
+    General,
+    /// one transcribed species `col`; `group[c]` indexes the distinct rate of configuration c
+    Shared { col: usize, group: Vec<usize>, distinct: Vec<f64> },
+    /// A = S W, W (n_sites × m)
+    Factored { n_sites: usize, w: Vec<f64> },
+}
+
+/// H^T, dense or as independent 2 × 2 site generators (transposed).
+enum ChromatinChain { Dense(SmallMat), Kron(Vec<SmallMat>) }
+
+/// exp(H^T h) in the matching form.
+#[derive(Clone)]
+enum ChainExp { Dense(SmallMat), Kron(Vec<SmallMat>) }
+
+impl ChainExp {
+    fn square(&self) -> ChainExp {
+        match self {
+            ChainExp::Dense(e) => ChainExp::Dense(e.mul(e)),
+            ChainExp::Kron(es) => ChainExp::Kron(es.iter().map(|e| e.mul(e)).collect()),
+        }
+    }
+}
+
+impl ChromatinChain {
+    fn expm(&self, h: f64) -> ChainExp {
+        let scaled = |m: &SmallMat| {
+            let mut x = m.clone();
+            for v in x.a.iter_mut() { *v *= h; }
+            x.expm()
+        };
+        match self {
+            ChromatinChain::Dense(ht) => ChainExp::Dense(scaled(ht)),
+            ChromatinChain::Kron(hts) => ChainExp::Kron(hts.iter().map(scaled).collect()),
+        }
+    }
+}
+
+struct ChromatinSys<'a> {
+    n:     usize,                 // configurations
+    m:     usize,                 // RNA species
+    chain: ChromatinChain,
+    a:     &'a [f64],             // (n, m) row-major transcription rates
+    c:     SmallMat,              // (m, m) characteristic generator
+    diag:  ChromatinDiag,
+    /// u[j][b * B + i]: PGF argument of species j at point i of block b (zero-padded)
+    ur: Vec<Vec<f64>>,
+    ui: Vec<Vec<f64>>,
+}
+
+/// The diagonal sub-flow's operator for one half of a step, in the form the
+/// mode needs: K = A M (n × m), the row M[col, :] (m), or W M (n_sites × m).
+enum DiagOps { General(Vec<f64>), Shared(Vec<f64>), Factored(Vec<f64>) }
+
+/// Step operators for a Strang step from time-to-go `tau` to `tau - h`:
+/// d1 over [tau - h/2, tau], E = exp(H^T h), d2 over [tau - h, tau - h/2].
+struct ChromatinOps { d1: DiagOps, e: ChainExp, d2: DiagOps }
+
+/// ∫_{tau_a}^{tau_a+delta} exp(C s) ds = exp(C tau_a) · delta phi_1(C delta),
+/// phi_1 read off exp([[C delta, I], [0, 0]]).
+fn chromatin_char_integral(c: &SmallMat, tau_a: f64, delta: f64) -> SmallMat {
+    let m = c.n;
+    let mut aug = SmallMat::zeros(2 * m);
+    for i in 0..m {
+        for j in 0..m { aug.set(i, j, c.get(i, j) * delta); }
+        aug.set(i, m + i, 1.0);
+    }
+    let x = aug.expm();
+    let mut phi = SmallMat::zeros(m);
+    for i in 0..m {
+        for j in 0..m { phi.set(i, j, delta * x.get(i, m + j)); }
+    }
+    let mut ct = c.clone();
+    for v in ct.a.iter_mut() { *v *= tau_a; }
+    ct.expm().mul(&phi)
+}
+
+/// X (rows × m) · M (m × m) as a flat (rows × m) array.
+fn chromatin_mat_mul(x: &[f64], rows: usize, m: usize, mm: &SmallMat) -> Vec<f64> {
+    let mut k = vec![0.0; rows * m];
+    for r in 0..rows {
+        for j in 0..m {
+            let mut s = 0.0;
+            for l in 0..m { s += x[r * m + l] * mm.get(l, j); }
+            k[r * m + j] = s;
+        }
+    }
+    k
+}
+
+fn chromatin_diag_ops(sys: &ChromatinSys, mm: &SmallMat) -> DiagOps {
+    let m = sys.m;
+    match &sys.diag {
+        ChromatinDiag::General => DiagOps::General(chromatin_mat_mul(sys.a, sys.n, m, mm)),
+        ChromatinDiag::Shared { col, .. } => DiagOps::Shared((0..m).map(|l| mm.get(*col, l)).collect()),
+        ChromatinDiag::Factored { n_sites, w } => DiagOps::Factored(chromatin_mat_mul(w, *n_sites, m, mm)),
+    }
+}
+
+fn chromatin_ops(sys: &ChromatinSys, tau: f64, h: f64, e: ChainExp) -> ChromatinOps {
+    let hh = 0.5 * h;
+    let d1 = chromatin_diag_ops(sys, &chromatin_char_integral(&sys.c, tau - hh, hh));
+    let d2 = chromatin_diag_ops(sys, &chromatin_char_integral(&sys.c, tau - h, hh));
+    ChromatinOps { d1, e, d2 }
+}
+
+/// (exp(x))·(gr, gi) in place for x = xr + i xi.
+#[inline(always)]
+fn cmul_exp(xr: f64, xi: f64, gr: &mut f64, gi: &mut f64) {
+    let s = xr.exp();
+    let (sn, cs) = xi.sin_cos();
+    let (er, ei) = (s * cs, s * sn);
+    let (x, y) = (*gr, *gi);
+    *gr = x * er - y * ei;
+    *gi = x * ei + y * er;
+}
+
+/// (ar + i ai) · (br + i bi)
+#[inline(always)]
+fn cmul(ar: f64, ai: f64, br: f64, bi: f64) -> (f64, f64) { (ar * br - ai * bi, ar * bi + ai * br) }
+
+/// g *= exp(d · u) on one block; `sr`, `si`, `tr`, `ti` are scratch of n × B.
+#[inline]
+fn chromatin_diag(sys: &ChromatinSys, d: &DiagOps, b0: usize, gr: &mut [f64], gi: &mut [f64],
+                  sr: &mut [f64], si: &mut [f64], tr: &mut [f64], ti: &mut [f64]) {
+    let (n, m, bw) = (sys.n, sys.m, CHROMATIN_BLOCK);
+    // y[r] = Σ_l coef[r, l] u_l at every point of the block, written to (sr, si) row r
+    let dots = |coef: &[f64], rows: usize, sr: &mut [f64], si: &mut [f64]| {
+        for r in 0..rows {
+            for i in 0..bw {
+                let (mut yr, mut yi) = (0.0, 0.0);
+                for l in 0..m {
+                    let k = coef[r * m + l];
+                    yr += k * sys.ur[l][b0 + i];
+                    yi += k * sys.ui[l][b0 + i];
+                }
+                sr[r * bw + i] = yr;
+                si[r * bw + i] = yi;
+            }
+        }
+    };
+    match (d, &sys.diag) {
+        (DiagOps::General(k), _) => {
+            dots(k, n, sr, si);
+            for c in 0..n {
+                for i in 0..bw {
+                    let idx = c * bw + i;
+                    cmul_exp(sr[idx], si[idx], &mut gr[idx], &mut gi[idx]);
+                }
+            }
+        }
+        (DiagOps::Shared(row), ChromatinDiag::Shared { group, distinct, .. }) => {
+            dots(row, 1, sr, si);                                   // z at every point in row 0
+            // exp(a_d z) for every distinct nonzero rate, into rows of (tr, ti)
+            for (dd, &a) in distinct.iter().enumerate() {
+                if a == 0.0 { continue; }
+                for i in 0..bw {
+                    let (zr, zi) = (a * sr[i], a * si[i]);
+                    let s = zr.exp();
+                    let (sn, cs) = zi.sin_cos();
+                    tr[dd * bw + i] = s * cs;
+                    ti[dd * bw + i] = s * sn;
+                }
+            }
+            for c in 0..n {
+                let dd = group[c];
+                if distinct[dd] == 0.0 { continue; }
+                for i in 0..bw {
+                    let (x, y) = cmul(gr[c * bw + i], gi[c * bw + i], tr[dd * bw + i], ti[dd * bw + i]);
+                    gr[c * bw + i] = x;
+                    gi[c * bw + i] = y;
+                }
+            }
+        }
+        (DiagOps::Factored(wm), ChromatinDiag::Factored { n_sites, .. }) => {
+            let ns = *n_sites;
+            dots(wm, ns, sr, si);                                   // y_j at every point, rows 0..ns
+            for j in 0..ns {
+                for i in 0..bw {
+                    let idx = j * bw + i;
+                    let s = sr[idx].exp();
+                    let (sn, cs) = si[idx].sin_cos();
+                    sr[idx] = s * cs;                               // e_j = exp(y_j) in place
+                    si[idx] = s * sn;
+                }
+            }
+            // E_c = Π_{j in c} e_j by one product per configuration (parent = c without its lowest bit)
+            for i in 0..bw { tr[i] = 1.0; ti[i] = 0.0; }
+            for c in 1..n {
+                let j = c.trailing_zeros() as usize;
+                let parent = c & (c - 1);
+                for i in 0..bw {
+                    let (x, y) = cmul(tr[parent * bw + i], ti[parent * bw + i], sr[j * bw + i], si[j * bw + i]);
+                    tr[c * bw + i] = x;
+                    ti[c * bw + i] = y;
+                }
+                for i in 0..bw {
+                    let (x, y) = cmul(gr[c * bw + i], gi[c * bw + i], tr[c * bw + i], ti[c * bw + i]);
+                    gr[c * bw + i] = x;
+                    gi[c * bw + i] = y;
+                }
+            }
+        }
+        _ => unreachable!("diagonal operator does not match the system's mode"),
+    }
+}
+
+/// tmp = E · g on one block (g state-major planes).
+#[inline]
+fn chromatin_apply(n: usize, e: &ChainExp, gr: &[f64], gi: &[f64], tr: &mut [f64], ti: &mut [f64]) {
+    let bw = CHROMATIN_BLOCK;
+    match e {
+        ChainExp::Dense(e) => {
+            for v in tr.iter_mut() { *v = 0.0; }
+            for v in ti.iter_mut() { *v = 0.0; }
+            for r in 0..n {
+                let (trr, tir) = (&mut tr[r * bw..(r + 1) * bw], &mut ti[r * bw..(r + 1) * bw]);
+                for k in 0..n {
+                    let erk = e.get(r, k);
+                    if erk == 0.0 { continue; }
+                    let (grk, gik) = (&gr[k * bw..(k + 1) * bw], &gi[k * bw..(k + 1) * bw]);
+                    for i in 0..bw {
+                        trr[i] += erk * grk[i];
+                        tir[i] += erk * gik[i];
+                    }
+                }
+            }
+        }
+        ChainExp::Kron(es) => {
+            tr.copy_from_slice(gr);
+            ti.copy_from_slice(gi);
+            for (j, ej) in es.iter().enumerate() {
+                let bit = 1usize << j;
+                let (e00, e01, e10, e11) = (ej.get(0, 0), ej.get(0, 1), ej.get(1, 0), ej.get(1, 1));
+                for c in 0..n {
+                    if c & bit != 0 { continue; }
+                    let c1 = c | bit;
+                    for plane in [&mut *tr, &mut *ti] {
+                        let (lo, hi) = plane.split_at_mut(c1 * bw);
+                        let r0 = &mut lo[c * bw..(c + 1) * bw];
+                        let r1 = &mut hi[..bw];
+                        for i in 0..bw {
+                            let (x0, x1) = (r0[i], r1[i]);
+                            r0[i] = e00 * x0 + e01 * x1;
+                            r1[i] = e10 * x0 + e11 * x1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One Strang step on a block, in place (`sr`, `si`, `tr`, `ti` scratch).
+#[inline]
+fn chromatin_step_block(sys: &ChromatinSys, ops: &ChromatinOps, b0: usize,
+                        gr: &mut [f64], gi: &mut [f64],
+                        sr: &mut [f64], si: &mut [f64], tr: &mut [f64], ti: &mut [f64]) {
+    chromatin_diag(sys, &ops.d1, b0, gr, gi, sr, si, tr, ti);
+    chromatin_apply(sys.n, &ops.e, gr, gi, tr, ti);
+    gr.copy_from_slice(tr);
+    gi.copy_from_slice(ti);
+    chromatin_diag(sys, &ops.d2, b0, gr, gi, sr, si, tr, ti);
+}
+
+/// Trial step on block `b`: writes the Richardson-extrapolated result to
+/// `out` and returns the block's maximum difference between the full step
+/// and the two half steps.
+fn chromatin_trial_block(
+    sys: &ChromatinSys, full: &ChromatinOps, half1: &ChromatinOps, half2: &ChromatinOps,
+    b: usize, gr: &[f64], gi: &[f64], outr: &mut [f64], outi: &mut [f64],
+) -> f64 {
+    let len = gr.len();
+    let b0 = b * CHROMATIN_BLOCK;
+    let mut g1r = gr.to_vec(); let mut g1i = gi.to_vec();
+    let mut g2r = gr.to_vec(); let mut g2i = gi.to_vec();
+    let mut sr = vec![0.0; len]; let mut si = vec![0.0; len];
+    let mut tr = vec![0.0; len]; let mut ti = vec![0.0; len];
+    chromatin_step_block(sys, full, b0, &mut g1r, &mut g1i, &mut sr, &mut si, &mut tr, &mut ti);
+    chromatin_step_block(sys, half1, b0, &mut g2r, &mut g2i, &mut sr, &mut si, &mut tr, &mut ti);
+    chromatin_step_block(sys, half2, b0, &mut g2r, &mut g2i, &mut sr, &mut si, &mut tr, &mut ti);
+    let mut err = 0.0_f64;
+    for i in 0..len {
+        let (dr, di) = (g2r[i] - g1r[i], g2i[i] - g1i[i]);
+        err = err.max((dr * dr + di * di).sqrt());
+        outr[i] = g2r[i] + dr / 3.0;
+        outi[i] = g2i[i] + di / 3.0;
+    }
+    err
+}
+
+fn chromatin_pgf(
+    sys: &ChromatinSys, w: &[f64], n_blocks: usize, t_horizon: f64, h_first: f64, h_min: f64, tol: f64,
+    fixed: Option<&[f64]>,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let (n, bw) = (sys.n, CHROMATIN_BLOCK);
+    let blen = n * bw;
+    let mut gr: Vec<f64> = (0..n_blocks).flat_map(|_| (0..n).flat_map(|c| std::iter::repeat(w[c]).take(bw))).collect();
+    let mut gi = vec![0.0; n_blocks * blen];
+    let mut outr = vec![0.0; n_blocks * blen];
+    let mut outi = vec![0.0; n_blocks * blen];
+    let par = n * n_blocks * bw >= CHROMATIN_PAR_MIN;
+    let adaptive = fixed.is_none();
+    let mut steps: Vec<f64> = Vec::new();
+    let mut tau = t_horizon;
+    let mut h = h_first;
+    let mut last_e: Option<(f64, ChainExp)> = None;      // the last accepted step's (h, exp(H^T h))
+    loop {
+        if adaptive {
+            if tau <= 0.0 || steps.len() >= CHROMATIN_MAX_STEPS { break; }
+            h = h.min(tau);
+        } else {
+            let f = fixed.unwrap();
+            if steps.len() >= f.len() { break; }
+            h = f[steps.len()];
+        }
+        let hh = 0.5 * h;
+        let e_half = match &last_e {
+            Some((hl, el)) if *hl == hh => el.clone(),
+            _ => sys.chain.expm(hh),
+        };
+        let full = chromatin_ops(sys, tau, h, e_half.square());
+        let half1 = chromatin_ops(sys, tau, hh, e_half.clone());
+        let half2 = chromatin_ops(sys, tau - hh, hh, e_half);
+        let err = if par {
+            outr.par_chunks_mut(blen).zip(outi.par_chunks_mut(blen))
+                .zip(gr.par_chunks(blen).zip(gi.par_chunks(blen)))
+                .enumerate()
+                .map(|(b, ((or_, oi), (sr, si)))| chromatin_trial_block(sys, &full, &half1, &half2, b, sr, si, or_, oi))
+                .reduce(|| 0.0_f64, f64::max)
+        } else {
+            let mut e = 0.0_f64;
+            for b in 0..n_blocks {
+                let r = b * blen..(b + 1) * blen;
+                e = e.max(chromatin_trial_block(sys, &full, &half1, &half2, b, &gr[r.clone()], &gi[r.clone()],
+                                                &mut outr[r.clone()], &mut outi[r]));
+            }
+            e
+        };
+        let mut fac = 1.0;
+        if adaptive {
+            if err > tol && h > h_min {
+                h *= (0.9 * (tol / err).powf(1.0 / 3.0)).max(0.2);
+                continue;
+            }
+            fac = (0.9 * (tol / err.max(1e-300)).powf(1.0 / 3.0)).max(0.2).min(2.0);
+        }
+        std::mem::swap(&mut gr, &mut outr);
+        std::mem::swap(&mut gi, &mut outi);
+        last_e = Some((h, full.e));
+        tau -= h;
+        steps.push(h);
+        if adaptive { h *= fac; }
+    }
+    (gr, gi, steps)
+}
+
+/// Vector generating function of the chromatin model on the half-spectrum
+/// mesh of `limits`.  `h` (n_states²), `a` (n_states × n_species) and `c`
+/// (n_species²) are row-major; `w` is the chain's stationary distribution;
+/// `t_horizon`, `h_first` and `h_min` are the horizon, first step and
+/// smallest step (the Python side derives them from the rates).
+/// `site_weights` (n_sites × n_species, with n_states = 2^n_sites) states
+/// that A = S W for the 0/1 site matrix S; `independent` (k_on_j, k_off_j
+/// per site) that H is the Kronecker sum of independent sites.  Returns
+/// `(re, im, mesh_shape, steps)` with G point-major: index `p * n_states + c`.
+#[pyfunction]
+#[pyo3(signature = (n_states, n_species, h, a, c, limits, w, t_horizon, h_first, h_min, tol, fixed_schedule=None, site_weights=None, independent=None))]
+fn eval_chromatin_pgf(
+    py:             Python<'_>,
+    n_states:       usize,
+    n_species:      usize,
+    h:              Vec<f64>,
+    a:              Vec<f64>,
+    c:              Vec<f64>,
+    limits:         Vec<usize>,
+    w:              Vec<f64>,
+    t_horizon:      f64,
+    h_first:        f64,
+    h_min:          f64,
+    tol:            f64,
+    fixed_schedule: Option<Vec<f64>>,
+    site_weights:   Option<Vec<f64>>,
+    independent:    Option<Vec<f64>>,
+) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>, Vec<f64>)> {
+    let (n, m) = (n_states, n_species);
+    if h.len() != n * n || a.len() != n * m || c.len() != m * m || w.len() != n || limits.len() != m {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "eval_chromatin_pgf: inconsistent shapes of h, a, c, w or limits",
+        ));
+    }
+    let n_sites = n.trailing_zeros() as usize;
+    let pow2 = n.is_power_of_two();
+    if let Some(sw) = &site_weights {
+        if !pow2 || sw.len() != n_sites * m {
+            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: site_weights must be (log2 n_states) × n_species"));
+        }
+    }
+    if let Some(ind) = &independent {
+        if !pow2 || ind.len() != 2 * n_sites {
+            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: independent must hold (k_on, k_off) per site"));
+        }
+    }
+    let (re, im, mx, steps) = py.allow_threads(|| {
+        let (u, mx, n_grid) = build_mesh_nd(&limits);
+        let bw = CHROMATIN_BLOCK;
+        let n_blocks = (n_grid + bw - 1) / bw;
+        let ur: Vec<Vec<f64>> = u.iter().map(|uj| (0..n_blocks * bw).map(|p| if p < n_grid { uj[p].re } else { 0.0 }).collect()).collect();
+        let ui: Vec<Vec<f64>> = u.iter().map(|uj| (0..n_blocks * bw).map(|p| if p < n_grid { uj[p].im } else { 0.0 }).collect()).collect();
+        let chain = match &independent {
+            Some(ind) => ChromatinChain::Kron((0..n_sites).map(|j| {
+                let (kon, koff) = (ind[2 * j], ind[2 * j + 1]);
+                SmallMat { n: 2, a: vec![-kon, koff, kon, -koff] }      // transposed 2 × 2 generator
+            }).collect()),
+            None => {
+                let mut ht = SmallMat::zeros(n);
+                for i in 0..n {
+                    for j in 0..n { ht.set(i, j, h[j * n + i]); }
+                }
+                ChromatinChain::Dense(ht)
+            }
+        };
+        let diag = if let Some(sw) = site_weights {
+            ChromatinDiag::Factored { n_sites, w: sw }
+        } else {
+            let nonzero: Vec<usize> = (0..m).filter(|&j| (0..n).any(|cc| a[cc * m + j] != 0.0)).collect();
+            if nonzero.len() == 1 {
+                let col = nonzero[0];
+                let mut distinct: Vec<f64> = Vec::new();
+                let mut group = vec![0usize; n];
+                for cc in 0..n {
+                    let r = a[cc * m + col];
+                    group[cc] = match distinct.iter().position(|&x| x == r) {
+                        Some(k) => k,
+                        None => { distinct.push(r); distinct.len() - 1 }
+                    };
+                }
+                ChromatinDiag::Shared { col, group, distinct }
+            } else {
+                ChromatinDiag::General
+            }
+        };
+        let cm = SmallMat { n: m, a: c.clone() };
+        let sys = ChromatinSys { n, m, chain, a: &a, c: cm, diag, ur, ui };
+        let (gr, gi, steps) = chromatin_pgf(&sys, &w, n_blocks, t_horizon, h_first, h_min, tol, fixed_schedule.as_deref());
+        // back to point-major (p * n + c)
+        let mut re = vec![0.0; n_grid * n];
+        let mut im = vec![0.0; n_grid * n];
+        for p in 0..n_grid {
+            let (b, i) = (p / bw, p % bw);
+            for cc in 0..n {
+                re[p * n + cc] = gr[b * n * bw + cc * bw + i];
+                im[p * n + cc] = gi[b * n * bw + cc * bw + i];
+            }
+        }
+        (re, im, mx, steps)
+    });
+    Ok((re, im, mx, steps))
+}
+
+// ============================================================================
 // KLD evaluation helpers (sparse "unique" histogram)
 // ============================================================================
 
@@ -5263,7 +5801,7 @@ fn eval_logl_2d_sd(
 /// gradient is free of step-count discontinuities.  `coords` is (n_points, 3)
 /// histogram support, `f` the matching frequencies.
 #[pyfunction]
-#[pyo3(signature = (p_log, limits, coords, f, fit_unspliced, protein_limit, min_fudge, max_fudge, fd_eps=1e-6, eps=1e-15))]
+#[pyo3(signature = (p_log, limits, coords, f, fit_unspliced, protein_limit, min_fudge, max_fudge, fd_eps=1e-6, eps=1e-15, fixed_schedule=None))]
 #[allow(clippy::too_many_arguments)]
 fn eval_kld_grad_protein_bursty(
     py: Python<'_>,
@@ -5277,6 +5815,7 @@ fn eval_kld_grad_protein_bursty(
     max_fudge: f64,
     fd_eps: f64,
     eps: f64,
+    fixed_schedule: Option<Vec<f64>>,
 ) -> PyResult<(f64, Vec<f64>)> {
     use pyo3::exceptions::PyValueError;
     if p_log.len() != 5 {
@@ -5299,7 +5838,7 @@ fn eval_kld_grad_protein_bursty(
     Ok(py.allow_threads(|| {
         eval_kld_and_grad_seq_protein_bursty(
             &p_log, &limits, &strides, &coords, &f,
-            fit_unspliced, protein_limit, min_fudge, max_fudge, fd_eps, eps,
+            fit_unspliced, protein_limit, min_fudge, max_fudge, fd_eps, eps, fixed_schedule.as_deref(),
         )
     }))
 }
@@ -5703,12 +6242,14 @@ fn eval_kld_and_grad_seq_protein_bursty(
     max_fudge:     f64,
     fd_eps:        f64,
     eps:           f64,
+    fixed:         Option<&[f64]>,
 ) -> (f64, Vec<f64>) {
-    // Base point with the adaptive schedule; every perturbed point replays that
-    // exact step sequence so the difference quotient sees only the smooth
-    // dependence on the parameters, not jumps in the discretisation.
+    // Base point with the adaptive schedule (or an outer pin's); every perturbed
+    // point replays that exact step sequence so the difference quotient sees
+    // only the smooth dependence on the parameters, not jumps in the
+    // discretisation.
     let (pss0, sched) = eval_model_pss_protein_bursty_seq_sched(
-        x, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, None,
+        x, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, fixed,
     );
     let kld0 = compute_kld_sparse_nd(&pss0, strides, coords, f_data, eps);
     let grad = fd_gradient(x, fd_eps, kld0, |xx| {
@@ -5767,7 +6308,7 @@ fn optimize_genes_protein_bursty_sd(
                 let (coords, f) = (&coords_list[gi], &f_list[gi]);
                 move |x: &[f64]| eval_kld_and_grad_seq_protein_bursty(
                     x, lims, &strides, coords, f,
-                    fit_unspliced, protein_limit, min_fudge, max_fudge, fd_eps, eps,
+                    fit_unspliced, protein_limit, min_fudge, max_fudge, fd_eps, eps, None,
                 )
             })
         })
@@ -6407,6 +6948,7 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(eval_model_pss_2d_batch, m)?)?;
     m.add_function(wrap_pyfunction!(eval_model_pss_protein_bursty, m)?)?;
     m.add_function(wrap_pyfunction!(protein_bursty_pgf, m)?)?;
+    m.add_function(wrap_pyfunction!(eval_model_pss_protein_bursty_sched, m)?)?;
     m.add_function(wrap_pyfunction!(eval_kld_2d, m)?)?;
     m.add_function(wrap_pyfunction!(eval_logl_2d, m)?)?;
     m.add_function(wrap_pyfunction!(eval_logl_2d_sd, m)?)?;
@@ -6429,6 +6971,7 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(searchdata_from_h5ad, m)?)?;
     m.add_function(wrap_pyfunction!(annotate_inference_results, m)?)?;
     m.add_function(wrap_pyfunction!(eval_custom_network_pgf, m)?)?;
+    m.add_function(wrap_pyfunction!(eval_chromatin_pgf, m)?)?;
     m.add_function(wrap_pyfunction!(partition_searchdata_2d, m)?)?;
     #[cfg(feature = "kmeans")]
     m.add_function(wrap_pyfunction!(initialize_q_kmeans, m)?)?;

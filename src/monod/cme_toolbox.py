@@ -897,6 +897,7 @@ class CMEModel:
             x, f_data = data
             x_np = np.asarray(x, dtype=np.int64)
             if x_np.ndim == 2 and x_np.shape[1] == 3:
+                outer = getattr(self, "_fixed_protein_schedule", None)   # an enclosing pinned_schedule block
                 kld0, grad_list = _mc.eval_kld_grad_protein_bursty(
                     p.tolist(),
                     [int(v) for v in limits],
@@ -908,6 +909,7 @@ class CMEModel:
                     float(self.max_fudge),
                     float(eps),
                     float(EPS),
+                    None if outer is None else [float(x) for x in np.asarray(outer, dtype=float)],
                 )
                 return kld0, np.array(grad_list)
 
@@ -1419,10 +1421,13 @@ class CMEModel:
             )
             return np.array(pss_flat).reshape([int(l) for l in limits]).squeeze()
         if be.kind == "rust" and be.family == "protein":
-            pss_flat = _mc.eval_model_pss_protein_bursty(
+            fixed = getattr(self, "_fixed_protein_schedule", None)
+            pss_flat, steps = _mc.eval_model_pss_protein_bursty_sched(
                 p.tolist(), [int(x) for x in limits], bool(self.fit_unspliced),
                 float(self.protein_limit), float(self.min_fudge), float(self.max_fudge),
+                None if fixed is None else [float(x) for x in np.asarray(fixed, dtype=float)],
             )
+            self._last_protein_schedule = np.asarray(steps, dtype=float)
             return np.array(pss_flat).reshape([int(l) for l in limits]).squeeze()
         if be.kind == "rust" and be.family == "custom":
             net  = self.network

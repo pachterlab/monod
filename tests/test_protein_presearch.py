@@ -140,9 +140,9 @@ class TestNullSampRouting:
         limits = [int(v) for v in protein_sd.M[:, 0]]
         x = np.array([0.3, -0.2, 0.1, 0.4, -0.5])
         hits = []
-        real_pss = ct._mc.eval_model_pss_protein_bursty
+        real_pss = ct._mc.eval_model_pss_protein_bursty_sched
         real_grad = ct._mc.eval_kld_grad_protein_bursty
-        monkeypatch.setattr(ct._mc, "eval_model_pss_protein_bursty",
+        monkeypatch.setattr(ct._mc, "eval_model_pss_protein_bursty_sched",
                             lambda *a, **k: (hits.append("pss"), real_pss(*a, **k))[1])
         monkeypatch.setattr(ct._mc, "eval_kld_grad_protein_bursty",
                             lambda *a, **k: (hits.append("grad"), real_grad(*a, **k))[1])
