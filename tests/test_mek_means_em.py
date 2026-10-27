@@ -392,3 +392,28 @@ def test_aic_attribute_is_deprecated_alias():
     assert gpr.aic_per_cell == 1.5
     with pytest.warns(DeprecationWarning, match="argmin"):
         assert gpr.aic == 1.5
+
+
+# ---------------------------------------------------------------------------
+# perform_inference with meK-Means: the cluster-prefixed columns end to end
+# ---------------------------------------------------------------------------
+
+def test_perform_inference_mek_means_writes_cluster_columns(tmp_path, monkeypatch):
+    """The meK-Means branch of perform_inference shares the result-writing loop
+    with the plain run: parameters, errors and AIC per cluster prefix, cluster
+    labels in obs, and the result list in uns."""
+    from monod.inference import perform_inference, search_result_list_from_uns
+    example = os.path.join(os.path.dirname(__file__), "..", "example_h5ad", "example_adata.h5ad")
+    monkeypatch.chdir(tmp_path)
+    gp = {"max_iterations": 5, "init_pattern": "moments", "num_restarts": 1, "num_gene_cores": 1}
+    adata = perform_inference(example, CMEModel("Bursty", "None"), n_genes=3, viz=False, gradient_params=gp, seed=1,
+                              mek_means_params=(2, 2), exclude_sigma=False)
+    names = [p.replace(r"\log_{10} ", "") for p in CMEModel("Bursty", "None").param_str]
+    for j in range(2):
+        for name in names:
+            assert f"c{j}_{name}" in adata.var.columns and f"c{j}_error_{name}" in adata.var.columns
+        assert f"c{j}_error_unreliable" in adata.var.columns
+    assert "AIC" in adata.var.columns and np.all(np.isfinite(adata.var["AIC"]))
+    assert adata.obs["cluster"].notna().all() and set(adata.obs["cluster"].unique()) <= {0, 1}
+    srs = search_result_list_from_uns(adata.uns["search_result_list"])
+    assert len(srs) == 2 and all(sr.phys_optimum.shape == (adata.n_vars, 3) for sr in srs)   # the example file has one gene

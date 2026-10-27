@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
 from scipy.special import logsumexp, softmax
-from .extract_data import make_dir, log, _build_sampling_grid
+from .extract_data import make_dir, log
 from .cme_toolbox import CMEModel, _MODELS_2D
 from .inference import (
     SearchData,
@@ -177,52 +177,17 @@ class MEKMeansParameters(_BaseInferenceParameters):
         function and KLD per epoch. Pass ``em_tol=0`` to reproduce that
         behaviour exactly.
         """
-        # Set biophysical parameter values to defaults.
-        if phys_lb is None:
-            phys_lb = model.bio_bounds['phys_lb']
-        if phys_ub is None:
-            phys_ub = model.bio_bounds['phys_ub']
-
-        # Set technical sequencing parameter values to defaults.
-        if samp_lb is None:
-            samp_lb = model.seq_bounds['samp_lb']
-        if samp_ub is None:
-            samp_ub = model.seq_bounds['samp_ub']
-        if gridsize is None:
-            gridsize = model.seq_bounds['gridsize']
-        
-        # meK-Means defaults: one start per gene and the Rust optimizer when available.
-        self.gradient_params = {
-            **DEFAULT_GRADIENT_PARAMS, "num_restarts": 1, "use_rust_lbfgsb": _HAS_RUST,
-            **(gradient_params or {}),
-        }
-        self.use_lengths, self.use_lengths_explicit = _normalize_use_lengths(use_lengths, model)
-        if model.seq_model == "None":
-            samp_lb, samp_ub, gridsize = [0, 0], [0, 0], [1, 1]
-        _validate_bounds(model, phys_lb, phys_ub, samp_lb, samp_ub, gridsize)
-        self.phys_lb = np.array(phys_lb)
-        self.phys_ub = np.array(phys_ub)
-        self.grad_bnd = scipy.optimize.Bounds(phys_lb, phys_ub)
-
-        self.poisson_average_log_length = poisson_average_log_length
-
-        if model.seq_model == "None":
-            log.info(
-                "Sequencing model set to None. All sampling parameters set to null."
-            )
-            samp_lb = [0, 0]
-            samp_ub = [0, 0]
-            gridsize = [1, 1]
-
-        self.samp_lb = np.array(samp_lb)
-        self.samp_ub = np.array(samp_ub)
-        self.gridsize = gridsize
-
-        self.grid_values_sampl, self.sampl_vals, self.n_grid_points = _build_sampling_grid(
-            self.samp_lb, self.samp_ub, self.gridsize
+        # Everything shared with a plain inference run (bounds, length handling,
+        # the sampling grid, the run directory) is the base constructor's job;
+        # meK-Means only changes two fitting defaults (one start per gene and
+        # the Rust optimizer when available) and adds the clustering settings.
+        # Saving waits until those are set, since parameters.h5 holds them too.
+        super().__init__(
+            dataset_string, model, use_lengths=use_lengths,
+            gradient_params={"num_restarts": 1, "use_rust_lbfgsb": _HAS_RUST, **(gradient_params or {})},
+            run_meta=run_meta, phys_lb=phys_lb, phys_ub=phys_ub, samp_lb=samp_lb, samp_ub=samp_ub,
+            gridsize=gridsize, poisson_average_log_length=poisson_average_log_length, save=False,
         )
-        self.model = model
-
         self.k = k
         self.epochs = epochs
         self.em_tol = float(em_tol)
@@ -233,26 +198,9 @@ class MEKMeansParameters(_BaseInferenceParameters):
                 f"init_modality must be 'sum' or one of {list(model.model_modalities)}; got {init_modality!r}"
             )
         self.init_modality = init_modality
-
-        self.n_phys_pars = model.get_num_params()
-        self.n_samp_pars = len(self.samp_ub)  # this will always be 2 for now
-
-        if len(run_meta) > 0:
-            run_meta = "_" + run_meta
-
-        self.dataset_string = dataset_string
-        
-        inference_string = f"{dataset_string}/{model.bio_model}_{model.seq_model}_"
-        for i in range(len(gridsize)):
-            inference_string += f"{gridsize[i]:.0f}x"
-        inference_string = inference_string[:-1]
-        inference_string += f"{run_meta}"
-        
-        inference_string = os.path.abspath(inference_string)
-        self.inference_string = inference_string
         if save:
-            make_dir(inference_string)
-            self.store_inference_parameters(inference_string + "/parameters.h5")
+            make_dir(self.inference_string)
+            self.store_inference_parameters(self.inference_string + "/parameters.h5")
 
     # ------------------------------------------------------------------
     # Structured (pickle-free) serialisation

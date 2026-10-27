@@ -187,124 +187,53 @@ def perform_inference(h5ad_filepath,
     
     log.info('Global inference parameters set.')
 
-    if not mek_means_params:
-        # Fit the model at all values of technical parameters, and save the location of the results.
-        # save=False here: with save=True the whole run (model, parameters, results)
-        # is written once, as monod_adata.h5ad, at the end.
-        search_result = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, checkpoint=checkpoint, save=False)
-        log.info('Grid points fit.')
-        search_result.find_sampling_optimum(discard_rejected=False)
-        parameters_per_gene = search_result.phys_optimum
-        log.info('Optimal parameters found.')
-        num_params = search_result.model.get_num_params()
-
-    else:
-        # Fit the model at all values of technical parameters, and save the location of the results.
-        search_result_list = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, checkpoint=checkpoint, save=False)
-        log.info('Grid points fit.')
-
-        cluster_params = {}
-        # Assume results are ordered according to desired cluster labels.
-        for i, sr in enumerate(search_result_list):
-            sr.find_sampling_optimum(discard_rejected=False)
-            parameters_per_gene = sr.phys_optimum
-            log.info('Optimal parameters found.')
-            cluster_params[i] = parameters_per_gene
-            
-        num_params = search_result_list[0].model.get_num_params()
+    # One or several SearchResults (one per meK-Means cluster); the var
+    # columns of a cluster result carry the prefix c<j>_.  save=False here:
+    # with save=True the whole run is written once, as monod_adata.h5ad.
+    fitted = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, checkpoint=checkpoint, save=False)
+    log.info('Grid points fit.')
+    results = list(fitted) if mek_means_params else [fitted]
+    prefixes = [f"c{j}_" for j in range(len(results))] if mek_means_params else [""]
+    for sr in results:
+        sr.find_sampling_optimum(discard_rejected=False)
+    log.info('Optimal parameters found.')
+    names = [p.replace(r"\log_{10} ", "") for p in results[0].model.param_str]
 
     # Load the AnnData object into memory if it is in backed mode
     if monod_adata.isbacked:
         monod_adata = monod_adata.to_memory()
 
-    # Save parameter results to adata.
-    for i in range(num_params):
-        
-        if not mek_means_params:
-            param_name = search_result.model.param_str[i]
-            without_log = param_name.replace(r"\log_{10} ", "")
+    for sr, pre in zip(results, prefixes):
+        for i, name in enumerate(names):
+            monod_adata.var[pre + name] = sr.phys_optimum[:, i]
+    log.info('Optimal parameters saved to anndata under .var attributes "%s<parameter>" (log-base 10).',
+             'ci_' if mek_means_params else '')
 
-            param_values = parameters_per_gene[:,i]
-            monod_adata.var[without_log] = param_values
-        else:
-            param_name = search_result_list[0].model.param_str[i]
-            without_log = param_name.replace(r"\log_{10} ", "")
-
-            for j in cluster_params.keys():
-                param_values = cluster_params[j][:,i]
-                # cluster_param_column = 
-                monod_adata.var["c{}_".format(j) + without_log] = param_values
-    
     if mek_means_params:
-        # log.info('Optimal parameters for each cluster saved to anndata. For cluster i, the .var attribute is of the form: ci_' + param_name)
-        log.info('Optimal parameters for each cluster saved to anndata. For cluster i, the .var attribute is of the form: \"ci_'+without_log+ '\". Note that the parameters are given in log-base 10.')
+        # AIC values from meK-Means are the same for all clusters.
+        monod_adata.var['AIC'] = get_AIC_mek_means(results, search_data, AIC_EPS=AIC_EPS, AIC_offs=AIC_offs)
     else:
-        log.info('Optimal parameters saved to anndata, under .var attributes in the form: \"'+without_log + '\". Note that the parameters are given in log-base 10.')
-
-    
-    # Save AIC values to adata.
-    if not mek_means_params:
-        AIC_per_gene(search_result, monod_adata)
-    else:
-        # AIC values from meK-Means are the same for all SRs.
-        AICs = get_AIC_mek_means(search_result_list, search_data, AIC_EPS=AIC_EPS, AIC_offs=AIC_offs)
-        monod_adata.var['AIC'] = AICs
-    
+        AIC_per_gene(results[0], monod_adata, search_data)
     log.info('AIC values calculated and saved under .var attribute: AIC.')
 
     if not exclude_sigma:
-        if not mek_means_params:
-            # Save uncertainties from Hessian.
-            search_result.compute_sigma(search_data, num_cores=num_cores)
-            all_sigmas = search_result.sigma
-            
-            for i in range(num_params):
-                param_name = search_result.model.param_str[i]
-                sigmas = all_sigmas[:,i]
-                without_log = param_name.replace(r"\log_{10} ", "")
-                # monod_adata.var[r'$\sigma$_' + param_name] = sigmas#[:,i]
-                monod_adata.var['error_' + without_log] = sigmas#[:,i]
-            monod_adata.var['error_unreliable'] = np.asarray(search_result.sigma_fail, dtype=bool)
+        for sr, pre in zip(results, prefixes):
+            # compute_sigma restricts the search data to the cluster's cells itself.
+            sr.compute_sigma(search_data, num_cores=num_cores)
+            for i, name in enumerate(names):
+                monod_adata.var[pre + 'error_' + name] = sr.sigma[:, i]
+            monod_adata.var[pre + 'error_unreliable'] = np.asarray(sr.sigma_fail, dtype=bool)
+        log.info('Uncertainties per gene saved under .var attributes "%serror_<parameter>" (log-base 10).',
+                 'ci_' if mek_means_params else '')
 
-        else:
-            # Save uncertainties from Hessian.
-            for j, sr in enumerate(search_result_list):
-                
-                # compute_sigma subsets the search data to this cluster's cells itself.
-                sr.compute_sigma(search_data, num_cores=num_cores)
-                all_sigmas = sr.sigma
-                
-                for i in range(num_params):
-                    param_name = sr.model.param_str[i]
-                    without_log = param_name.replace(r"\log_{10} ", "")
-
-                    sigmas = all_sigmas[:,i]
-                    monod_adata.var[r"c{}_error_".format(j) + without_log] = sigmas#[:,i]
-                monod_adata.var[f"c{j}_error_unreliable"] = np.asarray(sr.sigma_fail, dtype=bool)
-
-        if not mek_means_params:
-            # NB log.
-            log.info('Uncertainties per gene calculated, saved to anndata in .var attribute of the form: \"error_' + without_log + '\". Note that the errors are given for log-base 10 parameters.')
-        else:
-            # NB log.
-            log.info('Uncertainties per gene calculated for each cluster. E.g. for cluser, i, uncertainty saved to anndata in .var attribute of the form: \"ci_error_'+ without_log + '\". Note that the errors are given in log-base 10.')
-
-            
-    # If meK-Means, save clusters.
     if mek_means_params:
         monod_adata.obs['cluster'] = None
-        log.info('Saving clusters')
-        for sr in search_result_list:
-            cluster_label = sr.assigns
-            monod_adata.obs.loc[sr.filt, 'cluster'] = cluster_label
+        for sr in results:
+            monod_adata.obs.loc[sr.filt, 'cluster'] = sr.assigns
         log.info('Cluster labels added to anndata .obs')
-
-    # Also save entire objects to adata.
-
-    if not mek_means_params:
-        monod_adata.uns['search_result'] = search_result.to_dict()
+        monod_adata.uns['search_result_list'] = search_result_list_to_uns(results)
     else:
-        monod_adata.uns['search_result_list'] = search_result_list_to_uns(search_result_list)
+        monod_adata.uns['search_result'] = results[0].to_dict()
 
     # The SearchData is deliberately not stored: it is rebuilt in memory from
     # the AnnData (layers + uns['M']) via searchdata_from_adata(), which is fast
@@ -314,10 +243,7 @@ def perform_inference(h5ad_filepath,
     if save:
         # Everything (data, model, parameters, results, cluster labels) lives in
         # the AnnData, so one h5ad is the whole run on disk.
-        if mek_means_params:
-            inference_string = search_result_list[0].inference_string
-        else:
-            inference_string = search_result.inference_string
+        inference_string = results[0].inference_string
         make_dir(inference_string)
         adata_file_path = inference_string + '/monod_adata.h5ad'
         monod_adata.write_h5ad(adata_file_path)
@@ -469,23 +395,12 @@ class SearchData:
 
             
 
-def AIC_per_gene(search_result, monod_adata):
-    """
-    Computes the AIC value for each gene for a single model.
+def AIC_per_gene(search_result, monod_adata, search_data=None):
+    """Per-gene AIC, ``2 k - 2 logL``, stored in ``monod_adata.var['AIC']`` and returned.
 
-    Parameters
-    ----------
-    search_result : SearchResult
-        The search result object containing model fitting information.
-    adata : anndata.AnnData
-        The AnnData object containing the gene expression data.
-
-    Returns
-    -------
-    np.ndarray
-        The AIC values for each gene.
-    """
-    search_data = searchdata_from_adata(monod_adata)
+    ``search_data`` is rebuilt from the AnnData when not given."""
+    if search_data is None:
+        search_data = searchdata_from_adata(monod_adata)
     n_cells = monod_adata.n_obs
     # Calculate the log-likelihood for each gene
     logL = search_result.get_logL(search_data, n_cells)
@@ -1259,7 +1174,7 @@ class GradientInference:
             )
         return result
 
-    def optimize_gene(self, gene_index, model, search_data, x0=None):
+    def optimize_gene(self, gene_index, model, search_data, x0):
         """Fit the data for a single gene using KL divergence gradient descent.
 
         If init_pattern = moments, the first search's starting point is set to the
@@ -1275,9 +1190,8 @@ class GradientInference:
             CME model used for inference.
         search_data: monod.extract_data.SearchData
             SearchData object with the data to fit.
-        x0: array-like or None
-            Pre-built starting points (n_restarts × n_params). If None, starting
-            points are drawn fresh with np.random.rand.
+        x0: array-like
+            starting points, n_restarts x n_params (see :meth:`_starting_points`).
 
         Returns
         -------
@@ -1286,16 +1200,7 @@ class GradientInference:
         err: float
             Kullback-Leibler divergence of the model at x, relative to data.
         """
-        if x0 is None:
-            x0 = (
-                np.random.rand(self.gradient_params["num_restarts"], self.n_phys_pars)
-                * self._restart_range
-                + self._restart_lb
-            )
-            if self.gradient_params["init_pattern"] == "moments":
-                x0[0] = self.param_MoM[gene_index]
-        else:
-            x0 = np.asarray(x0)
+        x0 = np.asarray(x0)
         err = np.inf
         ERR_THRESH = 0.99
         if log.isEnabledFor(logging.DEBUG):
@@ -1507,6 +1412,21 @@ class GradientInference:
         _warn_optimizer_status(status_arr, name)
         return np.asarray(params_arr), np.asarray(klds_arr)
 
+    def _starting_points(self, n_genes):
+        """Starting points for every gene: ``num_restarts`` draws from the
+        restart box per gene, the first replaced by the moments estimate when
+        ``init_pattern == "moments"``.  Built once per grid point so the scipy
+        and Rust paths share identical restarts.  Returns nested lists
+        ``[gene][restart][parameter]``."""
+        n_restarts = self.gradient_params["num_restarts"]
+        x0_all = []
+        for gi in range(n_genes):
+            x0 = np.random.rand(n_restarts, self.n_phys_pars) * self._restart_range + self._restart_lb
+            if self.gradient_params["init_pattern"] == "moments":
+                x0[0] = self.param_MoM[gi]
+            x0_all.append(x0.tolist())
+        return x0_all
+
     def iterate_over_genes(self, model, search_data):
         """Run gradient descent for every gene at the current grid point.
 
@@ -1538,21 +1458,7 @@ class GradientInference:
         rust_family = self._rust_optimizer_family(model, search_data)
         _rust_opt_active = rust_family is not None
 
-        def _build_x0_all(n_genes, n_restarts):
-            x0_all = []
-            for gi in range(n_genes):
-                x0 = (
-                    np.random.rand(n_restarts, self.n_phys_pars)
-                    * self._restart_range
-                    + self._restart_lb
-                )
-                if self.gradient_params["init_pattern"] == "moments":
-                    x0[0] = self.param_MoM[gi]
-                x0_all.append(x0.tolist())
-            return x0_all
-
-        # Build starting points once so scipy and Rust paths share identical restarts.
-        x0_all_shared = _build_x0_all(search_data.n_genes, self.gradient_params["num_restarts"])
+        x0_all_shared = self._starting_points(search_data.n_genes)
         x0_all_shared = self._presearch_x0(model, search_data, x0_all_shared, n_gene_cores)
 
         if rust_family is not None:
@@ -1710,15 +1616,9 @@ class GradientInference:
         best_params = np.full((n_genes, n_params), np.nan)
         best_klds   = np.full(n_genes, np.inf)
 
-        rng = np.random.default_rng()
+        starts = np.asarray(self._starting_points(n_genes))          # (n_genes, num_restarts, n_params)
         for restart in range(restarts):
-            # Random initialization within restart bounds.
-            x = (
-                rng.random((n_genes, n_params)) * self._restart_range
-                + self._restart_lb
-            )
-            if self.gradient_params.get("init_pattern") == "moments" and hasattr(self, "param_MoM"):
-                x = np.clip(self.param_MoM.copy(), lb, ub)
+            x = np.clip(starts[:, min(restart, starts.shape[1] - 1), :], lb, ub)
 
             # Adam optimizer state (reset each restart).
             m_adam = np.zeros_like(x)
@@ -2461,14 +2361,10 @@ class SearchResults:
         """
         t1 = time.time()
 
-        _CSQ_RUST_MODELS = {
-            "Constitutive", "Bursty", "CIR",
-            "Extrinsic", "Delay", "DelayedSplicing",
-        }
         _sd_is_rust = _mc is not None and isinstance(search_data, _mc.SearchData)
         if (
             _sd_is_rust
-            and self.model.bio_model in _CSQ_RUST_MODELS
+            and self.model.bio_model in _MODELS_2D
             and self.model.amb_model == "None"
             and self.model.quad_method == "fixed_quad"
             and self.model.seq_model in ("None", "Poisson", "Bernoulli")
@@ -2492,175 +2388,145 @@ class SearchResults:
                 float(EPS),
                 self.model.seq_model,
             )
-            csq = np.asarray(csq)
-            pval = np.asarray(pval)
-            hellinger = np.asarray(hellinger)
-
-            if bonferroni:
-                threshold /= self.n_genes
-            self.rejected_genes = pval < threshold
-            if use_hellinger:
-                self.rejected_genes = self.rejected_genes & (hellinger > hellinger_thr)
-            if reject_at_bounds:
-                bound_range = self.sp.phys_ub - self.sp.phys_lb
-                lb_b = self.sp.phys_lb + bound_range * bound_thr
-                ub_b = self.sp.phys_ub - bound_range * bound_thr
-                self.rejected_genes = self.rejected_genes | (
-                    (self.phys_optimum < lb_b) | (self.phys_optimum > ub_b)
-                ).any(1)
-            self.pval = pval
-            self.csq = csq
-            self.hellinger = hellinger
-            self.rejection_index = self.samp_optimum_ind
-            t2 = time.time()
-            log.info(
-                "Chi-square computation complete (Rust). Rejected {:.0f} genes out of {:.0f}. Runtime: {:.1f} seconds.".format(
-                    np.sum(self.rejected_genes), self.n_genes, t2 - t1
-                )
-            )
-            return csq, pval, hellinger
-
-        csqarr = []
-        hellinger = []
-        for gene_index in range(self.n_genes):
-            # lm = search_data.M[:, gene_index]
-            lm = search_data.M[:, gene_index]
-            expect_freq = (
-                self.model.eval_model_pss(
-                    self.phys_optimum[gene_index],
-                    lm,
-                    self.regressor_optimum[gene_index],
-                )
-                * search_data.n_cells
-            )
-            # expected_freq[expected_freq < EPS] = EPS
-            # expected_freq /= expected_freq.sum()
-            # PROPOSAL = search_data.n_cells * expected_freq
-
-            counts = np.concatenate(
-                (search_data.n_cells * search_data.hist[gene_index][1], [0])
-            )
-            number_of_modalities = len(search_data.hist[gene_index][0][0])
-            if number_of_modalities == 2:
-                expect_freq = expect_freq[
-                    search_data.hist[gene_index][0][:, 0],
-                    search_data.hist[gene_index][0][:, 1],
-                ]
-            elif number_of_modalities == 3:
-                expect_freq = expect_freq[
-                    search_data.hist[gene_index][0][:, 0],
-                    search_data.hist[gene_index][0][:, 1],
-                    search_data.hist[gene_index][0][:, 2]
-                ]
-            expect_freq = np.concatenate(
-                (expect_freq, [search_data.n_cells - expect_freq.sum()])
-            )
-
-            hellinger_ = (
-                1
-                / np.sqrt(2)
-                * (
-                    (
-                        np.sqrt(expect_freq / search_data.n_cells)
-                        - np.sqrt(counts / search_data.n_cells)
+            backend = "Rust"
+        else:
+            backend = "Python"
+            csqarr = []
+            hellinger = []
+            for gene_index in range(self.n_genes):
+                # lm = search_data.M[:, gene_index]
+                lm = search_data.M[:, gene_index]
+                expect_freq = (
+                    self.model.eval_model_pss(
+                        self.phys_optimum[gene_index],
+                        lm,
+                        self.regressor_optimum[gene_index],
                     )
-                    ** 2
-                ).sum()
-            )
+                    * search_data.n_cells
+                )
+                # expected_freq[expected_freq < EPS] = EPS
+                # expected_freq /= expected_freq.sum()
+                # PROPOSAL = search_data.n_cells * expected_freq
 
-            bins = []
-            bin_ind = 0
-            run_bin_obs = 0
-            run_bin_exp = 0
-            bin_obs = []
-            bin_exp = []
-            # Same rule as the Rust path (group_bins): accumulate microstates until
-            # both observed and expected counts reach grouping_thr, then close a
-            # bin; the tail is merged into the last bin, or forms the only bin if
-            # none ever closed (tiny datasets).
-            for i in range(len(counts)):
-                bins.append(bin_ind)
-                run_bin_obs += counts[i]
-                run_bin_exp += expect_freq[i]
-                if min(run_bin_obs, run_bin_exp) >= grouping_thr:
-                    bin_ind += 1
-                    bin_obs.append(run_bin_obs)
-                    bin_exp.append(run_bin_exp)
-                    run_bin_obs = 0
-                    run_bin_exp = 0
-            bins = np.asarray(bins)
-            if not bin_obs:
-                observed = np.asarray([run_bin_obs], dtype=float)
-                proposed = np.asarray([run_bin_exp], dtype=float)
-            else:
-                observed = np.asarray(bin_obs, dtype=float)
-                proposed = np.asarray(bin_exp, dtype=float)
-                observed[-1] += run_bin_obs
-                proposed[-1] += run_bin_exp
-            bins[bins >= len(observed)] = len(observed) - 1
+                counts = np.concatenate(
+                    (search_data.n_cells * search_data.hist[gene_index][1], [0])
+                )
+                number_of_modalities = len(search_data.hist[gene_index][0][0])
+                if number_of_modalities == 2:
+                    expect_freq = expect_freq[
+                        search_data.hist[gene_index][0][:, 0],
+                        search_data.hist[gene_index][0][:, 1],
+                    ]
+                elif number_of_modalities == 3:
+                    expect_freq = expect_freq[
+                        search_data.hist[gene_index][0][:, 0],
+                        search_data.hist[gene_index][0][:, 1],
+                        search_data.hist[gene_index][0][:, 2]
+                    ]
+                expect_freq = np.concatenate(
+                    (expect_freq, [search_data.n_cells - expect_freq.sum()])
+                )
 
-            for b_ in range(len(bin_obs)):
-                assert np.isclose(observed[b_], counts[bins == b_].sum())
-                assert np.isclose(proposed[b_], expect_freq[bins == b_].sum())
-            assert np.isclose(observed.sum(), search_data.n_cells)
-            assert np.isclose(proposed.sum(), search_data.n_cells)
-            assert np.isclose(search_data.n_cells, counts.sum())
-            assert np.isclose(search_data.n_cells, expect_freq.sum())
+                hellinger_ = (
+                    1
+                    / np.sqrt(2)
+                    * (
+                        (
+                            np.sqrt(expect_freq / search_data.n_cells)
+                            - np.sqrt(counts / search_data.n_cells)
+                        )
+                        ** 2
+                    ).sum()
+                )
+
+                bins = []
+                bin_ind = 0
+                run_bin_obs = 0
+                run_bin_exp = 0
+                bin_obs = []
+                bin_exp = []
+                # Same rule as the Rust path (group_bins): accumulate microstates until
+                # both observed and expected counts reach grouping_thr, then close a
+                # bin; the tail is merged into the last bin, or forms the only bin if
+                # none ever closed (tiny datasets).
+                for i in range(len(counts)):
+                    bins.append(bin_ind)
+                    run_bin_obs += counts[i]
+                    run_bin_exp += expect_freq[i]
+                    if min(run_bin_obs, run_bin_exp) >= grouping_thr:
+                        bin_ind += 1
+                        bin_obs.append(run_bin_obs)
+                        bin_exp.append(run_bin_exp)
+                        run_bin_obs = 0
+                        run_bin_exp = 0
+                bins = np.asarray(bins)
+                if not bin_obs:
+                    observed = np.asarray([run_bin_obs], dtype=float)
+                    proposed = np.asarray([run_bin_exp], dtype=float)
+                else:
+                    observed = np.asarray(bin_obs, dtype=float)
+                    proposed = np.asarray(bin_exp, dtype=float)
+                    observed[-1] += run_bin_obs
+                    proposed[-1] += run_bin_exp
+                bins[bins >= len(observed)] = len(observed) - 1
+
+                for b_ in range(len(bin_obs)):
+                    assert np.isclose(observed[b_], counts[bins == b_].sum())
+                    assert np.isclose(proposed[b_], expect_freq[bins == b_].sum())
+                assert np.isclose(observed.sum(), search_data.n_cells)
+                assert np.isclose(proposed.sum(), search_data.n_cells)
+                assert np.isclose(search_data.n_cells, counts.sum())
+                assert np.isclose(search_data.n_cells, expect_freq.sum())
 
 
-            # Ensure the sums of f_obs and f_exp match
-            f_obs_sum = observed.sum()
-            f_exp_sum = proposed.sum()
+                # Ensure the sums of f_obs and f_exp match
+                f_obs_sum = observed.sum()
+                f_exp_sum = proposed.sum()
             
-            # Check if normalization is needed
-            if not np.isclose(f_obs_sum, f_exp_sum, rtol=1e-9):
-                # Print a warning/info message
-                warnings.warn(
-                    f"The sums of observed and expected frequencies differ by {f_obs_sum - f_exp_sum:.2e}. "
-                    "Normalizing expected frequencies to match observed frequencies.",
-                    UserWarning,
-                )
-                # Normalize f_exp
-                proposed = proposed * (f_obs_sum / f_exp_sum)
+                # Check if normalization is needed
+                if not np.isclose(f_obs_sum, f_exp_sum, rtol=1e-9):
+                    # Print a warning/info message
+                    warnings.warn(
+                        f"The sums of observed and expected frequencies differ by {f_obs_sum - f_exp_sum:.2e}. "
+                        "Normalizing expected frequencies to match observed frequencies.",
+                        UserWarning,
+                    )
+                    # Normalize f_exp
+                    proposed = proposed * (f_obs_sum / f_exp_sum)
 
 
-            # chi-squared takes only the number of biological parameters?
-            csqarr += [
-                scipy.stats.mstats.chisquare(
-                    observed,
-                    proposed,  # chisq_data, chisq_prop,
-                    self.model.get_num_params(),
-                )
-            ]
+                # chi-squared takes only the number of biological parameters?
+                csqarr += [
+                    scipy.stats.mstats.chisquare(
+                        observed,
+                        proposed,  # chisq_data, chisq_prop,
+                        self.model.get_num_params(),
+                    )
+                ]
 
-            hellinger.append(hellinger_)
+                hellinger.append(hellinger_)
 
-        csq, pval = zip(*csqarr)
+            csq, pval = zip(*csqarr)
         csq = np.asarray(csq)
         pval = np.asarray(pval)
         hellinger = np.asarray(hellinger)
 
-        log.info('P-value threshold: ' + str(threshold) + ', Adjusted P-value threshold:' + str(threshold)+ ', Hellinger Threshold:' + str(hellinger_thr))
-        
+        # the decision, shared by both backends
         if bonferroni:
             threshold /= self.n_genes
+        log.info('P-value threshold: %s (Bonferroni: %s), Hellinger threshold: %s', threshold, bonferroni, hellinger_thr)
         self.rejected_genes = pval < threshold
         if use_hellinger:
-            rej_hellinger = hellinger > hellinger_thr
-            self.rejected_genes = (self.rejected_genes) & rej_hellinger
-
+            self.rejected_genes = self.rejected_genes & (hellinger > hellinger_thr)
         if reject_at_bounds:
             bound_range = self.sp.phys_ub - self.sp.phys_lb
             lb = self.sp.phys_lb + bound_range * bound_thr
             ub = self.sp.phys_ub - bound_range * bound_thr
-
-            rej_at_bounds = ((self.phys_optimum < lb) | (self.phys_optimum > ub)).any(1)
-            self.rejected_genes = (self.rejected_genes) | rej_at_bounds
-
+            self.rejected_genes = self.rejected_genes | ((self.phys_optimum < lb) | (self.phys_optimum > ub)).any(1)
         self.pval = pval
         self.csq = csq
         self.hellinger = hellinger
-        self.rejection_index = self.samp_optimum_ind  # mostly for debug.
+        self.rejection_index = self.samp_optimum_ind
 
         if viz:
             plt.hist(csq)
@@ -2670,9 +2536,8 @@ class SearchResults:
 
         t2 = time.time()
         log.info(
-            "Chi-square computation complete. Rejected {:.0f} genes out of {:.0f}. Runtime: {:.1f} seconds.".format(
-                np.sum(self.rejected_genes), self.n_genes, t2 - t1
-            )
+            "Chi-square computation complete (%s). Rejected %.0f genes out of %.0f. Runtime: %.1f seconds.",
+            backend, np.sum(self.rejected_genes), self.n_genes, t2 - t1,
         )
         return (csq, pval, hellinger)
 
