@@ -64,6 +64,19 @@ convention used throughout monod.  The ordering of ``all_params`` is:
 If ``normalize_production_rate=True`` the rate constant of the first
 production reaction is fixed to 1 and removed from ``all_params``.
 
+With ``burst_mean_rate=True`` the rate constant of a geometric-burst
+production reaction is the **mean production rate** (bursts of mean size B
+arrive at frequency k/B) instead of the burst frequency:
+
+  ``dφ/dt += (k/B) · B·u_A / (1 − B·u_A)``
+
+The two forms describe the same networks; the mean-rate form makes the
+single-molecule network ``0 -> U`` the small-B limit of ``0 -> B x U`` at the
+same ``k``, so a constitutive model is nested in its bursty counterpart at
+the burst-size floor and the two can be compared with
+:func:`monod.analysis.compare_nested_models`.  In the frequency form the
+small-B limit is no production at all.
+
 Examples
 --------
 >>> net = ReactionNetwork("0 -> B x U -> S -> 0")
@@ -288,6 +301,10 @@ class ReactionNetwork:
         (source = ``0``) is fixed to 1 and excluded from ``all_params``.
         This matches the convention of the built-in Bursty model where the
         burst rate is absorbed into the burst-size parameter.
+    burst_mean_rate : bool, optional
+        If ``True``, the rate constant of every geometric-burst production
+        reaction is the mean production rate rather than the burst frequency
+        (see the module docstring); the parameter list is unchanged.
 
     Attributes
     ----------
@@ -312,9 +329,11 @@ class ReactionNetwork:
         self,
         network_str: str,
         normalize_production_rate: bool = False,
+        burst_mean_rate: bool = False,
     ) -> None:
         self.network_str = network_str
         self.normalize_production_rate = normalize_production_rate
+        self.burst_mean_rate = bool(burst_mean_rate)
         self.reactions: List[_Reaction] = self._parse(network_str)
 
         # ── collect species and named params in order of first appearance ──
@@ -571,6 +590,11 @@ class ReactionNetwork:
         }
         if self._norm_rate is not None:
             m[self._norm_rate] = 1.0
+        if self.burst_mean_rate:
+            # mean-rate bursts: the kernels take the burst frequency k/B
+            for rxn in self.reactions:
+                if not rxn.reactants and rxn.burst_param is not None:
+                    m[rxn.rate_name] = m[rxn.rate_name] / m[rxn.burst_param]
         return m
 
     # ------------------------------------------------------------------
@@ -1001,7 +1025,7 @@ class ReactionNetwork:
                 " + ".join(f"{n}×{s}" if n > 1 else s for s, n in rxn.products.items())
                 or "∅"
             )
-            burst = f"  [geometric {rxn.burst_param}]" if rxn.burst_param else ""
+            burst = f"  [geometric {rxn.burst_param}{', mean rate' if self.burst_mean_rate else ''}]" if rxn.burst_param else ""
             if rxn.is_delayed:
                 arrow = f"⇒({rxn.rate_name},{rxn.tau_name})"
             else:

@@ -321,6 +321,35 @@ def _tls_set(obj, key, value):
         d[(id(obj), key)] = value
 
 
+def _tls_snapshot(obj):
+    """This thread's thread-local entries for ``obj`` (pins, tolerance override)."""
+    d = getattr(_SCHEDULE_TLS, "d", None)
+    return {} if d is None else {k: v for k, v in d.items() if k[0] == id(obj)}
+
+
+@contextlib.contextmanager
+def _tls_carry(obj, snap):
+    """Install another thread's snapshot of ``obj``'s thread-local state for
+    the block and restore this thread's own afterwards.  Pool workers use it
+    to evaluate on the calling thread's pinned schedule and tolerance."""
+    d = getattr(_SCHEDULE_TLS, "d", None)
+    if d is None:
+        d = _SCHEDULE_TLS.d = {}
+    keys = set(snap) | {k for k in d if k[0] == id(obj)}
+    saved = {k: d.get(k) for k in keys}
+    for k in keys:
+        d.pop(k, None)
+    d.update(snap)
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                d.pop(k, None)
+            else:
+                d[k] = v
+
+
 def _tls_property(key):
     return property(lambda self: _tls_get(self, key),
                     lambda self, value: _tls_set(self, key, value))
@@ -375,6 +404,14 @@ class CMEModel:
         (The protein model chooses its steps by error control and ignores them.)
     network: ReactionNetwork or None
         the user-defined network for bio_model="Custom".
+    normalize_production_rate, burst_mean_rate: bool
+        ``bio_model="Custom"`` only: fix the first production rate to 1, and
+        read the rate of a geometric-burst production as the mean production
+        rate instead of the burst frequency (see :mod:`monod.reaction_network`).
+        With ``burst_mean_rate=True`` the burst-size box reaches down to 1e-3,
+        where the network is its single-molecule counterpart, so a constitutive
+        network is nested in its bursty version and
+        :func:`monod.analysis.compare_nested_models` can test the two.
     """
 
     # per-thread schedule state of the adaptive integrators (see _SCHEDULE_TLS)
@@ -413,6 +450,7 @@ class CMEModel:
         max_fudge = 10,
         network = None,
         normalize_production_rate = False,
+        burst_mean_rate = False,
         n_sites = 2,
         rule = "additive",
         periodic = False,
@@ -495,7 +533,8 @@ class CMEModel:
                     "bio_model='Custom' requires a network string passed as network=..."
                 )
             self.network = ReactionNetwork(
-                network, normalize_production_rate=normalize_production_rate
+                network, normalize_production_rate=normalize_production_rate,
+                burst_mean_rate=burst_mean_rate,
             )
         else:
             self.network = None
@@ -597,7 +636,8 @@ class CMEModel:
                 # exponential integrator's cost does not depend on the spread.
                 net = self.network
                 n_rates = len(net.delay_params) + len(net.rate_names)
-                lb = [-1.0] * len(net.named_params) + [-1.8] * n_rates
+                # mean-rate bursts reach down to the single-molecule limit
+                lb = [-3.0 if net.burst_mean_rate else -1.0] * len(net.named_params) + [-1.8] * n_rates
                 ub = [4.2] * len(net.named_params) + [3.5] * n_rates
                 self.bio_bounds = {'phys_lb': lb, 'phys_ub': ub}
             else:
@@ -744,7 +784,7 @@ class CMEModel:
     _CTOR_KEYS = (
         "bio_model", "seq_model", "amb_model", "quad_method", "fixed_quad_T", "quad_order",
         "quad_vec_T", "protein_limit", "fit_unspliced", "min_fudge", "max_fudge",
-        "network", "normalize_production_rate",
+        "network", "normalize_production_rate", "burst_mean_rate",
         "n_sites", "rule", "periodic", "chromatin_tol", "chromatin_search_tol", "dropout_bounds", "bursty",
     )
 
@@ -771,6 +811,7 @@ class CMEModel:
         if getattr(self, "network", None) is not None:
             d["network"] = self.network.network_str
             d["normalize_production_rate"] = bool(self.network.normalize_production_rate)
+            d["burst_mean_rate"] = bool(self.network.burst_mean_rate)
         if self.bio_model == "Chromatin":
             d.update(n_sites=int(self.n_sites), rule=self.rule, periodic=bool(self.periodic),
                      chromatin_tol=float(self._chromatin_tol), chromatin_search_tol=float(self.chromatin_search_tol),
@@ -1043,21 +1084,15 @@ class CMEModel:
         # pool carries it into each worker explicitly.
         pin_attr = {"ProteinBursty": "_fixed_protein_schedule", "Custom": "_fixed_custom_schedule",
                     "Chromatin": "_fixed_chromatin_schedule"}.get(self.bio_model)
-        pin = None
-        if pin_attr is not None:
-            if outer_pin:
-                pin = getattr(self, pin_attr)
-            else:
-                pin = getattr(self, pin_attr.replace("_fixed_", "_last_"), None)
-                setattr(self, pin_attr, pin)
+        if pin_attr is not None and not outer_pin:
+            setattr(self, pin_attr, getattr(self, pin_attr.replace("_fixed_", "_last_"), None))
+        state = self.thread_state()
 
         def _perturbed(i):
-            if pin_attr is not None and getattr(self, pin_attr) is not pin:   # a pool worker thread
-                setattr(self, pin_attr, pin)
-                try:
-                    return _perturbed(i)
-                finally:
-                    setattr(self, pin_attr, None)
+            with self.carry_thread_state(state):                             # no-op on the calling thread
+                return _perturbed_here(i)
+
+        def _perturbed_here(i):
             p_eps = p.copy()
             p_eps[i] += eps
             k_plus = self.eval_model_kld(p_eps, limits, samp, data, EPS)
@@ -1372,6 +1407,18 @@ class CMEModel:
             out.append(s.strip())
         return out
 
+    def thread_state(self):
+        """The calling thread's pinned schedule and tolerance override for
+        this model, to be installed in worker threads with
+        :meth:`carry_thread_state`."""
+        return _tls_snapshot(self)
+
+    def carry_thread_state(self, state):
+        """Context manager: evaluate on another thread's :meth:`thread_state`
+        (pool workers of a stencil or Hessian replaying the caller's pinned
+        schedule at the caller's tolerance)."""
+        return _tls_carry(self, state)
+
     def _schedule_is_pinned(self):
         return (getattr(self, "_fixed_protein_schedule", None) is not None
                 or getattr(self, "_fixed_custom_schedule", None) is not None
@@ -1587,9 +1634,7 @@ class CMEModel:
         if be.kind == "rust" and be.family == "custom":
             net  = self.network
             topo = net.rust_topology()
-            params_d = net._param_map(p)          # name → linear float
-            if net._norm_rate is not None:
-                params_d[net._norm_rate] = 1.0
+            params_d = net._param_map(p)          # name → linear float (frequency form, normalised rate = 1)
             params_linear = [float(params_d[name]) for name in topo["param_names"]]
             fixed = getattr(self, "_fixed_custom_schedule", None)
             taus = [1.0 / float(params_d[name]) for name in net.delay_params]

@@ -10,7 +10,7 @@ Each test:
 2. Runs the new Rust _sd optimizer.
 3. Runs a reference that independently computes KLD at the found params
    using the corresponding PSS function that *already* has its own parity
-   tests (eval_model_pss_protein_bursty / eval_model_pss_2d / eval_custom_network_pgf).
+   tests (eval_model_pss_protein_bursty_sched / eval_model_pss_2d / eval_custom_network_pgf).
 4. Asserts that the KLD returned by the optimizer matches the independently
    computed value (self-consistency), and that optimization actually improved
    over the starting point.
@@ -130,8 +130,8 @@ class TestOptimizeGenesProteinBurstySd:
         return [x0 for _ in range(n_genes)]
 
     def _kld_at_params(self, x, limits, coords, freqs):
-        """Compute KLD at x using eval_model_pss_protein_bursty."""
-        pss_flat = _mc.eval_model_pss_protein_bursty(
+        """Compute KLD at x using eval_model_pss_protein_bursty_sched."""
+        pss_flat, _steps = _mc.eval_model_pss_protein_bursty_sched(
             x,
             [int(l) for l in limits],
             self.FIT_UNSPLICED,

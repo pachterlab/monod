@@ -746,3 +746,32 @@ class TestCustomInferenceDefaults:
         gi = GradientInference(ip, m, _SD(), 0)
         np.testing.assert_allclose(gi.param_MoM, np.tile([1.6, 0.85, 0.85], (2, 1)))
         assert ip.identifiability["identifiable"]
+
+
+class TestMeanRateBursts:
+    """burst_mean_rate=True reads the rate of a burst production as the mean
+    production rate: the same network as the frequency form at k_freq = k_mean / B."""
+
+    def test_matches_the_frequency_form_at_matched_parameters(self):
+        freq = CMEModel("Custom", "None", network="0 -> B x U -> S -> 0")
+        mean = CMEModel("Custom", "None", network="0 -> B x U -> S -> 0", burst_mean_rate=True)
+        assert mean.network.all_params == freq.network.all_params == ["B", "k0", "k1", "k2"]
+        B, k0, k1, k2 = 3.0, 0.7, 0.4, 0.25
+        p_freq = np.log10([B, k0, k1, k2])
+        p_mean = np.log10([B, k0 * B, k1, k2])
+        np.testing.assert_allclose(mean.eval_model_pss(p_mean, [30, 40]), freq.eval_model_pss(p_freq, [30, 40]), atol=1e-9)
+        # and on the NumPy path of the network itself
+        g = [np.array([0.1 + 0.2j, -0.3j, 0.05]), np.array([0.05j, 0.2 - 0.1j, -0.1])]
+        np.testing.assert_allclose(mean.network.eval_pgf(p_mean, g), freq.network.eval_pgf(p_freq, g), atol=1e-9)
+
+    def test_small_bursts_are_the_single_molecule_network(self):
+        const = CMEModel("Custom", "None", network="0 -> U -> S -> 0", normalize_production_rate=True)
+        mean = CMEModel("Custom", "None", network="0 -> B x U -> S -> 0", normalize_production_rate=True, burst_mean_rate=True)
+        p = np.log10([0.4, 0.25])
+        np.testing.assert_allclose(mean.eval_model_pss(np.r_[-3.0, p], [30, 40]), const.eval_model_pss(p, [30, 40]), atol=5e-4)
+        np.testing.assert_allclose(mean.eval_model_pss(np.r_[-4.0, p], [30, 40]), const.eval_model_pss(p, [30, 40]), atol=5e-5)
+        # the box reaches down to that limit, and the flag survives serialisation
+        assert mean.bio_bounds["phys_lb"][0] == -3.0 and const.bio_bounds["phys_lb"][0] == -1.8
+        back = CMEModel.from_dict(mean.to_dict())
+        assert back.network.burst_mean_rate and "mean rate" in repr(back.network)
+        assert not CMEModel("Custom", "None", network="0 -> B x U -> S -> 0").network.burst_mean_rate

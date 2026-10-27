@@ -1,42 +1,26 @@
 import numpy as np
-import csv
 import matplotlib.pyplot as plt
 import pickle
 import sys
 from datetime import datetime
 import pytz
-import scanpy as sc
 import anndata
 import numpy as np
 import matplotlib.pyplot as plt
 import time
 import anndata as ad
 import os
-import collections
 import warnings
 import scipy
 from scipy import sparse
 import pandas as pd
 code_ver_global = "029"  # bumping up version April 2024
 
-from ._core import _mc          # None when the compiled extension is not installed
-_HAS_RUST = _mc is not None
-
 # ---------------------------------------------------------------------------
-# uns serialization helpers
+# uns legacy reader
 # ---------------------------------------------------------------------------
-# anndata's h5ad backend cannot write arbitrary Python objects.  Wrapping them
-# as pickle bytes keeps them round-trip-safe while allowing adata.write_h5ad().
-
-def _uns_pack(obj):
-    """Deprecated: pickle *obj* to bytes for storage in adata.uns.
-
-    monod no longer writes pickled objects into ``uns``; models and results are
-    stored as nested dicts (see ``CMEModel.to_dict`` and
-    ``SearchResults.to_dict``). Kept so old code paths keep working.
-    """
-    warnings.warn("_uns_pack is deprecated; use the object's to_dict()", DeprecationWarning, stacklevel=2)
-    return np.frombuffer(pickle.dumps(obj), dtype=np.uint8)
+# Older monod versions stored pickled objects in adata.uns; everything is a
+# nested dict now (to_dict/from_dict).  _uns_unpack only reads the old format.
 
 def _uns_unpack(v):
     """Restore an object previously packed with the (legacy) pickle format.
@@ -535,108 +519,10 @@ def make_histogram(monod_adata, hist_type, M, n_jobs=1):
 ## Helper functions.
 # Don't need store_search_data function anymore, can just save adata object in the normal way.
 
-def get_noise_decomp(
-    adata, sizefactor="pf", lognormalize=True, pcount=0, which_variance_measure="CV2"
-):
-    """
-    This function performs normalization and variance stabilization on the raw data, and
-    reports the fractions of normalized variance retained and removed as a result of the process.
-    The (unspliced and spliced) species are analyzed independently.
-
-    Parameters
-    ----------
-    adata: anndata.AnnData
-        AnnData object with layers containing raw data (e.g., 'unspliced', 'spliced').
-    sizefactor: str, float, int, or None, optional
-        What size factor to use.
-        If 'pf', use proportional fitting; set the size of each cell to the mean size.
-        If int or float, use this number (e.g., 1e4 for cp10k).
-        If None, do not do size/depth normalization.
-    lognormalize: bool, optional
-        Whether to apply log(1+x) transformation.
-    pcount: int or float, optional
-        Pseudocount added in size normalization to ensure division by zero does not occur.
-    which_variance_measure: str, optional
-        Measure of variance to use ('CV2', 'var', 'Fano').
-
-    Returns
-    -------
-    adata: anndata.AnnData
-        AnnData object with additional columns in `adata.obs` containing the fraction of variance retained or discarded.
-    """
-
-    layers = adata.layers.keys()
-
-    for layer in layers:
-        # Copy the layer to a temporary AnnData object for normalization
-        temp_adata = anndata.AnnData(X=adata.layers[layer])
-
-        if sizefactor is not None:
-            target = temp_adata.X.sum(0).mean() if sizefactor == "pf" else sizefactor
-            sc.pp.normalize_total(temp_adata, target_sum=target, inplace=True)
-        if lognormalize:
-            sc.pp.log1p(temp_adata)
-
-        # Compute variance before and after normalization
-        original_variance = var_fun(anndata.AnnData(X=adata.layers[layer]), which_variance_measure)
-        normalized_variance = var_fun(temp_adata, which_variance_measure)
-
-        # Store the results in the adata.obs
-        adata.obs[f'var_retained_{layer}'] = normalized_variance / original_variance
-        adata.obs[f'var_discarded_{layer}'] = 1 - adata.obs[f'var_retained_{layer}']
-
-    return adata
-
-
-def var_fun(adata, measure):
-    '''
-    Define a function to measure variance of gene count matrix.
-    '''    
-    if measure == "CV2":
-        mean = adata.X.mean(axis=1).A1
-        variance = adata.X.var(axis=1).A1
-        return variance / (mean ** 2)
-    elif measure == "var":
-        return adata.X.var(axis=1).A1
-    elif measure == "Fano":
-        mean = adata.X.mean(axis=1).A1
-        variance = adata.X.var(axis=1).A1
-        return variance / mean
-
-
 ########################
 ## Helper functions
 ########################
 
-
-def filter_by_gene(filter, *args):
-    """Convenience function to filter arrays by gene.
-
-    This function takes in a filter over genes,
-    then selects the entries of inputs that match the filter.
-
-    Parameters
-    ----------
-    filter: bool or int np.ndarray
-        filter over the gene dimension.
-    *args: variable number of np.ndarrays
-        np.ndarrays with dimension 0 that matches the filter dimension.
-
-    Returns
-    -------
-    tuple(out): tuple
-        tuple of filtered *args.
-
-    Examples
-    --------
-    >>> S_filt, U_filt = filter_by_gene(filter,S,U)
-    >>> assert((S_filt.shape[0]==filter.sum()) & (U_filt.shape[0]==filter.sum()))
-
-    """
-    out = []
-    for arg in args:
-        out += [arg[filter].squeeze()]
-    return tuple(out)
 
 def add_gene_lengths(adata, length_dict, attribute_name='length_given', lengths_name='lengths'):
     """
@@ -736,24 +622,6 @@ def threshold_by_expression(adata, filt_param=None):
     
     return adata
     
-
-def save_gene_list(dir_string, gene_list, filename):
-    """Store a list of genes to disk.
-
-    Parameters
-    ----------
-    dir_string: str
-        batch directory location.
-    gene_list: list of str
-        list of genes to store.
-    filename: str
-        file name string.
-    """
-    with open(dir_string + "/" + filename + ".csv", "w") as f:
-        writer = csv.writer(f)
-        writer.writerow(gene_list)
-
-
 
 def import_h5ad(filename, cf=None):
 
@@ -980,45 +848,6 @@ def get_transcriptome(transcriptome_filepath, repeat_thr=15):
     return len_dict
 
 
-def identify_annotated_genes(gene_names, feat_dict):
-    """Check which gene names are unique and have annotations in a feature dictionary.
-
-    Parameters
-    ----------
-    gene_names: str np.ndarray
-        gene names from raw data file.
-    feat_dict: dict
-        annotation dictionary imported by get_transcriptome.
-
-    Returns
-    -------
-    ann_filt: bool np.ndarray
-        boolean filter of genes that have annotations.
-    """
-    n_gen_tot = len(gene_names)
-    capitalize = False
-    if capitalize:
-        sel_ind_annot = [k for k in range(len(gene_names)) if gene_names[k].capitalize() in feat_dict]
-    else:
-        sel_ind_annot = [k for k in range(len(gene_names)) if gene_names[k] in feat_dict]
-
-    NAMES = [gene_names[k] for k in range(len(sel_ind_annot))]
-    COUNTS = collections.Counter(NAMES)
-    sel_ind = [x for x in sel_ind_annot if COUNTS[gene_names[x]] == 1]
-
-    log.info(
-        str(len(gene_names))
-        + " features observed, "
-        + str(len(sel_ind_annot))
-        + " match genome annotations. "
-        + str(len(sel_ind))
-        + " were unique."
-    )
-
-    ann_filt = np.zeros(n_gen_tot, dtype=bool)
-    ann_filt[sel_ind] = True
-    return ann_filt
-
 # same for ATAC?
 def knee_plot(X, ax1=None, thr=None, viz=False):
     """
@@ -1061,87 +890,3 @@ def knee_plot(X, ax1=None, thr=None, viz=False):
 
 
 # For multiple datasets, choose genes which pass the expression filter in the highest fraction of datasets 
-def select_genes_across_datasets(adata_list, filt_param, exp_filter_threshold, genes_to_fit, n_genes, seed):
-    n_datasets = len(adata_list)
-    expression_filter_array = np.zeros((n_datasets, adata_list[0].n_vars), dtype=bool)
-    gene_name_reference = adata_list[0].var_names
-
-    for dataset_index, adata in enumerate(adata_list):
-        log.info("Processing dataset: " + str(dataset_index))
-
-        # Apply expression filter
-        adata = threshold_by_expression(adata, filt_param)
-        gene_exp_filter = adata.var['expression_filter'].values
-        expression_filter_array[dataset_index, :] = gene_exp_filter
-
-    exp_fractions = expression_filter_array.mean(axis=0)
-
-    if exp_filter_threshold is None:
-        n_genes_enforced = 0
-        selected_genes_filter = np.zeros(exp_fractions.shape, dtype=bool)
-        
-        for gene in genes_to_fit:
-            gene_loc = np.where(gene_name_reference == gene)[0]
-            if len(gene_loc) == 0:
-                log.warning(f"Gene {gene} not found or has multiple entries in annotations.")
-            elif len(gene_loc) > 1:
-                log.error(f"Multiple entries found for gene {gene}: this should never happen.")
-            else:
-                exp_fractions[gene_loc[0]] = 0
-                n_genes_enforced += 1
-                selected_genes_filter[gene_loc[0]] = True
-        
-        q = np.quantile(exp_fractions, 1 - (n_genes - n_genes_enforced) / len(exp_fractions))
-
-        selected_genes_filter[exp_fractions > q] = True
-        np.random.seed(seed)
-        random_genes = np.where(exp_fractions == q)[0]
-        
-        if random_genes.size > 0:
-            random_genes_sel = np.random.choice(random_genes, n_genes - selected_genes_filter.sum(), replace=False)
-            selected_genes_filter[random_genes_sel] = True
-
-        selected_genes = gene_name_reference[selected_genes_filter]
-        log.info(f"Total of {selected_genes_filter.sum()} genes selected.")
-        log.warning(f"Selecting {selected_genes_filter.sum()} genes required {q * 100:.1f}% dataset threshold.")
-    else:
-        exp_filter = exp_fractions >= exp_filter_threshold
-        log.info(f"Gene set size according to a {exp_filter_threshold * 100:.1f}% dataset threshold: {exp_filter.sum()}")
-        
-        enforced_genes = np.zeros(exp_filter.shape, dtype=bool)
-        for gene in genes_to_fit:
-            gene_loc = np.where(gene_name_reference == gene)[0]
-            if len(gene_loc) == 0:
-                log.warning(f"Gene {gene} not found or has multiple entries in annotations.")
-            elif len(gene_loc) > 1:
-                log.error(f"Multiple entries found for gene {gene}: this should never happen.")
-            else:
-                exp_filter[gene_loc[0]] = False
-                n_genes -= 1
-                enforced_genes[gene_loc[0]] = True
-
-        np.random.seed(seed)
-        sampling_gene_set = np.where(exp_filter)[0]
-        if n_genes < len(sampling_gene_set):
-            gene_select_ind = np.random.choice(sampling_gene_set, n_genes, replace=False)
-            log.info(f"{n_genes} random genes selected.")
-        else:
-            gene_select_ind = sampling_gene_set
-            if n_genes > len(sampling_gene_set):
-                log.warning(f"Only {len(sampling_gene_set)} genes pass the filters; cannot satisfy query of {n_genes} genes.")
-            else:
-                log.info(f"All {len(sampling_gene_set)} genes passing the filters selected.")
-        
-        selected_genes_filter = np.zeros(exp_filter.shape, dtype=bool)
-        selected_genes_filter[gene_select_ind] = True
-        selected_genes_filter[enforced_genes] = True
-
-        selected_genes = gene_name_reference[selected_genes_filter]
-        sampling_gene_set = gene_name_reference[exp_filter]
-        log.info(f"Total of {selected_genes_filter.sum()} genes selected.")
-    
-    for adata in adata_list:
-        adata.var['selected_genes'] = selected_genes_filter
-
-    return adata_list
-

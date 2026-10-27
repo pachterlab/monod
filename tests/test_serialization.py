@@ -17,7 +17,7 @@ import pytest
 from monod import analysis
 import monod.mminference as mm
 from monod.cme_toolbox import CMEModel
-from monod.extract_data import extract_data, model_from_uns, _uns_pack
+from monod.extract_data import extract_data, model_from_uns
 from monod.inference import (
     InferenceParameters,
     SearchResults,
@@ -77,8 +77,8 @@ class TestCMEModel:
         assert sd.n_genes == out.n_vars
 
     def test_legacy_pickle_still_loads(self):
-        with pytest.warns(DeprecationWarning):
-            blob = _uns_pack(CMEModel("Bursty", "Poisson"))
+        import pickle
+        blob = np.frombuffer(pickle.dumps(CMEModel("Bursty", "Poisson")), dtype=np.uint8)   # the pre-0.3 uns format
         m = model_from_uns(blob)
         assert m.seq_model == "Poisson"
 

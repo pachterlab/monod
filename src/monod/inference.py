@@ -71,7 +71,7 @@ def perform_inference(h5ad_filepath,
     exclude_sigma=True,
     poisson_average_log_length=5,
     mek_means_params=None,
-    num_cores=1, grid_cores=1, AIC_EPS=1e-20, AIC_offs=0,
+    num_cores=1, AIC_EPS=1e-20, AIC_offs=0,
     save=False, checkpoint=False):
     '''
     Load and filter data from h5ad file.
@@ -157,7 +157,7 @@ def perform_inference(h5ad_filepath,
         if standard_ip.n_grid_points > 1:
             log.info('Running standard inference to find optimal technical parameters for meK-Means.')
             standard_result = standard_ip.fit_all_grid_points(
-                search_data, num_cores=num_cores, grid_cores=grid_cores,
+                search_data, num_cores=num_cores,
                 checkpoint=checkpoint, save=False)
             standard_result.find_sampling_optimum(discard_rejected=False)
             optimal_eta = list(standard_result.samp_optimum)
@@ -191,7 +191,7 @@ def perform_inference(h5ad_filepath,
         # Fit the model at all values of technical parameters, and save the location of the results.
         # save=False here: with save=True the whole run (model, parameters, results)
         # is written once, as monod_adata.h5ad, at the end.
-        search_result = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, grid_cores=grid_cores, checkpoint=checkpoint, save=False)
+        search_result = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, checkpoint=checkpoint, save=False)
         log.info('Grid points fit.')
         search_result.find_sampling_optimum(discard_rejected=False)
         parameters_per_gene = search_result.phys_optimum
@@ -200,7 +200,7 @@ def perform_inference(h5ad_filepath,
 
     else:
         # Fit the model at all values of technical parameters, and save the location of the results.
-        search_result_list = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, grid_cores=grid_cores, checkpoint=checkpoint, save=False)
+        search_result_list = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, checkpoint=checkpoint, save=False)
         log.info('Grid points fit.')
 
         cluster_params = {}
@@ -382,10 +382,7 @@ def searchdata_from_adata(adata):
         )
 
     # Python fallback (Rust unavailable).
-    if 'hist' in adata.uns:
-        hist = _uns_unpack(adata.uns['hist'])
-    else:
-        hist = make_histogram(adata, "unique", M)
+    hist = make_histogram(adata, "unique", M)
     layers  = np.array([adata.layers[layer_name] for layer_name in ordered_layer_names])
     moments = get_gene_moments(adata)
 
@@ -809,6 +806,7 @@ class InferenceParameters:
         self.gradient_params = {**DEFAULT_GRADIENT_PARAMS, **(gradient_params or {})}
         self.use_lengths, self.use_lengths_explicit = _normalize_use_lengths(use_lengths, model)
         if model.seq_model == "None":
+            log.info("Sequencing model set to None. All sampling parameters set to null.")
             samp_lb, samp_ub, gridsize = model.null_sampling_grid()
         _validate_bounds(model, phys_lb, phys_ub, samp_lb, samp_ub, gridsize)
         self.phys_lb = np.array(phys_lb)
@@ -816,12 +814,6 @@ class InferenceParameters:
         self.grad_bnd = scipy.optimize.Bounds(phys_lb, phys_ub)
 
         self.poisson_average_log_length = poisson_average_log_length
-
-        if model.seq_model == "None":
-            log.info(
-                "Sequencing model set to None. All sampling parameters set to null."
-            )
-            samp_lb, samp_ub, gridsize = model.null_sampling_grid()
 
         self.samp_lb = np.array(samp_lb)
         self.samp_ub = np.array(samp_ub)
@@ -960,127 +952,52 @@ class InferenceParameters:
                 exc_info=True,
             )
 
-    def fit_all_grid_points(self, search_data, num_cores=1, grid_cores=1, coarse_to_fine=False, checkpoint=False, save=False):
+    def fit_all_grid_points(self, search_data, num_cores=1, checkpoint=False, save=False):
         """Fits the search data for all genes over all grid points.
 
         Parameters
         ----------
-        num_cores: int
-            Number of cores for gene-level parallelization at each grid point.
-            Uses ThreadPoolExecutor with scipy L-BFGS-B per gene; the Rust PSS
-            fast-path fires automatically inside each thread. Pass -1 for all
-            available cores. Default 1 (sequential). Set
-            gradient_params["use_batch_optimizer"]=True to use batch Adam with
-            rayon instead (only beneficial for small-M datasets).
-        grid_cores: int
-            Number of cores to use for parallelization over grid points via
-            joblib. Default 1 (sequential). Note: combining grid_cores > 1 with
-            num_cores > 1 can oversubscribe CPU cores.
-        search_data: monod.extract_data.SearchData
+        search_data: SearchData
             SearchData object with the data to fit.
-        coarse_to_fine: bool, optional
-            If True and more than 1 grid point exists, runs a fast coarse scan
-            first (reduced iterations/restarts), then refines the top-3 grid
-            points with the full gradient_params. Default False.
+        num_cores: int
+            Gene-level parallelism at each grid point (a thread pool with
+            scipy L-BFGS-B per gene; the Rust kernels release the GIL).  -1
+            uses all cores.  Overrides ``gradient_params["num_gene_cores"]``
+            for this call.
         checkpoint: bool, optional
-            If True, write each grid point result to disk as a crash-recovery
-            checkpoint (.gp file). Default False.
+            Write each grid point result to disk (``grid_point_<i>.h5``) as it
+            finishes. Default False.
         save: bool, optional
-            If True, write the final SearchResults object to disk. Default False.
+            Write the final SearchResults to disk. Default False.
 
         Returns
         -------
-        results: SearchResults object
-            Saves search_result to disk and returns it.
+        results: SearchResults
+
+        Every grid point starts from the moments estimate (or the random box).
+        Grid points are not warm-started from their neighbours: the biological
+        optimum shifts systematically with the sampling parameters (burst size
+        trades off against capture), so a neighbour's optimum is a worse start
+        than the moments estimate and a poor solution at one point used to
+        cascade across the whole grid.
         """
         t1 = time.time()
         self._checkpoint = checkpoint
         if checkpoint:
             make_dir(self.inference_string)
 
-        # Apply gene-level parallelism override for this call.
         _prev_gene_cores = self.gradient_params.get("num_gene_cores", 1)
         if num_cores != 1:
             self.gradient_params["num_gene_cores"] = num_cores
 
-        from joblib import Parallel, delayed as jdelayed
-
-        # in-memory store: point_index -> GridPointResults
         gp_results: dict = {}
+        log.info("Starting grid scan (%d points).", self.n_grid_points)
+        for idx in tqdm(range(self.n_grid_points), desc="Grid scan"):
+            r = self.par_fun(idx, search_data, self.model)
+            if r is not None:
+                gp_results[r.point_index] = r
+        log.info("Grid scan complete.")
 
-        def _run_points(point_indices, init_warm_start=None):
-            """Run optimization for the given grid point indices.
-
-            Every grid point starts from the moments estimate (or the random
-            box). Grid points are not warm-started from their neighbours: the
-            biological optimum shifts systematically with the sampling
-            parameters (burst size trades off against capture), so a
-            neighbour's optimum is a worse start than the moments estimate and
-            a poor solution at one point used to cascade across the whole grid.
-
-            Parameters
-            ----------
-            init_warm_start: dict or None
-                Optional mapping point_index -> GridPointResults whose
-                param_estimates seed the fit at the *same* point (used in
-                coarse-to-fine Phase 2).
-            """
-            if grid_cores > 1:
-                log.info("Starting parallelized grid scan (%d points).", len(point_indices))
-                # Thread backend: the SearchData is shared in memory rather than
-                # pickled to worker processes; the Rust kernels release the GIL.
-                returned = Parallel(n_jobs=grid_cores, prefer="threads")(
-                    jdelayed(self.par_fun)(idx, search_data, self.model)
-                    for idx in tqdm(point_indices, desc="Grid scan")
-                )
-                for r in returned:
-                    if r is not None:
-                        gp_results[r.point_index] = r
-                log.info("Parallelized grid scan complete.")
-            else:
-                log.info("Starting non-parallelized grid scan (%d points).", len(point_indices))
-                for idx in tqdm(point_indices, desc="Grid scan"):
-                    ws = None
-                    if init_warm_start is not None and idx in init_warm_start:
-                        ws = init_warm_start[idx].param_estimates
-                    r = self.par_fun(idx, search_data, self.model, warm_start=ws)
-                    if r is not None:
-                        gp_results[r.point_index] = r
-                log.info("Non-parallelized grid scan complete.")
-
-        all_indices = list(range(self.n_grid_points))
-
-        if coarse_to_fine and self.n_grid_points > 1:
-            # ── Phase 1: fast coarse scan over all grid points ────────────────
-            orig_params = self.gradient_params.copy()
-            coarse_params = dict(orig_params)
-            coarse_params["max_iterations"] = max(3, orig_params.get("max_iterations", 10) // 4)
-            coarse_params["num_restarts"] = 1
-            self.gradient_params = coarse_params
-
-            _run_points(all_indices)
-
-            # Read coarse obj_func values from in-memory dict (fall back to disk if checkpoint)
-            coarse_klds = []
-            for i in all_indices:
-                if i in gp_results:
-                    coarse_klds.append(gp_results[i].obj_func)
-                else:
-                    gp_path = self.inference_string + "/grid_point_" + str(i) + ".h5"
-                    gp = GridPointResults.from_dict(_read_h5(gp_path))
-                    coarse_klds.append(gp.obj_func)
-
-            # ── Phase 2: refine top-k grid points using coarse results as warm-start
-            n_refine = min(3, self.n_grid_points)
-            top_k = list(np.argsort(coarse_klds)[:n_refine])
-            log.info("Coarse-to-fine: refining top-%d grid points %s.", n_refine, top_k)
-
-            self.gradient_params = orig_params
-            _run_points(top_k, init_warm_start=gp_results)
-        else:
-            _run_points(all_indices)
-
-        # Restore num_gene_cores to its value before this call.
         self.gradient_params["num_gene_cores"] = _prev_gene_cores
 
         results = SearchResults(self, search_data)
@@ -1094,8 +1011,8 @@ class InferenceParameters:
 
         return results
 
-    def par_fun(self, point_index, search_data, model, warm_start=None):
-        """Helper method for the grid point parallelization procedure.
+    def par_fun(self, point_index, search_data, model):
+        """Fit every gene at one grid point.
 
         Parameters
         ----------
@@ -1103,15 +1020,12 @@ class InferenceParameters:
             index within [0, n_grid_points) to evaluate at.
         search_data: SearchData
         model: CMEModel
-        warm_start: np.ndarray or None, optional
-            Shape (n_genes, n_phys_pars). If provided, seeds the first L-BFGS-B
-            restart for each gene instead of the method-of-moments estimate.
 
         Returns
         -------
         GridPointResults or None
         """
-        grad_inference = GradientInference(self, model, search_data, point_index, warm_start=warm_start)
+        grad_inference = GradientInference(self, model, search_data, point_index)
         return grad_inference.fit_all_genes(model, search_data, checkpoint=getattr(self, '_checkpoint', False))
 
 
@@ -1146,7 +1060,7 @@ class GradientInference:
         method of moments estimates for all genes under the current technical variation parameters.
     """
 
-    def __init__(self, global_parameters, model, search_data, point_index, warm_start=None):
+    def __init__(self, global_parameters, model, search_data, point_index):
         """Initialize a GradientInference object.
 
         Parameters
@@ -1244,7 +1158,6 @@ class GradientInference:
         self.n_samp_pars = global_parameters.n_samp_pars
 
         self.inference_string = global_parameters.inference_string
-        self.warm_start = warm_start  # shape (n_genes, n_phys_pars) or None
 
         # Pre-allocate restart initialisation bounds (constant across all genes/restarts).
         self._restart_lb = -2.0 * np.ones(self.n_phys_pars)
@@ -1381,8 +1294,6 @@ class GradientInference:
             )
             if self.gradient_params["init_pattern"] == "moments":
                 x0[0] = self.param_MoM[gene_index]
-            if self.warm_start is not None:
-                x0[0] = np.clip(self.warm_start[gene_index], self.phys_lb, self.phys_ub)
         else:
             x0 = np.asarray(x0)
         err = np.inf
@@ -1637,13 +1548,6 @@ class GradientInference:
                 )
                 if self.gradient_params["init_pattern"] == "moments":
                     x0[0] = self.param_MoM[gi]
-                # Warm-start override: skip for Rust optimizer paths.
-                # The Rust optimizer runs >10× faster so warm starts give no speed benefit,
-                # and propagating a bad solution from an earlier grid point can cascade into
-                # poor local minima for all subsequent grid points (the landscape shifts
-                # significantly across the grid). MoM is already a strong starting point.
-                if self.warm_start is not None and not _rust_opt_active:
-                    x0[0] = np.clip(self.warm_start[gi], self.phys_lb, self.phys_ub)
                 x0_all.append(x0.tolist())
             return x0_all
 
@@ -1815,8 +1719,6 @@ class GradientInference:
             )
             if self.gradient_params.get("init_pattern") == "moments" and hasattr(self, "param_MoM"):
                 x = np.clip(self.param_MoM.copy(), lb, ub)
-            if self.warm_start is not None:
-                x = np.clip(self.warm_start, lb, ub)
 
             # Adam optimizer state (reset each restart).
             m_adam = np.zeros_like(x)
@@ -2152,10 +2054,6 @@ class SearchResults:
     def _result_filename(self):
         return self.inference_string + "/grid_scan_results.h5"
 
-    @property
-    def _upd_result_filename(self):
-        return self.inference_string + "/grid_scan_results_upd.h5"
-
     # ------------------------------------------------------------------
     # Structured (pickle-free) serialisation
     # ------------------------------------------------------------------
@@ -2219,27 +2117,6 @@ class SearchResults:
             )
         self.full_result_string = full_result_string
         return full_result_string
-
-    def update_on_disk(self):
-        """This helper method attempts to store a modified SearchResults object to disk.
-
-        This is separate from store_on_disk() to avoid overwriting data.
-
-        Returns
-        -------
-        upd_result_string: str
-            file location.
-        """
-        try:
-            upd_result_string = self._upd_result_filename
-            _write_h5(upd_result_string, self.to_dict())
-            log.debug("Updated results stored to {}.".format(upd_result_string))
-        except:
-            log.error(
-                "Updated results could not be stored to {}.".format(upd_result_string)
-            )
-        self.upd_result_string = upd_result_string
-        return upd_result_string
 
     ####################################
     #         Analysis methods         #
@@ -3014,179 +2891,6 @@ class SearchResults:
                     f"{' (this is the protein k_p/gamma_p valley)' if self.model.bio_model == 'ProteinBursty' else ''}.")
         warnings.warn(msg, IdentifiabilityWarning, stacklevel=3)
 
-    def resample_opt_viz(
-        self, resamp_vec=(5, 10, 20, 40, 60), Ntries=4, figsize=(10, 10)
-    ):
-        """Test the sensitivity of the technical noise parameter landscape to the number of genes analyzed.
-
-        Parameters
-        ----------
-        resamp_vec: list or tuple of ints, optional
-            number of genes to select for downsampling (without replacement).
-        Ntries: int, optional
-            number of times to resample.
-        figsize: tuple of floats, optional
-            figure dimensions.
-        """
-        Nsamp = len(resamp_vec)
-
-        fig1, ax1 = plt.subplots(nrows=Nsamp, ncols=Ntries, figsize=figsize)
-        for samp_num in range(Nsamp):
-            for i_ in range(Ntries):
-                axloc = (samp_num, i_)
-                if resamp_vec[samp_num] <= self.n_genes:
-                    gene_filter = np.random.choice(
-                        self.n_genes, resamp_vec[samp_num], replace=False
-                    )
-                else:
-                    gene_filter = np.random.choice(
-                        self.n_genes, self.n_genes, replace=False
-                    )
-                subsampled_samp_optimum = self.find_sampling_optimum(gene_filter)
-                self.plot_landscape(ax1[axloc], gene_filter=gene_filter, hideticks=True)
-
-                if i_ == 0:
-                    ax1[axloc].set_ylabel("n_genes = " + str(resamp_vec[samp_num]))
-
-        self._savefig("subsampling.png")
-        self.find_sampling_optimum()  # reset sampling optimum here
-
-    def resample_opt_mc_viz(
-        self, resamp_vec=(5, 10, 20, 40, 60), Ntries=1000, figsize=(16, 4)
-    ):
-        """Test the sensitivity of technical noise parameter optima under gene downsampling.
-
-        The optima for each downsampled set are visualized on the parameter landscape
-        generated from the entire gene set.
-
-        Parameters
-        ----------
-        resamp_vec: list or tuple of ints, optional
-            number of genes to select for downsampling (without replacement).
-        Ntries: int, optional
-            number of times to resample.
-        figsize: tuple of floats, optional
-            figure dimensions.
-        """
-        Nsamp = len(resamp_vec)
-
-        fig1, ax1 = plt.subplots(nrows=1, ncols=Nsamp, figsize=figsize)
-        for samp_num in range(Nsamp):
-            axloc = samp_num
-            subsampled_samp_optimum_array = []
-            for i__ in range(Ntries):
-                if resamp_vec[samp_num] <= self.n_genes:
-                    gene_filter = np.random.choice(
-                        self.n_genes, resamp_vec[samp_num], replace=False
-                    )
-                else:
-                    gene_filter = np.random.choice(
-                        self.n_genes, self.n_genes, replace=False
-                    )
-                subsampled_samp_optimum = self.find_sampling_optimum(gene_filter)
-                subsampled_samp_optimum_array.append(subsampled_samp_optimum)
-            subsampled_samp_optimum_array = np.asarray(subsampled_samp_optimum_array)
-
-            self.plot_landscape(ax1[axloc], hideticks=True)
-            jit = np.random.normal(scale=0.1, size=subsampled_samp_optimum_array.shape)
-            subsampled_samp_optimum_array = subsampled_samp_optimum_array + jit
-            ax1[axloc].scatter(
-                subsampled_samp_optimum_array[:, 0],
-                subsampled_samp_optimum_array[:, 1],
-                c="r",
-                s=3,
-                alpha=0.3,
-            )
-            ax1[axloc].set_title("n_genes = " + str(resamp_vec[samp_num]))
-
-        self._savefig("subsampling_stability.png")
-
-        self.find_sampling_optimum()  # reset sampling optimum.
-
-    def chisq_best_param_correction(
-        self,
-        search_data,
-        threshold=0.05,
-        Ntries=10,
-        viz=True,
-        szfig=(2, 5),
-        figsize=(10, 4),
-        overwrite=True,
-    ):
-        """Test the sensitivity of technical noise parameter optima after gene rejection.
-
-        This method demonstrates the sensitivity of the sampling parameter landscape
-        and optimum to the specific genes retained after chi-squared testing.
-        It performs fixed-point iteration to illustrate whether the optimum converges.
-
-        This can be used with viz=True to inspect the qualitative behavior of the optimum,
-        or with viz=False as a sanity check to make sure the optimum is not strongly skewed
-        by a small number of very poorly fit genes.
-
-        The procedure does not typically move the optimum.
-
-        Parameters
-        ----------
-        search_data: monod.extract_data.SearchData
-            SearchData object with the fit data.
-        threshold: float, optional
-            chi-square rejection criterion; everything below this critical p-value
-            is rejected as unlikely to have been generated by the model.
-        Ntries: int, optional
-            number of steps of chi-squared testing to perform.
-        viz: bool, optional
-            whether to visualize the results.
-        szfig: tuple of ints, optional
-            dimensions of the figure subplot grid.
-        figsize: tuple of floats, optional
-            figure dimensions.
-        overwrite: bool, optional
-            whether to retain the optimum obtained at the end of the procedure.
-        """
-        search_data = self._search_data_for(search_data)
-        if viz:
-            fig1, ax1 = plt.subplots(nrows=szfig[0], ncols=szfig[1], figsize=figsize)
-        log.info(
-            "Original optimum: {:.2f}, {:.2f}.".format(
-                self.samp_optimum[0], self.samp_optimum[1]
-            )
-        )
-        for i_ in range(Ntries):
-            self.chisquare_testing(search_data, threshold=threshold)
-            # gene_filter = ~self.rejected_genes
-            well_fit_samp_optimum = self.find_sampling_optimum(discard_rejected=True)
-            log.info(
-                "New optimum: {:.2f}, {:.2f}.".format(
-                    self.samp_optimum[0], self.samp_optimum[1]
-                )
-            )
-
-            if viz:
-                axloc = (
-                    np.unravel_index(i_, szfig)
-                    if (szfig[0] > 1 and szfig[1] > 1)
-                    else i_
-                )
-                self.plot_landscape(ax1[axloc], discard_rejected=True, hideticks=True)
-        if viz:
-            self._savefig("chisquare_stability.png")
-
-        if overwrite:
-            self.chisquare_testing(search_data, threshold=threshold)
-            log.info(
-                "Optimum retained at {:.2f}, {:.2f}.".format(
-                    self.samp_optimum[0], self.samp_optimum[1]
-                )
-            )
-        else:
-            self.find_sampling_optimum()
-            self.chisquare_testing(search_data, threshold=threshold)
-            log.info(
-                "Optimum restored to {:.2f}, {:.2f}.".format(
-                    self.samp_optimum[0], self.samp_optimum[1]
-                )
-            )
-
     def plot_param_L_dep(
         self,
         gene_filter_=None,
@@ -3528,32 +3232,6 @@ class SearchResults:
                 EPS=EPS,
             )
         return logL
-
-    def get_noise_decomp(self):
-        """
-        #obsolete.
-        This method reports the fractions of normalized variance attributable to intrinsic,
-        extrinsic, and technical noise under the instantiated model, using the eval_model_noise
-        method of the CMEModel class.
-
-        Output:
-        f: array with size n_genes x 3 x 2.
-            dim 0: gene
-            dim 1: variance fraction (intrinsic, extrinsic, technical)
-            dim 2: species (unspliced, spliced)
-        The null technical noise model has dim 0 of size 2, as it has no technical noise component.
-        """
-        f = []
-        for gene_index in range(self.n_genes):
-            f.append(
-                [
-                    self.model.eval_model_noise(
-                        self.phys_optimum[gene_index],
-                        samp=self.regressor_optimum[gene_index],
-                    )
-                ]
-            )
-        return np.asarray(f).squeeze()
 
 def reject_genes(adata, viz=False, EPS=1e-15, threshold=0.05, bonferroni=True,
                  reject_at_bounds=True, bound_thr=0.01, grouping_thr=5,

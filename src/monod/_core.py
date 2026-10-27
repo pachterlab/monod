@@ -19,4 +19,3 @@ def load():
 
 
 _mc = load()
-HAS_RUST = _mc is not None

@@ -121,7 +121,7 @@ class TestRustEntryPoints:
 
     def test_protein_limit_zero(self):
         with pytest.raises(ValueError, match="protein_limit must be > 0"):
-            _mc.eval_model_pss_protein_bursty([0.3, 0, 0, 0, 0], [4, 4, 4], True, 0.0, 0.1, 10.0)
+            _mc.eval_model_pss_protein_bursty_sched([0.3, 0, 0, 0, 0], [4, 4, 4], True, 0.0, 0.1, 10.0)
 
     def test_optimizer_inverted_bounds(self):
         sd, _, _ = _tiny_sd()

@@ -124,6 +124,12 @@ def _kernels():
                      nested=(bursty, lambda th: np.append(th, np.log10(0.15) - 1.5)))
     udeg_bounds = udeg.bounds
     udeg.bounds = lambda: udeg_bounds()[:3] + [(np.log10(0.15) - 1.5, np.log10(0.15) + 1.5)]
+    # mean-rate bursts: the single-molecule network sits at the burst-size floor of the bursty one
+    const = CMEKernel("custom-constitutive", _custom("0 -> U -> S -> 0"), np.log10([0.4, 0.25]), [30, 40])
+    m_mr = CMEModel("Custom", "None", network="0 -> B x U -> S -> 0", normalize_production_rate=True, burst_mean_rate=True)
+    meanrate = CMEKernel("custom-bursty-meanrate", m_mr, np.log10([2.0, 0.4, 0.25]), [30, 40],
+                         nested=(const, lambda th: np.insert(th, 0, m_mr.bio_bounds["phys_lb"][0])),
+                         bounds=[(-3.0, 1.8), (np.log10(0.4) - 1.5, np.log10(0.4) + 1.5), (np.log10(0.25) - 1.5, np.log10(0.25) + 1.5)])
     protein = CMEKernel("protein", CMEModel("ProteinBursty", "None", fit_unspliced=True, protein_limit=float("inf")),
                         [0.5, -0.3, -0.6, 0.2, -0.7], [14, 12, 20], step=0.15)
     # chromatin through CMEModel: modalities (unspliced, spliced, configuration), no dropout grid
@@ -142,7 +148,7 @@ def _kernels():
     table_b = CMEKernel("chromatin-table-bursty", m_tb, cf.join_theta([0.5, 0.8], 0.6, [cf.RATE_FLOOR, 3.0, 3.0, 3.0], 0.8, 0.3, 2.0),
                         [40, 50, 4], step=0.15, nested=(switch_b, lambda th: cf.embed_in_table(th, "switch", 2)),
                         bounds=list(zip(m_tb.bio_bounds["phys_lb"], m_tb.bio_bounds["phys_ub"])))
-    return [udeg, protein, switch, table, switch_b, table_b]
+    return [udeg, meanrate, protein, switch, table, switch_b, table_b]
 
 
 KERNELS = _kernels()
@@ -214,6 +220,12 @@ class TestGradient:
             fo3, go3 = kernel.pinned_gradient(theta, data, n_jobs=3)
         assert fo1 == fo3
         np.testing.assert_array_equal(go1, go3)
+        # the search tolerance is thread-local too and must reach the workers
+        with kernel.m.search_tolerance():
+            fs1, gs1 = kernel.pinned_gradient(theta, data)
+            fs3, gs3 = kernel.pinned_gradient(theta, data, n_jobs=3)
+        assert fs1 == fs3
+        np.testing.assert_array_equal(gs1, gs3)
 
 
 class TestOuterPin:

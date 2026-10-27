@@ -111,11 +111,11 @@ class TestLogLAndAIC:
 class TestPairAndDE:
     def test_plot_params_for_pair(self, fit, tmp_path):
         _, sd, sr = fit
-        fig = analysis.plot_params_for_pair(sr, sr)                 # no batch dir -> not saved
+        fig = analysis.plot_params_for_pair(sr, sr)                 # no path -> not saved
         assert len(fig.axes) == sr.sp.n_phys_pars
-        analysis.make_batch_analysis_dir([sr], str(tmp_path))
-        analysis.plot_params_for_pair(sr, sr, plot_errorbars=True)  # sigma missing -> warning, no crash
-        assert os.path.exists(os.path.join(str(tmp_path), "analysis_figures", "pair_parameter_comparison_12.png"))
+        out = os.path.join(str(tmp_path), "pair.png")
+        analysis.plot_params_for_pair(sr, sr, plot_errorbars=True, savefig=out)  # sigma missing -> warning, no crash
+        assert os.path.exists(out)
         plt.close("all")
 
     def test_diffexp_pars_without_sigma_falls_back(self, fit):
@@ -212,7 +212,7 @@ def test_fit_line_eiv_matches_scipy_odr(fit_slope, use_err):
     data = odr.RealData(x, y, sx=sx, sy=sy) if use_err else odr.Data(x, y)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ref = odr.ODR(data, odr.Model(lambda B, t: analysis.linoffset(B, t, modeltype=modeltype)),
+        ref = odr.ODR(data, odr.Model(lambda B, t: t + B[0] if modeltype == "id" else B[1] * t + B[0]),
                       beta0=[0, 1] if fit_slope else [0]).run().beta
     np.testing.assert_allclose(ours, ref, rtol=1e-4, atol=1e-6)
     assert ours.shape == (2 if fit_slope else 1,)

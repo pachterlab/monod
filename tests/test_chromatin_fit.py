@@ -284,6 +284,23 @@ class TestPipeline:
         assert res["lr"] < 12.0 and not res["prefer_big"]                 # no real evidence for the free table
         assert abs(stat - res["lr"]) < 6.0                                 # score and likelihood ratio agree in size
 
+    def test_nested_comparison_is_identical_with_a_thread_pool(self):
+        """``n_jobs`` spreads the stencil and the score-test Hessian columns
+        over threads; the pinned schedule and the search tolerance must reach
+        the workers, so the statistic and the fit are bit-identical."""
+        small, big = _model("switch"), _model("table")
+        theta = _theta("switch", [1.0])
+        rng = np.random.default_rng(8)
+        data, lim = _hist(_cells(small, theta, 600, rng))
+        kw = dict(table="always", score=True, maxiter=3)
+        r1 = compare_nested_models(small, big, lambda x: cf.embed_in_table(x, "switch", 2), theta, lim, [0, 0, 0],
+                                   data, 600, n_jobs=1, **kw)
+        r3 = compare_nested_models(small, big, lambda x: cf.embed_in_table(x, "switch", 2), theta, lim, [0, 0, 0],
+                                   data, 600, n_jobs=3, **kw)
+        assert r1["score"] == r3["score"]
+        assert r1["kld_big"] == r3["kld_big"] and r1["lr"] == r3["lr"]
+        np.testing.assert_array_equal(r1["x_big"], r3["x_big"])
+
     def test_nested_comparison_finds_the_table_on_and_gate_data(self):
         """The warm-started table fit must actually move: on data from an
         AND gate (only the both-open configuration transcribes) it has to

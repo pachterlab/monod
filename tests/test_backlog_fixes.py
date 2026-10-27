@@ -120,7 +120,7 @@ class TestGridScanStarts:
     published fit and the landscape optimum moved to a corner.
     """
 
-    def test_serial_scan_passes_no_warm_start(self, monkeypatch):
+    def test_grid_scan_visits_every_point_in_order(self, monkeypatch):
         import monod.inference as inf
         from monod.cme_toolbox import CMEModel
         model = CMEModel("Bursty", "Poisson")
@@ -133,8 +133,8 @@ class TestGridScanStarts:
                 self.param_estimates = np.zeros((1, 3))
                 self.klds = np.zeros((1,)); self.obj_func = 0.0; self.d_time = 0.0; self.regressor = np.zeros((1, 2))
 
-        def fake_par_fun(point_index, search_data, model, warm_start=None):
-            seen.append((point_index, warm_start))
+        def fake_par_fun(point_index, search_data, model):
+            seen.append(point_index)
             return _R(point_index)
 
         monkeypatch.setattr(ip, "par_fun", fake_par_fun)
@@ -142,8 +142,7 @@ class TestGridScanStarts:
             ip.fit_all_grid_points(search_data=None, num_cores=1)
         except Exception:
             pass   # assembling SearchResults from the stubs is not the point
-        assert [idx for idx, _ in seen] == [0, 1, 2, 3]
-        assert all(ws is None for _, ws in seen)
+        assert seen == [0, 1, 2, 3]
 
 
 class TestRustOptimizerDefault:

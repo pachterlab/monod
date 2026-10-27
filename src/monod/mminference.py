@@ -7,6 +7,8 @@ from scipy.special import logsumexp, softmax
 from .extract_data import make_dir, log, _build_sampling_grid
 from .cme_toolbox import CMEModel, _MODELS_2D
 from .inference import (
+    SearchData,
+    parallelize,
     _normalize_use_lengths,
     _validate_bounds,
     _write_h5,
@@ -18,8 +20,6 @@ from .inference import (
     SearchResults as _BaseSearchResults,
     DEFAULT_GRADIENT_PARAMS,
 )
-import multiprocessing
-import multiprocessing.pool
 import os
 import itertools
 from sklearn.cluster import KMeans, SpectralClustering
@@ -358,8 +358,7 @@ class MEKMeansParameters(_BaseInferenceParameters):
         log.info("Runtime: {:.1f} seconds.".format(t2 - t1))
         return full_results
 
-    def fit_all_grid_points(self, search_data, num_cores=1, grid_cores=1,
-                            coarse_to_fine=False, checkpoint=False, save=False):
+    def fit_all_grid_points(self, search_data, num_cores=1, checkpoint=False, save=False):
         """Run meK-Means EM and return a list of SearchResults (one per cluster).
 
         Overrides the base class to delegate to run_mek_means, which handles
@@ -387,6 +386,92 @@ class MEKMeansParameters(_BaseInferenceParameters):
         grad_inference = GradientInference(self, model, search_data, point_index, k, epochs)
         return grad_inference.fit_all_genes(model, search_data, num_cores)
 
+
+def _partition_search_data(search_data, labels, k, padding=None):
+    """Split ``search_data`` by the integer cell ``labels`` (0..k-1) into one
+    SearchData per label with its own grid limits and histograms; labels with
+    no cells are left out.  Rust when the data is a Rust SearchData, else the
+    Python fallback."""
+    max_ks = np.asarray(labels).astype(int)
+
+    # Rust fast-path: partition + histogram rebuild entirely in Rust (rayon).
+    if _HAS_RUST and isinstance(search_data, _mc.SearchData):
+        pad = padding[0] if padding is not None else 10
+        subsets = _mc.partition_searchdata_2d(
+            search_data, max_ks.tolist(), k, int(pad)
+        )
+        return {k: sd for k, sd in enumerate(subsets) if sd is not None}
+
+    # Python fallback.
+    datas = []
+    inds = []
+
+    layer_names = search_data.layer_names
+    gene_names = search_data.gene_names
+    n_genes = len(gene_names)
+    n_layers = len(layer_names)
+
+    if padding is None:
+        padding = [10] * n_layers
+    padding = np.asarray(padding)[:, None]
+
+    for k in np.unique(max_ks):
+        #Select which obs in k 
+        obs_inds = max_ks == k
+        layers = search_data.layers[:,obs_inds,:]
+        n_cells = np.sum(obs_inds)
+
+        new_layers = np.transpose(layers, axes=(0, 2, 1))
+        # Compute maximum expression value across cells for each gene and each layer
+        max_values = np.amax(new_layers, axis=2)  # Shape: (n_genes, n_layers)
+
+        # Add padding to the maximum values
+        M = (max_values + padding).astype(int)
+
+        hist_type = search_data.hist_type
+
+        hist = make_histogram(layers, layer_names, hist_type, M)
+        moments = get_moment_dicts(layers, layer_names)
+
+
+        #Remake SearchData object
+        attr_names = [
+            "M",
+            "hist",
+            "moments",
+            "n_genes",
+            "gene_names",
+            "n_cells",
+            "layers",
+            "hist_type",
+            "layer_names",
+        ]
+
+        attr_values = [M,
+            hist,
+            moments,
+            n_genes,
+            gene_names,
+            n_cells,
+            layers,
+            hist_type,
+            layer_names]
+
+        try:
+            gene_log_lengths = search_data.gene_log_lengths
+            attr_names += ['gene_log_lengths']
+            attr_values += [gene_log_lengths]
+
+        except AttributeError:
+            pass
+
+        sub_data = SearchData(attr_names, *attr_values)                
+
+
+        inds += [k]
+        datas += [sub_data]
+
+    return dict(zip(inds,datas))
 
 class GradientInference(_BaseGradientInference):
     """Runs the grid point-specific inference procedures.
@@ -618,86 +703,7 @@ class GradientInference(_BaseGradientInference):
             dict, with k (keys) and SearchData objects (values)
         """
 
-        max_ks = np.argmax(Q, axis=1).astype(int)
-
-        # Rust fast-path: partition + histogram rebuild entirely in Rust (rayon).
-        if _HAS_RUST and isinstance(search_data, _mc.SearchData):
-            pad = padding[0] if padding is not None else 10
-            subsets = _mc.partition_searchdata_2d(
-                search_data, max_ks.tolist(), self.k, int(pad)
-            )
-            return {k: sd for k, sd in enumerate(subsets) if sd is not None}
-
-        # Python fallback.
-        datas = []
-        inds = []
-
-        layer_names = search_data.layer_names
-        gene_names = search_data.gene_names
-        n_genes = len(gene_names)
-        n_layers = len(layer_names)
-
-        if padding is None:
-            padding = [10] * n_layers
-        padding = np.asarray(padding)[:, None]
-
-        for k in np.unique(max_ks):
-            #Select which obs in k 
-            obs_inds = max_ks == k
-            layers = search_data.layers[:,obs_inds,:]
-            n_cells = np.sum(obs_inds)
-
-            new_layers = np.transpose(layers, axes=(0, 2, 1))
-            # Compute maximum expression value across cells for each gene and each layer
-            max_values = np.amax(new_layers, axis=2)  # Shape: (n_genes, n_layers)
-        
-            # Add padding to the maximum values
-            M = (max_values + padding).astype(int)
-
-            hist_type = search_data.hist_type
-
-            hist = make_histogram(layers, layer_names, hist_type, M)
-            moments = get_moment_dicts(layers, layer_names)
-            
-
-            #Remake SearchData object
-            attr_names = [
-                "M",
-                "hist",
-                "moments",
-                "n_genes",
-                "gene_names",
-                "n_cells",
-                "layers",
-                "hist_type",
-                "layer_names",
-            ]
-
-            attr_values = [M,
-                hist,
-                moments,
-                n_genes,
-                gene_names,
-                n_cells,
-                layers,
-                hist_type,
-                layer_names]
-
-            try:
-                gene_log_lengths = search_data.gene_log_lengths
-                attr_names += ['gene_log_lengths']
-                attr_values += [gene_log_lengths]
-                
-            except AttributeError:
-                pass
-            
-            sub_data = SearchData(attr_names, *attr_values)                
-
-
-            inds += [k]
-            datas += [sub_data]
-
-        return dict(zip(inds,datas))
+        return _partition_search_data(search_data, np.argmax(Q, axis=1), self.k, padding)
     
     def _m_step(self,model,k_dict,Q,EPS=1e-6,num_cores=1):
         """Update values for the k component weights and parameters theta_k.
@@ -1355,19 +1361,7 @@ class SearchResults(_BaseSearchResults):
         remove_files: bool, optional
             If True, delete .gp files from disk. Default False.
         """
-        if remove_files:
-            for point_index in range(self.sp.n_grid_points):
-                gp_path = self.inference_string + "/grid_point_" + str(point_index) + ".gp"
-                if os.path.exists(gp_path):
-                    os.remove(gp_path)
-            log.info("All grid point data cleaned from disk.")
-
-        self.param_estimates = np.asarray(self.param_estimates)
-        self.klds = np.asarray(self.klds)
-        self.obj_func = np.asarray(self.obj_func)
-        self.d_time = np.asarray(self.d_time)
-        self.regressor = np.asarray(self.regressor)
-
+        super().clean_up(remove_files)
         self.aic_per_cell = np.asarray(self.aic_per_cell)
         self.weights = np.asarray(self.weights)
         self.all_qs = np.asarray(self.all_qs)
@@ -1379,155 +1373,11 @@ class SearchResults(_BaseSearchResults):
 
     @property
     def _result_filename(self):
-        return self.inference_string + "/grid_scan_results_" + str(self.assigns) + ".res"
-
-    @property
-    def _upd_result_filename(self):
-        return self.inference_string + "/grid_scan_results_" + str(self.assigns) + "_upd.res"
+        return self.inference_string + "/grid_scan_results_" + str(self.assigns) + ".h5"
 
     ####################################
     #         Analysis methods         #
     ####################################
-
-    def _subset_search_data(self,search_data,EPS=1e-6,padding=None):
-        """Returns search_data counts after in specified cluster.
-
-        Parameters
-        ----------
-        search_data: monod.extract_data.SearchData
-            SearchData object with the data to fit.
-        assign: int
-            Which of the k clusters to select cells from
-
-        Returns
-        ----------
-        SearchData object
-            SearchData object for cells in assigned k (self.assigns)
-        """
-        layers = search_data.layers[:,self.filt,:]
-        n_cells = self.n_cells
-
-        layer_names = search_data.layer_names
-        gene_names = search_data.gene_names
-        n_genes = len(gene_names)
-
-        new_layers = np.transpose(layers, axes=(0, 2, 1))
-        # new_layers = layers
-        
-        # Compute maximum expression value across cells for each gene and each layer
-        max_values = np.amax(new_layers, axis=2)  # Shape: (n_genes, n_layers)
-    
-        # Define default padding if None
-        if padding is None:
-            padding = [10] * max_values.shape[1]  # One padding value per layer
-        
-        # Ensure padding is a column vector
-        padding = np.asarray(padding)[:, None]
-    
-        # Add padding to the maximum values
-        M = (max_values + padding.T).astype(int)
-
-        hist_type = search_data.hist_type
-
-        hist = make_histogram(layers, layer_names, hist_type, M)
-        moments = get_moment_dicts(layers, layer_names)
-
-        #Remake SearchData object
-        attr_names = [
-            "M",
-            "hist",
-            "moments",
-            "gene_log_lengths",
-            "n_genes",
-            "gene_names",
-            "n_cells",
-            "layers",
-            "hist_type",
-            "layer_names"
-        ]
-
-        
-        sub_data = SearchData(
-            attr_names,
-            M,
-            hist,
-            moments,
-            search_data.gene_log_lengths,
-            n_genes,
-            gene_names,
-            n_cells,
-            layers,
-            hist_type,
-            layer_names
-        )
-
-
-        # S = layers[1,:,:]
-        # U = layers[0,:,:]
-        # l = [U,S]
-        # if padding is None:
-        #     padding = np.asarray([10] * len(l))
-
-        # M = np.amax(l, axis=2) + padding[:, None]
-
-        # hist = []
-        # moments = []
-        # for gene_index in range(n_genes):
-        #     if search_data.hist_type == "grid":
-        #         H, xedges, yedges = np.histogramdd(
-        #             *[x[gene_index] for x in l],
-        #             bins=[np.arange(x[gene_index] + 1) - 0.5 for x in M],
-        #             density=True
-        #         )
-        #     elif search_data.hist_type == "unique":
-        #         unique, unique_counts = np.unique(
-        #             np.vstack([x[gene_index] for x in l]).T, axis=0, return_counts=True
-        #         )
-        #         frequencies = unique_counts / n_cells
-        #         unique = unique.astype(int)
-        #         H = (unique, frequencies)
-
-        #     hist.append(H)
-
-        #     moments.append(
-        #         {
-        #             "S_mean": S[gene_index].mean(),
-        #             "U_mean": U[gene_index].mean(),
-        #             "S_var": S[gene_index].var(),
-        #             "U_var": U[gene_index].var(),
-        #         }
-        #     )
-        
-
-        # #Remake SearchData object
-        # attr_names = [
-        #     "M",
-        #     "hist",
-        #     "moments",
-        #     "gene_log_lengths",
-        #     "n_genes",
-        #     "gene_names",
-        #     "n_cells",
-        #     "layers",
-        #     "hist_type",
-        # ]
-
-        
-        # sub_data = SearchData(
-        #     attr_names,
-        #     M,
-        #     hist,
-        #     moments,
-        #     search_data.gene_log_lengths,
-        #     n_genes,
-        #     gene_names,
-        #     n_cells,
-        #     layers,
-        #     search_data.hist_type,
-        # )
-
-        
-        return sub_data
 
     # Inherited from _BaseSearchResults (identical or superset behavior):
     # aggregate_grid_points, find_sampling_optimum, set_sampling_optimum, plot_landscape,
@@ -1535,8 +1385,9 @@ class SearchResults(_BaseSearchResults):
     # resample_opt_viz, resample_opt_mc_viz, plot_param_L_dep, get_noise_decomp.
 
     def _search_data_for(self, search_data):
-        """Restrict the search data to this cluster's cells (see ``_subset_search_data``)."""
-        return self._subset_search_data(search_data)
+        """The search data restricted to this cluster's cells (label 0 = in the cluster)."""
+        labels = np.where(self.filt, 0, 1)
+        return _partition_search_data(search_data, labels, 2)[0]
 
     # par_fun_hess, compute_sigma, chisq_best_param_correction, plot_gene_distributions,
     # plot_param_L_dep, resample_opt_viz and get_logL are inherited; each calls
@@ -1545,109 +1396,4 @@ class SearchResults(_BaseSearchResults):
     # get_noise_decomp is inherited from _BaseSearchResults.
 
 
-def parallelize(
-    function,
-    iterable,
-    num_cores,
-    num_entries,
-    completion_message="Parallelization complete.",
-    termination_message="Parallelization manually terminated.",
-    error_message="Parallelization terminated due to error.",
-    use_tqdm=True,
-):
-    """Helper function to safely parallelize computations.
-
-    Inputs a single-parameter function and an iterable, requests a number of cores, \
-    and gracefully shuts down if needed.
-
-    Parameters
-    ----------
-    function: function
-        a one-parameter function that can be mapped using entries of the iterable.
-    iterable: iterable
-        an iterable to be passed into the function.        
-    num_cores: int
-        number of cores to use for parallelization.
-    num_entries: int
-        length of the iterable, used for tqdm.
-    completion_message: str, optional
-        string to print to log upon completion.
-    termination_message: str, optional
-        string to print to log if the process is manually terminated.
-    error_message: str, optional
-        string to print to log if the process fails due to a ValueError.
-    use_tqdm: bool, optional
-        whether to visualize progress using tqdm.
-
-    Returns
-    -------
-    x: iterable
-        result of applying function to iterable.
-
-    """
-    try:
-        # Thread pool: per-cluster SearchData subsets are shared in memory
-        # rather than pickled to worker processes; Rust kernels release the GIL.
-        pool = multiprocessing.pool.ThreadPool(processes=num_cores)
-        if use_tqdm:
-            x = list(tqdm(pool.imap(function, iterable), total=num_entries))  # hacky
-        else:
-            x = pool.map(function, iterable)
-        pool.close()
-        pool.join()
-        log.info(completion_message)
-    except KeyboardInterrupt:
-        log.warning(termination_message)
-        pool.terminate()
-        pool.join()
-    except ValueError:
-        log.warning(error_message)
-        pool.terminate()
-        pool.join()
-    return x
-
-
 # Use class to make inference faster.
-class SearchData:
-    """Container for data for for inference, visualization, and testing.
-
-    Attributes
-    ----------
-    attr_names: tuple of str
-
-    layers: int np.ndarray
-        raw data from the layers of interest, size n_species x n_genes x n_cells.
-    M: int np.ndarray
-        grid size for PMF evaluation, size n_species x n_genes.
-    hist: tuple or np.ndarray
-        histogram of raw data, used to evaluate divergences.
-        if tuple, generated by np.unique.
-        if np.ndarray, generated by np.histogramdd.
-    moments: list of dict
-        length-n_genes list containing moments for each gene.
-        moments include 'mod2_mean', 'mod1_mean', 'mod2_var', 'mod1_var', and are used to define MoM estimates.
-        Also covariances in form 'mod1_mod2_covar'
-    gene_log_lengths: float np.ndarray
-        log lengths of analyzed genes.
-    n_genes: int
-        number of genes to analyze.
-    gene_names: str np.ndarray
-        list of genes to analyze.
-    n_cells: int
-        number of cells in the dataset.
-    hist_type: str
-        metadata defining the type of histogram.
-    """
-
-    def __init__(self, attr_names, *input_data):
-        """Creates a SearchData object from raw data.
-
-        Parameters
-        ----------
-        attr_names: tuple
-            list of attributes to store, provided in extract_data.
-        *input_data
-            attributes to store, as enumerated in the class definition.
-        """
-        for j in range(len(input_data)):
-            setattr(self, attr_names[j], input_data[j])

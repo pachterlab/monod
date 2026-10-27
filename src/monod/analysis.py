@@ -1,10 +1,9 @@
 from .cme_toolbox import CMEModel
 from .inference import SearchResults, plot_hist_and_fit, _resolve_marg, searchdata_from_adata, _read_h5, search_result_from_uns, search_result_list_from_uns
-from .extract_data import make_dir, knee_plot, log
+from .extract_data import knee_plot, log
 from .plot_aesthetics import aesthetics
 import pickle
 import scipy
-from scipy import stats
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -13,16 +12,178 @@ import matplotlib.pyplot as plt
 ## Helper functions
 ########################
 
-def compare_nested_models(model_small, model_big, embed, x_small, limits, samp, data, n_cells,
+
+def nesting_embedding(model_small, model_big):
+    """The map from ``model_small``'s log10 parameters into ``model_big``'s at
+    which the two models coincide, for the nestings monod knows:
+
+    - Chromatin models of the same locus: a ``switch`` or ``additive`` rule
+      inside the ``table`` rule (:func:`monod.chromatin_fit.embed_in_table`),
+      and a constitutive emission inside a bursty one (burst size at its
+      floor); both at once as well.
+    - Custom reaction networks: every reaction of the small network matched
+      in the big one by reactants and products; a reaction the big network
+      adds gets its rate at the floor of its box, a geometric burst the big
+      network adds gets its burst size at the floor (which needs
+      ``burst_mean_rate=True``, since in the burst-frequency form the small-size
+      limit is no production), and a delay the big network adds gets its
+      inverse delay at the ceiling (a delay of about 3e-4, so this one is
+      approximate).
+    - The same model family twice: the identity.
+
+    Anything else raises ``ValueError`` saying why; for pairs with no nesting
+    use :func:`compare_models`.  The built-in ``Bursty`` model is written in
+    units of the burst frequency and ``Constitutive`` in units of the
+    production rate, so the one is not a point of the other's box: write both
+    as reaction networks with ``burst_mean_rate=True`` instead.
+    """
+    ms, mb = model_small, model_big
+    if ms.seq_model != mb.seq_model or ms.amb_model != mb.amb_model:
+        raise ValueError("the two models must share the sequencing and ambiguity models")
+    if ms.bio_model == "Chromatin" and mb.bio_model == "Chromatin":
+        from . import chromatin_fit as cf
+        if ms.n_sites != mb.n_sites or bool(ms.periodic) != bool(mb.periodic):
+            raise ValueError("Chromatin models must describe the same locus (n_sites, periodic)")
+        if ms.rule != mb.rule and mb.rule != "table":
+            raise ValueError(f"the {mb.rule!r} rule does not nest the {ms.rule!r} rule; only 'table' nests the others")
+        if ms.bursty and not mb.bursty:
+            raise ValueError("a constitutive emission does not nest a bursty one")
+        n, rule_small, same_rule = ms.n_sites, ms.rule, ms.rule == mb.rule
+        add_burst = bool(mb.bursty) and not ms.bursty
+        b_floor = float(mb.bio_bounds["phys_lb"][-1])
+
+        def embed(x):
+            x = np.asarray(x, dtype=float)
+            if add_burst:
+                x = np.append(x, b_floor)                   # the burst size rides last and is carried by embed_in_table
+            return x if same_rule else cf.embed_in_table(x, rule_small, n)
+        return embed
+    if ms.bio_model == "Custom" and mb.bio_model == "Custom":
+        return _network_embedding(ms, mb)
+    if ms.bio_model == mb.bio_model and ms.get_num_params() == mb.get_num_params():
+        return lambda x: np.asarray(x, dtype=float).copy()
+    if {ms.bio_model, mb.bio_model} == {"Constitutive", "Bursty"}:
+        raise ValueError("monod's Bursty model is in units of the burst frequency and Constitutive in units of the "
+                         "production rate, so Constitutive is not a point of Bursty's parameter box. Write both as "
+                         "reaction networks with burst_mean_rate=True ('0 -> U -> S -> 0' and '0 -> B x U -> S -> 0', "
+                         "normalize_production_rate=True) and the constitutive one is nested at the burst-size floor; "
+                         "or use compare_models for a non-nested comparison.")
+    raise ValueError(f"no known nesting of {ms.bio_model} in {mb.bio_model}; pass embed= or use compare_models")
+
+
+def _network_embedding(ms, mb):
+    ns, nb = ms.network, mb.network
+    if ns.normalize_production_rate != nb.normalize_production_rate:
+        raise ValueError("both networks must use the same normalize_production_rate")
+    if ns.named_params and ns.burst_mean_rate != nb.burst_mean_rate:
+        raise ValueError("both networks must use the same burst_mean_rate")
+
+    def key(r):
+        return (tuple(sorted(r.reactants.items())), tuple(sorted(r.products.items())))
+
+    unmatched = list(nb.reactions)
+    mapping = {}                                            # big parameter -> ("copy", small name) | ("lb",) | ("ub",)
+    for r in ns.reactions:
+        cands = [c for c in unmatched if key(c) == key(r) and (r.burst_param is None or c.burst_param is not None)]
+        if not cands:
+            raise ValueError(f"the big network has no counterpart of the small network's reaction "
+                             f"{r.reactants or '0'} -> {r.products}")
+        c = cands[0]
+        unmatched.remove(c)
+        if (r.rate_name == ns._norm_rate) != (c.rate_name == nb._norm_rate):
+            raise ValueError("the normalised production reaction must be the same reaction in both networks")
+        if r.rate_name != ns._norm_rate:
+            mapping[c.rate_name] = ("copy", r.rate_name)
+        if c.burst_param is not None:
+            if r.burst_param is not None:
+                mapping[c.burst_param] = ("copy", r.burst_param)
+            elif not nb.burst_mean_rate:
+                raise ValueError("the big network adds a geometric burst in the burst-frequency form, whose small-size "
+                                 "limit is no production; build it with burst_mean_rate=True")
+            else:
+                mapping.setdefault(c.burst_param, ("lb",))
+        if r.is_delayed and not c.is_delayed:
+            raise ValueError("an immediate reaction does not nest a delayed one")
+        if c.is_delayed:
+            mapping[c.tau_name] = ("copy", r.tau_name) if r.is_delayed else ("ub",)
+    for c in unmatched:
+        if c.rate_name == nb._norm_rate:
+            raise ValueError("the big network's normalised production reaction has no counterpart in the small one")
+        mapping[c.rate_name] = ("lb",)
+        if c.burst_param is not None and c.burst_param not in mapping:
+            if not nb.burst_mean_rate:
+                raise ValueError("the big network adds a geometric burst in the burst-frequency form; build it with "
+                                 "burst_mean_rate=True so that the small-size limit is the single-molecule reaction")
+            mapping[c.burst_param] = ("lb",)
+        if c.is_delayed:
+            mapping[c.tau_name] = ("ub",)
+    missing = [n for n in nb.all_params if n not in mapping]
+    if missing:
+        raise ValueError(f"no embedding for the big network's parameters {missing}")
+    lb = np.asarray(mb.bio_bounds["phys_lb"], float)
+    ub = np.asarray(mb.bio_bounds["phys_ub"], float)
+    idx = {n: i for i, n in enumerate(ns.all_params)}
+    plan = [(mapping[n][0], idx.get(mapping[n][1]) if mapping[n][0] == "copy" else j) for j, n in enumerate(nb.all_params)]
+
+    def embed(x):
+        x = np.asarray(x, dtype=float)
+        return np.array([x[i] if how == "copy" else (lb[i] if how == "lb" else ub[i]) for how, i in plan])
+    return embed
+
+
+def compare_models(model_a, model_b, x_a, x_b, limits, samp, data, n_cells, EPS=1e-15):
+    """Compare two fitted models on one gene without assuming either nests the
+    other: divergences, AIC and BIC (``2k + 2 n_cells KLD`` and
+    ``k log n_cells + 2 n_cells KLD``, so differences are differences of
+    deviance) and Vuong's test, the per-cell log-likelihood ratios of the two
+    fits read off the histogram.  ``vuong_z`` is the raw statistic (positive
+    favours ``model_a``), ``vuong_z_bic`` the Schwarz-corrected one used for
+    the two-sided p-value ``p_vuong``, and ``prefer`` is ``"a"``, ``"b"`` or
+    ``None`` at the 5 % level.  For nested pairs use
+    :func:`compare_nested_models`, whose likelihood ratio is the sharper test.
+    """
+    from scipy.stats import norm
+    coords, freqs = data
+    coords = np.asarray(coords)
+    freqs = np.asarray(freqs, dtype=float)
+    freqs = freqs / freqs.sum()
+
+    def logp(m, x):
+        pss = np.asarray(m.eval_model_pss(np.asarray(x, dtype=float), limits, samp), dtype=float)
+        pss = np.where(pss < EPS, EPS, pss)
+        return np.log(pss[tuple(coords.T)])
+    la, lb_ = logp(model_a, x_a), logp(model_b, x_b)
+    lf = np.log(freqs)
+    kld_a, kld_b = float(freqs @ (lf - la)), float(freqs @ (lf - lb_))
+    ka, kb = model_a.get_num_params(), model_b.get_num_params()
+    n = float(n_cells)
+    d = la - lb_
+    m = float(freqs @ d)
+    v = float(freqs @ (d - m) ** 2)
+    if v > 0:
+        z = np.sqrt(n) * m / np.sqrt(v)
+        z_bic = (n * m - 0.5 * (ka - kb) * np.log(n)) / np.sqrt(n * v)
+    else:
+        z = z_bic = 0.0
+    p = float(2.0 * norm.sf(abs(z_bic)))
+    return dict(kld_a=kld_a, kld_b=kld_b, k_a=ka, k_b=kb,
+                aic_a=2 * ka + 2 * n * kld_a, aic_b=2 * kb + 2 * n * kld_b,
+                bic_a=ka * np.log(n) + 2 * n * kld_a, bic_b=kb * np.log(n) + 2 * n * kld_b,
+                vuong_z=float(z), vuong_z_bic=float(z_bic), p_vuong=p,
+                prefer=None if p >= 0.05 else ("a" if z_bic > 0 else "b"))
+
+
+def compare_nested_models(model_small, model_big, embed=None, x_small=None, limits=None, samp=None, data=None, n_cells=None,
                           alpha=0.05, table="score", hess_step=1e-2, maxiter=200, bounds=None, gtol=1e-2,
-                          score=None):
+                          score=None, n_jobs=1, nudge=True, extra_starts=None):
     """Test a fitted model against one that nests it, for one gene.
 
     ``embed`` maps the small model's log10 parameters into the big model's
-    space (for the Chromatin rules, :func:`monod.chromatin_fit.embed_in_table`;
-    for a network with one extra reaction, append that rate at its lower
-    bound).  Both models see the same ``data`` ``(coords, freqs)`` on ``limits``
-    with sampling vector ``samp``.
+    space; ``None`` takes the map :func:`nesting_embedding` knows for the pair
+    (Chromatin rules and emissions, reaction networks that add reactions,
+    bursts or delays), and raises when there is none.  Both models see the
+    same ``data`` ``(coords, freqs)`` on ``limits`` with sampling vector
+    ``samp``.
 
     With ``table="score"`` a Rao score test at the embedded optimum decides
     whether the big model is fitted at all: the gradient and observed
@@ -38,16 +199,34 @@ def compare_nested_models(model_small, model_big, embed, x_small, limits, samp, 
     gradient tolerance on that scale.  The score test needs the observed
     information, ``2 d`` gradient evaluations of the big model; with
     ``table="always"`` it decides nothing and is skipped unless
-    ``score=True`` (``score`` is then ``(nan, df, nan)``).
+    ``score=True`` (``score`` is then ``(nan, df, nan)``).  ``n_jobs`` is
+    the thread count of the finite-difference stencil behind every gradient
+    (:meth:`CMEModel.eval_model_kld_and_grad`); the Hessian columns of the
+    score test are taken in the same pool.
 
     Returns a dict with ``x_small``, ``kld_small``, ``score`` (statistic, df,
-    p), ``fitted`` (bool), ``x_big``, ``kld_big``, ``lr``, ``df``, ``p_lr``
-    and ``prefer_big`` (the likelihood ratio rejects the small model at
-    ``alpha``).
+    p), ``fitted`` (bool), ``x_big``, ``kld_big``, ``lr``, ``df``, ``p_lr``,
+    ``prefer_big`` (the likelihood ratio rejects the small model at
+    ``alpha``) and the ``aic``/``bic`` of both fits as in
+    :func:`compare_models`.  When the extra parameters sit at a bound in the
+    embedding (a burst size or a rate at its floor) the chi-square p-value is
+    conservative and the score test cannot see them, so use
+    ``table="always"`` there.  A parameter pinned at a bound is also a poor
+    place to start from when the data want it far inside the box (the
+    divergence is flat in a burst size near zero, and a gradient optimiser
+    does not leave), so with ``nudge=True`` the big model is fitted once
+    from the embedding and once more per pinned coordinate with that
+    coordinate moved to the middle of its box, and the best fit is kept;
+    ``extra_starts`` adds starts of your own (for instance the big model's
+    own moments fit).  The nesting guarantee holds for every start.
     """
     import scipy.optimize
     from scipy.stats import chi2
 
+    if x_small is None or limits is None or data is None or n_cells is None:
+        raise TypeError("compare_nested_models needs x_small, limits, data and n_cells")
+    if embed is None:
+        embed = nesting_embedding(model_small, model_big)
     x_small = np.asarray(x_small, dtype=float)
     kld_small = float(model_small.eval_model_kld(x_small, limits, samp, data))
     x0 = np.asarray(embed(x_small), dtype=float)
@@ -64,13 +243,21 @@ def compare_nested_models(model_small, model_big, embed, x_small, limits, samp, 
         score = table != "always"
     if score:
         with model_big.pinned_schedule(x0, limits, samp):
-            kld0, g = model_big.eval_model_kld_and_grad(x0, limits, samp, data)
-            cols = []
-            for j in range(d):
+            kld0, g = model_big.eval_model_kld_and_grad(x0, limits, samp, data, n_jobs=n_jobs)
+            state = model_big.thread_state()                 # the pin, for the pool's worker threads
+
+            def column(j):
                 e = np.zeros(d); e[j] = hess_step
-                _, gp = model_big.eval_model_kld_and_grad(x0 + e, limits, samp, data)
-                _, gm = model_big.eval_model_kld_and_grad(x0 - e, limits, samp, data)
-                cols.append((np.asarray(gp) - np.asarray(gm)) / (2 * hess_step))
+                with model_big.carry_thread_state(state):
+                    _, gp = model_big.eval_model_kld_and_grad(x0 + e, limits, samp, data)
+                    _, gm = model_big.eval_model_kld_and_grad(x0 - e, limits, samp, data)
+                return (np.asarray(gp) - np.asarray(gm)) / (2 * hess_step)
+            if n_jobs == 1 or d == 1:
+                cols = [column(j) for j in range(d)]
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=d if n_jobs < 0 else min(d, n_jobs)) as ex:
+                    cols = list(ex.map(column, range(d)))
         I = 0.5 * (np.column_stack(cols) + np.column_stack(cols).T) * n_cells
         g = np.asarray(g) * n_cells
         gf, If = g[free], I[np.ix_(free, free)]
@@ -95,54 +282,49 @@ def compare_nested_models(model_small, model_big, embed, x_small, limits, samp, 
         # a well-fitted gene on real data is far below 1e-2 already at the
         # embedded start, and the optimizer would not move at all.
         def fg(x):
-            k, g = model_big.eval_model_kld_and_grad(x, limits, samp, data)
+            k, g = model_big.eval_model_kld_and_grad(x, limits, samp, data, n_jobs=n_jobs)
             return n_cells * k, n_cells * np.asarray(g)
+        starts = [x0]
+        if nudge:
+            pinned = np.where((x0 <= lb + 1e-9) | (x0 >= ub - 1e-9))[0]
+            for j in pinned:
+                x_j = x0.copy()
+                x_j[j] = 0.5 * (lb[j] + ub[j])
+                starts.append(x_j)
+        for x_extra in (extra_starts or []):
+            starts.append(np.clip(np.asarray(x_extra, dtype=float), lb, ub))
+        x_big, kld_big = x0, float(kld0)              # a nesting model never fits worse than its start
         with model_big.search_tolerance():
-            res = scipy.optimize.minimize(fg, x0, jac=True, method="L-BFGS-B",
-                                          bounds=scipy.optimize.Bounds(lb, ub),
-                                          options=dict(maxiter=maxiter, ftol=1e-9, gtol=gtol))
-        x_big = res.x
-        kld_big = float(model_big.eval_model_kld(x_big, limits, samp, data))
-        if kld_big > kld0:                         # a nesting model never fits worse than its start
-            x_big, kld_big = x0, float(kld0)
-        out.update(fitted=True, x_big=x_big, kld_big=kld_big)
+            for x_start in starts:
+                res = scipy.optimize.minimize(fg, x_start, jac=True, method="L-BFGS-B",
+                                              bounds=scipy.optimize.Bounds(lb, ub),
+                                              options=dict(maxiter=maxiter, ftol=1e-9, gtol=gtol))
+                k_res = float(model_big.eval_model_kld(res.x, limits, samp, data))
+                if k_res < kld_big:
+                    x_big, kld_big = res.x, k_res
+        out.update(fitted=True, x_big=x_big, kld_big=kld_big, n_starts=len(starts))
     lr = max(2.0 * n_cells * (kld_small - out["kld_big"]), 0.0)
     out.update(lr=lr, p_lr=float(chi2.sf(lr, df_total)), prefer_big=bool(out["fitted"] and chi2.sf(lr, df_total) < alpha))
+    k_s, k_b, n = model_small.get_num_params(), model_big.get_num_params(), float(n_cells)
+    out.update(aic_small=2 * k_s + 2 * n * kld_small, aic_big=2 * k_b + 2 * n * out["kld_big"],
+               bic_small=k_s * np.log(n) + 2 * n * kld_small, bic_big=k_b * np.log(n) + 2 * n * out["kld_big"])
     return out
 
 
-def run_qc(monod_adata, mek_means_params=None,cluster=0, discard_rejected=True, marg='joint',
+def run_qc(monod_adata, mek_means_params=None, cluster=0, discard_rejected=True, marg='joint',
            gene_dist_size=(5, 5), show_axes=False):
+    """Quick look at a finished run: the sampling optimum, the divergence
+    landscape and the fitted distributions of a few genes."""
     # The SearchData is never stored in the AnnData; rebuild it in memory.
     sd = searchdata_from_adata(monod_adata)
-
     if not mek_means_params:
         sr = search_result_from_uns(monod_adata.uns['search_result'])
     else:
         sr = search_result_list_from_uns(monod_adata.uns['search_result_list'])[cluster]
-        
-    fig1,ax1 = plt.subplots(1,1)
     sr.find_sampling_optimum()
-    # sr.plot_landscape(ax1)d
-
-    fig1,ax1 = plt.subplots(1,1)
+    _, ax1 = plt.subplots(1, 1)
     sr.plot_KL(ax1, discard_rejected=discard_rejected)
-
-    sr.plot_gene_distributions(sd,marg=marg, sz=gene_dist_size, show_axes = show_axes)
-
-    # _=sr.chisquare_testing(sd)
-    # if monod_adata.n_vars >=60:
-    #     sr.resample_opt_viz()
-    #     sr.resample_opt_mc_viz()
-    # sr.chisq_best_param_correction(sd,viz=True) 
-
-    # sr.compute_sigma(sd,num_cores=1) #colab has a hard time with multiprocessing
-    # sr.plot_param_L_dep(plot_errorbars=True,plot_fit=True)
-    # sr.plot_param_marg(discard_rejected=discard_rejected)
-    # sr.update_on_disk()
-    
-    # # Update the anndata object with the new search result.
-    # monod_adata['search_result'] = sr
+    sr.plot_gene_distributions(sd, marg=marg, sz=gene_dist_size, show_axes=show_axes)
 
 
 def load_search_results(full_result_string):
@@ -190,27 +372,6 @@ def load_search_results(full_result_string):
             "Grid scan results could not be loaded from {}.".format(full_result_string)
         )
         raise ex
-
-
-def make_batch_analysis_dir(sr_arr, dir_string):
-    """Create a directory for batch analysis.
-
-    Parameters
-    -------
-    sr_arr: list of monod.inference.SearchResults
-        search result array to process.
-    dir_string: str
-        batch analysis directory to create and assign.
-
-    Sets
-    ----
-    batch_analysis_string: str
-        batch analysis directory.
-    """
-    batch_analysis_string = dir_string + "/analysis_figures"
-    make_dir(batch_analysis_string)
-    for sr in sr_arr:
-        sr.batch_analysis_string = batch_analysis_string
 
 
 def plot_params_for_pair(
@@ -263,7 +424,7 @@ def plot_params_for_pair(
     ylabel: str, optional
         figure y-label, name of the second dataset.
     savefig: bool, optional
-        save to ``sr1.batch_analysis_string`` when that directory has been set
+        save to this file path when a string is given
         with make_batch_analysis_dir; otherwise the figure is only returned.
 
     Returns
@@ -347,13 +508,11 @@ def plot_params_for_pair(
             ax1[i].plot(xl, xl, "r--", linewidth=2)
     fig1.tight_layout()
 
-    batch_dir = getattr(sr1, "batch_analysis_string", None)
-    if savefig and batch_dir:
-        fig_string = batch_dir + "/pair_parameter_comparison_{}.png".format(meta)
-        plt.savefig(fig_string, dpi=450)
-        log.info("Figure stored to {}.".format(fig_string))
+    if isinstance(savefig, str):
+        plt.savefig(savefig, dpi=450)
+        log.info("Figure stored to {}.".format(savefig))
     elif savefig:
-        log.info("No batch analysis directory set (see make_batch_analysis_dir); figure not saved.")
+        log.info("Pass a file path as savefig to store the figure; nothing saved.")
     return fig1
 
 
@@ -496,72 +655,13 @@ def plot_AIC_weights(
         ax1[i].set_title(models[i])
 
     fig1.tight_layout()
-    batch_dir = getattr(sr_arr[0], "batch_analysis_string", None)
-    if savefig and batch_dir:
-        fig_string = batch_dir + "/AIC_comparison{}.png".format(meta)
-        plt.savefig(fig_string, dpi=450)
-        log.info("Figure stored to {}.".format(fig_string))
+    if isinstance(savefig, str):
+        plt.savefig(savefig, dpi=450)
+        log.info("Figure stored to {}.".format(savefig))
     elif savefig:
-        log.info("No batch analysis directory set (see make_batch_analysis_dir); figure not saved.")
+        log.info("Pass a file path as savefig to store the figure; nothing saved.")
     return w
 
-
-def compare_AIC_weights(
-    w, dataset_names, batch_analysis_string, model_ind=0, figsize=(12, 12), kde_bw=0.05
-):
-    """Compare Akaike weights across datasets.
-
-    This function compares the consistency of AIC weights for a single model across several datasets.
-    For a given gene and model j, the function takes the weight w_j and compares its absolute difference
-    between two datasets. Then, it aggregates the information over all genes and plots the
-    kernel density estimates for a pair of datasets.
-
-    If the KDE is concentrated near zero, inference on the same dataset tends to choose the same model.
-
-    Returns
-    -------
-    w: np.ndarray
-        Akaike weights corresponding to each dataset and model, an n_datasets x n_models x n_genes array.
-    dataset_names: list of str
-        dataset metadata.
-    batch_analysis_string: str
-        location of the directory for batch-wide analyses.
-    model_ind: int
-        which model to plot weights for.
-    figsize: None or tuple of floats, optional
-        figure dimensions.
-    kde_bw: str, scalar or callable, optional
-        float kernel density estimate bandwidth or method, as documented for scipy.stats.gaussian_kde.
-
-    """
-    fs = 12
-    n_datasets = len(dataset_names)
-    fig1, ax1 = plt.subplots(nrows=n_datasets, ncols=n_datasets, figsize=figsize)
-    for i in range(n_datasets):
-        for k in range(n_datasets):
-            if i > k:
-                xx = np.linspace(-0.2, 1.2, 2000)
-
-                kde = stats.gaussian_kde(
-                    np.abs(w[i, model_ind, :] - w[k, model_ind, :]), bw_method=kde_bw
-                )
-                ax1[i, k].plot(xx, kde(xx), "k")
-            elif i == k:
-                ax1[i, k].hist(
-                    w[i, model_ind, :], 30, facecolor=aesthetics["hist_face_color"]
-                )
-            elif i < k:
-                fig1.delaxes(ax1[i, k])
-            ax1[i, k].set_yticks([])
-            if k == 0:
-                ax1[i, k].set_ylabel(dataset_names[i], fontsize=fs)
-            if i == (n_datasets - 1):
-                ax1[i, k].set_xlabel(dataset_names[k], fontsize=fs)
-    fig1.tight_layout()
-    fig_string = batch_analysis_string + "/AIC_comparison_grid.png"
-
-    plt.savefig(fig_string, dpi=450)
-    log.info("Figure stored to {}.".format(fig_string))
 
 def DE_parameters(adata1, adata2=None, modeltype="id",
     gene_filter_=None,
@@ -818,42 +918,12 @@ def diffexp_pars(
             ax.legend()
     if viz:
         fig1.tight_layout()
-        # fig_string = f"{sr1.batch_analysis_string}/parameter_residuals_{meta}.png"
         # plt.savefig(fig_string, dpi=450)
         # log.info("Figure stored to {}.".format(fig_string))
 
     return gn, np.asarray(gf), np.asarray(offs), np.asarray(resid)
 
 # def diffexp_pars_plot(gn, gf, offs, resid)
-
-
-def linoffset(B, x, modeltype="id"):
-    """Helper function for debiasing.
-
-    Defines a statistical model that governs the relationship between the parameter values in two
-    matched parameter sets, under the assumption that all differences are aleatory rather than systematic,
-    i.e., governed by random noise rather than any meaningful differential variation.
-
-    Parameters
-    ----------
-    B: float np.ndarray
-        statistical model parameters of size n_model_pars.
-    x: float np.ndarray
-        an array of optimal physical parameters of size n_genes_subset, where
-        n_genes_subset is within [1,n_genes] and may omit some genes.
-    modeltype: str, optional
-        If 'id', the relationship between datasets' parameters is assumed to be x + b = y; n_model_pars = 1.
-        If 'lin', the relationship between datasets' parameters is assumed to be ax + b = y; n_model_pars = 2.
-
-    Returns
-    -------
-    y: float np.ndarray
-        predicted parameter values accounting for potential bias between datasets.
-    """
-    if modeltype == "id":
-        return x + B[0]
-    elif modeltype == "lin":
-        return B[1] * x + B[0]
 
 
 def _fit_line_eiv(x, y, sx=None, sy=None, fit_slope=True, b0=1.0, tol=1e-12, maxiter=500):

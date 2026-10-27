@@ -26,10 +26,10 @@
 use lbfgsb_rs_pure::{IterationControl, LBFGSB};
 use num_complex::Complex64;
 use indexmap::IndexMap;
-use ruanndata::{read_h5ad, write_h5ad, ArrayData, ArrayValue, DataFrame, MatrixData, RuAnnData, SeriesData, UnsValue};
+use ruanndata::{read_h5ad, ArrayData, ArrayValue, DataFrame, MatrixData, RuAnnData, SeriesData, UnsValue};
 use pyo3::prelude::*;
 use rayon::prelude::*;
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2, PyUntypedArrayMethods};
 use ndarray::Array3;
 use realfft::RealFftPlanner;
 use rustfft::FftPlanner;
@@ -1154,22 +1154,6 @@ fn irfftn_3d(input: &[Complex64], mx0: usize, mx2_in: usize, n0: usize, n1: usiz
 // Shared protein_bursty_core helper
 // ============================================================================
 
-/// Shared logic for ProteinBursty: coarse-graining, mesh build, PGF evaluation, exp.
-/// Returns (gf, mx, lims) where gf is the exponentiated generating function on the
-/// coarse grid, mx is the reduced grid shape, and lims is the full output shape.
-fn protein_bursty_core(
-    p_log: &[f64],
-    limits: &[usize],
-    fit_unspliced: bool,
-    protein_limit: f64,
-    min_fudge: f64,
-    max_fudge: f64,
-) -> (Vec<Complex64>, [usize; 3], [usize; 3]) {
-    let (gf, mx, lims, _) =
-        protein_bursty_core_sched(p_log, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, None);
-    (gf, mx, lims)
-}
-
 /// `protein_bursty_core` with an optional fixed integration schedule; also returns
 /// the schedule actually used, so gradient stencils can reuse it.
 fn protein_bursty_core_sched(
@@ -1492,38 +1476,6 @@ fn eval_model_pss_2d_batch(
 // eval_model_pss — ProteinBursty (3-D)
 // ============================================================================
 
-#[pyfunction]
-#[allow(clippy::too_many_arguments)]
-fn eval_model_pss_protein_bursty(
-    py: Python<'_>,
-    p_log: Vec<f64>,
-    limits: Vec<usize>,
-    fit_unspliced: bool,
-    protein_limit: f64,
-    min_fudge: f64,
-    max_fudge: f64,
-) -> PyResult<Vec<f64>> {
-    validate_limits(&limits, 3, "eval_model_pss_protein_bursty")?;
-    if p_log.len() != 5 {
-        return verr(format!("eval_model_pss_protein_bursty: expected 5 parameters, got {}", p_log.len()));
-    }
-    if protein_limit.is_nan() || protein_limit <= 0.0 {
-        // +inf is allowed: it disables coarse-graining of the protein axis.
-        return verr(format!("eval_model_pss_protein_bursty: protein_limit must be > 0, got {protein_limit}"));
-    }
-    if !(min_fudge > 0.0) || !(max_fudge > 0.0) {
-        return verr(format!("eval_model_pss_protein_bursty: min_fudge/max_fudge must be > 0"));
-    }
-    // Released GIL: lets Python threads run several genes' integrations at once
-    // (the Nelder-Mead pre-search in inference.py relies on this).
-    let pss_raw = py.allow_threads(|| {
-        let (gf, mx, lims) =
-            protein_bursty_core(&p_log, &limits, fit_unspliced, protein_limit, min_fudge, max_fudge);
-        irfftn_3d(&gf, mx[0], mx[2], lims[0], lims[1], lims[2])
-    });
-    Ok(normalize_abs(pss_raw))
-}
-
 /// `eval_model_pss_protein_bursty` that also returns the integration schedule
 /// used and replays `fixed_schedule` when given, so `CMEModel.pinned_schedule`
 /// pins the Rust path exactly as it pins the Python one.
@@ -1555,27 +1507,6 @@ fn eval_model_pss_protein_bursty_sched(
             &p_log, &limits, fit_unspliced, protein_limit, min_fudge, max_fudge, fixed_schedule.as_deref(),
         )
     }))
-}
-
-// ============================================================================
-// protein_bursty_pgf — return gf array to Python for scipy irfftn
-// ============================================================================
-
-#[pyfunction]
-#[allow(clippy::too_many_arguments)]
-fn protein_bursty_pgf(
-    p_log: Vec<f64>,
-    limits: Vec<usize>,
-    fit_unspliced: bool,
-    protein_limit: f64,
-    min_fudge: f64,
-    max_fudge: f64,
-) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>)> {
-    let (gf, mx, _) =
-        protein_bursty_core(&p_log, &limits, fit_unspliced, protein_limit, min_fudge, max_fudge);
-    let re: Vec<f64> = gf.iter().map(|z| z.re).collect();
-    let im: Vec<f64> = gf.iter().map(|z| z.im).collect();
-    Ok((re, im, vec![mx[0], mx[1], mx[2]]))
 }
 
 // ============================================================================
@@ -3646,24 +3577,6 @@ fn load_h5ad_inner(
 
 // ── H5adInner accessors ───────────────────────────────────────────────────────
 
-/// Extract (gene_names, coords, freqs, limits) from an `H5adInner` for the
-/// `load_histograms_h5ad` return type.
-fn h5ad_inner_to_histograms(
-    inner: H5adInner,
-    n_layers: usize,
-) -> Result<(Vec<String>, Vec<Vec<Vec<i64>>>, Vec<Vec<f64>>, Vec<Vec<usize>>), String> {
-    let n_genes = inner.adata_sub.n_vars();
-    let gene_names = inner.adata_sub.var.index.clone();
-    let (coords, freqs) = extract_state_dists(&inner.adata_sub, n_genes, n_layers)?;
-    let limits_flat = extract_limits(&inner.adata_sub, n_genes, n_layers)?;
-    // Re-nest for the Python-facing return type.
-    let limits_nested: Vec<Vec<usize>> = limits_flat
-        .chunks(n_layers)
-        .map(|c| c.to_vec())
-        .collect();
-    Ok((gene_names, coords, freqs, limits_nested))
-}
-
 /// Read the monod state-distribution for gene `gene_idx` from a `RuAnnData`
 /// enriched by `load_h5ad_inner`.
 ///
@@ -3751,81 +3664,16 @@ fn extract_limits(
 
 // ── Public pyfunction wrappers ────────────────────────────────────────────────
 
-/// Read an h5ad file, apply optional expression filter, compute unique histograms.
-///
-/// Parameters
-/// ----------
-/// filepath      : path to the .h5ad file.
-/// layer_names   : ordered list of layer keys (e.g. ["unspliced","spliced"]).
-/// gene_names    : if Some, use exactly these genes (must be present in var.index).
-///                 if None, apply expression filter and return all passing genes.
-/// min_means     : per-layer minimum mean expression (default 0.01 each).
-/// max_maxes     : per-layer maximum allowed peak count (default 350 each).
-/// min_maxes     : per-layer minimum required peak count (default 4 each).
-/// padding       : added to per-gene per-layer maximum to form grid limit (default 10).
-///
-/// Returns
-/// -------
-/// (gene_names, coords, freqs, limits) where
-///   gene_names  : Vec<String> of selected gene names (in requested / filter order)
-///   coords[g]   : unique microstates (each a Vec<i64> of length n_layers)
-///   freqs[g]    : normalised frequencies corresponding to coords[g]
-///   limits[g]   : Vec<usize> per-layer grid bound (max_val + padding)
-#[pyfunction]
-#[pyo3(signature = (filepath, layer_names, gene_names=None,
-                    min_means=None, max_maxes=None, min_maxes=None, padding=10))]
-#[allow(clippy::too_many_arguments)]
-fn load_histograms_h5ad(
-    py: Python<'_>,
-    filepath: String,
-    layer_names: Vec<String>,
-    gene_names: Option<Vec<String>>,
-    min_means: Option<Vec<f64>>,
-    max_maxes: Option<Vec<f64>>,
-    min_maxes: Option<Vec<f64>>,
-    padding: usize,
-) -> PyResult<(Vec<String>, Vec<Vec<Vec<i64>>>, Vec<Vec<f64>>, Vec<Vec<usize>>)> {
-    let n_layers = layer_names.len();
-    if n_layers == 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err("layer_names must not be empty"));
-    }
-    if padding == 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "padding must be >= 1 so that the largest observed count lies inside the PMF grid",
-        ));
-    }
-    let min_means  = min_means .unwrap_or_else(|| vec![0.01;  n_layers]);
-    let max_maxes  = max_maxes .unwrap_or_else(|| vec![350.0; n_layers]);
-    let min_maxes  = min_maxes .unwrap_or_else(|| vec![4.0;   n_layers]);
-    if min_means.len() != n_layers || max_maxes.len() != n_layers || min_maxes.len() != n_layers {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "min_means, max_maxes, min_maxes must each have length == len(layer_names)",
-        ));
-    }
-
-    let result = py.allow_threads(|| {
-        let inner = load_h5ad_inner(
-            &filepath,
-            &layer_names,
-            gene_names.as_deref(),
-            &min_means,
-            &max_maxes,
-            &min_maxes,
-            padding,
-        )?;
-        h5ad_inner_to_histograms(inner, n_layers)
-    });
-
-    result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
-}
-
 /// Read an h5ad file and return a fully constructed `SearchData` object.
 ///
 /// This is the zero-Python-roundtrip path: the file is read, genes filtered,
 /// unique histograms and moments computed, all inside a single GIL-free block.
 ///
-/// Parameters are identical to `load_histograms_h5ad`, with the addition of:
-/// hist_type     : histogram type string stored on the SearchData (default "unique").
+/// Parameters
+/// ----------
+/// filepath, layer_names, gene_names, min_means, max_maxes, min_maxes, padding: as in
+/// `extract_data` (per-layer expression filter, grid padding); hist_type is the
+/// histogram type string stored on the SearchData (default "unique").
 ///
 /// Returns
 /// -------
@@ -6878,153 +6726,6 @@ fn e_step_2d(
     Ok(result)
 }
 
-/// E-step accumulation from precomputed PSS grids (PSS caching support).
-///
-/// `grids_per_k[k][g]` is the flat PSS array for cluster k, gene g.
-/// `limits_list[g] = [m_u, m_s]` — `m_s` is used to index into the flat grid.
-/// Returns (Q, lower_bound, q_func) identical to e_step_2d but skips PSS computation.
-#[pyfunction]
-#[pyo3(signature = (grids_per_k, limits_list, u_obs, s_obs, weights, eps=1e-15, num_threads=None))]
-fn e_step_2d_from_grids(
-    py: Python<'_>,
-    grids_per_k: Vec<Vec<Vec<f64>>>,   // n_k × n_genes × grid_flat
-    limits_list: Vec<Vec<usize>>,
-    u_obs: Vec<Vec<u64>>,
-    s_obs: Vec<Vec<u64>>,
-    weights: Vec<f64>,
-    eps: f64,
-    num_threads: Option<usize>,
-) -> PyResult<(Vec<Vec<f64>>, f64, f64)> {
-    let n_k = grids_per_k.len();
-    let n_genes = limits_list.len();
-    let n_cells = if n_genes > 0 && !u_obs.is_empty() { u_obs[0].len() } else { 0 };
-
-    let result = py.allow_threads(|| {
-        let run = || -> (Vec<Vec<f64>>, f64, f64) {
-            let mut log_l = vec![vec![0.0_f64; n_k]; n_cells];
-
-            for k in 0..n_k {
-                let gene_log_probs: Vec<Vec<f64>> = (0..n_genes)
-                    .into_par_iter()
-                    .map(|g| {
-                        let pss = &grids_per_k[k][g];
-                        let m_s = limits_list[g][1];
-                        u_obs[g].iter().zip(s_obs[g].iter()).map(|(&u, &s)| {
-                            let idx = u as usize * m_s + s as usize;
-                            let p = if idx < pss.len() { pss[idx] } else { 0.0 };
-                            p.max(eps).ln()
-                        }).collect::<Vec<f64>>()
-                    })
-                    .collect();
-
-                let log_w = weights[k].max(f64::MIN_POSITIVE).ln();
-                for c in 0..n_cells {
-                    let gene_sum: f64 = gene_log_probs.iter().map(|lp| lp[c]).sum();
-                    log_l[c][k] = gene_sum + log_w;
-                }
-            }
-
-            // Softmax row-wise → Q; logsumexp → lower_bound; Q·log_l → q_func
-            let mut q_mat = vec![vec![0.0_f64; n_k]; n_cells];
-            let mut total_lse = 0.0_f64;
-            for c in 0..n_cells {
-                let max_val = log_l[c].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let sum_exp: f64 = log_l[c].iter().map(|&v| (v - max_val).exp()).sum();
-                let lse = max_val + sum_exp.ln();
-                total_lse += lse;
-                for k in 0..n_k {
-                    q_mat[c][k] = (log_l[c][k] - max_val).exp() / sum_exp;
-                }
-            }
-            let lower_bound = if n_cells > 0 { total_lse / n_cells as f64 } else { 0.0 };
-            let q_func: f64 = q_mat.iter().zip(log_l.iter()).map(|(q_row, l_row)| {
-                q_row.iter().zip(l_row.iter()).map(|(&q, &l)| q * l).sum::<f64>()
-            }).sum();
-
-            (q_mat, lower_bound, q_func)
-        };
-
-        match num_threads {
-            Some(nt) => rayon::ThreadPoolBuilder::new()
-                .num_threads(nt)
-                .build()
-                .map(|pool| pool.install(run))
-                .unwrap_or_else(|_| run()),
-            None => run(),
-        }
-    });
-
-    Ok(result)
-}
-
-// ============================================================================
-// Phase 3: write inference results back into a RuAnnData and save as h5ad
-// ============================================================================
-
-/// Annotate the `RuAnnData` carried by `search_data` with fitted parameters and
-/// KLD values, then write the result to `output_path` as an h5ad file.
-///
-/// Parameters
-/// ----------
-/// search_data  : SearchData built via `searchdata_from_h5ad` (must carry adata)
-/// param_names  : column names for each parameter (e.g. ["b", "beta", "gamma"])
-/// params       : 2-D array, shape [n_genes, n_params], log10 parameter values
-/// klds         : 1-D array, shape [n_genes], per-gene KLD at optimum
-/// output_path  : destination h5ad path
-#[pyfunction]
-fn annotate_inference_results(
-    py: Python<'_>,
-    search_data: &Bound<'_, PySearchData>,
-    param_names: Vec<String>,
-    params: PyReadonlyArray2<'_, f64>,
-    klds: PyReadonlyArray1<'_, f64>,
-    output_path: String,
-) -> PyResult<()> {
-    let sd = search_data.borrow();
-    let mut adata = sd.inner.adata.clone();
-
-    let n_genes = adata.n_vars();
-    let params_arr = params.as_array();
-    let klds_arr   = klds.as_array();
-
-    if params_arr.nrows() != n_genes || klds_arr.len() != n_genes {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "params/klds length ({}/{}) does not match n_genes ({})",
-            params_arr.nrows(), klds_arr.len(), n_genes,
-        )));
-    }
-    if params_arr.ncols() != param_names.len() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "params has {} columns but {} param_names were given",
-            params_arr.ncols(), param_names.len(),
-        )));
-    }
-
-    // Add one var column per parameter.
-    for (col_idx, name) in param_names.iter().enumerate() {
-        let values: Vec<Option<f64>> = (0..n_genes)
-            .map(|g| Some(params_arr[[g, col_idx]]))
-            .collect();
-        adata.var.columns.insert(
-            name.clone(),
-            SeriesData::Float64 { values },
-        );
-    }
-
-    // Add kld column.
-    let kld_values: Vec<Option<f64>> = (0..n_genes).map(|g| Some(klds_arr[g])).collect();
-    adata.var.columns.insert("kld".to_string(), SeriesData::Float64 { values: kld_values });
-
-    // Strip internal monod scaffolding that uses encoding types Python anndata cannot read.
-    for key in &["state_dist_coords", "state_dist_freqs", "limits"] {
-        adata.uns.shift_remove(*key);
-    }
-
-    py.allow_threads(|| {
-        write_h5ad(&output_path, &adata).map_err(|e| e.to_string())
-    }).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
-}
-
 // ============================================================================
 // PyO3 module
 // ============================================================================
@@ -7033,8 +6734,6 @@ fn annotate_inference_results(
 fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(eval_model_pss_2d, m)?)?;
     m.add_function(wrap_pyfunction!(eval_model_pss_2d_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(eval_model_pss_protein_bursty, m)?)?;
-    m.add_function(wrap_pyfunction!(protein_bursty_pgf, m)?)?;
     m.add_function(wrap_pyfunction!(eval_model_pss_protein_bursty_sched, m)?)?;
     m.add_function(wrap_pyfunction!(eval_kld_2d, m)?)?;
     m.add_function(wrap_pyfunction!(eval_logl_2d, m)?)?;
@@ -7049,14 +6748,11 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(optimize_genes_2d_amb_sd, m)?)?;
     m.add_function(wrap_pyfunction!(optimize_genes_custom_sd, m)?)?;
     m.add_function(wrap_pyfunction!(e_step_2d, m)?)?;
-    m.add_function(wrap_pyfunction!(e_step_2d_from_grids, m)?)?;
     m.add_function(wrap_pyfunction!(compute_moments, m)?)?;
     m.add_class::<PySearchData>()?;
     m.add_function(wrap_pyfunction!(searchdata_from_arrays, m)?)?;
     m.add_function(wrap_pyfunction!(make_state_dist, m)?)?;
-    m.add_function(wrap_pyfunction!(load_histograms_h5ad, m)?)?;
     m.add_function(wrap_pyfunction!(searchdata_from_h5ad, m)?)?;
-    m.add_function(wrap_pyfunction!(annotate_inference_results, m)?)?;
     m.add_function(wrap_pyfunction!(eval_custom_network_pgf, m)?)?;
     m.add_function(wrap_pyfunction!(eval_chromatin_pgf, m)?)?;
     m.add_function(wrap_pyfunction!(partition_searchdata_2d, m)?)?;
