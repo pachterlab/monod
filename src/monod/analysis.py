@@ -14,7 +14,8 @@ import matplotlib.pyplot as plt
 ########################
 
 def compare_nested_models(model_small, model_big, embed, x_small, limits, samp, data, n_cells,
-                          alpha=0.05, table="score", hess_step=1e-2, maxiter=200, bounds=None):
+                          alpha=0.05, table="score", hess_step=1e-2, maxiter=200, bounds=None, gtol=1e-2,
+                          score=None):
     """Test a fitted model against one that nests it, for one gene.
 
     ``embed`` maps the small model's log10 parameters into the big model's
@@ -32,7 +33,12 @@ def compare_nested_models(model_small, model_big, embed, x_small, limits, samp, 
     regardless; ``"never"`` only reports the score test.  The big model is
     warm-started from the embedding and can therefore never end worse than
     the small one (the nested-model check); the likelihood ratio
-    ``2 n_cells (KLD_small - KLD_big)`` and its p-value are reported.
+    ``2 n_cells (KLD_small - KLD_big)`` and its p-value are reported.  The
+    big model is optimised in nats; ``gtol`` is the L-BFGS-B projected
+    gradient tolerance on that scale.  The score test needs the observed
+    information, ``2 d`` gradient evaluations of the big model; with
+    ``table="always"`` it decides nothing and is skipped unless
+    ``score=True`` (``score`` is then ``(nan, df, nan)``).
 
     Returns a dict with ``x_small``, ``kld_small``, ``score`` (statistic, df,
     p), ``fitted`` (bool), ``x_big``, ``kld_big``, ``lr``, ``df``, ``p_lr``
@@ -54,36 +60,47 @@ def compare_nested_models(model_small, model_big, embed, x_small, limits, samp, 
     # score test at the embedded optimum
     free = np.where((x0 > lb + 1e-9) & (x0 < ub - 1e-9))[0]
     df = max(df_total - (d - free.size), 1)
-    with model_big.pinned_schedule(x0, limits, samp):
-        kld0, g = model_big.eval_model_kld_and_grad(x0, limits, samp, data)
-        cols = []
-        for j in range(d):
-            e = np.zeros(d); e[j] = hess_step
-            _, gp = model_big.eval_model_kld_and_grad(x0 + e, limits, samp, data)
-            _, gm = model_big.eval_model_kld_and_grad(x0 - e, limits, samp, data)
-            cols.append((np.asarray(gp) - np.asarray(gm)) / (2 * hess_step))
-    I = 0.5 * (np.column_stack(cols) + np.column_stack(cols).T) * n_cells
-    g = np.asarray(g) * n_cells
-    gf, If = g[free], I[np.ix_(free, free)]
-    try:
-        y = np.linalg.solve(np.linalg.cholesky(If), gf)
-        stat = float(y @ y)
-    except np.linalg.LinAlgError:
-        vals, vecs = np.linalg.eigh(If)
-        vals = np.maximum(vals, 1e-8 * max(vals.max(), 1e-300))
-        stat = float((vecs.T @ gf) ** 2 @ (1.0 / vals))
-    p_score = float(chi2.sf(stat, df))
+    if score is None:
+        score = table != "always"
+    if score:
+        with model_big.pinned_schedule(x0, limits, samp):
+            kld0, g = model_big.eval_model_kld_and_grad(x0, limits, samp, data)
+            cols = []
+            for j in range(d):
+                e = np.zeros(d); e[j] = hess_step
+                _, gp = model_big.eval_model_kld_and_grad(x0 + e, limits, samp, data)
+                _, gm = model_big.eval_model_kld_and_grad(x0 - e, limits, samp, data)
+                cols.append((np.asarray(gp) - np.asarray(gm)) / (2 * hess_step))
+        I = 0.5 * (np.column_stack(cols) + np.column_stack(cols).T) * n_cells
+        g = np.asarray(g) * n_cells
+        gf, If = g[free], I[np.ix_(free, free)]
+        try:
+            y = np.linalg.solve(np.linalg.cholesky(If), gf)
+            stat = float(y @ y)
+        except np.linalg.LinAlgError:
+            vals, vecs = np.linalg.eigh(If)
+            vals = np.maximum(vals, 1e-8 * max(vals.max(), 1e-300))
+            stat = float((vecs.T @ gf) ** 2 @ (1.0 / vals))
+        p_score = float(chi2.sf(stat, df))
+    else:
+        kld0 = float(model_big.eval_model_kld(x0, limits, samp, data))
+        stat, p_score = float("nan"), float("nan")
     out = dict(x_small=x_small, kld_small=kld_small, score=(stat, df, p_score), fitted=False,
                x_big=x0, kld_big=float(kld0), lr=0.0, df=df_total, p_lr=1.0, prefer_big=False)
 
     run = table == "always" or (table == "score" and p_score < alpha)
     if run:
+        # Optimise in nats (n_cells times the divergence) so the gradient
+        # tolerance has a fixed meaning: the per-cell divergence gradient of
+        # a well-fitted gene on real data is far below 1e-2 already at the
+        # embedded start, and the optimizer would not move at all.
         def fg(x):
-            return model_big.eval_model_kld_and_grad(x, limits, samp, data)
+            k, g = model_big.eval_model_kld_and_grad(x, limits, samp, data)
+            return n_cells * k, n_cells * np.asarray(g)
         with model_big.search_tolerance():
             res = scipy.optimize.minimize(fg, x0, jac=True, method="L-BFGS-B",
                                           bounds=scipy.optimize.Bounds(lb, ub),
-                                          options=dict(maxiter=maxiter, ftol=1e-8, gtol=1e-2))
+                                          options=dict(maxiter=maxiter, ftol=1e-9, gtol=gtol))
         x_big = res.x
         kld_big = float(model_big.eval_model_kld(x_big, limits, samp, data))
         if kld_big > kld0:                         # a nesting model never fits worse than its start

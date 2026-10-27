@@ -14,8 +14,9 @@ method-of-moments hook needs, which the per-modality moments do not carry:
    ``beta``; the mature mean gives ``gamma``; a short scan of the likelihood
    fixes ``beta`` (:func:`moment_start`).
 
-The parameter vector is ``log10 [k_on (n), epsilon, rates (k), beta, gamma]``
-(:func:`split_theta`, :func:`join_theta`); :func:`embed_in_table` maps the
+The parameter vector is ``log10 [k_on (n), epsilon, rates (k), beta, gamma]``,
+with the burst size ``b`` appended for a bursty model (:func:`split_theta`,
+:func:`burst_size`, :func:`join_theta`); :func:`embed_in_table` maps the
 ``switch`` and ``additive`` rules into the ``table`` rule's space, for nested
 comparisons (:func:`monod.analysis.compare_nested_models`).
 """
@@ -30,33 +31,47 @@ from scipy.optimize import minimize
 from . import chromatin as ch
 
 K_OFF = 1.0
-RATE_FLOOR = 1e-2        # a configuration whose nested rate is zero sits here in the table's space
+RATE_FLOOR = 1e-4        # a configuration whose nested rate is zero sits here in the table's space
 
 
 # ---------------------------------------------------------------------------
 # Parameter vectors
 # ---------------------------------------------------------------------------
 
-def n_params(rule: str, n_sites: int) -> int:
-    return n_sites + 1 + ch.n_rule_params(rule, n_sites) + 2
+def n_params(rule: str, n_sites: int, bursty: bool = False) -> int:
+    return n_sites + 1 + ch.n_rule_params(rule, n_sites) + 2 + int(bursty)
 
 
 def split_theta(theta: np.ndarray, rule: str, n_sites: int):
-    """``theta`` (log10) -> ``(k_on, eps, rates, beta, gamma)`` on the linear scale."""
+    """``theta`` (log10) -> ``(k_on, eps, rates, beta, gamma)`` on the linear
+    scale; a trailing burst size is left to :func:`burst_size`."""
     n, k = n_sites, ch.n_rule_params(rule, n_sites)
     lin = 10.0 ** np.asarray(theta, dtype=float)
     return lin[:n], float(lin[n]), lin[n + 1:n + 1 + k], float(lin[n + 1 + k]), float(lin[n + 2 + k])
 
 
-def join_theta(k_on, eps, rates, beta, gamma) -> np.ndarray:
-    return np.log10(np.concatenate([np.atleast_1d(k_on), [eps], np.atleast_1d(rates), [beta, gamma]]).astype(float))
+def burst_size(theta: np.ndarray, rule: str, n_sites: int) -> Optional[float]:
+    """The mean burst size (linear) when ``theta`` carries one, else None."""
+    theta = np.asarray(theta, dtype=float)
+    if theta.size == n_params(rule, n_sites, bursty=True):
+        return float(10.0 ** theta[-1])
+    if theta.size == n_params(rule, n_sites):
+        return None
+    raise ValueError(f"theta has {theta.size} entries; rule {rule!r} with {n_sites} sites takes "
+                     f"{n_params(rule, n_sites)} or {n_params(rule, n_sites, True)}")
+
+
+def join_theta(k_on, eps, rates, beta, gamma, burst: Optional[float] = None) -> np.ndarray:
+    tail = [beta, gamma] if burst is None else [beta, gamma, burst]
+    return np.log10(np.concatenate([np.atleast_1d(k_on), [eps], np.atleast_1d(rates), tail]).astype(float))
 
 
 def embed_in_table(theta: np.ndarray, rule: str, n_sites: int, floor: float = RATE_FLOOR) -> np.ndarray:
-    """The parameters of ``rule`` as a point of the ``table`` rule's space."""
+    """The parameters of ``rule`` as a point of the ``table`` rule's space
+    (a burst size is carried over)."""
     k_on, eps, rates, beta, gamma = split_theta(theta, rule, n_sites)
     tab = ch.rule_as_table(rule, n_sites, rates)
-    return join_theta(k_on, eps, np.maximum(tab, floor), beta, gamma)
+    return join_theta(k_on, eps, np.maximum(tab, floor), beta, gamma, burst_size(theta, rule, n_sites))
 
 
 # ---------------------------------------------------------------------------
@@ -140,12 +155,14 @@ def fit_chain_marginal(config_counts, dropout: Optional[str] = None, periodic: b
 
 def moment_start(hist: np.ndarray, rule: str, n_sites: int, chain: ChainFit, objective: Callable[[np.ndarray], float],
                  rate_bounds=(-2.0, 2.0), gamma_bounds=(-1.8, 3.5), betas: Sequence[float] = (0.3, 1.0, 3.0),
-                 rna_scale=(1.0, 1.0)) -> np.ndarray:
+                 rna_scale=(1.0, 1.0), bursts: Optional[Sequence[float]] = None) -> np.ndarray:
     """Starting ``theta`` for ``rule`` from a dense histogram over
     (configuration, nascent, mature): rates from the conditional nascent means
     per configuration (scaled by ``beta``), ``gamma`` from the mature mean,
     ``beta`` from the best of ``betas`` under ``objective``.  ``rna_scale`` is
-    the sequencing model's expected capture per RNA modality, divided out."""
+    the sequencing model's expected capture per RNA modality, divided out.
+    For a bursty model ``bursts`` lists the burst sizes to try with each
+    ``beta``; the rates are mean production rates either way."""
     hist = np.asarray(hist, dtype=float)
     n = n_sites
     per_config = hist.sum(axis=(1, 2))
@@ -173,10 +190,11 @@ def moment_start(hist: np.ndarray, rule: str, n_sites: int, chain: ChainFit, obj
         rates = rates_for(beta)
         mean_rate = float(w @ ch.transcription_rates(rule, n, rates))
         gamma = np.clip(mean_rate / max(mu_s, 1e-6), 10.0 ** gamma_bounds[0], 10.0 ** gamma_bounds[1])
-        theta = join_theta(chain.k_on, chain.eps, rates, beta, gamma)
-        f = float(objective(theta))
-        if best is None or f < best[0]:
-            best = (f, theta)
+        for b in ([None] if bursts is None else list(bursts)):
+            theta = join_theta(chain.k_on, chain.eps, rates, beta, gamma, b)
+            f = float(objective(theta))
+            if best is None or f < best[0]:
+                best = (f, theta)
     return best[1]
 
 
@@ -202,5 +220,12 @@ def chromatin_start(model, hist, limits, samp, lb_log, ub_log) -> np.ndarray:
         with model.search_tolerance():
             return model.eval_model_kld(np.clip(theta, lb_log, ub_log), limits, samp, data)
 
+    bursty = bool(getattr(model, "bursty", False))
+    i_gamma = n + 2 + ch.n_rule_params(model.rule, n)
+    bursts = None
+    if bursty:
+        lo, hi = 10.0 ** lb_log[-1], 10.0 ** ub_log[-1]
+        bursts = [float(np.clip(b, lo, hi)) for b in (0.5, 2.0, 8.0)]
     return moment_start(dense, model.rule, n, chain, objective,
-                        rate_bounds=(lb_log[n + 1], ub_log[n + 1]), gamma_bounds=(lb_log[-1], ub_log[-1]), rna_scale=scale)
+                        rate_bounds=(lb_log[n + 1], ub_log[n + 1]), gamma_bounds=(lb_log[i_gamma], ub_log[i_gamma]),
+                        rna_scale=scale, bursts=bursts)

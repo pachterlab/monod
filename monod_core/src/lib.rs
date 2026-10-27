@@ -4881,9 +4881,11 @@ struct ChromatinSys<'a> {
     n:     usize,                 // configurations
     m:     usize,                 // RNA species
     chain: ChromatinChain,
-    a:     &'a [f64],             // (n, m) row-major transcription rates
+    a:     &'a [f64],             // (n, m) row-major mean production rates
     c:     SmallMat,              // (m, m) characteristic generator
     diag:  ChromatinDiag,
+    /// geometric bursts of this mean size (`a` stays the mean rate), or single molecules
+    burst: Option<f64>,
     /// u[j][b * B + i]: PGF argument of species j at point i of block b (zero-padded)
     ur: Vec<Vec<f64>>,
     ui: Vec<Vec<f64>>,
@@ -4893,9 +4895,15 @@ struct ChromatinSys<'a> {
 /// mode needs: K = A M (n × m), the row M[col, :] (m), or W M (n_sites × m).
 enum DiagOps { General(Vec<f64>), Shared(Vec<f64>), Factored(Vec<f64>) }
 
+/// The diagonal sub-flow over one half of a step: `exp(coef · x(p))` with
+/// `x(p) = M u(p)` (single molecules, `M = ∫ e^{Cs} ds` folded into `coef`)
+/// or, with bursts, `x(p) = Σ_k w_k φ(e^{C s_k} u(p))`, `φ(U) = U / (1 - b U)`,
+/// Simpson's nodes and weights in `quad`.
+struct DiagFlow { coef: DiagOps, quad: Option<Vec<(SmallMat, f64)>> }
+
 /// Step operators for a Strang step from time-to-go `tau` to `tau - h`:
 /// d1 over [tau - h/2, tau], E = exp(H^T h), d2 over [tau - h, tau - h/2].
-struct ChromatinOps { d1: DiagOps, e: ChainExp, d2: DiagOps }
+struct ChromatinOps { d1: DiagFlow, e: ChainExp, d2: DiagFlow }
 
 /// ∫_{tau_a}^{tau_a+delta} exp(C s) ds = exp(C tau_a) · delta phi_1(C delta),
 /// phi_1 read off exp([[C delta, I], [0, 0]]).
@@ -4938,10 +4946,29 @@ fn chromatin_diag_ops(sys: &ChromatinSys, mm: &SmallMat) -> DiagOps {
     }
 }
 
+/// The diagonal flow over `[tau_a, tau_a + delta]`.
+fn chromatin_diag_flow(sys: &ChromatinSys, tau_a: f64, delta: f64) -> DiagFlow {
+    match sys.burst {
+        None => DiagFlow { coef: chromatin_diag_ops(sys, &chromatin_char_integral(&sys.c, tau_a, delta)), quad: None },
+        Some(_) => {
+            let m = sys.m;
+            let mut eye = SmallMat::zeros(m);
+            for i in 0..m { eye.set(i, i, 1.0); }
+            let nodes = [(tau_a, delta / 6.0), (tau_a + 0.5 * delta, 4.0 * delta / 6.0), (tau_a + delta, delta / 6.0)];
+            let quad = nodes.iter().map(|&(s, w)| {
+                let mut cs = sys.c.clone();
+                for v in cs.a.iter_mut() { *v *= s; }
+                (cs.expm(), w)
+            }).collect();
+            DiagFlow { coef: chromatin_diag_ops(sys, &eye), quad: Some(quad) }
+        }
+    }
+}
+
 fn chromatin_ops(sys: &ChromatinSys, tau: f64, h: f64, e: ChainExp) -> ChromatinOps {
     let hh = 0.5 * h;
-    let d1 = chromatin_diag_ops(sys, &chromatin_char_integral(&sys.c, tau - hh, hh));
-    let d2 = chromatin_diag_ops(sys, &chromatin_char_integral(&sys.c, tau - h, hh));
+    let d1 = chromatin_diag_flow(sys, tau - hh, hh);
+    let d2 = chromatin_diag_flow(sys, tau - h, hh);
     ChromatinOps { d1, e, d2 }
 }
 
@@ -4962,25 +4989,57 @@ fn cmul(ar: f64, ai: f64, br: f64, bi: f64) -> (f64, f64) { (ar * br - ai * bi, 
 
 /// g *= exp(d · u) on one block; `sr`, `si`, `tr`, `ti` are scratch of n × B.
 #[inline]
-fn chromatin_diag(sys: &ChromatinSys, d: &DiagOps, b0: usize, gr: &mut [f64], gi: &mut [f64],
+fn chromatin_diag(sys: &ChromatinSys, d: &DiagFlow, b0: usize, gr: &mut [f64], gi: &mut [f64],
                   sr: &mut [f64], si: &mut [f64], tr: &mut [f64], ti: &mut [f64]) {
     let (n, m, bw) = (sys.n, sys.m, CHROMATIN_BLOCK);
-    // y[r] = Σ_l coef[r, l] u_l at every point of the block, written to (sr, si) row r
+    // the flow's input per species at every point of the block: u itself, or
+    // the burst integral Σ_k w_k φ(e^{C s_k} u) with φ(U) = U / (1 - b U)
+    let mut xr = vec![0.0; m * bw];
+    let mut xi = vec![0.0; m * bw];
+    match (&d.quad, sys.burst) {
+        (Some(quad), Some(b)) => {
+            for (ek, wk) in quad.iter() {
+                for j in 0..m {
+                    for i in 0..bw {
+                        let (mut ur_, mut ui_) = (0.0, 0.0);
+                        for l in 0..m {
+                            let e = ek.get(j, l);
+                            ur_ += e * sys.ur[l][b0 + i];
+                            ui_ += e * sys.ui[l][b0 + i];
+                        }
+                        // U / (1 - b U) = U · conj(d) / |d|², d = 1 - b U
+                        let (dr, di) = (1.0 - b * ur_, -b * ui_);
+                        let den = dr * dr + di * di;
+                        let (pr, pi) = cmul(ur_, ui_, dr, -di);
+                        xr[j * bw + i] += wk * pr / den;
+                        xi[j * bw + i] += wk * pi / den;
+                    }
+                }
+            }
+        }
+        _ => {
+            for j in 0..m {
+                xr[j * bw..(j + 1) * bw].copy_from_slice(&sys.ur[j][b0..b0 + bw]);
+                xi[j * bw..(j + 1) * bw].copy_from_slice(&sys.ui[j][b0..b0 + bw]);
+            }
+        }
+    }
+    // y[r] = Σ_l coef[r, l] x_l at every point of the block, written to (sr, si) row r
     let dots = |coef: &[f64], rows: usize, sr: &mut [f64], si: &mut [f64]| {
         for r in 0..rows {
             for i in 0..bw {
                 let (mut yr, mut yi) = (0.0, 0.0);
                 for l in 0..m {
                     let k = coef[r * m + l];
-                    yr += k * sys.ur[l][b0 + i];
-                    yi += k * sys.ui[l][b0 + i];
+                    yr += k * xr[l * bw + i];
+                    yi += k * xi[l * bw + i];
                 }
                 sr[r * bw + i] = yr;
                 si[r * bw + i] = yi;
             }
         }
     };
-    match (d, &sys.diag) {
+    match (&d.coef, &sys.diag) {
         (DiagOps::General(k), _) => {
             dots(k, n, sr, si);
             for c in 0..n {
@@ -5203,10 +5262,12 @@ fn chromatin_pgf(
 /// smallest step (the Python side derives them from the rates).
 /// `site_weights` (n_sites × n_species, with n_states = 2^n_sites) states
 /// that A = S W for the 0/1 site matrix S; `independent` (k_on_j, k_off_j
-/// per site) that H is the Kronecker sum of independent sites.  Returns
-/// `(re, im, mesh_shape, steps)` with G point-major: index `p * n_states + c`.
+/// per site) that H is the Kronecker sum of independent sites.  `burst`
+/// makes the emission geometric bursts of that mean size (`a` stays the
+/// mean production rate).  Returns `(re, im, mesh_shape, steps)` with G
+/// point-major: index `p * n_states + c`.
 #[pyfunction]
-#[pyo3(signature = (n_states, n_species, h, a, c, limits, w, t_horizon, h_first, h_min, tol, fixed_schedule=None, site_weights=None, independent=None, u_re=None, u_im=None))]
+#[pyo3(signature = (n_states, n_species, h, a, c, limits, w, t_horizon, h_first, h_min, tol, fixed_schedule=None, site_weights=None, independent=None, u_re=None, u_im=None, burst=None))]
 fn eval_chromatin_pgf(
     py:             Python<'_>,
     n_states:       usize,
@@ -5225,8 +5286,14 @@ fn eval_chromatin_pgf(
     independent:    Option<Vec<f64>>,
     u_re:           Option<Vec<f64>>,
     u_im:           Option<Vec<f64>>,
+    burst:          Option<f64>,
 ) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>, Vec<f64>)> {
     let (n, m) = (n_states, n_species);
+    if let Some(b) = burst {
+        if !(b > 0.0) || !b.is_finite() {
+            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: burst must be a positive number"));
+        }
+    }
     if let (Some(ur), Some(ui)) = (&u_re, &u_im) {
         if ur.len() != ui.len() || ur.len() % m != 0 {
             return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: u_re/u_im must be n_species × n_grid"));
@@ -5302,7 +5369,7 @@ fn eval_chromatin_pgf(
             }
         };
         let cm = SmallMat { n: m, a: c.clone() };
-        let sys = ChromatinSys { n, m, chain, a: &a, c: cm, diag, ur, ui };
+        let sys = ChromatinSys { n, m, chain, a: &a, c: cm, diag, burst, ur, ui };
         let (gr, gi, steps) = chromatin_pgf(&sys, &w, n_blocks, t_horizon, h_first, h_min, tol, fixed_schedule.as_deref());
         // back to point-major (p * n + c)
         let mut re = vec![0.0; n_grid * n];

@@ -65,6 +65,18 @@ class TestParameterVectors:
         np.testing.assert_allclose(tab, [cf.RATE_FLOOR, 4.0, 2.0, 6.0])
         assert cf.n_params("table", 2) == 9 and cf.n_params("switch", 2) == 6
 
+    def test_burst_size_rides_at_the_end(self):
+        theta = cf.join_theta([0.5, 0.8], 0.6, [4.0, 2.0], 0.8, 0.3, 2.5)
+        assert theta.size == cf.n_params("additive", 2, bursty=True) == 8
+        assert cf.burst_size(theta, "additive", 2) == pytest.approx(2.5)
+        assert cf.burst_size(theta[:-1], "additive", 2) is None
+        k_on, eps, rates, beta, gamma = cf.split_theta(theta, "additive", 2)
+        np.testing.assert_allclose(rates, [4.0, 2.0]); assert (beta, gamma) == pytest.approx((0.8, 0.3))
+        emb = cf.embed_in_table(theta, "additive", 2)
+        assert emb.size == 10 and cf.burst_size(emb, "table", 2) == pytest.approx(2.5)
+        with pytest.raises(ValueError):
+            cf.burst_size(theta[:-2], "additive", 2)
+
     def test_dense_sparse_round_trip(self):
         rng = np.random.default_rng(0)
         dense = rng.integers(0, 3, size=(5, 6, 4)).astype(float)
@@ -86,6 +98,21 @@ class TestCMEModel:
             CMEModel("Chromatin", "None", n_sites=2, rule="gate")
         again = CMEModel.from_dict(m.to_dict())
         assert again.rule == "additive" and again.n_sites == 2 and again.dropout_bounds == (0.0, 0.0, 1)
+
+    def test_bursty_model_adds_one_parameter_and_nests_the_constitutive_one(self):
+        m = _model("additive", bursty=True)
+        assert m.get_num_params() == 8 == len(m.param_str) == len(m.bio_bounds["phys_lb"])
+        assert m.param_str[-1] == r"$\log_{10} b$" and m.param_names()[-1] == "b"
+        again = CMEModel.from_dict(m.to_dict())
+        assert again.bursty and again.get_num_params() == 8
+        theta = _theta("additive", [4.0, 2.0])
+        base = _model("additive").eval_model_pss(theta, [40, 50, 4])
+        small = m.eval_model_pss(np.append(theta, -3.0), [40, 50, 4])
+        assert small.sum() == pytest.approx(1.0)
+        np.testing.assert_allclose(small, base, atol=2e-4)              # b = 0.001: the constitutive model
+        H, A, C = ch.nascent_mature_system(TRUTH["k_on"], 1.0, TRUTH["eps"], "additive", TRUTH["beta"], TRUTH["gamma"], rule_params=[4.0, 2.0])
+        ref = ch.eval_joint_pss(H, A, C, [40, 50], burst=2.0, tol=m.chromatin_tol)
+        np.testing.assert_allclose(np.moveaxis(m.eval_model_pss(np.append(theta, np.log10(2.0)), [40, 50, 4]), -1, 0), ref, atol=1e-12)
 
     def test_default_dropout_grid_rides_on_the_sampling_grid(self):
         m = CMEModel("Chromatin", "Poisson", n_sites=2, rule="switch")
@@ -137,6 +164,31 @@ class TestCMEModel:
         assert m.chromatin_tol == 1e-5
         assert coarse == pytest.approx(f, abs=1e-5)
 
+    def test_search_tolerance_is_per_thread(self):
+        """One model serves a pool of per-gene threads: a thread inside the
+        search block must not change what the others, or the main thread, see."""
+        import threading
+        m = _model("switch")
+        inside, release, seen = threading.Event(), threading.Event(), {}
+
+        def worker():
+            with m.search_tolerance():
+                seen["worker"] = m.chromatin_tol
+                inside.set()
+                release.wait(5)
+            seen["worker_after"] = m.chromatin_tol
+        t = threading.Thread(target=worker); t.start()
+        assert inside.wait(5)
+        assert m.chromatin_tol == 1e-5 and m.has_search_tolerance()        # the main thread is unaffected
+        with m.search_tolerance():
+            assert m.chromatin_tol == m.chromatin_search_tol
+            with m.search_tolerance():                                     # nesting restores the outer block
+                pass
+            assert m.chromatin_tol == m.chromatin_search_tol
+        release.set(); t.join(5)
+        assert seen == {"worker": m.chromatin_search_tol, "worker_after": 1e-5}
+        assert CMEModel.from_dict(m.to_dict()).chromatin_tol == 1e-5
+
     def test_moments_start_recovers_the_chain_and_lands_in_the_box(self):
         m = _model("additive")
         theta = _theta("additive", [4.0, 2.0])
@@ -151,6 +203,17 @@ class TestCMEModel:
         mid = 0.5 * (lb + ub)
         assert m.eval_model_kld(x0, lim, [0, 0, 0], data) < m.eval_model_kld(mid, lim, [0, 0, 0], data)
         assert np.array_equal(m.get_MoM(None, lb, ub, [0, 0, 0]), mid)      # no histogram: the box middle
+
+    def test_moments_start_for_a_bursty_model_scans_the_burst_size(self):
+        m = _model("additive", bursty=True)
+        theta = np.append(_theta("additive", [4.0, 2.0]), np.log10(3.0))
+        rng = np.random.default_rng(3)
+        data, lim = _hist(_cells(m, theta, 1500, rng))
+        lb, ub = np.array(m.bio_bounds["phys_lb"]), np.array(m.bio_bounds["phys_ub"])
+        x0 = m.get_MoM(None, lb, ub, [0, 0, 0], hist=data, limits=lim)
+        assert x0.shape == (8,) and np.all(x0 >= lb) and np.all(x0 <= ub)
+        assert 10 ** x0[-1] >= 2.0                                           # bursty data do not get the smallest size
+        np.testing.assert_allclose(10 ** x0[:2], TRUTH["k_on"], rtol=0.25)
 
 
 @pytest.mark.filterwarnings("ignore::UserWarning")
@@ -209,11 +272,38 @@ class TestPipeline:
             fit = scipy.optimize.minimize(lambda x: small.eval_model_kld_and_grad(x, lim, [0, 0, 0], data), truths[0],
                                           jac=True, method="L-BFGS-B",
                                           bounds=scipy.optimize.Bounds(small.bio_bounds["phys_lb"], small.bio_bounds["phys_ub"]),
-                                          options=dict(maxiter=100, ftol=1e-7, gtol=1e-3))
+                                          options=dict(maxiter=150, ftol=1e-9, gtol=1e-6))
+        # alpha = 0.01: with 1200 cells the table picks up a few nats of noise
+        # (this seed gives a likelihood ratio of about 8 on two degrees of
+        # freedom); the AND-gate test below is what a real gain looks like.
         res = compare_nested_models(small, big, lambda x: cf.embed_in_table(x, "switch", 2), fit.x, lim, [0, 0, 0],
-                                    data, 1200, table="always")
+                                    data, 1200, table="always", alpha=0.01, score=True)
         stat, df, p_score = res["score"]
         assert df == 2 and res["fitted"]
         assert res["kld_big"] <= res["kld_small"] + 1e-9                 # the nesting model never ends worse
-        assert res["lr"] < 12.0 and not res["prefer_big"]                 # no evidence for the free table
+        assert res["lr"] < 12.0 and not res["prefer_big"]                 # no real evidence for the free table
         assert abs(stat - res["lr"]) < 6.0                                 # score and likelihood ratio agree in size
+
+    def test_nested_comparison_finds_the_table_on_and_gate_data(self):
+        """The warm-started table fit must actually move: on data from an
+        AND gate (only the both-open configuration transcribes) it has to
+        reach the table truth's divergence and reject the switch."""
+        import scipy.optimize
+        small, big = _model("switch"), _model("table")
+        truth_tab = _theta("table", [0.05, 0.05, 0.05, 5.0])
+        rng = np.random.default_rng(7)
+        n_cells = 2000
+        data, lim = _hist(_cells(big, truth_tab, n_cells, rng))
+        with small.search_tolerance():
+            fit = scipy.optimize.minimize(lambda x: small.eval_model_kld_and_grad(x, lim, [0, 0, 0], data),
+                                          _theta("switch", [1.0]), jac=True, method="L-BFGS-B",
+                                          bounds=scipy.optimize.Bounds(small.bio_bounds["phys_lb"], small.bio_bounds["phys_ub"]),
+                                          options=dict(maxiter=100, ftol=1e-7, gtol=1e-5))
+        res = compare_nested_models(small, big, lambda x: cf.embed_in_table(x, "switch", 2), fit.x, lim, [0, 0, 0],
+                                    data, n_cells, table="always")
+        kld_truth = float(big.eval_model_kld(truth_tab, lim, [0, 0, 0], data))
+        assert res["fitted"] and res["prefer_big"]
+        assert res["kld_big"] <= kld_truth + 1e-3 * kld_truth + 1e-4, (res["kld_big"], kld_truth, res["kld_small"])
+        assert res["lr"] > 20.0
+        rates = cf.split_theta(res["x_big"], "table", 2)[2]
+        assert rates[3] > 5 * rates[:3].max()                               # the AND gate is recovered

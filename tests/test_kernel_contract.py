@@ -85,8 +85,8 @@ class CMEKernel:
     def objective(self, theta, data):
         return float(self.m.eval_model_kld(np.asarray(theta, float), self.limits, None, data, 1e-15))
 
-    def pinned_gradient(self, theta, data):
-        f, g = self.m.eval_model_kld_and_grad(np.asarray(theta, float), self.limits, None, data, 1e-15, eps=1e-6)
+    def pinned_gradient(self, theta, data, n_jobs=1):
+        f, g = self.m.eval_model_kld_and_grad(np.asarray(theta, float), self.limits, None, data, 1e-15, eps=1e-6, n_jobs=n_jobs)
         return float(f), np.asarray(g, float)
 
     def free_gradient(self, theta, data, h=1e-3):
@@ -127,15 +127,22 @@ def _kernels():
     protein = CMEKernel("protein", CMEModel("ProteinBursty", "None", fit_unspliced=True, protein_limit=float("inf")),
                         [0.5, -0.3, -0.6, 0.2, -0.7], [14, 12, 20], step=0.15)
     # chromatin through CMEModel: modalities (unspliced, spliced, configuration), no dropout grid
-    def chrom(rule):
-        return CMEModel("Chromatin", "None", n_sites=2, rule=rule, dropout_bounds=(0.0, 0.0, 1))
+    def chrom(rule, **kw):
+        return CMEModel("Chromatin", "None", n_sites=2, rule=rule, dropout_bounds=(0.0, 0.0, 1), **kw)
     m_switch, m_table = chrom("switch"), chrom("table")
     switch = CMEKernel("chromatin-switch", m_switch, cf.join_theta([0.5, 0.8], 0.6, [5.0], 0.8, 0.3), [30, 40, 4], step=0.15,
                        bounds=list(zip(m_switch.bio_bounds["phys_lb"], m_switch.bio_bounds["phys_ub"])))
     table = CMEKernel("chromatin-table", m_table, cf.join_theta([0.5, 0.8], 0.6, [cf.RATE_FLOOR, 5.0, 5.0, 5.0], 0.8, 0.3), [30, 40, 4],
                       step=0.15, nested=(switch, lambda th: cf.embed_in_table(th, "switch", 2)),
                       bounds=list(zip(m_table.bio_bounds["phys_lb"], m_table.bio_bounds["phys_ub"])))
-    return [udeg, protein, switch, table]
+    # bursty emission: the burst size is the last parameter and is carried through the embedding
+    m_sb, m_tb = chrom("switch", bursty=True), chrom("table", bursty=True)
+    switch_b = CMEKernel("chromatin-switch-bursty", m_sb, cf.join_theta([0.5, 0.8], 0.6, [3.0], 0.8, 0.3, 2.0), [40, 50, 4], step=0.15,
+                         bounds=list(zip(m_sb.bio_bounds["phys_lb"], m_sb.bio_bounds["phys_ub"])))
+    table_b = CMEKernel("chromatin-table-bursty", m_tb, cf.join_theta([0.5, 0.8], 0.6, [cf.RATE_FLOOR, 3.0, 3.0, 3.0], 0.8, 0.3, 2.0),
+                        [40, 50, 4], step=0.15, nested=(switch_b, lambda th: cf.embed_in_table(th, "switch", 2)),
+                        bounds=list(zip(m_tb.bio_bounds["phys_lb"], m_tb.bio_bounds["phys_ub"])))
+    return [udeg, protein, switch, table, switch_b, table_b]
 
 
 KERNELS = _kernels()
@@ -192,6 +199,21 @@ class TestGradient:
         for (fs, gs), (fp, gp) in zip(serial, pooled):
             assert fs == fp
             np.testing.assert_array_equal(gs, gp)
+
+    def test_gradient_is_identical_with_the_stencil_in_a_thread_pool(self, kernel, data):
+        """``n_jobs > 1`` spreads the stencil points over worker threads; the
+        base point's pinned schedule must reach every one of them (the pin is
+        thread-local), inside and outside an enclosing pinned block."""
+        theta = kernel.theta + 0.05
+        f1, g1 = kernel.pinned_gradient(theta, data)
+        f3, g3 = kernel.pinned_gradient(theta, data, n_jobs=3)
+        assert f1 == f3
+        np.testing.assert_array_equal(g1, g3)
+        with kernel.m.pinned_schedule(kernel.theta, kernel.limits):
+            fo1, go1 = kernel.pinned_gradient(theta, data)
+            fo3, go3 = kernel.pinned_gradient(theta, data, n_jobs=3)
+        assert fo1 == fo3
+        np.testing.assert_array_equal(go1, go3)
 
 
 class TestOuterPin:

@@ -384,6 +384,20 @@ class CMEModel:
     _last_custom_schedule = _tls_property("last_custom")
     _fixed_chromatin_schedule = _tls_property("fixed_chromatin")
     _last_chromatin_schedule = _tls_property("last_chromatin")
+
+    # The chromatin integrator's tolerance: the model's value, or the thread's
+    # override while inside search_tolerance(), so that one model instance can
+    # serve a pool of per-gene threads that enter and leave the search at
+    # different times.
+    @property
+    def chromatin_tol(self):
+        override = _tls_get(self, "chromatin_tol")
+        return self._chromatin_tol if override is None else override
+
+    @chromatin_tol.setter
+    def chromatin_tol(self, value):
+        self._chromatin_tol = float(value)
+
     def __init__(
         self,
         bio_model,
@@ -405,6 +419,7 @@ class CMEModel:
         chromatin_tol = 1e-5,
         chromatin_search_tol = 1e-4,
         dropout_bounds = (-2.0, -0.05, 3),
+        bursty = False,
     ):
         """Initialize the CMEModel instance.
 
@@ -444,6 +459,11 @@ class CMEModel:
             closing rate ``k_off = 1``.  Modalities are ``unspliced``, ``spliced``
             and ``configuration`` (the integer 0..2**n_sites-1 encoding which
             sites are open, site 0 the least significant bit).
+        bursty: bool
+            ``bio_model="Chromatin"`` only: transcribe in geometric bursts of a
+            shared mean size ``b`` (one more parameter, last) instead of single
+            molecules.  The rule's rates stay mean production rates, so the
+            constitutive model is the small-``b`` limit.
         chromatin_tol, chromatin_search_tol: float
             step tolerance of the chromatin integrator for reported values and
             during the search (see :meth:`search_tolerance`).
@@ -492,6 +512,7 @@ class CMEModel:
             self.chromatin_tol = float(chromatin_tol)
             self.chromatin_search_tol = float(chromatin_search_tol)
             self.dropout_bounds = tuple(dropout_bounds)
+            self.bursty = bool(bursty)
 
         # Define the modalities used for each model, and their order.
         CMEModel.available_model_modalities = {"Delay":['unspliced', 'spliced'],
@@ -560,11 +581,16 @@ class CMEModel:
             
         except KeyError:
             if self.bio_model == "Chromatin":
-                # k_on per site and the rule's rates in units of k_off; beta and gamma as Bursty
+                # k_on per site and the rule's mean production rates in units of
+                # k_off (the floor low enough for "no transcription in this
+                # configuration"); beta and gamma as Bursty; the burst size last
                 from . import chromatin as _chromatin
                 k = _chromatin.n_rule_params(self.rule, self.n_sites)
-                self.bio_bounds = {'phys_lb': [-2.0] * self.n_sites + [-1.5] + [-2.0] * k + [-1.8, -1.8],
+                self.bio_bounds = {'phys_lb': [-2.0] * self.n_sites + [-1.5] + [-4.0] * k + [-1.8, -1.8],
                                    'phys_ub': [2.0] * self.n_sites + [0.5] + [2.0] * k + [2.5, 3.5]}
+                if self.bursty:
+                    self.bio_bounds['phys_lb'].append(-3.0)
+                    self.bio_bounds['phys_ub'].append(2.0)
             elif self.bio_model == "Custom":
                 # Burst sizes get the Bursty b range; rates and inverse delays
                 # span the union of the Bursty beta and gamma ranges.  The
@@ -696,6 +722,8 @@ class CMEModel:
             else:
                 param_str += [rf"$\log_{{10}} a_{{{c}}}$" for c in range(2 ** self.n_sites)]
             param_str += [r"$\log_{10} \beta$", r"$\log_{10} \gamma$"]
+            if self.bursty:
+                param_str += [r"$\log_{10} b$"]
 
         else:
             raise ValueError(
@@ -717,7 +745,7 @@ class CMEModel:
         "bio_model", "seq_model", "amb_model", "quad_method", "fixed_quad_T", "quad_order",
         "quad_vec_T", "protein_limit", "fit_unspliced", "min_fudge", "max_fudge",
         "network", "normalize_production_rate",
-        "n_sites", "rule", "periodic", "chromatin_tol", "chromatin_search_tol", "dropout_bounds",
+        "n_sites", "rule", "periodic", "chromatin_tol", "chromatin_search_tol", "dropout_bounds", "bursty",
     )
 
     def to_dict(self):
@@ -745,8 +773,9 @@ class CMEModel:
             d["normalize_production_rate"] = bool(self.network.normalize_production_rate)
         if self.bio_model == "Chromatin":
             d.update(n_sites=int(self.n_sites), rule=self.rule, periodic=bool(self.periodic),
-                     chromatin_tol=float(self.chromatin_tol), chromatin_search_tol=float(self.chromatin_search_tol),
-                     dropout_bounds=[float(self.dropout_bounds[0]), float(self.dropout_bounds[1]), int(self.dropout_bounds[2])])
+                     chromatin_tol=float(self._chromatin_tol), chromatin_search_tol=float(self.chromatin_search_tol),
+                     dropout_bounds=[float(self.dropout_bounds[0]), float(self.dropout_bounds[1]), int(self.dropout_bounds[2])],
+                     bursty=bool(self.bursty))
         return d
 
     @classmethod
@@ -782,7 +811,7 @@ class CMEModel:
             numpars += len(self.network.all_params)
         elif self.bio_model == "Chromatin":
             from . import chromatin as _chromatin
-            numpars += self.n_sites + 1 + _chromatin.n_rule_params(self.rule, self.n_sites) + 2
+            numpars += self.n_sites + 1 + _chromatin.n_rule_params(self.rule, self.n_sites) + 2 + int(self.bursty)
         else:
             numpars += 3
             
@@ -1006,7 +1035,29 @@ class CMEModel:
         if central:
             eps = max(float(eps), _CUSTOM_FD_EPS)
 
+        n_params = len(p)
+        # ProteinBursty, Custom and Chromatin: integrate every stencil point with
+        # the base point's schedule so the quotient is not polluted by step-size
+        # jumps (an enclosing ``pinned_schedule`` block already provides one).
+        # The pin lives in thread-local state, so a stencil spread over a thread
+        # pool carries it into each worker explicitly.
+        pin_attr = {"ProteinBursty": "_fixed_protein_schedule", "Custom": "_fixed_custom_schedule",
+                    "Chromatin": "_fixed_chromatin_schedule"}.get(self.bio_model)
+        pin = None
+        if pin_attr is not None:
+            if outer_pin:
+                pin = getattr(self, pin_attr)
+            else:
+                pin = getattr(self, pin_attr.replace("_fixed_", "_last_"), None)
+                setattr(self, pin_attr, pin)
+
         def _perturbed(i):
+            if pin_attr is not None and getattr(self, pin_attr) is not pin:   # a pool worker thread
+                setattr(self, pin_attr, pin)
+                try:
+                    return _perturbed(i)
+                finally:
+                    setattr(self, pin_attr, None)
             p_eps = p.copy()
             p_eps[i] += eps
             k_plus = self.eval_model_kld(p_eps, limits, samp, data, EPS)
@@ -1015,29 +1066,18 @@ class CMEModel:
             p_eps[i] -= 2 * eps
             return k_plus, self.eval_model_kld(p_eps, limits, samp, data, EPS)
 
-        n_params = len(p)
-        # ProteinBursty and Custom: integrate every stencil point with the base
-        # point's schedule so the quotient is not polluted by step-size jumps
-        # (an enclosing ``pinned_schedule`` block already provides one).
-        if not outer_pin:
-            if self.bio_model == "ProteinBursty":
-                self._fixed_protein_schedule = getattr(self, "_last_protein_schedule", None)
-            elif self.bio_model == "Custom":
-                self._fixed_custom_schedule = getattr(self, "_last_custom_schedule", None)
-            elif self.bio_model == "Chromatin":
-                self._fixed_chromatin_schedule = getattr(self, "_last_chromatin_schedule", None)
         try:
             if n_jobs == 1:
                 klds_eps = [_perturbed(i) for i in range(n_params)]
             else:
-                klds_eps = Parallel(n_jobs=min(n_params, n_jobs) if n_jobs > 0 else n_jobs)(
+                # threads: the kernels release the GIL, and a process pool would
+                # re-pickle the model and the histogram at every gradient
+                klds_eps = Parallel(n_jobs=min(n_params, n_jobs) if n_jobs > 0 else n_jobs, prefer="threads")(
                     delayed(_perturbed)(i) for i in range(n_params)
                 )
         finally:
-            if not outer_pin:
-                self._fixed_protein_schedule = None
-                self._fixed_custom_schedule = None
-                self._fixed_chromatin_schedule = None
+            if not outer_pin and pin_attr is not None:
+                setattr(self, pin_attr, None)
         if central:
             grad = np.array([(kp - km) / (2 * eps) for kp, km in klds_eps])
         else:
@@ -1347,15 +1387,15 @@ class CMEModel:
         if self.bio_model != "Chromatin":
             yield
             return
-        fine = self.chromatin_tol
-        self.chromatin_tol = self.chromatin_search_tol
+        previous = _tls_get(self, "chromatin_tol")                      # this thread's enclosing block, if any
+        _tls_set(self, "chromatin_tol", float(self.chromatin_search_tol))
         try:
             yield
         finally:
-            self.chromatin_tol = fine
+            _tls_set(self, "chromatin_tol", previous)
 
     def has_search_tolerance(self):
-        return self.bio_model == "Chromatin" and self.chromatin_search_tol != self.chromatin_tol
+        return self.bio_model == "Chromatin" and self.chromatin_search_tol != self._chromatin_tol
 
     def null_sampling_grid(self):
         """``(samp_lb, samp_ub, gridsize)`` for ``seq_model="None"``: zeros, plus
@@ -1640,13 +1680,21 @@ class CMEModel:
         return g
 
     def chromatin_system(self, p):
-        """``(H, A, C)`` of the Chromatin model at log10 parameters ``p``."""
+        """``(H, A, C)`` of the Chromatin model at log10 parameters ``p``
+        (``A`` holds mean production rates; see :meth:`chromatin_burst`)."""
         from . import chromatin as _chromatin
         n = self.n_sites
         k = _chromatin.n_rule_params(self.rule, n)
         lin = np.power(10.0, np.asarray(p, dtype=float))
         k_on, eps, rates, beta, gamma = lin[:n], float(lin[n]), lin[n + 1:n + 1 + k], float(lin[n + 1 + k]), float(lin[n + 2 + k])
         return _chromatin.nascent_mature_system(k_on, 1.0, eps, self.rule, beta, gamma, periodic=self.periodic, rule_params=rates)
+
+    def chromatin_burst(self, p):
+        """Mean burst size at log10 parameters ``p`` (the last entry) for a
+        bursty Chromatin model, else None."""
+        if not getattr(self, "bursty", False):
+            return None
+        return float(10.0 ** float(np.asarray(p, dtype=float)[-1]))
 
     def chromatin_dropout(self, samp):
         """Per-open-site dropout probability from the sampling vector (its third
@@ -1673,7 +1721,8 @@ class CMEModel:
         g = self._apply_seq_transform(g, samp)
         H, A, C = self.chromatin_system(p)
         G, sched = _chromatin.eval_joint_pgf(H, A, C, g, tol=self.chromatin_tol,
-                                             fixed_schedule=getattr(self, "_fixed_chromatin_schedule", None))
+                                             fixed_schedule=getattr(self, "_fixed_chromatin_schedule", None),
+                                             burst=self.chromatin_burst(p))
         self._last_chromatin_schedule = sched
         pss = _chromatin.invert_joint_pgf(G, mx, (lu, ls))              # (N, lu, ls)
         p_drop = self.chromatin_dropout(samp)

@@ -295,12 +295,17 @@ def locus_structure(H: np.ndarray, A: np.ndarray, rtol: float = 1e-12):
 
 def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
                    tol: float = _TOL, fixed_schedule: Optional[StepSchedule] = None,
-                   backend: Optional[str] = None):
+                   backend: Optional[str] = None, burst: Optional[float] = None):
     """Vector generating function ``G[c, p] = E[prod_j (1+u_j)^{x_j}; state c]``
     at the PGF arguments ``u`` (shape ``(m, P)``), returned with the accepted
     :class:`StepSchedule`.  This is the kernel proper; :func:`eval_joint_pss`
     builds the FFT mesh and inverts, and :class:`monod.cme_toolbox.CMEModel`
-    passes arguments already transformed by its sequencing-noise model."""
+    passes arguments already transformed by its sequencing-noise model.
+
+    ``burst`` switches the emission from single molecules to geometric bursts
+    of that mean size, shared by all configurations and species; ``A`` keeps
+    its meaning as the mean production rate (burst frequency ``A / burst``),
+    so ``burst -> 0`` is the constitutive model."""
     H = np.asarray(H, dtype=float); A = np.asarray(A, dtype=float); C = np.asarray(C, dtype=float)
     u = np.asarray(u, dtype=np.complex128)
     N, m = A.shape
@@ -328,13 +333,15 @@ def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
             None if fixed_schedule is None else [float(x) for x in np.asarray(fixed_schedule, dtype=float)],
             None if site_weights is None else np.asarray(site_weights, dtype=float).ravel().tolist(),
             independent,
-            u.real.ravel().tolist(), u.imag.ravel().tolist())
+            u.real.ravel().tolist(), u.imag.ravel().tolist(),
+            None if burst is None else float(burst))
         G = (np.asarray(re) + 1j * np.asarray(im)).reshape(P, N).T
         steps = list(steps)
     elif backend == "python":
         HT = H.T
         G = np.repeat(w[:, None].astype(np.complex128), P, axis=1)
-        G, steps = _integrate_numpy(HT, A, C, u, G, T, h_first, h_min, tol, fixed_schedule)
+        G, steps = _integrate_numpy(HT, A, C, u, G, T, h_first, h_min, tol, fixed_schedule,
+                                    None if burst is None else float(burst))
     else:
         raise ValueError(f"backend must be 'rust', 'python' or None, got {backend!r}")
     return G, StepSchedule(steps)
@@ -352,7 +359,8 @@ def invert_joint_pgf(G: np.ndarray, mesh_shape: Sequence[int], limits: Sequence[
 
 def eval_joint_pss(H: np.ndarray, A: np.ndarray, C: np.ndarray, limits: Sequence[int],
                    tol: float = _TOL, fixed_schedule: Optional[StepSchedule] = None,
-                   return_schedule: bool = False, backend: Optional[str] = None):
+                   return_schedule: bool = False, backend: Optional[str] = None,
+                   burst: Optional[float] = None):
     """Joint steady-state distribution ``P[c, x_1, ..., x_m]`` of the chromatin
     configuration and the RNA counts on the grid ``limits``.
 
@@ -368,32 +376,55 @@ def eval_joint_pss(H: np.ndarray, A: np.ndarray, C: np.ndarray, limits: Sequence
     fixed_schedule : replay these steps instead of adapting (stencils).
     return_schedule : also return the accepted :class:`StepSchedule`.
     backend : ``"rust"``, ``"python"`` or ``None`` (Rust when installed).
+    burst : mean size of geometric transcription bursts (``A`` stays the mean
+        production rate); ``None`` for single molecules.
     """
     u, mx = _mesh(limits)
-    G, sched = eval_joint_pgf(H, A, C, u, tol=tol, fixed_schedule=fixed_schedule, backend=backend)
+    G, sched = eval_joint_pgf(H, A, C, u, tol=tol, fixed_schedule=fixed_schedule, backend=backend, burst=burst)
     pss = invert_joint_pgf(G, mx, limits)
     if return_schedule:
         return pss, sched
     return pss
 
 
-def _ops(A, C, tau, h, E):
-    """Operators of the Strang step from time-to-go ``tau`` to ``tau - h``:
-    ``K1 = A ∫_{tau-h/2}^{tau} e^{Cs} ds``, ``E = exp(H^T h)``, ``K2 = A ∫_{tau-h}^{tau-h/2} e^{Cs} ds``."""
+def _production_exponent(A, C, u, tau_a, delta, burst):
+    """``X[c, p] = Σ_j A[c, j] ∫_{tau_a}^{tau_a+delta} φ(U_j(s, p)) ds`` with
+    ``U(s) = e^{Cs} u`` the characteristic: the diagonal sub-flow over the
+    interval multiplies ``G[c, p]`` by ``exp(X[c, p])``.  Constitutive
+    production has ``φ(U) = U`` and the integral in closed form; geometric
+    bursts of mean size ``burst`` at mean production rate ``A`` have
+    ``φ(U) = U / (1 - burst U)`` (burst frequency ``A / burst``), integrated
+    by Simpson's rule on the interval, which the step-doubling error control
+    covers like the splitting error."""
+    if burst is None:
+        return (A @ _char_integral(C, tau_a, delta)) @ u
+    nodes = (tau_a, tau_a + 0.5 * delta, tau_a + delta)
+    weights = (delta / 6.0, 4.0 * delta / 6.0, delta / 6.0)
+    I = np.zeros_like(u)
+    for s, w in zip(nodes, weights):
+        U = _expm(C * s) @ u
+        I += w * (U / (1.0 - burst * U))
+    return A @ I
+
+
+def _ops(A, C, u, tau, h, E, burst):
+    """Operators of the Strang step from time-to-go ``tau`` to ``tau - h``: the
+    production exponents over ``[tau-h/2, tau]`` and ``[tau-h, tau-h/2]`` and
+    ``E = exp(H^T h)`` between them."""
     hh = 0.5 * h
-    K1 = A @ _char_integral(C, tau - hh, hh)
-    K2 = A @ _char_integral(C, tau - h, hh)
-    return K1, E, K2
+    X1 = _production_exponent(A, C, u, tau - hh, hh, burst)
+    X2 = _production_exponent(A, C, u, tau - h, hh, burst)
+    return X1, E, X2
 
 
-def _step(G, u, ops):
-    K1, E, K2 = ops
-    G = np.exp(K1 @ u) * G
+def _step(G, ops):
+    X1, E, X2 = ops
+    G = np.exp(X1) * G
     G = E @ G
-    return np.exp(K2 @ u) * G
+    return np.exp(X2) * G
 
 
-def _integrate_numpy(HT, A, C, u, G, T, h_first, h_min, tol, fixed_schedule):
+def _integrate_numpy(HT, A, C, u, G, T, h_first, h_min, tol, fixed_schedule, burst=None):
     """NumPy mirror of ``monod_core.eval_chromatin_pgf``: Strang steps with step
     doubling and Richardson extrapolation; returns ``(G, steps)``.  The two
     half steps share one ``exp(H^T h/2)``, the full step uses its square, and
@@ -414,11 +445,11 @@ def _integrate_numpy(HT, A, C, u, G, T, h_first, h_min, tol, fixed_schedule):
             h = float(np.asarray(fixed_schedule)[len(steps)])
         hh = 0.5 * h
         E_half = last_E[1] if last_E is not None and last_E[0] == hh else _expm(HT * hh)
-        full = _ops(A, C, tau, h, E_half @ E_half)
-        half1 = _ops(A, C, tau, hh, E_half)
-        half2 = _ops(A, C, tau - hh, hh, E_half)
-        G1 = _step(G, u, full)
-        G2 = _step(_step(G, u, half1), u, half2)
+        full = _ops(A, C, u, tau, h, E_half @ E_half, burst)
+        half1 = _ops(A, C, u, tau, hh, E_half, burst)
+        half2 = _ops(A, C, u, tau - hh, hh, E_half, burst)
+        G1 = _step(G, full)
+        G2 = _step(_step(G, half1), half2)
         diff = G2 - G1
         if adaptive:
             err = float(np.abs(diff).max())

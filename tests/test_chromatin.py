@@ -102,6 +102,26 @@ class TestLimits:
         np.testing.assert_allclose(pss.sum(0), ref_pss, atol=1e-6)
         assert pss[1].sum() > 1 - 1e-6                                  # the open configuration carries the mass
 
+    def test_one_always_open_site_with_bursts_is_the_bursty_model(self):
+        """Mean production rate b at burst size b is burst frequency 1, monod's
+        Bursty model in its own time unit."""
+        b, beta, gamma = 3.0, 0.7, 0.3
+        H, A, C = ch.nascent_mature_system([1.0], 1e-9, 1.0, lambda s: b * s.sum(), beta, gamma)
+        ref_pss = CMEModel("Bursty", "None").eval_model_pss(np.log10([b, beta, gamma]), [40, 50])
+        pss = ch.eval_joint_pss(H, A, C, [40, 50], burst=b, backend="python")
+        np.testing.assert_allclose(pss.sum(0), ref_pss, atol=1e-6)
+
+    def test_small_bursts_are_the_constitutive_model_and_large_ones_overdisperse(self):
+        H, A, C = ch.nascent_mature_system([0.5, 0.8], 1.0, 0.6, "additive", 0.8, 0.3, rule_params=[4.0, 2.0])
+        base = ch.eval_joint_pss(H, A, C, [40, 50], backend="python")
+        small = ch.eval_joint_pss(H, A, C, [40, 50], burst=1e-4, backend="python")
+        np.testing.assert_allclose(small, base, atol=1e-5)
+        big = ch.eval_joint_pss(H, A, C, [40, 50], burst=3.0, backend="python")
+        mu0, cov0 = ch.moments(base, 2)
+        mu1, cov1 = ch.moments(big, 2)
+        np.testing.assert_allclose(mu1, mu0, rtol=2e-2)                 # same configuration and RNA means
+        assert cov1[2, 2] > 1.5 * cov0[2, 2] and cov1[3, 3] > 1.5 * cov0[3, 3]
+
     def test_single_site_is_the_telegraph_model(self):
         k_on, k_off, b, d = 0.4, 0.9, 6.0, 1.0
         H, A, C = ch.fgp_system([k_on], k_off, 1.0, [b], [d])
@@ -237,6 +257,23 @@ class TestRustBackend:
         assert s_rs.size == s_py.size
         np.testing.assert_allclose(np.asarray(s_rs), np.asarray(s_py), rtol=1e-6)   # controller rounding
         np.testing.assert_allclose(p_rs, p_py, atol=1e-12)
+
+    @pytest.mark.parametrize("case", ["switch", "additive", "table", "independent"])
+    def test_bursty_matches_numpy_in_every_mode(self, case):
+        """Bursts through the distinct-rate, factored, general and Kronecker paths."""
+        eps = 1.0 if case == "independent" else 0.6
+        rule = "additive" if case == "independent" else case
+        rates = {"switch": [5.0], "additive": [4.0, 2.0], "table": [0.3, 4.0, 2.0, 1.0]}[rule]
+        H, A, C = ch.nascent_mature_system([0.5, 0.8], 1.0, eps, rule, 0.8, 0.3, rule_params=rates)
+        p_py, s_py = ch.eval_joint_pss(H, A, C, [30, 40], burst=2.5, backend="python", return_schedule=True)
+        p_rs, s_rs = ch.eval_joint_pss(H, A, C, [30, 40], burst=2.5, backend="rust", return_schedule=True)
+        assert s_rs.size == s_py.size
+        np.testing.assert_allclose(np.asarray(s_rs), np.asarray(s_py), rtol=1e-6)
+        np.testing.assert_allclose(p_rs, p_py, atol=1e-12)
+        replay = ch.eval_joint_pss(H, A, C, [30, 40], burst=2.5, fixed_schedule=s_py, backend="rust")
+        np.testing.assert_allclose(replay, p_py, atol=1e-12)
+        with pytest.raises(ValueError):
+            ch.eval_joint_pss(H, A, C, [30, 40], burst=-1.0, backend="rust")
 
     def test_default_backend_is_rust_and_replays_python_schedule(self):
         H, A, C = ch.fgp_system([0.3, 0.6], 0.5, 0.4, [4.0, 2.0], [1.0, 1.0])
