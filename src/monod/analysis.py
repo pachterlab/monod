@@ -1,5 +1,5 @@
 from .cme_toolbox import CMEModel
-from .inference import SearchResults, plot_hist_and_fit, _resolve_marg, searchdata_from_adata, _read_h5, search_result_from_uns, search_result_list_from_uns
+from .inference import SearchResults, plot_hist_and_fit, _resolve_marg, searchdata_from_adata, _read_h5, search_result_from_uns, search_result_list_from_uns, aic_values
 from .extract_data import knee_plot, log
 from .plot_aesthetics import aesthetics
 import pickle
@@ -133,9 +133,11 @@ def _network_embedding(ms, mb):
 
 def compare_models(model_a, model_b, x_a, x_b, limits, samp, data, n_cells, EPS=1e-15):
     """Compare two fitted models on one gene without assuming either nests the
-    other: divergences, AIC and BIC (``2k + 2 n_cells KLD`` and
-    ``k log n_cells + 2 n_cells KLD``, so differences are differences of
-    deviance) and Vuong's test, the per-cell log-likelihood ratios of the two
+    other: divergences, AIC and BIC in the deviance form (``2k + 2 n_cells KLD``
+    and ``k log n_cells + 2 n_cells KLD``; these differ from ``adata.var['AIC']``
+    and :func:`monod.inference.aic_values` by ``2 n_cells`` times the entropy of
+    the empirical distribution, a per-gene constant that cancels in any
+    difference between models) and Vuong's test, the per-cell log-likelihood ratios of the two
     fits read off the histogram.  ``vuong_z`` is the raw statistic (positive
     favours ``model_a``), ``vuong_z_bic`` the Schwarz-corrected one used for
     the two-sided p-value ``p_vuong``, and ``prefer`` is ``"a"``, ``"b"`` or
@@ -574,11 +576,7 @@ def get_AIC_weights(sr_arr, sd):
         Akaike weights corresponding to each model, an n_models x n_genes array.
     """
 
-    n_models = len(sr_arr)
-    AIC = []
-    for j in range(n_models):
-        AIC += [2 * sr_arr[j].sp.n_phys_pars - 2 * np.asarray(sr_arr[j].get_logL(sd))]
-    AIC = np.asarray(AIC)
+    AIC = np.asarray([aic_values(sr, sd) for sr in sr_arr])          # the convention of adata.var['AIC']
     min_AIC = AIC.min(0)
     normalization = np.exp(-(AIC - min_AIC) / 2).sum(0)
     w = np.exp(-(AIC - min_AIC) / 2) / normalization

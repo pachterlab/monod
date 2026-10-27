@@ -39,7 +39,7 @@ RNG = np.random.default_rng(42)
 
 def _ref_histogram(layers_sub):
     """
-    Replicate make_histogram (hist_type='unique') for a single cell subset.
+    Replicate extract_data.unique_histograms for a single cell subset.
 
     Parameters
     ----------
@@ -62,7 +62,7 @@ def _ref_histogram(layers_sub):
 
 def _ref_moments(layers_sub, layer_names):
     """
-    Replicate get_moment_dicts for a single cell subset.
+    Replicate extract_data.layer_moments for a single cell subset.
 
     Parameters
     ----------

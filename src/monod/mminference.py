@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
 from scipy.special import logsumexp, softmax
-from .extract_data import make_dir, log
+from .extract_data import make_dir, log, unique_histograms, layer_moments
 from .cme_toolbox import CMEModel, _MODELS_2D
 from .inference import (
     SearchData,
@@ -378,8 +378,8 @@ def _partition_search_data(search_data, labels, k, padding=None):
 
         hist_type = search_data.hist_type
 
-        hist = make_histogram(layers, layer_names, hist_type, M)
-        moments = get_moment_dicts(layers, layer_names)
+        hist = unique_histograms(list(layers))
+        moments = layer_moments(list(layers), layer_names)
 
 
         #Remake SearchData object
@@ -979,103 +979,6 @@ def mek_means_aic(Q, lower_bound, n_phys_pars, n_genes, n_cells):
     log_joint_per_cell = lower_bound + np.mean(np.log(np.max(Q, axis=1)))
     k_param = n_phys_pars * n_genes * k_final + (k_final - 1)
     return float(-log_joint_per_cell + k_param / n_cells)
-
-
-def make_histogram(layers, layer_names, hist_type, M):
-    """
-    Generate histograms based on the provided layers and layer names.
-
-    Parameters
-    ----------
-    layers : list of np.ndarray
-        List of arrays, each corresponding to a different layer (modality) of data.
-    layer_names : list of str
-        List of names corresponding to each layer in the same order as `layers`.
-    hist_type : str
-        Type of histogram to generate ("grid", "unique", or "none").
-    M : list of np.ndarray
-        List of arrays specifying the bin structure for histogram calculation.
-
-    Returns
-    -------
-    hist : list
-        A list where each entry corresponds to a histogram for a specific gene.
-    """
-
-
-    hist = []
-    n_cells = layers[0].shape[0]  # Assuming all layers have the same number of cells
-    n_genes = layers[0].shape[1]  # Assuming all layers have the same number of genes
-
-    for gene_index in range(n_genes):
-        unique, unique_counts = np.unique(
-            np.vstack([x[:, gene_index] for x in layers]).T, axis=0, return_counts=True
-        )
-        hist.append((unique.astype(int), unique_counts / n_cells))
-
-    return hist
-
-def get_moment_dicts(layers, layer_names, cov_matrix_key='layer_covariances'):
-    """
-    Compute and add mean and variance for each gene within each layer, and add covariances
-    between layers for each gene, returning a list of dictionaries where each dictionary 
-    corresponds to a gene with calculated moments and covariances.
-
-    Parameters
-    ----------
-    adata: anndata.AnnData
-        AnnData object with layers containing gene expression data.
-    layer_names: list of strings.
-    cov_matrix_key: str, optional
-        Key under which the covariance matrix will be stored in `adata.uns`.
-
-    Returns
-    -------
-    gene_moments: list of dict
-        A list where each entry is a dictionary representing a gene, with keys as the column names 
-        (e.g., mean, variance, covariance) and values as the corresponding values for that gene.
-    """
-    n_layers = len(layer_names)
-    n_genes = np.shape(layers[0])[1]
-    # print('n_genes', n_genes)
-
-    gene_moments = []
-
-    # Compute mean, variance, and covariances for each gene
-    for gene_index in range(n_genes):
-        gene_dict = {}
-
-        for i in range(n_layers):
-            # These have already been ordered.
-            modality_name = layer_names[i]
-            layer = layers[i]
-            
-            mean_col = f"MOM_{modality_name}_mean"
-            var_col = f"MOM_{modality_name}_var"
-            
-            # Calculate mean and variance for each layer
-            gene_dict[mean_col] = layer[:, gene_index].mean()
-            gene_dict[var_col] = layer[:, gene_index].var()
-
-        # Compute covariances between each pair of layers
-        for i in range(n_layers):
-            for j in range(i + 1, n_layers):
-                layer_i = layers[i]
-                layer_j = layers[j]
-                mod_i, mod_j = layer_names[i], layer_names[j]
-                layer_layer_string = f"MOM_cov_{mod_i}_{mod_j}"
-
-                covar = np.cov(
-                    [layer_i[:, gene_index].flatten(), 
-                     layer_j[:, gene_index].flatten()]
-                )[0, 1]
-                
-                gene_dict[layer_layer_string] = covar
-        
-        gene_moments.append(gene_dict)
-
-    return gene_moments
-
 
 
 ########################

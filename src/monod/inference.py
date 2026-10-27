@@ -395,24 +395,25 @@ class SearchData:
 
             
 
+def aic_values(search_result, search_data, EPS=1e-20, offs=0):
+    """Per-gene AIC of one fit at its sampling optimum, ``2 k - 2 logL`` with
+    ``k`` the number of biological parameters: the convention of
+    ``adata.var['AIC']``, the Akaike weights and the meK-Means score.  (The
+    model-comparison functions in :mod:`monod.analysis` report the deviance
+    form ``2 k + 2 n_cells KLD`` instead, which differs by the entropy of the
+    empirical distribution, a per-gene constant that cancels in differences.)"""
+    logL = np.asarray(search_result.get_logL(search_data, EPS=EPS, offs=offs))
+    return 2 * search_result.sp.n_phys_pars - 2 * logL
+
+
 def AIC_per_gene(search_result, monod_adata, search_data=None):
-    """Per-gene AIC, ``2 k - 2 logL``, stored in ``monod_adata.var['AIC']`` and returned.
+    """Per-gene AIC (:func:`aic_values`), stored in ``monod_adata.var['AIC']`` and returned.
 
     ``search_data`` is rebuilt from the AnnData when not given."""
     if search_data is None:
         search_data = searchdata_from_adata(monod_adata)
-    n_cells = monod_adata.n_obs
-    # Calculate the log-likelihood for each gene
-    logL = search_result.get_logL(search_data, n_cells)
-    
-    # Calculate the number of parameters
-    n_params = search_result.sp.n_phys_pars
-    
-    # Calculate AIC for each gene
-    AIC = 2 * n_params - 2 * logL
-
+    AIC = aic_values(search_result, search_data)
     monod_adata.var['AIC'] = AIC
-    
     return AIC
 
 
@@ -3175,13 +3176,7 @@ def get_AIC_mek_means(search_result_list, search_data, AIC_EPS=1e-20, AIC_offs=0
     which cannot be attributed to individual genes; see
     ``mminference.mek_means_aic`` for the whole-model score.)
     """
-    LL = np.zeros(search_result_list[0].n_genes)
-    for sr in search_result_list:
-        LL += np.asarray(sr.get_logL(search_data, EPS=AIC_EPS, offs=AIC_offs))
-
-    n_params = search_result_list[0].sp.n_phys_pars
-    k_final = len(search_result_list)
-    return 2 * n_params * k_final - 2 * LL
+    return sum(aic_values(sr, search_data, EPS=AIC_EPS, offs=AIC_offs) for sr in search_result_list)
 
 
 def parallelize(

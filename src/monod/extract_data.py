@@ -385,136 +385,76 @@ def CSRDataset_to_arrays(adata):
 
     return adata_dense_layers
 
-def add_moments(adata, modality_name_dict=None, cov_matrix_key='layer_covariances'):
-    """
-    Compute and add mean and variance for each gene within each layer to `adata.var`, 
-    and add covariances between layers for each gene to `adata.var`.
+def unique_histograms(layers):
+    """Per-gene histograms of the unique joint states.
 
-    Parameters
-    ----------
-    adata: anndata.AnnData
-        AnnData object with layers containing gene expression data.
-    cov_matrix_key: str, optional
-        Key under which the covariance matrix will be stored in `adata.uns`.
-    modality_name_dict: dictionary
-        mapping of form {'modality_name':'anndata layer name'} for modality names as given in cme_toolbox,
-        and anndata layer names from the data.
+    ``layers`` are dense or sparse cells x genes arrays, one per modality, in
+    the model's modality order.  Returns one ``(coords, freqs)`` pair per gene:
+    the distinct state vectors (integer array, n_states x n_modalities) and
+    their frequencies.  This is the Python mirror of the Rust
+    ``make_state_dist``; the inference pipeline uses the Rust one whenever the
+    extension is installed."""
+    layers = [to_dense(x) for x in layers]
+    n_cells, n_genes = layers[0].shape
+    hist = []
+    for g in range(n_genes):
+        unique, counts = np.unique(np.column_stack([x[:, g] for x in layers]), axis=0, return_counts=True)
+        hist.append((unique.astype(int), counts / n_cells))
+    return hist
 
-    Returns
-    -------
-    adata: anndata.AnnData
-        AnnData object with moments and layer covariances added to `adata.var` and `adata.uns`.
-    """
-    layer_names = adata.layers.keys()
-    n_layers = len(layer_names)
-    n_genes = adata.n_vars
 
-    # If no mapping specified, assume layers are named the same as CME model modalities.
+def layer_moments(layers, names):
+    """Per-gene means, variances and pairwise covariances of the modalities.
+
+    ``layers`` as in :func:`unique_histograms`, ``names`` their modality names.
+    Returns one dict per gene with keys ``MOM_<name>_mean``, ``MOM_<name>_var``
+    (population variance) and ``MOM_cov_<a>_<b>`` (sample covariance, as
+    ``np.cov``), the keys the method-of-moments starts read.  Mirror of the
+    Rust ``compute_moments``."""
+    X = [np.asarray(to_dense(x), dtype=float) for x in layers]
+    n_cells, n_genes = X[0].shape
+    cols = {}
+    for name, x in zip(names, X):
+        cols[f"MOM_{name}_mean"] = x.mean(0)
+        cols[f"MOM_{name}_var"] = x.var(0)
+    for i in range(len(X)):
+        for j in range(i + 1, len(X)):
+            di, dj = X[i] - X[i].mean(0), X[j] - X[j].mean(0)
+            denom = max(n_cells - 1, 1)
+            cols[f"MOM_cov_{names[i]}_{names[j]}"] = (di * dj).sum(0) / denom
+    return [{k: float(v[g]) for k, v in cols.items()} for g in range(n_genes)]
+
+
+def add_moments(adata, modality_name_dict=None):
+    """Write each gene's moments (see :func:`layer_moments`) into ``adata.var``
+    as ``MOM_*`` columns, naming the modalities through ``modality_name_dict``
+    (``{modality: layer}``) or by their layer names.  Returns ``adata``."""
+    layer_names = list(adata.layers.keys())
     if modality_name_dict:
-        layer_name_to_modality = {v:k for k,v in modality_name_dict.items()}
+        layer_to_modality = {v: k for k, v in modality_name_dict.items()}
     else:
-        layer_name_to_modality = {v:v for v in layer_names}
-
-    
-    # Create DataFrame to store moments
-    moments_df = pd.DataFrame(index=adata.var.index)
-
-    # Compute mean and variance for each gene within each layer
-    for layer in layer_names:
-
-        modality_name = layer_name_to_modality[layer]
-        
-        mean_col = f"MOM_{modality_name}_mean"
-        var_col = f"MOM_{modality_name}_var"
-        
-        # # Calculate mean and variance for each layer
-        # moments_df[mean_col] = adata.layers[layer].mean(axis=0).flatten()
-        # moments_df[var_col] = adata.layers[layer].var(axis=0).flatten()
-
-        # Calculate mean and variance for each layer
-        adata.var[mean_col] = adata.layers[layer].mean(axis=0).flatten() # toarray
-        adata.var[var_col] = adata.layers[layer].var(axis=0).flatten() #toarray
-    
-    index = 0
-    for i in range(n_layers):
-        for j in range(i + 1, n_layers):
-            layer_i = [p for p in layer_names][i]
-            layer_j = [p for p in layer_names][j]
-            mod_i, mod_j = layer_name_to_modality[layer_i], layer_name_to_modality[layer_j]
-            layer_layer_string = f"MOM_cov_{mod_i}_{mod_j}"
-
-            gene_covars = []
-            for gene_index in range(n_genes):
-                covar = np.cov([adata.layers[layer_i][:, gene_index], adata.layers[layer_j][:, gene_index]])[0, 1] # toarray
-                # covariances[gene_index, index] = covar
-                gene_covars += [covar]
-
-            adata.var[layer_layer_string] = np.array(gene_covars)
-            
-            index += 1
-
-    # # Add layer covariances DataFrame to adata.var
-    # covariances_df = pd.DataFrame(covariances, index=adata.var.index)
-    
-    # covariances_df.columns = [f"MOM_cov_{[p for p in layers][i]}_{[p for p in layers][j]}" for i in range(n_layers) for j in range(i + 1, n_layers)]
-    
-    # adata.var = adata.var.join(covariances_df)
-
-    # # Add the covariance matrix between layers to `adata.uns` (not needed?)
-    # adata.uns[cov_matrix_key] = covariances
-
+        layer_to_modality = {v: v for v in layer_names}
+    names = [layer_to_modality[l] for l in layer_names]
+    moments = layer_moments([adata.layers[l] for l in layer_names], names)
+    for key in moments[0] if moments else []:
+        adata.var[key] = np.array([m[key] for m in moments])
     return adata
 
 
-def _make_histogram_one_gene(gene_index, layers, hist_type, M, n_cells):
-    """Compute the histogram for a single gene (parallelisable worker)."""
-    gene_cols = [to_dense(x[:, gene_index]).ravel() for x in layers]
-    stacked = np.column_stack(gene_cols)  # (n_cells, n_modalities) — built once
-
-    unique, unique_counts = np.unique(stacked, axis=0, return_counts=True)
-    return (unique.astype(int), unique_counts / n_cells)
-
-
-def make_histogram(monod_adata, hist_type, M, n_jobs=1):
-    """Build per-gene expression histograms.
-
-    Parameters
-    ----------
-    monod_adata : AnnData
-    hist_type : str
-        Must be "unique".
-    M : array-like
-        Grid limits per layer per gene.
-    n_jobs : int
-        Number of joblib workers (1 = serial; -1 = all cores).
-    """
-    from joblib import Parallel, delayed as jdelayed
-
-    # NB the order of the layers here will be enforced to be the same as the order of the model
-    # modalities defined in cme_toolbox.
-
+def _ordered_layers(monod_adata):
+    """The AnnData's layers in the model's modality order."""
     modality_name_dict = monod_adata.uns['modality_name_dict']
     model = model_from_uns(monod_adata.uns['model'])
+    return [monod_adata.layers[modality_name_dict[m]] for m in model.model_modalities]
 
-    ordered_modalities = model.model_modalities
-    ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
 
-    layers = [monod_adata.layers[layer_name] for layer_name in ordered_layer_names]
-    n_cells = monod_adata.n_obs
-    n_genes = monod_adata.n_vars
-
-    if n_jobs == 1:
-        hist = [
-            _make_histogram_one_gene(i, layers, hist_type, M, n_cells)
-            for i in range(n_genes)
-        ]
-    else:
-        hist = Parallel(n_jobs=n_jobs)(
-            jdelayed(_make_histogram_one_gene)(i, layers, hist_type, M, n_cells)
-            for i in range(n_genes)
-        )
-
-    return hist
+def make_histogram(monod_adata, hist_type="unique", M=None):
+    """Per-gene unique-state histograms of a monod AnnData, layers in the
+    model's modality order (:func:`unique_histograms`).  ``hist_type`` must be
+    ``"unique"``; ``M`` is accepted for compatibility and not needed."""
+    if hist_type != "unique":
+        raise ValueError(f"hist_type must be 'unique'; got {hist_type!r}")
+    return unique_histograms(_ordered_layers(monod_adata))
 
 ## Helper functions.
 # Don't need store_search_data function anymore, can just save adata object in the normal way.

@@ -59,7 +59,7 @@ def _make_hist_unique(layers, n_layers, n_genes):
 
 
 def _ref_moments(layers, layer_names):
-    """Pure-Python moments reference (mirrors mminference.get_moment_dicts)."""
+    """Pure-Python moments reference (mirrors extract_data.layer_moments)."""
     n_layers = len(layer_names)
     n_genes = layers[0].shape[1]
     n_cells = layers[0].shape[0]

@@ -1,6 +1,6 @@
 """
 Tests verifying that monod_core.compute_moments matches the Python
-get_moment_dicts reference implementation (mminference.py) exactly.
+layer_moments reference implementation (extract_data.py) exactly.
 
 Covers:
   - 1-layer (single modality): mean and population variance (ddof=0)
@@ -24,11 +24,11 @@ _HAS_RUST = _mc is not None
 pytestmark = pytest.mark.skipif(not _HAS_RUST, reason="monod_core not available")
 
 # ---------------------------------------------------------------------------
-# Reference implementation (mirrors mminference.get_moment_dicts exactly)
+# Reference implementation (mirrors extract_data.layer_moments exactly)
 # ---------------------------------------------------------------------------
 
 def _ref_moments(layers, layer_names):
-    """Pure-Python reference matching mminference.get_moment_dicts."""
+    """Pure-Python reference matching extract_data.layer_moments."""
     n_layers = len(layer_names)
     n_genes = layers[0].shape[1]
     result = []
@@ -231,3 +231,27 @@ class TestComputeMomentsRealData:
         rust = _mc.compute_moments(layers, layer_names)
         ref = _ref_moments(layers, layer_names)
         _compare(rust, ref, tol=1e-9)
+
+
+
+def test_python_cores_match_the_reference():
+    """extract_data.layer_moments / unique_histograms are the Python mirrors of the Rust
+    kernels and the meK-Means partitioner's fallback; pin them to the reference here."""
+    from monod.extract_data import layer_moments, unique_histograms
+    rng = np.random.default_rng(0)
+    layers = [rng.poisson(2.0, (50, 4)), rng.poisson(5.0, (50, 4))]
+    names = ["unspliced", "spliced"]
+    got = layer_moments(layers, names)
+    ref = _ref_moments(layers, names)
+    for g in range(4):
+        u, s_ = layers[0][:, g].astype(float), layers[1][:, g].astype(float)
+        assert got[g]["MOM_unspliced_mean"] == pytest.approx(u.mean())
+        assert got[g]["MOM_spliced_var"] == pytest.approx(s_.var())
+        assert got[g]["MOM_cov_unspliced_spliced"] == pytest.approx(np.cov(u, s_)[0, 1])
+        if ref is not None:
+            assert got[g] == pytest.approx(ref[g])
+    hist = unique_histograms(layers)
+    coords, freqs = hist[1]
+    assert coords.shape[1] == 2 and freqs.sum() == pytest.approx(1.0)
+    stacked = np.column_stack([layers[0][:, 1], layers[1][:, 1]])
+    assert coords.shape[0] == len({tuple(r) for r in stacked})
