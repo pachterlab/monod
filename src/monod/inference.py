@@ -7,7 +7,7 @@ import scipy
 from scipy import optimize, stats
 from ._core import make_dir, log, _build_sampling_grid, to_dense
 from .extract_data import extract_data, make_histogram, _uns_unpack, model_from_uns
-from .cme_toolbox import CMEModel, _HAS_RUST, _MODELS_2D, _format_direction, _PROTEIN_FUDGE
+from .cme_toolbox import CMEModel, _HAS_RUST, _MODELS_2D, _format_direction, _PROTEIN_ODE, _CUSTOM_ODE
 from .reaction_network import ReactionNetworkWarning, IdentifiabilityWarning
 from ._core import _mc          # None when the compiled extension is not installed
 
@@ -1332,10 +1332,7 @@ class GradientInference:
             or not isinstance(search_data, _mc.SearchData)
         ):
             return None
-        family = model._kernel_family()
-        if family == "custom" and len(model.network.species) not in (2, 3):
-            return None
-        return family
+        return model._kernel_family()
 
     def _optimize_genes_rust(self, family, model, search_data, x0_all, n_gene_cores):
         """Fit every gene with the Rust L-BFGS-B kernel of ``family``.
@@ -1386,7 +1383,7 @@ class GradientInference:
             out = _mc.optimize_genes_protein_bursty_sd(
                 search_data, fit_unspliced=bool(model.fit_unspliced),
                 protein_limit=float(model.protein_limit),
-                min_fudge=_PROTEIN_FUDGE[0], max_fudge=_PROTEIN_FUDGE[1],
+                ode=_PROTEIN_ODE,
                 **common,
             )
         elif family == "custom":
@@ -1398,7 +1395,7 @@ class GradientInference:
                 rxn_kinds=topo["rxn_kinds"], rxn_rate_idxs=topo["rxn_rate_idxs"],
                 rxn_extra1=topo["rxn_extra1"], rxn_extra2=topo["rxn_extra2"],
                 prod_sp=topo["prod_sp"], prod_st=topo["prod_st"], prod_off=topo["prod_off"],
-                has_norm_rate=(net._norm_rate is not None),
+                has_norm_rate=(net._norm_rate is not None), ode=_CUSTOM_ODE,
                 **common,
             )
         else:

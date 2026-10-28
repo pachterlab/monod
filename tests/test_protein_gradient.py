@@ -87,7 +87,7 @@ class TestRustPinnedGradient:
         coords, freqs = data
         k_rs, g_rs = _mc.eval_kld_grad_protein_bursty(
             X.tolist(), LIMITS, coords.tolist(), freqs.tolist(),
-            True, float("inf"), 0.1, 10.0, 1e-6, 1e-15,
+            True, float("inf"), ode=ct._PROTEIN_ODE, fd_eps=1e-6, eps=1e-15,
         )
         monkeypatch.setattr(ct, "_HAS_RUST", False)
         ref, _ = _python_reference(model, data, monkeypatch)
@@ -100,7 +100,7 @@ class TestRustPinnedGradient:
         k1, g1 = model.eval_model_kld_and_grad(X, LIMITS, None, (coords, freqs), eps=1e-6)
         k2, g2 = _mc.eval_kld_grad_protein_bursty(
             X.tolist(), LIMITS, coords.tolist(), freqs.tolist(),
-            True, float("inf"), 0.1, 10.0, 1e-6, 1e-15,
+            True, float("inf"), ode=ct._PROTEIN_ODE, fd_eps=1e-6, eps=1e-15,
         )
         assert abs(k1 - k2) < 1e-12
         np.testing.assert_allclose(g1, np.array(g2), rtol=1e-9, atol=1e-12)
@@ -110,10 +110,10 @@ class TestRustPinnedGradient:
         with pytest.raises(ValueError, match="outside grid"):
             _mc.eval_kld_grad_protein_bursty(
                 X.tolist(), [2, 2, 2], coords.tolist(), freqs.tolist(),
-                True, float("inf"), 0.1, 10.0,
+                True, float("inf"), ode=ct._PROTEIN_ODE,
             )
         with pytest.raises(ValueError, match="5 log10"):
             _mc.eval_kld_grad_protein_bursty(
                 [0.0] * 4, LIMITS, coords.tolist(), freqs.tolist(),
-                True, float("inf"), 0.1, 10.0,
+                True, float("inf"), ode=ct._PROTEIN_ODE,
             )

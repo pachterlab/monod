@@ -11,7 +11,7 @@ import pytest
 import monod.cme_toolbox as ct
 from monod._core import _mc
 from monod.cme_toolbox import CMEModel
-from monod.reaction_network import ReactionNetwork
+from monod.reaction_network import ReactionNetwork, _CUSTOM_ODE
 
 BURSTY = "0 -> B x U -> S -> 0"
 UDEG = "0 -> B x U -> S -> 0; U -> 0"
@@ -176,9 +176,9 @@ class TestRustParity:
         params = [2.0, 0.5, 0.8, 1.0]                       # B, k1, k2, k0 (normalised)
         args = (2, [12, 10], topo["rxn_kinds"], topo["rxn_rate_idxs"], topo["rxn_extra1"],
                 topo["rxn_extra2"], topo["prod_sp"], topo["prod_st"], topo["prod_off"], params)
-        re1, im1, shape, steps = _mc.eval_custom_network_pgf(*args)
+        re1, im1, shape, steps = _mc.eval_custom_network_pgf(*args, ode=_CUSTOM_ODE)
         assert len(steps) > 10 and shape == [12, 6]
-        re2, im2, _, steps2 = _mc.eval_custom_network_pgf(*args, fixed_schedule=steps)
+        re2, im2, _, steps2 = _mc.eval_custom_network_pgf(*args, ode=_CUSTOM_ODE, fixed_schedule=steps)
         assert steps2 == steps and re2 == re1 and im2 == im1
 
 

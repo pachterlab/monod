@@ -7,8 +7,8 @@
 ///     6 two-modality bio_models, seq_model="None"/"Poisson", amb_model="None"/"Equal"/"Unequal".
 ///     p_log contains only bio params; amb_log = [log10_p] (Equal) or [log10_p0, log10_p1] (Unequal).
 ///
-/// eval_model_pss_protein_bursty(p_log, limits, fit_unspliced,
-///                                protein_limit, min_fudge, max_fudge) -> Vec<f64>
+/// eval_model_pss_protein_bursty_sched(p_log, limits, fit_unspliced, protein_limit,
+///                                      *, ode, fixed_schedule=None) -> (Vec<f64>, steps)
 ///     ProteinBursty bio_model, seq_model="None".
 ///
 /// Optimizations over prior version:
@@ -224,6 +224,9 @@ static MESH_CACHE_2D: OnceLock<Mutex<BoundedCache<(usize, usize), (Vec<Complex64
 /// Stores (g0, g1, g_amb) each of length l0 * l1 * (l2/2+1).
 static MESH_CACHE_3D: OnceLock<Mutex<BoundedCache<(usize, usize, usize), (Vec<Complex64>, Vec<Complex64>, Vec<Complex64>)>>> =
     OnceLock::new();
+/// N-D half-spectrum meshes (custom networks, chromatin), keyed by the grid.
+static MESH_CACHE_ND: OnceLock<Mutex<BoundedCache<Vec<usize>, (Vec<Vec<Complex64>>, Vec<usize>, usize)>>> =
+    OnceLock::new();
 
 fn build_mesh_2d_cached(l0: usize, l1: usize) -> Arc<(Vec<Complex64>, Vec<Complex64>)> {
     cached(&MESH_CACHE_2D, (l0, l1), || {
@@ -249,6 +252,24 @@ fn build_mesh_3d_cached(
 /// Poisson-transformed 2-D mesh cache — Arc-wrapped, keyed by (l0, l1, lam0_bits, lam1_bits).
 static MESH_CACHE_POISSON: OnceLock<Mutex<BoundedCache<(usize, usize, u64, u64), (Vec<Complex64>, Vec<Complex64>)>>> =
     OnceLock::new();
+
+/// The (g0, g1) mesh of a two-species model under its sequencing model:
+/// the Poisson or Bernoulli transform of the base mesh when `samp_log` is
+/// given, the base mesh otherwise.
+fn mesh_2d_for(
+    l0: usize,
+    l1: usize,
+    samp_log: Option<&[f64]>,
+    seq_model: &str,
+) -> Arc<(Vec<Complex64>, Vec<Complex64>)> {
+    match (samp_log, seq_model) {
+        (Some(samp), "Poisson") => {
+            build_mesh_2d_poisson_cached(l0, l1, 10f64.powf(samp[0]), 10f64.powf(samp[1]))
+        }
+        (Some(samp), "Bernoulli") => build_mesh_2d_bernoulli_cached(l0, l1, samp[0], samp[1]),
+        _ => build_mesh_2d_cached(l0, l1),
+    }
+}
 
 fn build_mesh_2d_poisson_cached(
     l0: usize,
@@ -299,6 +320,7 @@ fn mesh_cache_clear() {
     cache_clear(&MESH_CACHE_3D);
     cache_clear(&MESH_CACHE_POISSON);
     cache_clear(&MESH_CACHE_BERNOULLI);
+    cache_clear(&MESH_CACHE_ND);
 }
 
 /// Per-cache (number of meshes, total complex entries) plus the active cap.
@@ -309,6 +331,7 @@ fn mesh_cache_stats() -> HashMap<String, (usize, usize)> {
     m.insert("mesh_3d".to_string(), cache_stats(&MESH_CACHE_3D));
     m.insert("poisson".to_string(), cache_stats(&MESH_CACHE_POISSON));
     m.insert("bernoulli".to_string(), cache_stats(&MESH_CACHE_BERNOULLI));
+    m.insert("mesh_nd".to_string(), cache_stats(&MESH_CACHE_ND));
     m.insert("cap_entries".to_string(), (MESH_CACHE_CAP_ENTRIES.load(Ordering::Relaxed), 0));
     m
 }
@@ -328,6 +351,34 @@ fn mesh_cache_set_cap(entries: usize) {
 /// switching to sequential avoids this for the common inference case where
 /// per-gene grids have median ~100–500 rfft points (3×3 or 5×5 gridsize).
 const PAR_THRESHOLD: usize = 2048;
+
+/// Step-size control shared by the adaptive integrators (protein, custom,
+/// chromatin): after a step with error estimate `err`, either retry with a
+/// smaller step or accept and scale the next step.  The floating-point order
+/// is part of the contract: `0.9 * (tol / err)^(1/3)`, then max 0.2, then min 2.
+enum StepControl {
+    /// Reject: the step to retry with.
+    Retry(f64),
+    /// Accept: the factor for the next step.
+    Accept(f64),
+}
+
+fn control_step(err: f64, h: f64, h_min: f64, tol: f64) -> StepControl {
+    if err > tol && h > h_min {
+        StepControl::Retry(h * (0.9 * (tol / err).powf(1.0 / 3.0)).max(0.2))
+    } else {
+        StepControl::Accept((0.9 * (tol / err.max(1e-300)).powf(1.0 / 3.0)).max(0.2).min(2.0))
+    }
+}
+
+/// exp of a log-PGF, element-wise; parallel above PAR_THRESHOLD.
+fn exp_par(gf_log: &[Complex64]) -> Vec<Complex64> {
+    if gf_log.len() >= PAR_THRESHOLD {
+        gf_log.par_iter().map(|z| z.exp()).collect()
+    } else {
+        gf_log.iter().map(|z| z.exp()).collect()
+    }
+}
 
 #[inline]
 fn np_isclose(a: f64, b: f64) -> bool {
@@ -670,16 +721,7 @@ fn eval_kld_and_grad_analytic_seq(
     let (l0, l1) = (limits[0], limits[1]);
     let t = fixed_quad_t * (1.0 / p[1] + 1.0 / p[2] + 1.0);
 
-    // Build mesh with the appropriate sequencing model transform.
-    let mesh = match (samp_log, seq_model) {
-        (Some(samp), "Poisson") => {
-            build_mesh_2d_poisson_cached(l0, l1, 10f64.powf(samp[0]), 10f64.powf(samp[1]))
-        }
-        (Some(samp), "Bernoulli") => {
-            build_mesh_2d_bernoulli_cached(l0, l1, samp[0], samp[1])
-        }
-        _ => build_mesh_2d_cached(l0, l1),
-    };
+    let mesh = mesh_2d_for(l0, l1, samp_log, seq_model);
     let (g0, g1) = (&mesh.0, &mesh.1);
 
     // Single quadrature pass: phi and all three dphi.
@@ -749,14 +791,24 @@ fn eval_kld_and_grad_analytic_seq(
 // at the default bounds); this scheme needs 80-300 steps in every regime and is
 // 10-100x more accurate on the generating function.
 
-/// Error tolerance per step on the generating-function scale (|exp(phi)| <= 1).
-const PROTEIN_ODE_TOL: f64 = 1e-6;
-/// First step as a fraction of the fastest time scale.
-const PROTEIN_ODE_C0: f64 = 0.05;
-/// Hard cap on accepted steps (adaptive mode); the per-step error target is then
-/// no longer guaranteed but the integration still covers the full horizon
-/// as far as the cap allows.
-const PROTEIN_ODE_MAX_STEPS: usize = 20_000;
+/// Integrator settings of the protein kernel.  Python owns the one definition
+/// (`monod.cme_toolbox._PROTEIN_ODE`) and passes it as `ode=(tol, c0, max_steps)`:
+/// the error tolerance per step on the generating-function scale
+/// (|exp(phi)| <= 1), the first step as a fraction of the fastest time scale,
+/// and the hard cap on accepted steps in adaptive mode (the per-step error
+/// target is then no longer guaranteed but the integration still covers the
+/// horizon as far as the cap allows).
+#[derive(Clone, Copy)]
+struct ProteinOde { tol: f64, c0: f64, max_steps: usize }
+
+impl ProteinOde {
+    fn from_py(ode: (f64, f64, usize), who: &str) -> PyResult<Self> {
+        if !(ode.0 > 0.0) || !(ode.1 > 0.0) || ode.2 == 0 {
+            return verr(format!("{who}: ode=(tol, c0, max_steps) must be positive, got {ode:?}"));
+        }
+        Ok(ProteinOde { tol: ode.0, c0: ode.1, max_steps: ode.2 })
+    }
+}
 
 #[inline(always)]
 fn rphi1(z: f64) -> f64 {
@@ -873,9 +925,8 @@ fn protein_pgf_sched(
     g1: &[Complex64],
     g2: &[Complex64],
     p: &[f64],
-    _min_fudge: f64,
-    _max_fudge: f64,
     fixed: Option<&[f64]>,
+    ode: &ProteinOde,
 ) -> (Vec<Complex64>, Vec<f64>) {
     let n_grid = g0.len();
     let (b, beta, gamma, k_p, gamma_p) = (p[0], p[1], p[2], p[3], p[4]);
@@ -883,7 +934,7 @@ fn protein_pgf_sched(
 
     let lam_fast = beta.max(gamma + 2.0 * k_p).max(gamma_p);
     let lam_slow = beta.min(gamma).min(gamma_p);
-    let t_end = (1.0 / PROTEIN_ODE_TOL).ln() / lam_slow
+    let t_end = (1.0 / ode.tol).ln() / lam_slow
         + (2.0 * k_p / gamma).ln().max(0.0) / gamma_p;
 
     let mut states: Vec<ProteinState> = (0..n_grid)
@@ -895,7 +946,7 @@ fn protein_pgf_sched(
     let adaptive = fixed.is_none();
     let mut steps: Vec<f64> = Vec::with_capacity(fixed.map_or(256, |f| f.len()));
     let mut t = 0.0_f64;
-    let mut h = PROTEIN_ODE_C0 / lam_fast;
+    let mut h = ode.c0 / lam_fast;
     let h_min = 1e-12 / lam_fast;
     let par = n_grid >= PAR_THRESHOLD;
 
@@ -906,7 +957,7 @@ fn protein_pgf_sched(
                 h = f[steps.len()];
             }
             None => {
-                if t >= t_end || steps.len() >= PROTEIN_ODE_MAX_STEPS { break; }
+                if t >= t_end || steps.len() >= ode.max_steps { break; }
                 h = h.min(t_end - t);
             }
         }
@@ -930,11 +981,10 @@ fn protein_pgf_sched(
             } else {
                 trial.iter().map(|x| x.3).fold(0.0_f64, f64::max)
             };
-            if err > PROTEIN_ODE_TOL && h > h_min {
-                h *= (0.9 * (PROTEIN_ODE_TOL / err).powf(1.0 / 3.0)).max(0.2);
-                continue;
+            match control_step(err, h, h_min, ode.tol) {
+                StepControl::Retry(h_new) => { h = h_new; continue; }
+                StepControl::Accept(f) => fac = f,
             }
-            fac = (0.9 * (PROTEIN_ODE_TOL / err.max(1e-300)).powf(1.0 / 3.0)).clamp(0.2, 2.0);
         }
         let accept = |(s, tr): (&mut ProteinState, &(Complex64, Complex64, Complex64, f64))| {
             s.v = tr.0; s.w = tr.1; s.phi += tr.2;
@@ -962,192 +1012,89 @@ fn protein_pgf_sched(
 // 2-D irfftn — parallel column IFFTs + parallel row irffts, no mid buffer
 // ============================================================================
 
-/// irfftn for shape [n0, mx1=n1/2+1] → [n0, n1].
+/// Inverse real FFT of a half-spectrum in any number of dimensions.
 ///
-/// Algorithm (verified vs scipy):
-///   1. Transpose input to column-major; parallel IFFT of length n0 per column j.
-///   2. For each row i: gather the half-spectrum (length mx1) from col_buf with
-///      stride n0, then run a real-output IFFT via the `realfft` crate.
-///      This avoids filling in the Hermitian conjugate and uses a size-n1/2
-///      complex FFT internally, making the row step ~2× faster than a full
-///      complex IFFT of length n1.
-///
-/// Each parallel task uses its own thread-local planners and scratch buffers.
-fn irfftn_2d(input: &[Complex64], n0: usize, n1: usize) -> Vec<f64> {
-    let mx1 = n1 / 2 + 1;
+/// `input` is row-major with shape `mx_in`; `n` is the full output shape.
+/// Every axis but the last is a complex inverse FFT of length `n[k]`,
+/// zero-padded when `mx_in[k] < n[k]` (a coarse-grained axis, as the protein
+/// model's axis 0 with `fit_unspliced = false`); the last axis is the real
+/// inverse of `n[d-1]/2 + 1` bins, of which the first `mx_in[d-1]` are given
+/// and the rest are zero (the protein model's coarse-grained protein axis).
+/// Unnormalised like the 1-D transforms it is built from; callers normalise.
+fn irfftn_nd(input: &[Complex64], mx_in: &[usize], n: &[usize]) -> Vec<f64> {
+    let d = n.len();
+    assert!(d >= 1 && mx_in.len() == d, "irfftn_nd: shape mismatch");
     let zero = Complex64::new(0.0, 0.0);
-
-    // Step 1: Transpose to column-major, then IFFT along axis 0.
-    let mut col_buf = vec![zero; mx1 * n0];
-    for i in 0..n0 {
-        for j in 0..mx1 {
-            col_buf[j * n0 + i] = input[i * mx1 + j];
+    let mut shape: Vec<usize> = mx_in.to_vec();
+    let mut cur: Vec<Complex64> = input.to_vec();
+    for k in 0..d - 1 {
+        let (len_in, len_out) = (shape[k], n[k]);
+        let outer: usize = shape[..k].iter().product();
+        let inner: usize = shape[k + 1..].iter().product();
+        let n_lines = outer * inner;
+        // every line along axis k, contiguous and zero-padded, transformed in place
+        let mut lines = vec![zero; n_lines * len_out];
+        let do_line = |(line, buf): (usize, &mut [Complex64])| {
+            let (o, i) = (line / inner, line % inner);
+            for t in 0..len_in { buf[t] = cur[(o * len_in + t) * inner + i]; }
+            let fft = plan_ifft(len_out);
+            ifft_inplace(buf, &fft);
+        };
+        if lines.len() >= PAR_THRESHOLD {
+            lines.par_chunks_mut(len_out).enumerate().for_each(do_line);
+        } else {
+            lines.chunks_mut(len_out).enumerate().for_each(do_line);
         }
+        let mut next = vec![zero; outer * len_out * inner];
+        for line in 0..n_lines {
+            let (o, i) = (line / inner, line % inner);
+            for t in 0..len_out { next[(o * len_out + t) * inner + i] = lines[line * len_out + t]; }
+        }
+        cur = next;
+        shape[k] = len_out;
     }
-    if input.len() >= PAR_THRESHOLD {
-        col_buf.par_chunks_mut(n0).for_each(|col| {
-            let fft = plan_ifft(n0);
-            ifft_inplace(col, &fft);
-        });
-    } else {
-        col_buf.chunks_mut(n0).for_each(|col| {
-            let fft = plan_ifft(n0);
-            ifft_inplace(col, &fft);
-        });
-    }
-
-    // Step 2: irfft along axis 1 using realfft (ComplexToReal plan).
-    // Gather each row i (length mx1) from col_buf with stride n0, then run
-    // the real-output IFFT directly on the half-spectrum — no Hermitian fill.
-    let mut result = vec![0.0_f64; n0 * n1];
-    let irfft_row = |(i, row_out): (usize, &mut [f64])| {
-        let irfft = REAL_FFT_PLANNER.with(|cell| cell.borrow_mut().plan_fft_inverse(n1));
+    let last = d - 1;
+    let n_last = n[last];
+    let mx_out = n_last / 2 + 1;
+    let in_stride = shape[last];
+    let copy_len = in_stride.min(mx_out);
+    let rows: usize = shape[..last].iter().product();
+    let mut result = vec![0.0_f64; rows * n_last];
+    let irfft_row = |(r, row_out): (usize, &mut [f64])| {
+        let irfft = REAL_FFT_PLANNER.with(|cell| cell.borrow_mut().plan_fft_inverse(n_last));
         let scratch_len = irfft.get_scratch_len();
         HALF_BUF.with(|hb| {
             SCRATCH_BUF.with(|sc| {
                 let mut half = hb.borrow_mut();
                 let mut scratch = sc.borrow_mut();
-                if half.len() < mx1 {
-                    half.resize(mx1, zero);
-                }
-                if scratch.len() < scratch_len {
-                    scratch.resize(scratch_len, zero);
-                }
-                // Gather positive-frequency slice from col_buf (stride n0).
-                for k in 0..mx1 {
-                    half[k] = col_buf[k * n0 + i];
-                }
-                // realfft requires the DC (k=0) bin to be real-valued.
-                // For even n1 only, the Nyquist bin (k=mx1-1) must also be real.
-                // Column IFFTs leave small floating-point residuals; zero them.
+                if half.len() < mx_out { half.resize(mx_out, zero); }
+                if scratch.len() < scratch_len { scratch.resize(scratch_len, zero); }
+                half[..mx_out].fill(zero);
+                half[..copy_len].copy_from_slice(&cur[r * in_stride..r * in_stride + copy_len]);
                 half[0].im = 0.0;
-                if n1 % 2 == 0 {
-                    half[mx1 - 1].im = 0.0;
-                }
-                // Real-output IFFT: half[..mx1] → row_out[..n1].
-                // Input is modified in-place (scratch); output is f64.
-                irfft.process_with_scratch(
-                    &mut half[..mx1],
-                    row_out,
-                    &mut scratch[..scratch_len],
-                ).expect("irfft row failed");
+                if n_last % 2 == 0 { half[mx_out - 1].im = 0.0; }
+                irfft.process_with_scratch(&mut half[..mx_out], row_out, &mut scratch[..scratch_len])
+                    .expect("irfft row failed");
             });
         });
     };
-    if n0 * n1 >= PAR_THRESHOLD {
-        result.par_chunks_mut(n1).enumerate().for_each(irfft_row);
+    if rows * n_last >= PAR_THRESHOLD {
+        result.par_chunks_mut(n_last).enumerate().for_each(irfft_row);
     } else {
-        result.chunks_mut(n1).enumerate().for_each(irfft_row);
+        result.chunks_mut(n_last).enumerate().for_each(irfft_row);
     }
     result
 }
 
-// ============================================================================
-// 3-D irfftn — parallel all three axes, no buf0/buf1 intermediate allocations
-// ============================================================================
+/// 2-D inverse real FFT of an `(n0, n1/2 + 1)` half-spectrum (see `irfftn_nd`).
+fn irfftn_2d(input: &[Complex64], n0: usize, n1: usize) -> Vec<f64> {
+    irfftn_nd(input, &[n0, n1 / 2 + 1], &[n0, n1])
+}
 
-/// irfftn for shape [mx0, n1, mx2_in] → [n0, n1, n2].
-///
-/// Algorithm (verified vs scipy):
-///   1. Transpose to column-major; parallel IFFT along axis 0 (zero-pad mx0 → n0).
-///   2. Gather columns (i, j2) directly from col0_buf (no buf0 allocation);
-///      parallel IFFT along axis 1.
-///   3. For each row (i, j1): gather with stride n1 from col1_buf (no buf1 allocation),
-///      expand Hermitian conjugate (zero-pad mx2_in → mx2_out), irfft.
-///
-/// Each parallel task uses its own thread-local FftPlanner, scratch buffer, and row buffer.
+/// 3-D inverse real FFT of an `(mx0, n1, mx2_in)` half-spectrum, axis 0 and the
+/// protein axis possibly coarse-grained (see `irfftn_nd`).
 fn irfftn_3d(input: &[Complex64], mx0: usize, mx2_in: usize, n0: usize, n1: usize, n2: usize) -> Vec<f64> {
-    let mx2_out = n2 / 2 + 1;
-    let zero = Complex64::new(0.0, 0.0);
-
-    // Step 1: Transpose to column-major, parallel IFFT along axis 0 (zero-pad mx0 → n0).
-    // col0_buf layout: [c * n0 + i] where c = j1 * mx2_in + j2.
-    let n_cols_0 = n1 * mx2_in;
-    let mut col0_buf = vec![zero; n_cols_0 * n0];
-    for j1 in 0..n1 {
-        for j2 in 0..mx2_in {
-            let c = j1 * mx2_in + j2;
-            for i in 0..mx0 {
-                col0_buf[c * n0 + i] = input[i * n1 * mx2_in + j1 * mx2_in + j2];
-            }
-            // Indices mx0..n0 are already zero (zero-padding).
-        }
-    }
-    if col0_buf.len() >= PAR_THRESHOLD {
-        col0_buf.par_chunks_mut(n0).for_each(|col| {
-            let fft = plan_ifft(n0);
-            ifft_inplace(col, &fft);
-        });
-    } else {
-        col0_buf.chunks_mut(n0).for_each(|col| {
-            let fft = plan_ifft(n0);
-            ifft_inplace(col, &fft);
-        });
-    }
-    // After: col0_buf[(j1*mx2_in+j2)*n0 + i] = IFFT result at axis-0 position i.
-
-    // Step 2: Gather columns (i, j2) of length n1 from col0_buf, IFFT along axis 1.
-    // col1_buf layout: [(i*mx2_in+j2)*n1 + j1] — eliminates buf0 intermediate allocation.
-    let n_cols_1 = n0 * mx2_in;
-    let mut col1_buf = vec![zero; n_cols_1 * n1];
-    for i in 0..n0 {
-        for j2 in 0..mx2_in {
-            let c1 = i * mx2_in + j2;
-            for j1 in 0..n1 {
-                col1_buf[c1 * n1 + j1] = col0_buf[(j1 * mx2_in + j2) * n0 + i];
-            }
-        }
-    }
-    if col1_buf.len() >= PAR_THRESHOLD {
-        col1_buf.par_chunks_mut(n1).for_each(|col| {
-            let fft = plan_ifft(n1);
-            ifft_inplace(col, &fft);
-        });
-    } else {
-        col1_buf.chunks_mut(n1).for_each(|col| {
-            let fft = plan_ifft(n1);
-            ifft_inplace(col, &fft);
-        });
-    }
-    // After: col1_buf[(i*mx2_in+j2)*n1 + j1] = IFFT result at axis-1 position j1.
-
-    // Step 3: irfft along axis 2.
-    // Gather row (i, j1) from col1_buf with stride n1 — eliminates buf1 intermediate allocation.
-    let copy_len = mx2_in.min(mx2_out);
-    let mut result = vec![0.0_f64; n0 * n1 * n2];
-    let irfft_row3 = |(row_idx, row_out): (usize, &mut [f64])| {
-        let i = row_idx / n1;
-        let j1 = row_idx % n1;
-        let fft = plan_ifft(n2);
-        ROW_BUF.with(|rb| {
-            let mut buf = rb.borrow_mut();
-            if buf.len() < n2 {
-                buf.resize(n2, zero);
-            }
-            // Zero, then gather positive frequencies: buf[j2] = col1_buf[(i*mx2_in+j2)*n1 + j1].
-            buf[..n2].fill(zero);
-            for j2 in 0..copy_len {
-                buf[j2] = col1_buf[(i * mx2_in + j2) * n1 + j1];
-            }
-            // Fill Hermitian conjugate for negative frequencies.
-            for k in 1..copy_len {
-                let nk = n2 - k;
-                if nk >= mx2_out {
-                    buf[nk] = buf[k].conj();
-                }
-            }
-            ifft_inplace(&mut buf[..n2], &fft);
-            for (out, c) in row_out.iter_mut().zip(buf[..n2].iter()) {
-                *out = c.re;
-            }
-        });
-    };
-    if n0 * n1 * n2 >= PAR_THRESHOLD {
-        result.par_chunks_mut(n2).enumerate().for_each(irfft_row3);
-    } else {
-        result.chunks_mut(n2).enumerate().for_each(irfft_row3);
-    }
-    result
+    irfftn_nd(input, &[mx0, n1, mx2_in], &[n0, n1, n2])
 }
 
 // ============================================================================
@@ -1161,9 +1108,8 @@ fn protein_bursty_core_sched(
     limits: &[usize],
     fit_unspliced: bool,
     protein_limit: f64,
-    min_fudge: f64,
-    max_fudge: f64,
     fixed: Option<&[f64]>,
+    ode: &ProteinOde,
 ) -> (Vec<Complex64>, [usize; 3], [usize; 3], Vec<f64>) {
     let p: Vec<f64> = p_log.iter().map(|&x| 10.0_f64.powf(x)).collect();
     let mut mx = [limits[0], limits[1], limits[2]];
@@ -1178,13 +1124,8 @@ fn protein_bursty_core_sched(
     let lims = [limits[0], limits[1], limits[2]];
     let (g0, g1, g2) = build_mesh_3d(&mx, &lims);
 
-    let (gf_log, sched) = protein_pgf_sched(&g0, &g1, &g2, &p, min_fudge, max_fudge, fixed);
-    let n = gf_log.len();
-    let gf: Vec<Complex64> = if n >= PAR_THRESHOLD {
-        gf_log.par_iter().map(|z| z.exp()).collect()
-    } else {
-        gf_log.iter().map(|z| z.exp()).collect()
-    };
+    let (gf_log, sched) = protein_pgf_sched(&g0, &g1, &g2, &p, fixed, ode);
+    let gf = exp_par(&gf_log);
     (gf, mx, lims, sched)
 }
 
@@ -1217,24 +1158,21 @@ fn pgf_2d(
     }
 }
 
-/// `pgf_2d` with a Python error for unknown models.
-fn eval_pgf_2d(
-    bio_model: &str,
-    g0: &[Complex64],
-    g1: &[Complex64],
-    p: &[f64],
-    fixed_quad_t: f64,
-    quad_order: usize,
-) -> PyResult<Vec<Complex64>> {
-    validate_bio_model_2d(bio_model, "eval_model_pss_2d")?;
-    Ok(pgf_2d(bio_model, g0, g1, p, fixed_quad_t, quad_order))
-}
-
 /// |x| / sum|x| over a raw inverse-FFT result.
+///
+/// The sum is taken over fixed 4096-element chunks (in parallel above
+/// PAR_THRESHOLD) and the chunk sums are added in order, so the result does not
+/// depend on how rayon happens to split the work: the finite-difference
+/// gradients replay a schedule and must be bit-identical from any thread.
 fn normalize_abs(pss_raw: Vec<f64>) -> Vec<f64> {
+    const CHUNK: usize = 4096;
     let par = pss_raw.len() >= PAR_THRESHOLD;
-    let abs_sum: f64 = if par { pss_raw.par_iter().map(|x| x.abs()).sum() }
-                       else { pss_raw.iter().map(|x| x.abs()).sum() };
+    let chunk_sum = |c: &[f64]| c.iter().map(|x| x.abs()).sum::<f64>();
+    let abs_sum: f64 = if par {
+        pss_raw.par_chunks(CHUNK).map(chunk_sum).collect::<Vec<f64>>().iter().sum()
+    } else {
+        pss_raw.chunks(CHUNK).map(chunk_sum).sum()
+    };
     if par { pss_raw.par_iter().map(|x| x.abs() / abs_sum).collect() }
     else { pss_raw.iter().map(|x| x.abs() / abs_sum).collect() }
 }
@@ -1273,94 +1211,17 @@ fn eval_model_pss_2d(
     if n_amb > 0 && amb_log.as_ref().map_or(true, |a| a.len() < n_amb) {
         return verr(format!("eval_model_pss_2d: amb_model={amb_model} needs {n_amb} amb_log entries"));
     }
-    let p: Vec<f64> = p_log.iter().map(|&x| 10.0_f64.powf(x)).collect();
-
-    if amb_model == "None" {
-        // --- 2-D path (no ambient model) ---
-        let (l0, l1) = (limits[0], limits[1]);
-        let mesh = match (samp_log.as_deref(), seq_model) {
-            (Some(samp), "Poisson") => {
-                build_mesh_2d_poisson_cached(l0, l1, 10f64.powf(samp[0]), 10f64.powf(samp[1]))
-            }
-            (Some(samp), "Bernoulli") => {
-                build_mesh_2d_bernoulli_cached(l0, l1, samp[0], samp[1])
-            }
-            _ => build_mesh_2d_cached(l0, l1),
-        };
-        let (g0, g1) = (&mesh.0, &mesh.1);
-        let gf_log = eval_pgf_2d(bio_model, g0, g1, &p, fixed_quad_t, quad_order)?;
-        let n = gf_log.len();
-        let gf: Vec<Complex64> = if n >= PAR_THRESHOLD {
-            gf_log.par_iter().map(|z| z.exp()).collect()
-        } else {
-            gf_log.iter().map(|z| z.exp()).collect()
-        };
-        let pss_raw = irfftn_2d(&gf, l0, l1);
-        let pn = pss_raw.len();
-        let abs_sum: f64 = if pn >= PAR_THRESHOLD {
-            pss_raw.par_iter().map(|x| x.abs()).sum()
-        } else {
-            pss_raw.iter().map(|x| x.abs()).sum()
-        };
-        return Ok(if pn >= PAR_THRESHOLD {
-            pss_raw.par_iter().map(|x| x.abs() / abs_sum).collect()
-        } else {
-            pss_raw.iter().map(|x| x.abs() / abs_sum).collect()
-        });
+    if n_amb == 0 {
+        return Ok(eval_model_pss_2d_seq(
+            bio_model, &p_log, &limits, fixed_quad_t, quad_order, samp_log.as_deref(), seq_model,
+        ));
     }
-
-    // --- 3-D ambient path ---
-    // limits = [l0, l1, l_amb].  p_log contains only bio params; amb_log has
-    // [log10_p_amb] (Equal) or [log10_p0, log10_p1] (Unequal).
-    let (l0, l1, l2) = (limits[0], limits[1], limits[2]);
-    let mx2 = l2 / 2 + 1;
-
-    let amb = amb_log.as_deref().unwrap_or(&[]);
-    let (p_amb0, p_amb1): (f64, f64) = match amb_model {
-        "Equal"   => { let v = 10.0_f64.powf(amb[0]); (v, v) }
-        "Unequal" => (10.0_f64.powf(amb[0]), 10.0_f64.powf(amb[1])),
-        _ => return Err(pyo3::exceptions::PyValueError::new_err(
-            format!("Unknown amb_model: {amb_model}")
-        )),
-    };
-
-    // Build (or retrieve cached) 3-D base mesh.
-    let mesh3 = build_mesh_3d_cached(l0, l1, l2);
-    let (g0_base, g1_base, g_amb) = (&mesh3.0, &mesh3.1, &mesh3.2);
-
-    // Mix: g0_eff = (1-p0)*g0 + p0*g_amb,  g1_eff = (1-p1)*g1 + p1*g_amb.
-    let one  = Complex64::new(1.0, 0.0);
-    let q0   = Complex64::new(1.0 - p_amb0, 0.0);
-    let pa0  = Complex64::new(p_amb0, 0.0);
-    let q1   = Complex64::new(1.0 - p_amb1, 0.0);
-    let pa1  = Complex64::new(p_amb1, 0.0);
-
-    let mut g0_eff: Vec<Complex64> = g0_base.iter().zip(g_amb.iter())
-        .map(|(&g0, &ga)| g0 * q0 + ga * pa0)
-        .collect();
-    let mut g1_eff: Vec<Complex64> = g1_base.iter().zip(g_amb.iter())
-        .map(|(&g1, &ga)| g1 * q1 + ga * pa1)
-        .collect();
-
-    // Apply Poisson seq_model if requested (applied to mixed variables).
-    if let Some(ref samp) = samp_log {
-        let lam0 = 10.0_f64.powf(samp[0]);
-        let lam1 = 10.0_f64.powf(samp[1]);
-        g0_eff.iter_mut().for_each(|z| *z = (*z * lam0).exp() - one);
-        g1_eff.iter_mut().for_each(|z| *z = (*z * lam1).exp() - one);
-    }
-
-    // Evaluate log-PGF, exp, 3-D irfftn, normalize.
-    let gf_log = eval_pgf_2d(bio_model, &g0_eff, &g1_eff, &p, fixed_quad_t, quad_order)?;
-    let n = gf_log.len();
-    let gf: Vec<Complex64> = if n >= PAR_THRESHOLD {
-        gf_log.par_iter().map(|z| z.exp()).collect()
-    } else {
-        gf_log.iter().map(|z| z.exp()).collect()
-    };
-    // irfftn_3d(input, mx0, mx2_in, n0, n1, n2): mx0=l0 (no axis-0 coarsening)
-    let pss_raw = irfftn_3d(&gf, l0, mx2, l0, l1, l2);
-    Ok(normalize_abs(pss_raw))
+    // The ambient kernel takes [bio_params..., amb_params].
+    let mut p_all = p_log;
+    p_all.extend_from_slice(&amb_log.as_deref().unwrap()[..n_amb]);
+    Ok(eval_model_pss_2d_amb_seq(
+        bio_model, &p_all, &limits, fixed_quad_t, quad_order, samp_log.as_deref(), amb_model,
+    ))
 }
 
 // ============================================================================
@@ -1383,26 +1244,9 @@ fn eval_model_pss_2d_seq(
     let p: Vec<f64> = p_log.iter().map(|&x| 10.0_f64.powf(x)).collect();
     let (l0, l1) = (limits[0], limits[1]);
 
-    let mesh = match (samp_log, seq_model) {
-        (Some(samp), "Poisson") => {
-            build_mesh_2d_poisson_cached(l0, l1, 10f64.powf(samp[0]), 10f64.powf(samp[1]))
-        }
-        (Some(samp), "Bernoulli") => {
-            build_mesh_2d_bernoulli_cached(l0, l1, samp[0], samp[1])
-        }
-        _ => build_mesh_2d_cached(l0, l1),
-    };
-    let (g0, g1) = (&mesh.0, &mesh.1);
-
-    let gf_log = pgf_2d(bio_model, g0, g1, &p, fixed_quad_t, quad_order);
-
-    let n = gf_log.len();
-    let gf: Vec<Complex64> = if n >= PAR_THRESHOLD {
-        gf_log.par_iter().map(|z| z.exp()).collect()
-    } else {
-        gf_log.iter().map(|z| z.exp()).collect()
-    };
-    normalize_abs(irfftn_2d(&gf, l0, l1))
+    let mesh = mesh_2d_for(l0, l1, samp_log, seq_model);
+    let gf_log = pgf_2d(bio_model, &mesh.0, &mesh.1, &p, fixed_quad_t, quad_order);
+    normalize_abs(irfftn_2d(&exp_par(&gf_log), l0, l1))
 }
 
 /// Evaluate the 2-D PSS for N (params, limits) pairs in parallel using rayon.
@@ -1460,14 +1304,7 @@ fn eval_model_pss_2d_batch(
                 })
                 .collect::<Vec<Vec<f64>>>()
         };
-        match num_threads {
-            Some(nt) => rayon::ThreadPoolBuilder::new()
-                .num_threads(nt)
-                .build()
-                .map(|pool| pool.install(run))
-                .unwrap_or_else(|_| run()),
-            None => run(),
-        }
+        run_with_pool(num_threads, run)
     });
     Ok(results)
 }
@@ -1480,7 +1317,7 @@ fn eval_model_pss_2d_batch(
 /// used and replays `fixed_schedule` when given, so `CMEModel.pinned_schedule`
 /// pins the Rust path exactly as it pins the Python one.
 #[pyfunction]
-#[pyo3(signature = (p_log, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, fixed_schedule=None))]
+#[pyo3(signature = (p_log, limits, fit_unspliced, protein_limit, *, ode, fixed_schedule=None))]
 #[allow(clippy::too_many_arguments)]
 fn eval_model_pss_protein_bursty_sched(
     py: Python<'_>,
@@ -1488,10 +1325,10 @@ fn eval_model_pss_protein_bursty_sched(
     limits: Vec<usize>,
     fit_unspliced: bool,
     protein_limit: f64,
-    min_fudge: f64,
-    max_fudge: f64,
+    ode: (f64, f64, usize),
     fixed_schedule: Option<Vec<f64>>,
 ) -> PyResult<(Vec<f64>, Vec<f64>)> {
+    let ode = ProteinOde::from_py(ode, "eval_model_pss_protein_bursty_sched")?;
     validate_limits(&limits, 3, "eval_model_pss_protein_bursty_sched")?;
     if p_log.len() != 5 {
         return verr(format!("eval_model_pss_protein_bursty_sched: expected 5 parameters, got {}", p_log.len()));
@@ -1499,12 +1336,9 @@ fn eval_model_pss_protein_bursty_sched(
     if protein_limit.is_nan() || protein_limit <= 0.0 {
         return verr(format!("eval_model_pss_protein_bursty_sched: protein_limit must be > 0, got {protein_limit}"));
     }
-    if !(min_fudge > 0.0) || !(max_fudge > 0.0) {
-        return verr(format!("eval_model_pss_protein_bursty_sched: min_fudge/max_fudge must be > 0"));
-    }
     Ok(py.allow_threads(|| {
         eval_model_pss_protein_bursty_seq_sched(
-            &p_log, &limits, fit_unspliced, protein_limit, min_fudge, max_fudge, fixed_schedule.as_deref(),
+            &p_log, &limits, fit_unspliced, protein_limit, fixed_schedule.as_deref(), &ode,
         )
     }))
 }
@@ -1770,6 +1604,24 @@ where
 /// objective carries a small noise floor (far-tail histogram bins near the
 /// FFT's absolute precision): a wider, symmetric stencil keeps the noise out
 /// of the gradient at the cost of 2n evaluations.
+/// `fd_gradient` with the base point and the perturbations evaluated in
+/// parallel: for a single gene outside the gene-parallel optimizers.
+fn fd_gradient_par<K>(x: &[f64], fd_eps: f64, kld_at: K) -> (f64, Vec<f64>)
+where
+    K: Fn(&[f64]) -> f64 + Sync,
+{
+    let klds: Vec<f64> = (0..=x.len())
+        .into_par_iter()
+        .map(|i| {
+            let mut x_eval = x.to_vec();
+            if i > 0 { x_eval[i - 1] += fd_eps; }
+            kld_at(&x_eval)
+        })
+        .collect();
+    let kld0 = klds[0];
+    (kld0, klds[1..].iter().map(|k| (k - kld0) / fd_eps).collect())
+}
+
 fn fd_gradient_central<K>(x: &[f64], fd_eps: f64, kld_at: K) -> Vec<f64>
 where
     K: Fn(&[f64]) -> f64,
@@ -2936,10 +2788,10 @@ fn initialize_q_kmeans<'py>(
 
 /// Run `run` on a rayon thread pool of the requested size, falling back to the
 /// global pool if `num_threads` is `None` or pool creation fails.
-fn run_with_pool<T, F>(num_threads: Option<usize>, run: F) -> Vec<T>
+fn run_with_pool<T, F>(num_threads: Option<usize>, run: F) -> T
 where
     T: Send,
-    F: Fn() -> Vec<T> + Send + Sync,
+    F: Fn() -> T + Send + Sync,
 {
     match num_threads {
         Some(nt) => rayon::ThreadPoolBuilder::new()
@@ -3794,6 +3646,15 @@ fn build_mesh_nd(limits: &[usize]) -> (Vec<Vec<Complex64>>, Vec<usize>, usize) {
     (build_mesh_axes(&mx, limits), mx, n_grid)
 }
 
+/// `build_mesh_nd` through the mesh cache: `(axes, reduced shape, n_grid)`.
+fn build_mesh_nd_cached(limits: &[usize]) -> Arc<(Vec<Vec<Complex64>>, Vec<usize>, usize)> {
+    cached(&MESH_CACHE_ND, limits.to_vec(), || {
+        let m = build_mesh_nd(limits);
+        let n = m.0.iter().map(|v| v.len()).sum();
+        (m, n)
+    })
+}
+
 // ============================================================================
 // Custom reaction networks: exponential integrator
 // ============================================================================
@@ -3823,11 +3684,24 @@ fn build_mesh_nd(limits: &[usize]) -> (Vec<Vec<Complex64>>, Vec<usize>, usize) {
 // interpolation (every knot stores its derivative); a delay shorter than the
 // step is read off the step's own predictor.  Mirrors `ReactionNetwork.eval_pgf`.
 
-const CUSTOM_ODE_TOL: f64 = 1e-6;        // per-step error target on the generating-function scale
-const CUSTOM_ODE_C0: f64 = 0.05;         // first step as a fraction of the fastest time scale
-const CUSTOM_ODE_U_END: f64 = 1e-8;      // stop once exp(Re phi)·|u| is below this everywhere (for a delay's length, if any)
-const CUSTOM_ODE_MAX_STEPS: usize = 20_000;
-const CUSTOM_ODE_H_MAX: f64 = 1e4;       // step cap in units of the slowest time scale
+/// Integrator settings of the custom-network kernel.  Python owns the one
+/// definition (`monod.reaction_network._CUSTOM_ODE`) and passes it as
+/// `ode=(tol, c0, u_end, max_steps, h_max)`: the per-step error target on the
+/// generating-function scale, the first step as a fraction of the fastest time
+/// scale, the level of exp(Re phi)·|u| below which the integration stops (for
+/// a delay's length, if any), the cap on accepted steps, and the step cap in
+/// units of the slowest time scale.
+#[derive(Clone, Copy)]
+struct CustomOde { tol: f64, c0: f64, u_end: f64, max_steps: usize, h_max: f64 }
+
+impl CustomOde {
+    fn from_py(ode: (f64, f64, f64, usize, f64), who: &str) -> PyResult<Self> {
+        if !(ode.0 > 0.0) || !(ode.1 > 0.0) || !(ode.2 > 0.0) || ode.3 == 0 || !(ode.4 > 0.0) {
+            return verr(format!("{who}: ode=(tol, c0, u_end, max_steps, h_max) must be positive, got {ode:?}"));
+        }
+        Ok(CustomOde { tol: ode.0, c0: ode.1, u_end: ode.2, max_steps: ode.3, h_max: ode.4 })
+    }
+}
 const CUSTOM_MAX_SPECIES: usize = 8;
 const CUSTOM_FD_EPS: f64 = 1e-4;         // central finite-difference step for custom-network gradients (log10 units)
 
@@ -3849,6 +3723,10 @@ impl SmallMat {
     fn get(&self, i: usize, j: usize) -> f64 { self.a[i * self.n + j] }
     #[inline(always)]
     fn set(&mut self, i: usize, j: usize, v: f64) { self.a[i * self.n + j] = v; }
+    /// self · s
+    fn scaled(&self, s: f64) -> SmallMat {
+        SmallMat { n: self.n, a: self.a.iter().map(|v| v * s).collect() }
+    }
     fn mul(&self, o: &SmallMat) -> SmallMat {
         let n = self.n;
         let mut r = SmallMat::zeros(n);
@@ -3874,9 +3752,7 @@ impl SmallMat {
         let n = self.n;
         let nrm = self.norm1();
         let s = if nrm > 0.5 { (nrm / 0.5).log2().ceil() as i32 } else { 0 };
-        let scale = 0.5_f64.powi(s);
-        let mut x = self.clone();
-        for v in x.a.iter_mut() { *v *= scale; }
+        let x = self.scaled(0.5_f64.powi(s));
         let mut r = SmallMat::eye(n);
         for k in (1..=18).rev() {
             let t = x.mul(&r);
@@ -3899,30 +3775,34 @@ impl SmallMat {
     }
 }
 
-/// Step operators for one step size: E = exp(A h), P1 = h phi_1(A h), P2 = h phi_2(A h),
-/// read off exp([[A h, I, 0], [0, 0, I], [0, 0, 0]]).
+/// `[exp(A h), h φ_1(A h), …, h φ_k(A h)]` from one exponential of the block
+/// matrix `[[A h, I, 0, …], [0, 0, I, …], …]`: the φ-functions of the
+/// exponential integrators (`custom_step_ops` takes k = 2, the chromatin
+/// production exponent k = 1).  Mirrors `reaction_network._phi_ops`.
+fn phi_ops(a: &SmallMat, h: f64, k: usize) -> Vec<SmallMat> {
+    let n = a.n;
+    let mut m = SmallMat::zeros((k + 1) * n);
+    for i in 0..n {
+        for j in 0..n { m.set(i, j, a.get(i, j) * h); }
+        for b in 0..k { m.set(b * n + i, (b + 1) * n + i, 1.0); }
+    }
+    let x = m.expm();
+    (0..=k).map(|b| {
+        let s = if b == 0 { 1.0 } else { h };
+        let mut out = SmallMat::zeros(n);
+        for i in 0..n {
+            for j in 0..n { out.set(i, j, s * x.get(i, b * n + j)); }
+        }
+        out
+    }).collect()
+}
+
+/// Step operators for one step size: E = exp(A h), P1 = h phi_1(A h), P2 = h phi_2(A h).
 struct CustomStepOps { e: SmallMat, p1: SmallMat, p2: SmallMat }
 
 fn custom_step_ops(a: &SmallMat, h: f64) -> CustomStepOps {
-    let n = a.n;
-    let mut m = SmallMat::zeros(3 * n);
-    for i in 0..n {
-        for j in 0..n { m.set(i, j, a.get(i, j) * h); }
-        m.set(i, n + i, 1.0);
-        m.set(n + i, 2 * n + i, 1.0);
-    }
-    let x = m.expm();
-    let mut e = SmallMat::zeros(n);
-    let mut p1 = SmallMat::zeros(n);
-    let mut p2 = SmallMat::zeros(n);
-    for i in 0..n {
-        for j in 0..n {
-            e.set(i, j, x.get(i, j));
-            p1.set(i, j, h * x.get(i, n + j));
-            p2.set(i, j, h * x.get(i, 2 * n + j));
-        }
-    }
-    CustomStepOps { e, p1, p2 }
+    let mut ops = phi_ops(a, h, 2).into_iter();
+    CustomStepOps { e: ops.next().unwrap(), p1: ops.next().unwrap(), p2: ops.next().unwrap() }
 }
 
 /// A network at fixed (linear-scale) parameters, split into its linear part
@@ -4235,13 +4115,13 @@ impl CustomHistory {
     /// has grown long during a quiet stretch reads a delayed pulse narrower
     /// than itself only at its stage times, both the full step and the
     /// half-steps miss it, and the pulse is skipped.
-    fn max_step(&self, s0: f64, h: f64) -> f64 {
+    fn max_step(&self, s0: f64, h: f64, tol: f64) -> f64 {
         let m = self.knots.len();
         let mut k = self.knots.partition_point(|kn| kn.t <= s0).max(1);
         let mut h = h;
         while k < m {
             if self.knots[k - 1].t >= s0 + h { break; }
-            if self.knots[k].amp >= CUSTOM_ODE_TOL { h = h.min(2.0 * self.knots[k].h_ctrl); }
+            if self.knots[k].amp >= tol { h = h.min(2.0 * self.knots[k].h_ctrl); }
             k += 1;
         }
         h
@@ -4314,6 +4194,7 @@ fn custom_pgf_sched(
     sys: &CustomSystem,
     n_grid: usize,
     fixed: Option<(&[f64], &[f64])>,
+    ode: &CustomOde,
 ) -> (Vec<Complex64>, Vec<f64>) {
     let n = sys.n;
     assert!(n <= CUSTOM_MAX_SPECIES, "custom networks support at most 8 species");
@@ -4356,7 +4237,7 @@ fn custom_pgf_sched(
         };
         flat(&f)
     };
-    let h0 = CUSTOM_ODE_C0 / sys.lam_fast;
+    let h0 = ode.c0 / sys.lam_fast;
     let mut hist = if n_del > 0 {
         let mut hs = CustomHistory { n, n_grid, knots: std::collections::VecDeque::new() };
         hs.push(0.0, flat(&u), h0, 1.0);
@@ -4373,7 +4254,7 @@ fn custom_pgf_sched(
     let mut h_prop = h0;
     let mut clipped = false;
     let h_min = 1e-12 / sys.lam_fast;
-    let h_max = CUSTOM_ODE_H_MAX / sys.lam_slow;
+    let h_max = ode.h_max / sys.lam_slow;
     // A delayed network is finished only once the state has been negligible
     // for a full delay: the history still feeds the system until then.
     let mut quiet_since: Option<f64> = None;
@@ -4389,10 +4270,10 @@ fn custom_pgf_sched(
                 h = f[steps.len()];
             }
             None => {
-                if steps.len() >= CUSTOM_ODE_MAX_STEPS { break; }
+                if steps.len() >= ode.max_steps { break; }
                 h = h_prop.min(h_max);
                 if let Some(hs) = &hist {
-                    for &tau in &sys.taus { h = hs.max_step(t - tau, h); }
+                    for &tau in &sys.taus { h = hs.max_step(t - tau, h, ode.tol); }
                 }
                 // land exactly on the time a delayed product first switches on
                 clipped = false;
@@ -4447,11 +4328,10 @@ fn custom_pgf_sched(
             } else {
                 trial.iter().map(|x| x.err).fold(0.0_f64, f64::max)
             };
-            if err > CUSTOM_ODE_TOL && h > h_min {
-                h_prop = h * (0.9 * (CUSTOM_ODE_TOL / err).powf(1.0 / 3.0)).max(0.2);
-                continue;
+            match control_step(err, h, h_min, ode.tol) {
+                StepControl::Retry(h_new) => { h_prop = h_new; continue; }
+                StepControl::Accept(f) => fac = f,
             }
-            fac = (0.9 * (CUSTOM_ODE_TOL / err.max(1e-300)).powf(1.0 / 3.0)).clamp(0.2, 2.0);
         }
         // accept
         for k in 0..n_grid {
@@ -4486,7 +4366,7 @@ fn custom_pgf_sched(
             hs.prune(t - tau_max);
         }
         if adaptive {
-            if remaining < CUSTOM_ODE_U_END {
+            if remaining < ode.u_end {
                 if n_del == 0 { break; }
                 let since = *quiet_since.get_or_insert(t);
                 if t - since >= tau_max { break; }
@@ -4511,15 +4391,11 @@ fn custom_pgf_parallel(
     n_species: usize,
     n_grid:    usize,
     fixed:     Option<(&[f64], &[f64])>,
+    ode:       &CustomOde,
 ) -> (Vec<Complex64>, Vec<f64>) {
     let sys = custom_system(n_species, rxns, prod_sp, prod_st, params);
-    let (phi, steps) = custom_pgf_sched(g, &sys, n_grid, fixed);
-    let exp_phi: Vec<Complex64> = if n_grid >= PAR_THRESHOLD {
-        phi.into_par_iter().map(|p| p.exp()).collect()
-    } else {
-        phi.into_iter().map(|p| p.exp()).collect()
-    };
-    (exp_phi, steps)
+    let (phi, steps) = custom_pgf_sched(g, &sys, n_grid, fixed, ode);
+    (exp_par(&phi), steps)
 }
 
 /// Evaluate the custom reaction-network log-PGF over all grid points in
@@ -4541,7 +4417,7 @@ fn custom_pgf_parallel(
 /// Returns `(re_exphi, im_exphi, shape, schedule)`: exp(phi) in row-major flat
 /// order and the accepted step sizes.
 #[pyfunction]
-#[pyo3(signature = (n_species, limits, rxn_kinds, rxn_rate_idxs, rxn_extra1, rxn_extra2, prod_sp, prod_st, prod_off, params, fixed_schedule=None, fixed_breakpoints=None))]
+#[pyo3(signature = (n_species, limits, rxn_kinds, rxn_rate_idxs, rxn_extra1, rxn_extra2, prod_sp, prod_st, prod_off, params, *, ode, fixed_schedule=None, fixed_breakpoints=None))]
 fn eval_custom_network_pgf(
     py:              Python<'_>,
     n_species:       usize,
@@ -4554,9 +4430,11 @@ fn eval_custom_network_pgf(
     prod_st:         Vec<u32>,
     prod_off:        Vec<u32>,
     params:          Vec<f64>,
+    ode:             (f64, f64, f64, usize, f64),
     fixed_schedule:  Option<Vec<f64>>,
     fixed_breakpoints: Option<Vec<f64>>,
 ) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>, Vec<f64>)> {
+    let ode = CustomOde::from_py(ode, "eval_custom_network_pgf")?;
     if n_species > CUSTOM_MAX_SPECIES {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "custom networks support at most 8 species",
@@ -4569,13 +4447,14 @@ fn eval_custom_network_pgf(
         ));
     }
     let (exp_phi, mx, steps) = py.allow_threads(|| {
-        let (g, mx, n_grid) = build_mesh_nd(&limits);
+        let mesh = build_mesh_nd_cached(&limits);
+        let (g, n_grid) = (&mesh.0, mesh.2);
         let bp: &[f64] = fixed_breakpoints.as_deref().unwrap_or(&[]);
         let (exp_phi, steps) = custom_pgf_parallel(
-            &g, &params, &rxns, &prod_sp, &prod_st, n_species, n_grid,
-            fixed_schedule.as_deref().map(|s| (s, bp)),
+            g, &params, &rxns, &prod_sp, &prod_st, n_species, n_grid,
+            fixed_schedule.as_deref().map(|s| (s, bp)), &ode,
         );
-        (exp_phi, mx, steps)
+        (exp_phi, mesh.1.clone(), steps)
     });
     let re: Vec<f64> = exp_phi.iter().map(|z| z.re).collect();
     let im: Vec<f64> = exp_phi.iter().map(|z| z.im).collect();
@@ -4653,11 +4532,7 @@ impl ChainExp {
 
 impl ChromatinChain {
     fn expm(&self, h: f64) -> ChainExp {
-        let scaled = |m: &SmallMat| {
-            let mut x = m.clone();
-            for v in x.a.iter_mut() { *v *= h; }
-            x.expm()
-        };
+        let scaled = |m: &SmallMat| m.scaled(h).expm();
         match self {
             ChromatinChain::Dense(ht) => ChainExp::Dense(scaled(ht)),
             ChromatinChain::Kron(hts) => ChainExp::Kron(hts.iter().map(scaled).collect()),
@@ -4696,20 +4571,8 @@ struct ChromatinOps { d1: DiagFlow, e: ChainExp, d2: DiagFlow }
 /// ∫_{tau_a}^{tau_a+delta} exp(C s) ds = exp(C tau_a) · delta phi_1(C delta),
 /// phi_1 read off exp([[C delta, I], [0, 0]]).
 fn chromatin_char_integral(c: &SmallMat, tau_a: f64, delta: f64) -> SmallMat {
-    let m = c.n;
-    let mut aug = SmallMat::zeros(2 * m);
-    for i in 0..m {
-        for j in 0..m { aug.set(i, j, c.get(i, j) * delta); }
-        aug.set(i, m + i, 1.0);
-    }
-    let x = aug.expm();
-    let mut phi = SmallMat::zeros(m);
-    for i in 0..m {
-        for j in 0..m { phi.set(i, j, delta * x.get(i, m + j)); }
-    }
-    let mut ct = c.clone();
-    for v in ct.a.iter_mut() { *v *= tau_a; }
-    ct.expm().mul(&phi)
+    let phi1 = phi_ops(c, delta, 1).pop().unwrap();          // delta · φ_1(C delta)
+    c.scaled(tau_a).expm().mul(&phi1)
 }
 
 /// X (rows × m) · M (m × m) as a flat (rows × m) array.
@@ -4739,16 +4602,9 @@ fn chromatin_diag_flow(sys: &ChromatinSys, tau_a: f64, delta: f64) -> DiagFlow {
     match sys.burst {
         None => DiagFlow { coef: chromatin_diag_ops(sys, &chromatin_char_integral(&sys.c, tau_a, delta)), quad: None },
         Some(_) => {
-            let m = sys.m;
-            let mut eye = SmallMat::zeros(m);
-            for i in 0..m { eye.set(i, i, 1.0); }
             let nodes = [(tau_a, delta / 6.0), (tau_a + 0.5 * delta, 4.0 * delta / 6.0), (tau_a + delta, delta / 6.0)];
-            let quad = nodes.iter().map(|&(s, w)| {
-                let mut cs = sys.c.clone();
-                for v in cs.a.iter_mut() { *v *= s; }
-                (cs.expm(), w)
-            }).collect();
-            DiagFlow { coef: chromatin_diag_ops(sys, &eye), quad: Some(quad) }
+            let quad = nodes.iter().map(|&(s, w)| (sys.c.scaled(s).expm(), w)).collect();
+            DiagFlow { coef: chromatin_diag_ops(sys, &SmallMat::eye(sys.m)), quad: Some(quad) }
         }
     }
 }
@@ -5027,11 +4883,10 @@ fn chromatin_pgf(
         };
         let mut fac = 1.0;
         if adaptive {
-            if err > tol && h > h_min {
-                h *= (0.9 * (tol / err).powf(1.0 / 3.0)).max(0.2);
-                continue;
+            match control_step(err, h, h_min, tol) {
+                StepControl::Retry(h_new) => { h = h_new; continue; }
+                StepControl::Accept(f) => fac = f,
             }
-            fac = (0.9 * (tol / err.max(1e-300)).powf(1.0 / 3.0)).max(0.2).min(2.0);
         }
         std::mem::swap(&mut gr, &mut outr);
         std::mem::swap(&mut gi, &mut outi);
@@ -5109,16 +4964,17 @@ fn eval_chromatin_pgf(
     let (re, im, mx, steps) = py.allow_threads(|| {
         // the PGF arguments: the half-spectrum mesh of `limits`, or the caller's
         // (already transformed by a sequencing-noise model)
-        let (u, mx, n_grid) = match (&u_re, &u_im) {
+        let mesh = match (&u_re, &u_im) {
             (Some(ur), Some(ui)) => {
                 let n_grid = ur.len() / m;
                 let u: Vec<Vec<Complex64>> = (0..m)
                     .map(|j| (0..n_grid).map(|p| Complex64::new(ur[j * n_grid + p], ui[j * n_grid + p])).collect())
                     .collect();
-                (u, vec![n_grid], n_grid)
+                Arc::new((u, vec![n_grid], n_grid))
             }
-            _ => build_mesh_nd(&limits),
+            _ => build_mesh_nd_cached(&limits),
         };
+        let (u, mx, n_grid) = (&mesh.0, mesh.1.clone(), mesh.2);
         let bw = CHROMATIN_BLOCK;
         let n_blocks = (n_grid + bw - 1) / bw;
         let ur: Vec<Vec<f64>> = u.iter().map(|uj| (0..n_blocks * bw).map(|p| if p < n_grid { uj[p].re } else { 0.0 }).collect()).collect();
@@ -5225,6 +5081,31 @@ fn compute_kld_sparse(
 /// seq_model    : sequencing model ("None", "Poisson", or "Bernoulli"); default "Poisson"
 ///
 /// Returns the scalar KLD value.
+/// The validated 2-D PSS behind `eval_kld_2d` and `eval_logl_2d`: checks the
+/// model, grid, coordinates and parameter count, then evaluates.
+#[allow(clippy::too_many_arguments)]
+fn pss_2d_for_histogram(
+    bio_model: &str,
+    p_log: &[f64],
+    limits: &[usize],
+    u_idx: &[u64],
+    s_idx: &[u64],
+    fixed_quad_t: f64,
+    quad_order: usize,
+    samp_log: Option<&[f64]>,
+    seq_model: &str,
+) -> PyResult<Vec<f64>> {
+    validate_bio_model_2d(bio_model, "eval_kld_2d/eval_logl_2d")?;
+    validate_limits(limits, 2, "eval_kld_2d/eval_logl_2d")?;
+    validate_coords_2d(u_idx, s_idx, limits[0], limits[1], "eval_kld_2d/eval_logl_2d")?;
+    if let Some(n) = n_bio_params(bio_model) {
+        if p_log.len() < n {
+            return verr(format!("eval_kld_2d/eval_logl_2d: {bio_model} takes {n} parameters, got {}", p_log.len()));
+        }
+    }
+    Ok(eval_model_pss_2d_seq(bio_model, p_log, limits, fixed_quad_t, quad_order, samp_log, seq_model))
+}
+
 #[pyfunction]
 #[pyo3(signature = (bio_model, p_log, limits, u_idx, s_idx, f, fixed_quad_t, quad_order, samp_log=None, eps=1e-15, seq_model="Poisson"))]
 #[allow(clippy::too_many_arguments)]
@@ -5241,23 +5122,8 @@ fn eval_kld_2d(
     eps: f64,
     seq_model: &str,
 ) -> PyResult<f64> {
-    validate_bio_model_2d(bio_model, "eval_kld_2d/eval_logl_2d")?;
-    validate_limits(&limits, 2, "eval_kld_2d/eval_logl_2d")?;
-    validate_coords_2d(&u_idx, &s_idx, limits[0], limits[1], "eval_kld_2d/eval_logl_2d")?;
-    if let Some(n) = n_bio_params(bio_model) {
-        if p_log.len() < n {
-            return verr(format!("eval_kld_2d/eval_logl_2d: {bio_model} takes {n} parameters, got {}", p_log.len()));
-        }
-    }
-    let pss = eval_model_pss_2d_seq(
-        bio_model,
-        &p_log,
-        &limits,
-        fixed_quad_t,
-        quad_order,
-        samp_log.as_deref(),
-        seq_model,
-    );
+    let pss = pss_2d_for_histogram(bio_model, &p_log, &limits, &u_idx, &s_idx,
+                                   fixed_quad_t, quad_order, samp_log.as_deref(), seq_model)?;
     let l1 = limits[1];
     Ok(compute_kld_sparse(&pss, l1, &u_idx, &s_idx, &f, eps))
 }
@@ -5577,23 +5443,8 @@ fn eval_logl_2d(
     eps: f64,
     seq_model: &str,
 ) -> PyResult<f64> {
-    validate_bio_model_2d(bio_model, "eval_kld_2d/eval_logl_2d")?;
-    validate_limits(&limits, 2, "eval_kld_2d/eval_logl_2d")?;
-    validate_coords_2d(&u_idx, &s_idx, limits[0], limits[1], "eval_kld_2d/eval_logl_2d")?;
-    if let Some(n) = n_bio_params(bio_model) {
-        if p_log.len() < n {
-            return verr(format!("eval_kld_2d/eval_logl_2d: {bio_model} takes {n} parameters, got {}", p_log.len()));
-        }
-    }
-    let pss = eval_model_pss_2d_seq(
-        bio_model,
-        &p_log,
-        &limits,
-        fixed_quad_t,
-        quad_order,
-        samp_log.as_deref(),
-        seq_model,
-    );
+    let pss = pss_2d_for_histogram(bio_model, &p_log, &limits, &u_idx, &s_idx,
+                                   fixed_quad_t, quad_order, samp_log.as_deref(), seq_model)?;
     let l1 = limits[1];
     Ok(compute_logl_sparse(&pss, l1, &u_idx, &s_idx, &f, n_cells, eps))
 }
@@ -5676,7 +5527,7 @@ fn eval_logl_2d_sd(
 /// gradient is free of step-count discontinuities.  `coords` is (n_points, 3)
 /// histogram support, `f` the matching frequencies.
 #[pyfunction]
-#[pyo3(signature = (p_log, limits, coords, f, fit_unspliced, protein_limit, min_fudge, max_fudge, fd_eps=1e-6, eps=1e-15, fixed_schedule=None))]
+#[pyo3(signature = (p_log, limits, coords, f, fit_unspliced, protein_limit, *, ode, fd_eps=1e-6, eps=1e-15, fixed_schedule=None))]
 #[allow(clippy::too_many_arguments)]
 fn eval_kld_grad_protein_bursty(
     py: Python<'_>,
@@ -5686,12 +5537,12 @@ fn eval_kld_grad_protein_bursty(
     f: Vec<f64>,
     fit_unspliced: bool,
     protein_limit: f64,
-    min_fudge: f64,
-    max_fudge: f64,
+    ode: (f64, f64, usize),
     fd_eps: f64,
     eps: f64,
     fixed_schedule: Option<Vec<f64>>,
 ) -> PyResult<(f64, Vec<f64>)> {
+    let ode = ProteinOde::from_py(ode, "eval_kld_grad_protein_bursty")?;
     use pyo3::exceptions::PyValueError;
     if p_log.len() != 5 {
         return Err(PyValueError::new_err("eval_kld_grad_protein_bursty: expected 5 log10 parameters"));
@@ -5713,7 +5564,7 @@ fn eval_kld_grad_protein_bursty(
     Ok(py.allow_threads(|| {
         eval_kld_and_grad_seq_protein_bursty(
             &p_log, &limits, &strides, &coords, &f,
-            fit_unspliced, protein_limit, min_fudge, max_fudge, fd_eps, eps, fixed_schedule.as_deref(),
+            fit_unspliced, protein_limit, fd_eps, eps, fixed_schedule.as_deref(), &ode,
         )
     }))
 }
@@ -5752,37 +5603,16 @@ fn eval_kld_grad_2d(
         return Ok((kld0, grad));
     }
 
-    let n_params = p_log.len();
+    // Other models: forward differences, the base point and the perturbations in parallel.
     let l1 = limits[1];
-    // Other models: parallel forward FD.
-    let all_klds: Vec<f64> = py.allow_threads(|| {
-        (0..=n_params)
-            .into_par_iter()
-            .map(|i| {
-                let p_eval: Vec<f64> = if i == 0 {
-                    p_log.clone()
-                } else {
-                    let mut p_eps = p_log.clone();
-                    p_eps[i - 1] += fd_eps;
-                    p_eps
-                };
-                let pss = eval_model_pss_2d_seq(
-                    &bio_model,
-                    &p_eval,
-                    &limits,
-                    fixed_quad_t,
-                    quad_order,
-                    samp_ref.as_deref(),
-                    &seq_model,
-                );
-                compute_kld_sparse(&pss, l1, &u_idx, &s_idx, &f, eps)
-            })
-            .collect()
-    });
-
-    let kld0 = all_klds[0];
-    let grad: Vec<f64> = (1..=n_params).map(|i| (all_klds[i] - kld0) / fd_eps).collect();
-    Ok((kld0, grad))
+    Ok(py.allow_threads(|| {
+        fd_gradient_par(&p_log, fd_eps, |p_eval| {
+            let pss = eval_model_pss_2d_seq(
+                &bio_model, p_eval, &limits, fixed_quad_t, quad_order, samp_ref.as_deref(), &seq_model,
+            );
+            compute_kld_sparse(&pss, l1, &u_idx, &s_idx, &f, eps)
+        })
+    }))
 }
 
 // ============================================================================
@@ -5969,15 +5799,12 @@ fn eval_model_pss_protein_bursty_seq_sched(
     limits:        &[usize],
     fit_unspliced: bool,
     protein_limit: f64,
-    min_fudge:     f64,
-    max_fudge:     f64,
     fixed:         Option<&[f64]>,
+    ode:           &ProteinOde,
 ) -> (Vec<f64>, Vec<f64>) {
     let (gf, mx, lims, sched) =
-        protein_bursty_core_sched(p_log, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, fixed);
-    let pss_raw = irfftn_3d(&gf, mx[0], mx[2], lims[0], lims[1], lims[2]);
-    let abs_sum: f64 = pss_raw.iter().map(|x| x.abs()).sum();
-    (pss_raw.iter().map(|x| x.abs() / abs_sum).collect(), sched)
+        protein_bursty_core_sched(p_log, limits, fit_unspliced, protein_limit, fixed, ode);
+    (normalize_abs(irfftn_3d(&gf, mx[0], mx[2], lims[0], lims[1], lims[2])), sched)
 }
 
 /// KLD + forward finite-difference gradient for ProteinBursty (sequential).
@@ -5990,23 +5817,22 @@ fn eval_kld_and_grad_seq_protein_bursty(
     f_data:        &[f64],
     fit_unspliced: bool,
     protein_limit: f64,
-    min_fudge:     f64,
-    max_fudge:     f64,
     fd_eps:        f64,
     eps:           f64,
     fixed:         Option<&[f64]>,
+    ode:           &ProteinOde,
 ) -> (f64, Vec<f64>) {
     // Base point with the adaptive schedule (or an outer pin's); every perturbed
     // point replays that exact step sequence so the difference quotient sees
     // only the smooth dependence on the parameters, not jumps in the
     // discretisation.
     let (pss0, sched) = eval_model_pss_protein_bursty_seq_sched(
-        x, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, fixed,
+        x, limits, fit_unspliced, protein_limit, fixed, ode,
     );
     let kld0 = compute_kld_sparse_nd(&pss0, strides, coords, f_data, eps);
     let grad = fd_gradient(x, fd_eps, kld0, |xx| {
         let (pss, _) = eval_model_pss_protein_bursty_seq_sched(
-            xx, limits, fit_unspliced, protein_limit, min_fudge, max_fudge, Some(&sched),
+            xx, limits, fit_unspliced, protein_limit, Some(&sched), ode,
         );
         compute_kld_sparse_nd(&pss, strides, coords, f_data, eps)
     });
@@ -6017,7 +5843,7 @@ fn eval_kld_and_grad_seq_protein_bursty(
 /// Optimize all genes with the ProteinBursty model in parallel, reading histogram
 /// data directly from a Rust `SearchData` — no Python marshal loop.
 #[pyfunction]
-#[pyo3(signature = (sd, x0_list, lb, ub, fit_unspliced, protein_limit, min_fudge, max_fudge,
+#[pyo3(signature = (sd, x0_list, lb, ub, fit_unspliced, protein_limit, *, ode,
                     fd_eps=1e-6, maxiter=1000, ftol=1e-10, gtol=1e-6,
                     eps=1e-15, m_lbfgs=10, num_threads=None, return_status=false))]
 #[allow(clippy::too_many_arguments)]
@@ -6029,8 +5855,7 @@ fn optimize_genes_protein_bursty_sd(
     ub: Vec<f64>,
     fit_unspliced: bool,
     protein_limit: f64,
-    min_fudge: f64,
-    max_fudge: f64,
+    ode: (f64, f64, usize),
     fd_eps: f64,
     maxiter: usize,
     ftol: f64,
@@ -6040,6 +5865,7 @@ fn optimize_genes_protein_bursty_sd(
     num_threads: Option<usize>,
     return_status: bool,
 ) -> PyResult<PyObject> {
+    let ode = ProteinOde::from_py(ode, "optimize_genes_protein_bursty_sd")?;
     let (coords_list, f_list, limits_flat, n_genes, n_lim) = {
         let sd_ref = sd.borrow();
         if sd_ref.n_layers < 3 {
@@ -6060,7 +5886,7 @@ fn optimize_genes_protein_bursty_sd(
                 let (coords, f) = (&coords_list[gi], &f_list[gi]);
                 move |x: &[f64]| eval_kld_and_grad_seq_protein_bursty(
                     x, lims, &strides, coords, f,
-                    fit_unspliced, protein_limit, min_fudge, max_fudge, fd_eps, eps, None,
+                    fit_unspliced, protein_limit, fd_eps, eps, None, &ode,
                 )
             })
         })
@@ -6132,9 +5958,7 @@ fn eval_model_pss_2d_amb_seq(
     }
 
     let gf_log = pgf_2d(bio_model, &g0_eff, &g1_eff, &p, fixed_quad_t, quad_order);
-
-    let gf: Vec<Complex64> = gf_log.iter().map(|z| z.exp()).collect();
-    normalize_abs(irfftn_3d(&gf, l0, mx2, l0, l1, l2))
+    normalize_abs(irfftn_3d(&exp_par(&gf_log), l0, mx2, l0, l1, l2))
 }
 
 /// KLD + forward finite-difference gradient for 2-D amb_model (sequential).
@@ -6235,20 +6059,9 @@ fn optimize_genes_2d_amb_sd(
 // Custom reaction-network L-BFGS-B optimizer
 // ============================================================================
 
-/// Build `Vec<RxnInfo>` from flat topology arrays.
-fn build_rxns(
-    rxn_kinds:     &[u8],
-    rxn_rate_idxs: &[u32],
-    rxn_extra1:    &[i32],
-    rxn_extra2:    &[i32],
-    prod_off:      &[u32],
-) -> Vec<RxnInfo> {
-    build_rxn_infos(rxn_kinds, rxn_rate_idxs, rxn_extra1, rxn_extra2, prod_off)
-}
-
 /// Evaluate the custom-network PSS in-process (no PyO3).
 ///
-/// Supports 2-D and 3-D species counts; panics for any other N.
+/// Any number of species (the mesh and the inverse FFT are N-D).
 fn eval_custom_network_pss_seq(
     n_species:        usize,
     limits:           &[usize],
@@ -6257,17 +6070,15 @@ fn eval_custom_network_pss_seq(
     prod_st:          &[u32],
     params_linear:    &[f64],
     fixed:            Option<(&[f64], &[f64])>,
+    ode:              &CustomOde,
 ) -> (Vec<f64>, Vec<f64>) {
-    let (g, mx, n_grid) = build_mesh_nd(limits);
+    let mesh = build_mesh_nd_cached(limits);
+    let (g, mx, n_grid) = (&mesh.0, &mesh.1, mesh.2);
     let (exp_phi, steps) = custom_pgf_parallel(
-        &g, params_linear, rxns, prod_sp, prod_st, n_species, n_grid, fixed,
+        g, params_linear, rxns, prod_sp, prod_st, n_species, n_grid, fixed, ode,
     );
 
-    let pss_raw: Vec<f64> = match n_species {
-        2 => irfftn_2d(&exp_phi, limits[0], limits[1]),
-        3 => irfftn_3d(&exp_phi, mx[0], mx[2], limits[0], limits[1], limits[2]),
-        _ => panic!("eval_custom_network_pss_seq: only 2- and 3-species networks supported"),
-    };
+    let pss_raw = irfftn_nd(&exp_phi, mx, limits);
 
     (normalize_abs(pss_raw), steps)
 }
@@ -6296,10 +6107,11 @@ fn eval_kld_and_grad_seq_custom(
     has_norm_rate: bool,
     fd_eps:        f64,
     eps:           f64,
+    ode:           &CustomOde,
 ) -> (f64, Vec<f64>) {
     let params = custom_network_params(x, has_norm_rate);
     let (pss0, steps) = eval_custom_network_pss_seq(
-        n_species, limits, rxns, prod_sp, prod_st, &params, None,
+        n_species, limits, rxns, prod_sp, prod_st, &params, None, ode,
     );
     let breakpoints = custom_breakpoints(rxns, &params);
     let kld0 = compute_kld_sparse_nd(&pss0, strides, coords, f_data, eps);
@@ -6309,7 +6121,7 @@ fn eval_kld_and_grad_seq_custom(
     let grad = fd_gradient_central(x, fd_eps.max(CUSTOM_FD_EPS), |xx| {
         let params_eps = custom_network_params(xx, has_norm_rate);
         let (pss, _) = eval_custom_network_pss_seq(
-            n_species, limits, rxns, prod_sp, prod_st, &params_eps, Some((&steps, &breakpoints)),
+            n_species, limits, rxns, prod_sp, prod_st, &params_eps, Some((&steps, &breakpoints)), ode,
         );
         compute_kld_sparse_nd(&pss, strides, coords, f_data, eps)
     });
@@ -6320,13 +6132,13 @@ fn eval_kld_and_grad_seq_custom(
 /// Optimize all genes with a custom reaction network in parallel, reading histogram
 /// data directly from a Rust `SearchData` — no Python marshal loop.
 ///
-/// Only 2- and 3-species networks are supported.
+/// Any number of species up to `CUSTOM_MAX_SPECIES`; the `SearchData` must have one layer per species.
 /// Reaction topology is passed as flat arrays (same encoding as `eval_custom_network_pgf`).
 #[pyfunction]
 #[pyo3(signature = (sd, x0_list, lb, ub, n_species,
                     rxn_kinds, rxn_rate_idxs, rxn_extra1, rxn_extra2,
                     prod_sp, prod_st, prod_off,
-                    has_norm_rate,
+                    has_norm_rate, *, ode,
                     fd_eps=1e-6, maxiter=1000, ftol=1e-10, gtol=1e-6,
                     eps=1e-15, m_lbfgs=10, num_threads=None, return_status=false))]
 #[allow(clippy::too_many_arguments)]
@@ -6345,6 +6157,7 @@ fn optimize_genes_custom_sd(
     prod_st:       Vec<u32>,
     prod_off:      Vec<u32>,
     has_norm_rate: bool,
+    ode:           (f64, f64, f64, usize, f64),
     fd_eps:        f64,
     maxiter:       usize,
     ftol:          f64,
@@ -6354,17 +6167,16 @@ fn optimize_genes_custom_sd(
     num_threads:   Option<usize>,
     return_status: bool,
 ) -> PyResult<PyObject> {
-    if n_species != 2 && n_species != 3 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "optimize_genes_custom_sd only supports 2- and 3-species custom networks",
-        ));
-    }
+    let ode = CustomOde::from_py(ode, "optimize_genes_custom_sd")?;
 
     let (coords_list, f_list, limits_flat, n_genes, n_lim) = sd.borrow().extract_for_parallel();
+    if n_lim != n_species {
+        return verr(format!("optimize_genes_custom_sd: the SearchData has {n_lim} layers but the network has {n_species} species"));
+    }
     validate_bounds(&lb, &ub, None, "optimize_genes_custom_sd")?;
     validate_x0_list(&x0_list, n_genes, lb.len(), "optimize_genes_custom_sd")?;
 
-    let rxns = build_rxns(&rxn_kinds, &rxn_rate_idxs, &rxn_extra1, &rxn_extra2, &prod_off);
+    let rxns = build_rxn_infos(&rxn_kinds, &rxn_rate_idxs, &rxn_extra1, &rxn_extra2, &prod_off);
     let settings = LbfgsbSettings { maxiter, ftol, gtol, m_mem: m_lbfgs };
     let results = py.allow_threads(|| {
         run_with_pool(num_threads, || {
@@ -6375,7 +6187,7 @@ fn optimize_genes_custom_sd(
                 let (coords, f) = (&coords_list[gi], &f_list[gi]);
                 move |x: &[f64]| eval_kld_and_grad_seq_custom(
                     x, n_species, lims, &strides, rx, ps, pst, coords, f,
-                    has_norm_rate, fd_eps, eps,
+                    has_norm_rate, fd_eps, eps, &ode,
                 )
             })
         })
@@ -6530,14 +6342,7 @@ fn e_step_2d(
             (q_mat, lower_bound, q_func)
         };
 
-        match num_threads {
-            Some(nt) => rayon::ThreadPoolBuilder::new()
-                .num_threads(nt)
-                .build()
-                .map(|pool| pool.install(run))
-                .unwrap_or_else(|_| run()),
-            None => run(),
-        }
+        run_with_pool(num_threads, run)
     });
 
     Ok(result)

@@ -43,8 +43,8 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 from scipy.fft import irfftn
 
-from ._core import _mc
-from .reaction_network import ReactionNetwork, StepSchedule
+from ._core import _mc, step_control
+from .reaction_network import ReactionNetwork, StepSchedule, _phi_ops
 
 _TOL = 1e-5            # per-step error target on the generating function; with the Richardson
                        # extrapolation the error on P is about tol/100 (1e-7 here), tighter than the
@@ -264,21 +264,17 @@ def nascent_mature_system(k_on, k_off, epsilon, rates, beta: float, gamma: float
 
 def _mesh(limits: Sequence[int]) -> Tuple[np.ndarray, Tuple[int, ...]]:
     """PGF arguments ``u_j = exp(-2 pi i k / l_j) - 1`` on the half-spectrum mesh
-    monod uses for ``irfftn``: shape ``(m, P)`` and the mesh shape."""
-    mx = tuple(int(l) if i < len(limits) - 1 else int(l) // 2 + 1 for i, l in enumerate(limits))
-    axes = [np.exp(-2j * np.pi * np.arange(mx[i]) / int(limits[i])) - 1 for i in range(len(limits))]
-    grids = np.meshgrid(*axes, indexing="ij")
-    return np.stack([g.ravel() for g in grids]), mx
+    monod uses for ``irfftn``: shape ``(m, P)`` and the mesh shape (the cached
+    builder of :mod:`monod.cme_toolbox`)."""
+    from .cme_toolbox import _build_mesh          # lazy: cme_toolbox imports this module
+    limits = tuple(int(l) for l in limits)
+    mx = tuple(l if i < len(limits) - 1 else l // 2 + 1 for i, l in enumerate(limits))
+    return _build_mesh(limits, mx), mx
 
 
 def _char_integral(C: np.ndarray, tau_a: float, delta: float) -> np.ndarray:
     """``∫_{tau_a}^{tau_a+delta} exp(C tau') dtau'`` = ``exp(C tau_a) · delta φ1(C delta)``."""
-    m = C.shape[0]
-    aug = np.zeros((2 * m, 2 * m))
-    aug[:m, :m] = C * delta
-    aug[:m, m:] = np.eye(m)
-    x = _expm(aug)
-    return _expm(C * tau_a) @ (delta * x[:m, m:])
+    return _expm(C * tau_a) @ _phi_ops(C, delta, 1)[1]
 
 
 def _rust_available() -> bool:
@@ -324,9 +320,32 @@ def locus_structure(H: np.ndarray, A: np.ndarray, rtol: float = 1e-12):
     return site_weights, independent
 
 
+def rule_structure(H: np.ndarray, A: np.ndarray, k_on, k_off, epsilon: float, rule, rule_params=None):
+    """:func:`locus_structure` of a :func:`nascent_mature_system`, with the
+    parts the rule fixes read off directly instead of detected: the additive
+    rule's rates factorise over sites (``site_weights`` holds the per-site
+    rates), and ``epsilon = 1`` makes every flip independent of the other
+    sites.  Anything else is detected from the matrices as before."""
+    k_on = np.asarray(k_on, dtype=float)
+    n = k_on.size
+    k_off = np.broadcast_to(np.asarray(k_off, dtype=float), (n,))
+    site_weights = independent = None
+    if isinstance(rule, str) and rule == "additive":
+        site_weights = np.zeros((n, A.shape[1]))
+        site_weights[:, 0] = np.asarray(rule_params, dtype=float)
+    if float(epsilon) == 1.0:
+        independent = [float(v) for j in range(n) for v in (k_on[j], k_off[j])]
+    if site_weights is None or independent is None:
+        sw, ind = locus_structure(H, A)
+        site_weights = sw if site_weights is None else site_weights
+        independent = ind if independent is None else independent
+    return site_weights, independent
+
+
 def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
                    tol: float = _TOL, fixed_schedule: Optional[StepSchedule] = None,
-                   backend: Optional[str] = None, burst: Optional[float] = None):
+                   backend: Optional[str] = None, burst: Optional[float] = None,
+                   structure=None):
     """Vector generating function ``G[c, p] = E[prod_j (1+u_j)^{x_j}; state c]``
     at the PGF arguments ``u`` (shape ``(m, P)``), returned with the accepted
     :class:`StepSchedule`.  This is the kernel proper; :func:`eval_joint_pss`
@@ -336,7 +355,12 @@ def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
     ``burst`` switches the emission from single molecules to geometric bursts
     of that mean size, shared by all configurations and species; ``A`` keeps
     its meaning as the mean production rate (burst frequency ``A / burst``),
-    so ``burst -> 0`` is the constitutive model."""
+    so ``burst -> 0`` is the constitutive model.
+
+    ``structure`` is the ``(site_weights, independent)`` pair of
+    :func:`locus_structure` when the caller already knows it
+    (:func:`rule_structure`); the Rust kernel exploits it, and it is detected
+    from the matrices when not given."""
     H = np.asarray(H, dtype=float); A = np.asarray(A, dtype=float); C = np.asarray(C, dtype=float)
     u = np.asarray(u, dtype=np.complex128)
     N, m = A.shape
@@ -357,7 +381,7 @@ def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
     if backend == "rust":
         if not _rust_available():
             raise RuntimeError("monod_core with eval_chromatin_pgf is not installed")
-        site_weights, independent = locus_structure(H, A)
+        site_weights, independent = locus_structure(H, A) if structure is None else structure
         re, im, _, steps = _mc.eval_chromatin_pgf(
             N, m, H.ravel().tolist(), A.ravel().tolist(), C.ravel().tolist(),
             [1] * m, w.tolist(), float(T), float(h_first), float(h_min), float(tol),
@@ -484,10 +508,10 @@ def _integrate_numpy(HT, A, C, u, G, T, h_first, h_min, tol, fixed_schedule, bur
         diff = G2 - G1
         if adaptive:
             err = float(np.abs(diff).max())
-            if err > tol and h > h_min:
-                h *= max(0.2, 0.9 * (tol / err) ** (1.0 / 3.0))
+            accept, fac = step_control(err, h, h_min, tol)
+            if not accept:
+                h = fac
                 continue
-            fac = min(2.0, max(0.2, 0.9 * (tol / max(err, 1e-300)) ** (1.0 / 3.0)))
         G = G2 + diff / 3.0                                 # Richardson
         last_E = (h, full[1])
         tau -= h

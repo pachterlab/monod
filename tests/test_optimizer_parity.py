@@ -31,6 +31,8 @@ import sys
 import numpy as np
 import pytest
 from monod._core import _mc  # None unless the compiled extension is really installed
+from monod.cme_toolbox import _PROTEIN_ODE
+from monod.reaction_network import _CUSTOM_ODE
 _HAS_RUST = _mc is not None
 
 pytestmark = pytest.mark.skipif(not _HAS_RUST, reason="monod_core not available")
@@ -94,8 +96,6 @@ class TestOptimizeGenesProteinBurstySd:
     # Fixed model config used in all tests.
     FIT_UNSPLICED  = True
     PROTEIN_LIMIT  = np.inf
-    MIN_FUDGE      = 0.1
-    MAX_FUDGE      = 10.0
     FIXED_QUAD_T   = 20.0
     QUAD_ORDER     = 10
 
@@ -136,8 +136,7 @@ class TestOptimizeGenesProteinBurstySd:
             [int(l) for l in limits],
             self.FIT_UNSPLICED,
             float(self.PROTEIN_LIMIT),
-            self.MIN_FUDGE,
-            self.MAX_FUDGE,
+            ode=_PROTEIN_ODE,
         )
         return _compute_kld_from_pss(pss_flat, [int(l) for l in limits], coords, freqs)
 
@@ -152,7 +151,7 @@ class TestOptimizeGenesProteinBurstySd:
             lb=self.LB.tolist(), ub=self.UB.tolist(),
             fit_unspliced=self.FIT_UNSPLICED,
             protein_limit=float(self.PROTEIN_LIMIT),
-            min_fudge=self.MIN_FUDGE, max_fudge=self.MAX_FUDGE,
+            ode=_PROTEIN_ODE,
             fd_eps=1e-6, maxiter=5, ftol=1e-10, gtol=1e-6, eps=1e-15,
         )
 
@@ -177,7 +176,7 @@ class TestOptimizeGenesProteinBurstySd:
             lb=self.LB.tolist(), ub=self.UB.tolist(),
             fit_unspliced=self.FIT_UNSPLICED,
             protein_limit=float(self.PROTEIN_LIMIT),
-            min_fudge=self.MIN_FUDGE, max_fudge=self.MAX_FUDGE,
+            ode=_PROTEIN_ODE,
             fd_eps=1e-6, maxiter=20, ftol=1e-10, gtol=1e-6, eps=1e-15,
         )
 
@@ -209,7 +208,7 @@ class TestOptimizeGenesProteinBurstySd:
             lb=self.LB.tolist(), ub=self.UB.tolist(),
             fit_unspliced=self.FIT_UNSPLICED,
             protein_limit=float(self.PROTEIN_LIMIT),
-            min_fudge=self.MIN_FUDGE, max_fudge=self.MAX_FUDGE,
+            ode=_PROTEIN_ODE,
             fd_eps=1e-6, maxiter=200, ftol=1e-10, gtol=1e-6, eps=1e-15,
             return_status=True,
         )
@@ -242,7 +241,7 @@ class TestOptimizeGenesProteinBurstySd:
                 sd, x0_list=[[[-1.0]*5]]*n_genes,
                 lb=self.LB.tolist(), ub=self.UB.tolist(),
                 fit_unspliced=True, protein_limit=np.inf,
-                min_fudge=0.1, max_fudge=10.0,
+                ode=_PROTEIN_ODE,
             )
 
 
@@ -492,7 +491,7 @@ class TestOptimizeGenesCustomSd:
             self.RXN_KINDS, self.RXN_RATE_IDXS,
             self.RXN_EXTRA1, self.RXN_EXTRA2,
             self.PROD_SP, self.PROD_ST, self.PROD_OFF,
-            p_lin.tolist(),
+            p_lin.tolist(), ode=_CUSTOM_ODE,
         )
         exp_phi = (np.array(re_e) + 1j * np.array(im_e)).reshape(mx_shape)
         pss_raw = np.abs(irfftn(exp_phi, s=[int(l) for l in limits]))
@@ -511,7 +510,7 @@ class TestOptimizeGenesCustomSd:
             n_species=self.N_SPECIES,
             rxn_kinds=self.RXN_KINDS, rxn_rate_idxs=self.RXN_RATE_IDXS,
             rxn_extra1=self.RXN_EXTRA1, rxn_extra2=self.RXN_EXTRA2,
-            prod_sp=self.PROD_SP, prod_st=self.PROD_ST, prod_off=self.PROD_OFF,
+            prod_sp=self.PROD_SP, prod_st=self.PROD_ST, prod_off=self.PROD_OFF, ode=_CUSTOM_ODE,
             has_norm_rate=self.HAS_NORM_RATE,
             fd_eps=1e-6, maxiter=5, ftol=1e-10, gtol=1e-6, eps=1e-15,
         )
@@ -536,7 +535,7 @@ class TestOptimizeGenesCustomSd:
             n_species=self.N_SPECIES,
             rxn_kinds=self.RXN_KINDS, rxn_rate_idxs=self.RXN_RATE_IDXS,
             rxn_extra1=self.RXN_EXTRA1, rxn_extra2=self.RXN_EXTRA2,
-            prod_sp=self.PROD_SP, prod_st=self.PROD_ST, prod_off=self.PROD_OFF,
+            prod_sp=self.PROD_SP, prod_st=self.PROD_ST, prod_off=self.PROD_OFF, ode=_CUSTOM_ODE,
             has_norm_rate=self.HAS_NORM_RATE,
             fd_eps=1e-6, maxiter=20, ftol=1e-10, gtol=1e-6, eps=1e-15,
         )
@@ -564,7 +563,7 @@ class TestOptimizeGenesCustomSd:
             n_species=self.N_SPECIES,
             rxn_kinds=self.RXN_KINDS, rxn_rate_idxs=self.RXN_RATE_IDXS,
             rxn_extra1=self.RXN_EXTRA1, rxn_extra2=self.RXN_EXTRA2,
-            prod_sp=self.PROD_SP, prod_st=self.PROD_ST, prod_off=self.PROD_OFF,
+            prod_sp=self.PROD_SP, prod_st=self.PROD_ST, prod_off=self.PROD_OFF, ode=_CUSTOM_ODE,
             has_norm_rate=self.HAS_NORM_RATE,
             fd_eps=1e-6, maxiter=200, ftol=1e-10, gtol=1e-6, eps=1e-15,
         )
@@ -586,15 +585,15 @@ class TestOptimizeGenesCustomSd:
                 f"gene {gi}: Rust KLD {klds_out[gi]:.6g} > scipy KLD {res.fun:.6g}"
             )
 
-    def test_unsupported_species_raises(self, synthetic_sd):
+    def test_layer_count_must_match_species(self, synthetic_sd):
         sd = synthetic_sd[0]
-        with pytest.raises(Exception, match="2- and 3-species"):
+        with pytest.raises(Exception, match="layers but the network has 4 species"):
             _mc.optimize_genes_custom_sd(
                 sd, x0_list=[[[-1.0, -1.0, -1.0]]] * sd.n_genes,
                 lb=self.LB.tolist(), ub=self.UB.tolist(),
                 n_species=4,
                 rxn_kinds=self.RXN_KINDS, rxn_rate_idxs=self.RXN_RATE_IDXS,
                 rxn_extra1=self.RXN_EXTRA1, rxn_extra2=self.RXN_EXTRA2,
-                prod_sp=self.PROD_SP, prod_st=self.PROD_ST, prod_off=self.PROD_OFF,
+                prod_sp=self.PROD_SP, prod_st=self.PROD_ST, prod_off=self.PROD_OFF, ode=_CUSTOM_ODE,
                 has_norm_rate=self.HAS_NORM_RATE,
             )

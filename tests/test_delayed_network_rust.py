@@ -10,7 +10,7 @@ import pytest
 import monod.cme_toolbox as ct
 from monod._core import _mc
 from monod.cme_toolbox import CMEModel
-from monod.reaction_network import ReactionNetwork
+from monod.reaction_network import ReactionNetwork, _CUSTOM_ODE
 
 pytestmark = pytest.mark.skipif(_mc is None, reason="monod_core not available")
 
@@ -96,7 +96,38 @@ def sd():
     return _mc.searchdata_from_arrays(layers, ["unspliced", "spliced"], limits, coords, freqs, ["G0"], 150, "unique")
 
 
+NET4 = "0 -> B x U -> S -> 0; S -> S + P; P -> P + Q; P -> 0; Q -> 0"
+
+
+@pytest.fixture(scope="module")
+def sd4():
+    rng = np.random.default_rng(6)
+    layers = [np.ascontiguousarray(rng.integers(0, 4, size=(100, 1)), dtype=np.int64) for _ in range(4)]
+    coords, freqs = _mc.make_state_dist(layers)
+    limits = np.array([[6]] * 4, dtype=np.int64)
+    return _mc.searchdata_from_arrays(layers, ["U", "S", "P", "Q"], limits, coords, freqs, ["G0"], 100, "unique")
+
+
 class TestOptimizer:
+    def test_four_species_network_runs_in_rust(self, sd4):
+        """A 4-species network goes through the Rust optimizer (N-D inverse FFT);
+        the reported KLD is the Python model's KLD at the reported point."""
+        model = _model(NET4)
+        topo = model.network.rust_topology()
+        n = model.get_num_params()
+        x0 = np.zeros(n)
+        params, klds, status = _mc.optimize_genes_custom_sd(
+            sd4, x0_list=[[x0.tolist()]], lb=[-1.0] * n, ub=[2.0] * n, n_species=4,
+            rxn_kinds=topo["rxn_kinds"], rxn_rate_idxs=topo["rxn_rate_idxs"],
+            rxn_extra1=topo["rxn_extra1"], rxn_extra2=topo["rxn_extra2"],
+            prod_sp=topo["prod_sp"], prod_st=topo["prod_st"], prod_off=topo["prod_off"],
+            has_norm_rate=True, ode=_CUSTOM_ODE, fd_eps=1e-6, maxiter=3,
+            ftol=1e-9, gtol=1e-6, eps=1e-15, m_lbfgs=10, num_threads=None, return_status=True,
+        )
+        assert status[0] in (0, 1, 2)
+        kld_py = model.eval_model_kld(np.asarray(params[0]), [6] * 4, None, sd4.hist[0])
+        assert klds[0] == pytest.approx(kld_py, rel=1e-6)
+
     def test_rust_optimizer_improves_kld(self, sd):
         model = _model(NET2)
         net = model.network
@@ -108,7 +139,7 @@ class TestOptimizer:
             rxn_kinds=topo["rxn_kinds"], rxn_rate_idxs=topo["rxn_rate_idxs"],
             rxn_extra1=topo["rxn_extra1"], rxn_extra2=topo["rxn_extra2"],
             prod_sp=topo["prod_sp"], prod_st=topo["prod_st"], prod_off=topo["prod_off"],
-            has_norm_rate=True, fd_eps=1e-6, maxiter=15,
+            has_norm_rate=True, ode=_CUSTOM_ODE, fd_eps=1e-6, maxiter=15,
             ftol=1e-9, gtol=1e-6, eps=1e-15, m_lbfgs=10, num_threads=None, return_status=True,
         )
         assert status[0] in (0, 1, 2)

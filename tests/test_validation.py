@@ -9,7 +9,7 @@ import os
 import numpy as np
 import pytest
 
-from monod.cme_toolbox import CMEModel
+from monod.cme_toolbox import CMEModel, _PROTEIN_ODE
 from monod.inference import InferenceParameters
 import monod.mminference as mminference
 
@@ -121,7 +121,7 @@ class TestRustEntryPoints:
 
     def test_protein_limit_zero(self):
         with pytest.raises(ValueError, match="protein_limit must be > 0"):
-            _mc.eval_model_pss_protein_bursty_sched([0.3, 0, 0, 0, 0], [4, 4, 4], True, 0.0, 0.1, 10.0)
+            _mc.eval_model_pss_protein_bursty_sched([0.3, 0, 0, 0, 0], [4, 4, 4], True, 0.0, ode=_PROTEIN_ODE)
 
     def test_optimizer_inverted_bounds(self):
         sd, _, _ = _tiny_sd()

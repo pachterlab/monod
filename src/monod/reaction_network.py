@@ -100,12 +100,16 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# Exponential-integrator controls (shared with monod_core::custom_pgf_sched).
+from ._core import step_control
+
+# Exponential-integrator controls; the one definition, passed to the Rust
+# kernels as ``ode=_CUSTOM_ODE`` (monod_core::custom_pgf_sched).
 _CUSTOM_ODE_TOL = 1e-6        # per-step error target on the generating-function scale
 _CUSTOM_ODE_C0 = 0.05         # first step as a fraction of the fastest time scale
 _CUSTOM_ODE_U_END = 1e-8      # stop once exp(Re φ)·|u| is below this everywhere (for a delay's length, if any)
 _CUSTOM_ODE_MAX_STEPS = 20_000
 _CUSTOM_ODE_H_MAX = 1e4       # step cap in units of the slowest time scale
+_CUSTOM_ODE = (_CUSTOM_ODE_TOL, _CUSTOM_ODE_C0, _CUSTOM_ODE_U_END, _CUSTOM_ODE_MAX_STEPS, _CUSTOM_ODE_H_MAX)
 
 
 class ReactionNetworkWarning(UserWarning):
@@ -726,15 +730,9 @@ class ReactionNetwork:
 
     @classmethod
     def _step_ops(cls, A: np.ndarray, h: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """``(E, P1, P2) = (exp(A h), h φ₁(A h), h φ₂(A h))`` read off the
-        exponential of the block matrix ``[[A h, I, 0], [0, 0, I], [0, 0, 0]]``."""
-        n = A.shape[0]
-        m = np.zeros((3 * n, 3 * n))
-        m[:n, :n] = A * h
-        m[:n, n:2 * n] = np.eye(n)
-        m[n:2 * n, 2 * n:] = np.eye(n)
-        x = cls._expm(m)
-        return x[:n, :n], h * x[:n, n:2 * n], h * x[:n, 2 * n:]
+        """``(E, P1, P2) = (exp(A h), h φ₁(A h), h φ₂(A h))``, see :func:`_phi_ops`."""
+        E, P1, P2 = _phi_ops(A, h, 2)
+        return E, P1, P2
 
     def _etd_step(
         self,
@@ -935,10 +933,10 @@ class ReactionNetwork:
             um, u2, dphi, err = self._trial(u, phi, h, ops_h, ops_h2, dl, adaptive, ctx)
             fac = 1.0
             if adaptive:
-                if err > _CUSTOM_ODE_TOL and h > h_min:
-                    h_prop = h * max(0.2, 0.9 * (_CUSTOM_ODE_TOL / err) ** (1.0 / 3.0))
+                accept, fac = step_control(err, h, h_min, _CUSTOM_ODE_TOL)
+                if not accept:
+                    h_prop = fac
                     continue
-                fac = min(2.0, max(0.2, 0.9 * (_CUSTOM_ODE_TOL / max(err, 1e-300)) ** (1.0 / 3.0)))
             u = u2
             phi = phi + dphi
             t = t_end
@@ -1037,6 +1035,20 @@ class ReactionNetwork:
 # ---------------------------------------------------------------------------
 # Module-level helper (used by the ODE RHS)
 # ---------------------------------------------------------------------------
+
+def _phi_ops(A: np.ndarray, h: float, k: int) -> List[np.ndarray]:
+    """``[exp(A h), h φ₁(A h), …, h φ_k(A h)]`` read off one exponential of the
+    block matrix ``[[A h, I, 0, …], [0, 0, I, …], …]``: the φ-functions of the
+    exponential integrators (the ETD2RK step takes ``k = 2``, the chromatin
+    production exponent ``k = 1``).  Mirrors ``monod_core::phi_ops``."""
+    n = A.shape[0]
+    m = np.zeros(((k + 1) * n, (k + 1) * n))
+    m[:n, :n] = A * h
+    for b in range(k):
+        m[b * n:(b + 1) * n, (b + 1) * n:(b + 2) * n] = np.eye(n)
+    x = ReactionNetwork._expm(m)
+    return [x[:n, :n]] + [h * x[:n, b * n:(b + 1) * n] for b in range(1, k + 1)]
+
 
 class StepSchedule:
     """Accepted step sizes of one custom-network integration, with the delay

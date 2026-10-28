@@ -325,6 +325,27 @@ class TestRustBackend:
         sw, ind = ch.locus_structure(H, A)
         assert sw is not None and ind is None
 
+    @pytest.mark.parametrize("rule, eps, params", [
+        ("additive", 0.6, [4.0, 2.0, 1.0]), ("additive", 1.0, [1.0, 2.0, 0.5]),
+        ("switch", 0.6, [5.0]), ("switch", 1.0, [5.0]),
+        ("table", 0.6, [0.0, 3.0, 3.0, 1.0, 2.0, 1.0, 0.5, 4.0]), ("table", 1.0, np.sqrt(np.arange(8))),
+    ])
+    def test_rule_structure_matches_detection(self, rule, eps, params):
+        """What the rule fixes agrees with what locus_structure detects from the matrices."""
+        k_on = [0.5, 0.8, 0.3]
+        H, A, C = ch.nascent_mature_system(k_on, 1.0, eps, rule, 0.8, 0.3, rule_params=params)
+        sw_d, ind_d = ch.locus_structure(H, A)
+        sw_r, ind_r = ch.rule_structure(H, A, k_on, 1.0, eps, rule, params)
+        assert (sw_r is None) == (sw_d is None) and (ind_r is None) == (ind_d is None)
+        if sw_d is not None:
+            np.testing.assert_allclose(sw_r, sw_d, atol=1e-12)
+        if ind_d is not None:
+            np.testing.assert_allclose(ind_r, ind_d, rtol=1e-12)
+        p_a = ch.eval_joint_pss(H, A, C, [20, 24], backend="rust")
+        G, _ = ch.eval_joint_pgf(H, A, C, ch._mesh([20, 24])[0], structure=(sw_r, ind_r))
+        p_b = ch.invert_joint_pgf(G, ch._mesh([20, 24])[1], (20, 24))
+        np.testing.assert_allclose(p_b, p_a, atol=1e-13)
+
     def test_shape_errors(self):
         with pytest.raises(ValueError):
             ch._mc.eval_chromatin_pgf(2, 1, [0.0] * 4, [0.0] * 3, [0.0], [10], [0.5, 0.5], 1.0, 0.1, 1e-9, 1e-6)

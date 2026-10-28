@@ -13,8 +13,8 @@ import scipy
 from scipy.fft import irfftn
 
 # from .nn_toolbox import basic_ml_bivariate, ml_microstate_logP
-from ._core import log
-from .reaction_network import ReactionNetwork, IdentifiabilityWarning, StepSchedule
+from ._core import log, step_control
+from .reaction_network import ReactionNetwork, IdentifiabilityWarning, StepSchedule, _CUSTOM_ODE
 
 _MESH_CACHE: dict = {}
 _MESH_CACHE_ENTRIES = [0]          # total complex128 entries currently cached
@@ -65,10 +65,12 @@ _HAS_RUST = _mc is not None
 # implementation that broadcasts the grid × quadrature computation onto the
 # GPU.  Results match the Python/Rust baseline within rtol=1e-5.
 # ---------------------------------------------------------------------------
-# ProteinBursty integrator settings; keep in sync with monod_core (PROTEIN_ODE_*).
+# ProteinBursty integrator settings; the one definition, passed to the Rust
+# kernels as ``ode=_PROTEIN_ODE``.
 _PROTEIN_ODE_TOL = 1e-6        # per-step error target on the generating-function scale
 _PROTEIN_ODE_C0 = 0.05         # first step as a fraction of the fastest time scale
 _PROTEIN_ODE_MAX_STEPS = 20_000
+_PROTEIN_ODE = (_PROTEIN_ODE_TOL, _PROTEIN_ODE_C0, _PROTEIN_ODE_MAX_STEPS)
 _CUSTOM_FD_EPS = 1e-4          # central finite-difference step for custom-network gradients (log10 units)
 
 
@@ -268,7 +270,6 @@ _QUADRATURE_MODELS = frozenset({"Bursty", "CIR"})
 _Backend = _collections.namedtuple("_Backend", "kind family samp")
 _LN10 = np.log(10.0)
 
-_PROTEIN_FUDGE = (0.1, 10.0)        # legacy step-size bounds the Rust protein kernels still take
 _BIO_MODELS = ("Delay", "Bursty", "Extrinsic", "Constitutive", "CIR", "DelayedSplicing", "ProteinBursty", "Custom", "Chromatin")
 _SEQ_MODELS = ("None", "Bernoulli", "Poisson")
 _AMB_MODELS = ("None", "Equal", "Unequal")
@@ -1016,10 +1017,8 @@ class CMEModel:
                     np.asarray(f_data, dtype=float).tolist(),
                     bool(self.fit_unspliced),
                     float(self.protein_limit),
-                    _PROTEIN_FUDGE[0], _PROTEIN_FUDGE[1],
-                    float(eps),
-                    float(EPS),
-                    None if outer is None else [float(x) for x in np.asarray(outer, dtype=float)],
+                    ode=_PROTEIN_ODE, fd_eps=float(eps), eps=float(EPS),
+                    fixed_schedule=None if outer is None else [float(x) for x in np.asarray(outer, dtype=float)],
                 )
                 return kld0, np.array(grad_list)
 
@@ -1467,8 +1466,8 @@ class CMEModel:
             fixed = self._fixed_schedule
             pss_flat, steps = _mc.eval_model_pss_protein_bursty_sched(
                 p.tolist(), [int(x) for x in limits], bool(self.fit_unspliced),
-                float(self.protein_limit), _PROTEIN_FUDGE[0], _PROTEIN_FUDGE[1],
-                None if fixed is None else [float(x) for x in np.asarray(fixed, dtype=float)],
+                float(self.protein_limit), ode=_PROTEIN_ODE,
+                fixed_schedule=None if fixed is None else [float(x) for x in np.asarray(fixed, dtype=float)],
             )
             self._last_schedule = np.asarray(steps, dtype=float)
             return np.array(pss_flat).reshape([int(l) for l in limits]).squeeze()
@@ -1483,9 +1482,9 @@ class CMEModel:
                 len(net.species), [int(x) for x in limits],
                 topo["rxn_kinds"], topo["rxn_rate_idxs"], topo["rxn_extra1"], topo["rxn_extra2"],
                 topo["prod_sp"], topo["prod_st"], topo["prod_off"],
-                params_linear,
-                None if fixed is None else [float(x) for x in np.asarray(fixed, dtype=float)],
-                None if fixed is None else list(getattr(fixed, "breakpoints", ())),
+                params_linear, ode=_CUSTOM_ODE,
+                fixed_schedule=None if fixed is None else [float(x) for x in np.asarray(fixed, dtype=float)],
+                fixed_breakpoints=None if fixed is None else list(getattr(fixed, "breakpoints", ())),
             )
             self._last_schedule = StepSchedule(steps, taus)
             exp_phi = (np.array(re_e) + 1j * np.array(im_e)).reshape(mx_shape)
@@ -1604,9 +1603,13 @@ class CMEModel:
         g = _build_mesh((lu, ls), mx)
         g = self._apply_seq_transform(g, samp)
         H, A, C = self.chromatin_system(p)
+        k_on, eps, rates, _, _ = _chromatin.split_theta(p, self.rule, self.n_sites)
+        structure = _chromatin.rule_structure(H, A, k_on, 1.0, eps, self.rule, rates)
+        backend = "rust" if _HAS_RUST and _chromatin._rust_available() else "python"
         G, sched = _chromatin.eval_joint_pgf(H, A, C, g, tol=self.chromatin_tol,
                                              fixed_schedule=self._fixed_schedule,
-                                             burst=self.chromatin_burst(p))
+                                             burst=self.chromatin_burst(p), structure=structure,
+                                             backend=backend)
         self._last_schedule = sched
         pss = _chromatin.invert_joint_pgf(G, mx, (lu, ls))              # (N, lu, ls)
         p_drop = self.chromatin_dropout(samp)
@@ -1843,10 +1846,10 @@ class CMEModel:
                 trap = (f0 + fm * 2.0 + f2) * (h / 4.0)
                 v1, _ = step(consts(t, h), v, w)
                 err = float(np.max(np.exp(phi.real) * (np.abs(simpson - trap) + b * h * np.abs(v2 - v1) / 3.0)))
-                if err > _PROTEIN_ODE_TOL and h > h_min:
-                    h *= max(0.2, 0.9 * (_PROTEIN_ODE_TOL / err) ** (1.0 / 3.0))
+                accept, fac = step_control(err, h, h_min, _PROTEIN_ODE_TOL)
+                if not accept:
+                    h = fac
                     continue
-                fac = min(2.0, max(0.2, 0.9 * (_PROTEIN_ODE_TOL / max(err, 1e-300)) ** (1.0 / 3.0)))
             v, w = v2, w2
             phi = phi + simpson
             t += h

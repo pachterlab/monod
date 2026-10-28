@@ -52,6 +52,21 @@ def _build_sampling_grid(samp_lb, samp_ub, gridsize):
     return grid_values, sampl_vals, len(grid_values[0])
 
 
+def step_control(err, h, h_min, tol):
+    """Step-size control shared by the adaptive integrators (protein, custom
+    network, chromatin), the mirror of the Rust ``control_step``.
+
+    Returns ``(accept, value)``: ``(False, h_new)`` when the step must be
+    retried with ``h_new``, ``(True, factor)`` when it is accepted and the next
+    step is ``h * factor``.  The floating-point order is part of the contract
+    with the Rust kernels: ``0.9 * (tol / err) ** (1/3)``, then max 0.2, then
+    min 2.
+    """
+    if err > tol and h > h_min:
+        return False, h * max(0.2, 0.9 * (tol / err) ** (1.0 / 3.0))
+    return True, min(2.0, max(0.2, 0.9 * (tol / max(err, 1e-300)) ** (1.0 / 3.0)))
+
+
 def load():
     try:
         import monod_core as mc
