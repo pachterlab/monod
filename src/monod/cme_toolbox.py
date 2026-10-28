@@ -203,12 +203,7 @@ def _gpu_pgf_quadrature_batch(bio_model, g0, g1, b, beta, gamma, T, quad_order):
         u_general = b_ * ((g0c - g1c * f) * eb + g1c * f * eg)
         u_close = b_ * (g0c * eb + g1c * (beta_ * x.unsqueeze(1) * eg))
         u = _torch.where(close, u_close, u_general)           # [G, n, Q]
-        if bio_model == "Bursty":
-            integrand = u / (1.0 - u)
-            out[:, s:s + n_chunk] = (integrand * w).sum(dim=2)
-        else:
-            integrand = 1.0 - _torch.sqrt(1.0 - 4.0 * u)
-            out[:, s:s + n_chunk] = (integrand * w).sum(dim=2) / 2.0
+        out[:, s:s + n_chunk] = (_burst_integrand(bio_model, u, xp=_torch) * w).sum(dim=2)
     return out
 
 
@@ -251,27 +246,11 @@ def _eval_model_pss_gpu_batch(bio_model, params_list, limits_list, fixed_quad_T,
         g0b = g0b.expand(G, -1)
         g1b = g1b.expand(G, -1)
 
-        if bio_model == "Constitutive":
-            gf = g0b / p[:, 0:1] + g1b / p[:, 1:2]
-        elif bio_model == "Extrinsic":
-            gf = -p[:, 0:1] * _torch.log(one - g0b / p[:, 1:2] - g1b / p[:, 2:3])
-        elif bio_model == "Delay":
-            b, beta, tauinv = p[:, 0:1], p[:, 1:2], p[:, 2:3]
-            tau = 1.0 / tauinv
-            exp_bt = _torch.exp(-beta * tau)
-            u = g1b + (g0b - g1b) * exp_bt
-            term1 = -_torch.log(one - u * b) / beta
-            ratio = (u * b - one) / (g0b * b - one)
-            term2 = _torch.log(ratio) / (beta * (one - g1b * b))
-            term3 = g1b * b * tau / (one - g1b * b)
-            gf = term1 + term2 + term3
-        elif bio_model == "DelayedSplicing":
-            b, tauinv, gamma = p[:, 0:1], p[:, 1:2], p[:, 2:3]
-            tau = 1.0 / tauinv
-            gf = g0b * b * tau / (one - g0b * b) - _torch.log(one - g1b * b) / gamma
-        elif bio_model in ("Bursty", "CIR"):
+        if bio_model in _CLOSED_FORM_MODELS:
+            gf = _closed_form_pgf(bio_model, g0b, g1b, [p[:, j:j + 1] for j in range(p.shape[1])], xp=_torch)
+        elif bio_model in _QUADRATURE_MODELS:
             b, beta, gamma = p[:, 0], p[:, 1], p[:, 2]
-            T = fixed_quad_T * (1.0 / beta + 1.0 / gamma + 1.0)
+            T = _quadrature_horizon(fixed_quad_T, beta, gamma)
             gf = _gpu_pgf_quadrature_batch(bio_model, g0b, g1b, b, beta, gamma, T, quad_order)
         else:
             raise ValueError(f"Unknown bio_model for GPU path: {bio_model}")
@@ -286,7 +265,124 @@ def _eval_model_pss_gpu_batch(bio_model, params_list, limits_list, fixed_quad_T,
 
 
 _MODELS_2D = frozenset({"Constitutive", "Bursty", "CIR", "Extrinsic", "Delay", "DelayedSplicing"})
+_CLOSED_FORM_MODELS = frozenset({"Constitutive", "Extrinsic", "Delay", "DelayedSplicing"})
+_QUADRATURE_MODELS = frozenset({"Bursty", "CIR"})
 _Backend = _collections.namedtuple("_Backend", "kind family samp")
+_LN10 = np.log(10.0)
+
+_PROTEIN_FUDGE = (0.1, 10.0)        # legacy step-size bounds the Rust protein kernels still take
+_BIO_MODELS = ("Delay", "Bursty", "Extrinsic", "Constitutive", "CIR", "DelayedSplicing", "ProteinBursty", "Custom", "Chromatin")
+_SEQ_MODELS = ("None", "Bernoulli", "Poisson")
+_AMB_MODELS = ("None", "Equal", "Unequal")
+
+# Per-family defaults for the built-in models: modalities, expression filter
+# and log10 parameter box (burst size [-1, 4.2], rates [-1.8, 2.5 or 3.5]).
+# Custom networks and Chromatin derive theirs from their structure in __init__.
+_TWO_SPECIES = dict(modalities=['unspliced', 'spliced'],
+                    filt={'min_means': [0.01, 0.01], 'max_maxes': [350, 350], 'min_maxes': [4, 4]},
+                    lb=[-1.0, -1.8, -1.8], ub=[4.2, 2.5, 3.5])
+_FAMILIES = {
+    "Constitutive": {**_TWO_SPECIES, "lb": [-1.8, -1.8], "ub": [2.5, 3.5]},
+    "Bursty": _TWO_SPECIES, "CIR": _TWO_SPECIES, "Extrinsic": _TWO_SPECIES,
+    "Delay": _TWO_SPECIES, "DelayedSplicing": _TWO_SPECIES,
+    "ProteinBursty": dict(modalities=['unspliced', 'spliced', 'protein'],
+                          filt={'min_means': [0.01, 0.01, 1], 'max_maxes': [350, 350, 1000], 'min_maxes': [4, 4, 10]},
+                          lb=[-1.0, -1.8, -1.8, -1.8, -1.8], ub=[4.2, 2.5, 3.5, 3.5, 3.5]),
+}
+# Sampling-parameter box per sequencing model (log10); "None" is the null grid.
+_SEQ_BOUNDS = {"None": {'samp_lb': [0, 0], 'samp_ub': [0, 0], 'gridsize': [1, 1]},
+               "Bernoulli": {'samp_lb': [-8, -3], 'samp_ub': [-5, 0], 'gridsize': [6, 7]},
+               "Poisson": {'samp_lb': [-8, -3], 'samp_ub': [-5, 0], 'gridsize': [6, 7]}}
+
+
+def _closed_form_pgf(bio_model, g0, g1, params, xp=np, grad=False):
+    """log-PGF ``phi`` of the four closed-form two-species models at the mesh
+    points ``(g0, g1)``, written once against an array namespace ``xp`` so the
+    NumPy and torch paths evaluate the same expressions.  ``params`` are the
+    linear parameters, each broadcastable against ``g0`` (scalars on the CPU,
+    ``[G, 1]`` columns on the GPU).  With ``grad`` (NumPy only) also returns
+    the list of ``d phi / d log10(param)``."""
+    if bio_model == "Constitutive":
+        beta, gamma = params
+        phi = g0 / beta + g1 / gamma
+        if not grad:
+            return phi
+        return phi, [-g0 / beta * _LN10, -g1 / gamma * _LN10]
+    if bio_model == "Extrinsic":
+        alpha, beta, gamma = params
+        D = 1.0 - g0 / beta - g1 / gamma
+        phi = -alpha * xp.log(D)
+        if not grad:
+            return phi
+        return phi, [phi * _LN10, -alpha * g0 / (beta * D) * _LN10, -alpha * g1 / (gamma * D) * _LN10]
+    if bio_model == "DelayedSplicing":
+        b, tauinv, gamma = params
+        tau = 1.0 / tauinv
+        D0 = 1.0 - b * g0
+        D1 = 1.0 - b * g1
+        phi = b * g0 * tau / D0 - xp.log(D1) / gamma
+        if not grad:
+            return phi
+        return phi, [(g0 * tau / D0 ** 2 + g1 / (gamma * D1)) * b * _LN10,
+                     -b * g0 * tau / D0 * _LN10,
+                     xp.log(D1) / gamma * _LN10]
+    if bio_model == "Delay":
+        b, beta, tauinv = params
+        tau = 1.0 / tauinv
+        E = xp.exp(-beta * tau)
+        U = g1 + (g0 - g1) * E
+        A = 1.0 - b * U
+        B = 1.0 - b * g0
+        C = 1.0 - b * g1
+        logAB = xp.log(A / B)
+        phi = -xp.log(A) / beta + logAB / (beta * C) + tau * b * g1 / C
+        if not grad:
+            return phi
+        dA_dbeta = b * tau * (g0 - g1) * E
+        dA_dtau = b * beta * (g0 - g1) * E
+        dphi_db = (U / (A * beta) - U / (A * beta * C) + g0 / (B * beta * C)
+                   + logAB * g1 / (beta * C ** 2) + tau * g1 / C + tau * b * g1 ** 2 / C ** 2) * b * _LN10
+        dphi_dbeta = (xp.log(A) / beta ** 2 - dA_dbeta / (A * beta) + dA_dbeta / (A * beta * C)
+                      - logAB / (beta ** 2 * C)) * beta * _LN10
+        dphi_dtauinv = (-b * g1 * tau / C * (dA_dtau / (A * beta) + 1.0)) * _LN10
+        return phi, [dphi_db, dphi_dbeta, dphi_dtauinv]
+    raise ValueError(f"{bio_model!r} has no closed-form generating function")
+
+
+def _burst_characteristic(x, g0, g1, b, beta, gamma, grad=False):
+    """``U(t)`` of the Bursty and CIR characteristics at times ``x`` (Singh and
+    Bokes 2012; Gorin, Vastola, Fang and Pachter 2021), with the limiting form
+    at ``beta == gamma``; with ``grad`` also ``dU/dbeta`` and ``dU/dgamma``.
+    ``g0``, ``g1`` broadcast against ``x`` (a trailing time axis)."""
+    eb = np.exp(-beta * x)
+    eg = np.exp(-gamma * x)
+    if np.isclose(beta, gamma):
+        U = b * (g0 * eb + g1 * (beta * x * eg))
+        if not grad:
+            return U
+        return U, b * (-g0 * x * eb + g1 * x * eg), -b * g1 * beta * x ** 2 * eg
+    f = beta / (beta - gamma)
+    c2 = g1 * f
+    c1 = g0 - c2
+    U = b * (c1 * eb + c2 * eg)
+    if not grad:
+        return U
+    dU_dbeta = b * g1 * gamma / (beta - gamma) ** 2 * (eb - eg) - b * c1 * x * eb
+    dU_dgamma = b * g1 * beta / (beta - gamma) ** 2 * (eg - eb) - b * c2 * x * eg
+    return U, dU_dbeta, dU_dgamma
+
+
+def _burst_integrand(bio_model, U, xp=np):
+    """The integrand of the log-PGF time integral: ``U/(1-U)`` for Bursty,
+    ``(1 - sqrt(1-4U))/2`` for CIR."""
+    if bio_model == "Bursty":
+        return U / (1.0 - U)
+    return 0.5 * (1.0 - xp.sqrt(1.0 - 4.0 * U))
+
+
+def _quadrature_horizon(fixed_quad_T, beta, gamma):
+    """Upper limit of the Bursty/CIR time integral."""
+    return fixed_quad_T * (1.0 / beta + 1.0 / gamma + 1.0)
 
 
 def _format_direction(direction, min_weight=0.15):
@@ -512,19 +608,9 @@ class CMEModel:
             (the null sampling vector) means no dropout.
         """
         self.bio_model = bio_model
-        self.available_biomodels = (
-            "Delay",
-            "Bursty",
-            "Extrinsic",
-            "Constitutive",
-            "CIR",
-            "DelayedSplicing",
-            "ProteinBursty",
-            "Custom",
-            "Chromatin",
-        )
-        self.available_seqmodels = ("None", "Bernoulli", "Poisson")
-        self.available_ambmodels = ("None", "Equal", "Unequal")
+        self.available_biomodels = _BIO_MODELS
+        self.available_seqmodels = _SEQ_MODELS
+        self.available_ambmodels = _AMB_MODELS
 
         # Store the custom reaction network (required when bio_model == "Custom").
         if bio_model == "Custom":
@@ -553,103 +639,49 @@ class CMEModel:
             self.dropout_bounds = tuple(dropout_bounds)
             self.bursty = bool(bursty)
 
-        # Define the modalities used for each model, and their order.
-        CMEModel.available_model_modalities = {"Delay":['unspliced', 'spliced'],
-            "Bursty":['unspliced', 'spliced'],
-            "Extrinsic":['unspliced', 'spliced'],
-            "Constitutive":['unspliced', 'spliced'],
-            "CIR":['unspliced', 'spliced'],
-            "DelayedSplicing":['unspliced', 'spliced'],
-            "ProteinBursty":['unspliced', 'spliced', 'protein'],
-            "Chromatin":['unspliced', 'spliced', 'configuration']}
-
-        try:
-            self.model_modalities = CMEModel.available_model_modalities[self.bio_model]
-
-        except KeyError:
-            if self.bio_model == "Custom":
-                self.model_modalities = self.network.species
-            else:
-                log.error("Modalities unknown for model: {}".format(self.bio_model))
-
+        # Modalities (in order), expression filter and parameter box: from the
+        # family table for the built-in models, from the structure otherwise.
+        fam = _FAMILIES.get(self.bio_model)
+        if fam is not None:
+            self.model_modalities = list(fam["modalities"])
+            self.filter_bounds = {k: list(v) for k, v in fam["filt"].items()}
+            self.bio_bounds = {'phys_lb': list(fam["lb"]), 'phys_ub': list(fam["ub"])}
+        elif self.bio_model == "Custom":
+            # One filter entry per species with the mRNA defaults (override with
+            # filt_param= when a species lives on a different scale); burst sizes
+            # get the Bursty b range (down to the single-molecule limit for
+            # mean-rate bursts), rates and inverse delays the union of the beta
+            # and gamma ranges: the exponential integrator's cost does not
+            # depend on the spread.
+            net = self.network
+            n_sp = len(net.species)
+            self.model_modalities = net.species
+            self.filter_bounds = {'min_means': [0.01] * n_sp, 'max_maxes': [350] * n_sp, 'min_maxes': [4] * n_sp}
+            n_rates = len(net.delay_params) + len(net.rate_names)
+            self.bio_bounds = {'phys_lb': [-3.0 if net.burst_mean_rate else -1.0] * len(net.named_params) + [-1.8] * n_rates,
+                               'phys_ub': [4.2] * len(net.named_params) + [3.5] * n_rates}
+        elif self.bio_model == "Chromatin":
+            # k_on per site and the rule's mean production rates in units of
+            # k_off (the floor low enough for "no transcription in this
+            # configuration"); beta and gamma as Bursty; the burst size last
+            from . import chromatin as _chromatin
+            k = _chromatin.n_rule_params(self.rule, self.n_sites)
+            self.model_modalities = ['unspliced', 'spliced', 'configuration']
+            self.filter_bounds = {'min_means': [0.01, 0.01, 0.0], 'max_maxes': [350, 350, 2 ** self.n_sites],
+                                  'min_maxes': [4, 4, 0]}
+            self.bio_bounds = {'phys_lb': [-2.0] * self.n_sites + [-1.5] + [-4.0] * k + [-1.8, -1.8],
+                               'phys_ub': [2.0] * self.n_sites + [0.5] + [2.0] * k + [2.5, 3.5]}
+            if self.bursty:
+                self.bio_bounds['phys_lb'].append(-3.0)
+                self.bio_bounds['phys_ub'].append(2.0)
+        else:
+            raise ValueError(f"Please select a biological noise model from {_BIO_MODELS}; got {bio_model!r}")
         log.debug("Modalities for %s: %s", self.bio_model, self.model_modalities)
-
-        # TODO: make nascent and mature also detected automatically
-
-
-        # Define the expression filter each biophysical model.
-        # TODO: check reasonableness of these.
-        CMEModel.available_filter_bounds = {"Delay":{'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]},
-            "Bursty":{'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]},
-            "Extrinsic":{'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]},
-            "Constitutive":{'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]},
-            "CIR":{'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]},
-            "DelayedSplicing":{'min_means':[0.01, 0.01], 'max_maxes':[350, 350], 'min_maxes':[4,4]},
-            "ProteinBursty":{'min_means':[0.01, 0.01, 1], 'max_maxes':[350, 350, 1000], 'min_maxes':[4,4,10]}}
-        
-        try:
-            self.filter_bounds = CMEModel.available_filter_bounds[self.bio_model]
-            
-        except KeyError:
-            if self.bio_model == "Chromatin":
-                self.filter_bounds = {'min_means': [0.01, 0.01, 0.0], 'max_maxes': [350, 350, 2 ** self.n_sites],
-                                      'min_maxes': [4, 4, 0]}
-            elif self.bio_model == "Custom":
-                # One entry per species, with the mRNA defaults; override with
-                # filt_param= in extract_data / perform_inference when a species
-                # (a protein, say) lives on a different scale.
-                n_sp = len(self.network.species)
-                self.filter_bounds = {'min_means': [0.01] * n_sp, 'max_maxes': [350] * n_sp,
-                                      'min_maxes': [4] * n_sp}
-            else:
-                log.info("Biophysical bounds unknown for model: {}".format(self.bio_model))
-            
-            
-        # Define the parameter bounds used for each biophysical model.
-        # TODO: check reasonableness of these bounds.
-        CMEModel.available_bio_bounds = {"Delay":{'phys_lb':[-1.0, -1.8, -1.8 ], 'phys_ub':[4.2, 2.5, 3.5]},
-            "Bursty":{'phys_lb':[-1.0, -1.8, -1.8 ], 'phys_ub':[4.2, 2.5, 3.5]},
-            "Extrinsic":{'phys_lb':[-1.0, -1.8, -1.8 ], 'phys_ub':[4.2, 2.5, 3.5]},
-            "Constitutive":{'phys_lb':[-1.8, -1.8 ], 'phys_ub':[2.5, 3.5]},
-            "CIR":{'phys_lb':[-1.0, -1.8, -1.8 ], 'phys_ub':[4.2, 2.5, 3.5]},
-            "DelayedSplicing":{'phys_lb':[-1.0, -1.8, -1.8 ], 'phys_ub':[4.2, 2.5, 3.5]},
-            "ProteinBursty":{'phys_lb':[-1.0, -1.8, -1.8, -1.8, -1.8], 'phys_ub':[4.2, 2.5, 3.5, 3.5, 3.5]}}
-        
-        try:
-            self.bio_bounds = CMEModel.available_bio_bounds[self.bio_model]
-            
-        except KeyError:
-            if self.bio_model == "Chromatin":
-                # k_on per site and the rule's mean production rates in units of
-                # k_off (the floor low enough for "no transcription in this
-                # configuration"); beta and gamma as Bursty; the burst size last
-                from . import chromatin as _chromatin
-                k = _chromatin.n_rule_params(self.rule, self.n_sites)
-                self.bio_bounds = {'phys_lb': [-2.0] * self.n_sites + [-1.5] + [-4.0] * k + [-1.8, -1.8],
-                                   'phys_ub': [2.0] * self.n_sites + [0.5] + [2.0] * k + [2.5, 3.5]}
-                if self.bursty:
-                    self.bio_bounds['phys_lb'].append(-3.0)
-                    self.bio_bounds['phys_ub'].append(2.0)
-            elif self.bio_model == "Custom":
-                # Burst sizes get the Bursty b range; rates and inverse delays
-                # span the union of the Bursty beta and gamma ranges.  The
-                # exponential integrator's cost does not depend on the spread.
-                net = self.network
-                n_rates = len(net.delay_params) + len(net.rate_names)
-                # mean-rate bursts reach down to the single-molecule limit
-                lb = [-3.0 if net.burst_mean_rate else -1.0] * len(net.named_params) + [-1.8] * n_rates
-                ub = [4.2] * len(net.named_params) + [3.5] * n_rates
-                self.bio_bounds = {'phys_lb': lb, 'phys_ub': ub}
-            else:
-                log.info("Biophysical bounds unknown for model: {}".format(self.bio_model))
 
         if amb_model in ["None", None, "Null"]:
             amb_model = "None"
-        CMEModel.available_amb_models = ("None", "Equal", "Unequal")
-        if amb_model not in CMEModel.available_amb_models:
-            raise ValueError(
-                f"amb_model must be one of {CMEModel.available_amb_models}; got {amb_model!r}"
-            )
+        if amb_model not in _AMB_MODELS:
+            raise ValueError(f"amb_model must be one of {_AMB_MODELS}; got {amb_model!r}")
         self.amb_model = amb_model
         if seq_model in ["None", None, "Null"]:
             self.seq_model = "None"
@@ -659,31 +691,22 @@ class CMEModel:
             fixed_quad_T, quad_order, quad_vec_T, quad_method
         )
         
-        if self.bio_model in ("ProteinBursty", "Custom"):
+        if self.bio_model == "ProteinBursty":
+            # min_fudge / max_fudge are accepted and ignored (step control is by
+            # error since 0.4.0); the Rust kernels still take them as constants.
             self.protein_limit = protein_limit
             self.fit_unspliced = fit_unspliced
-            self.min_fudge = min_fudge
-            self.max_fudge = max_fudge
-            if self.bio_model == "ProteinBursty":
-                log.info("Protein grid limit: {}".format(self.protein_limit))
-            
-        # Define the parameter bounds used for each technical noise model.
-        # TODO: check reasonableness of these bounds.
-        CMEModel.available_seq_bounds = {"None":{'samp_lb':[1, 1],'samp_ub':[1, 1],'gridsize':[1, 1]}, 
-                                         "Bernoulli":{'samp_lb':[-8, -3], 'samp_ub':[-5, 0],'gridsize':[6, 7]}, 
-                                         "Poisson":{'samp_lb':[-8, -3], 'samp_ub':[-5, 0],'gridsize':[6, 7]}}
-        
-        try:
-            self.seq_bounds = CMEModel.available_seq_bounds[self.seq_model]
-        except KeyError:
-            log.info("Technical sequencing bounds unknown for model: {}".format(self.seq_model))
+            log.info("Protein grid limit: {}".format(self.protein_limit))
+
+        if self.seq_model not in _SEQ_BOUNDS:
+            raise ValueError(f"seq_model must be one of {_SEQ_MODELS}; got {self.seq_model!r}")
+        self.seq_bounds = {k: list(v) for k, v in _SEQ_BOUNDS[self.seq_model].items()}
         if self.bio_model == "Chromatin":
             # a third sampling parameter: log10 ATAC dropout per open site on the configuration axis
             lo, hi, ng = self.dropout_bounds
-            base = self.seq_bounds if self.seq_model != "None" else {'samp_lb': [0, 0], 'samp_ub': [0, 0], 'gridsize': [1, 1]}
-            self.seq_bounds = {'samp_lb': list(base['samp_lb']) + [float(lo)],
-                               'samp_ub': list(base['samp_ub']) + [float(hi)],
-                               'gridsize': list(base['gridsize']) + [int(ng)]}
+            self.seq_bounds['samp_lb'].append(float(lo))
+            self.seq_bounds['samp_ub'].append(float(hi))
+            self.seq_bounds['gridsize'].append(int(ng))
         
         # Get all biological and technical parameters.
         self.param_str = self.get_log_name_str()
@@ -804,10 +827,9 @@ class CMEModel:
             "quad_order": int(self.quad_order),
             "quad_vec_T": float(self.quad_vec_T),
         }
-        for k in ("protein_limit", "fit_unspliced", "min_fudge", "max_fudge"):
-            if hasattr(self, k):
-                v = getattr(self, k)
-                d[k] = bool(v) if isinstance(v, (bool, np.bool_)) else float(v)
+        if self.bio_model == "ProteinBursty":
+            d["protein_limit"] = float(self.protein_limit)
+            d["fit_unspliced"] = bool(self.fit_unspliced)
         if getattr(self, "network", None) is not None:
             d["network"] = self.network.network_str
             d["normalize_production_rate"] = bool(self.network.normalize_production_rate)
@@ -843,24 +865,8 @@ class CMEModel:
         numpars: int
             The number of gene-specific parameters.
         """
-        numpars = 0
-        if self.bio_model == "Constitutive":
-            numpars += 2
-        elif self.bio_model == "ProteinBursty":
-            numpars += 5
-        elif self.bio_model == "Custom":
-            numpars += len(self.network.all_params)
-        elif self.bio_model == "Chromatin":
-            from . import chromatin as _chromatin
-            numpars += self.n_sites + 1 + _chromatin.n_rule_params(self.rule, self.n_sites) + 2 + int(self.bursty)
-        else:
-            numpars += 3
-            
-        if self.amb_model == "Equal":
-            numpars += 1
-        elif self.amb_model == "Unequal":
-            numpars += 2
-        return numpars
+        # the parameter list is the single source of the count
+        return len(getattr(self, "param_str", None) or self.get_log_name_str())
 
     def eval_model_logL(self, p, limits, samp, data, n_cells, EPS=1e-15):
         """Compute the log-likelihood of data under a set of parameters.
@@ -883,30 +889,17 @@ class CMEModel:
         logL: float
             log-likelihood.
         """
-        be = self._backend(samp)
-        if _HAS_RUST and be.family == "2d":
-            x, f = data
-            x_np = np.asarray(x, dtype=np.int64)
-            return _mc.eval_logl_2d(
-                self.bio_model,
-                np.asarray(p, dtype=float).tolist(),
-                [int(v) for v in limits],
-                x_np[:, 0].tolist(),
-                x_np[:, 1].tolist(),
-                np.asarray(f, dtype=float).tolist(),
-                float(n_cells),
-                float(self.fixed_quad_T),
-                int(self.quad_order),
-                be.samp,
-                float(EPS),
-                self.seq_model,
-            )
+        # logL = n_cells * (sum f log f - KLD): one kernel for both quantities.
+        f = np.asarray(data[1], dtype=float)
+        entropy = float(np.sum(f * np.log(f)))
+        return n_cells * (entropy - self.eval_model_kld(p, limits, samp, data, EPS))
 
+    def _rust_2d_args(self, p, limits, data):
+        """``(p, limits, x0, x1, f)`` as the 2-D Rust kernels take them."""
         x, f = data
-        proposal = self.eval_model_pss(p, limits, samp)
-        proposal[proposal < EPS] = EPS
-        proposal = proposal[tuple(x.T)]
-        return np.sum(np.log(proposal) * f * n_cells)
+        x_np = np.asarray(x, dtype=np.int64)
+        return (np.asarray(p, dtype=float).tolist(), [int(v) for v in limits],
+                x_np[:, 0].tolist(), x_np[:, 1].tolist(), np.asarray(f, dtype=float).tolist())
 
     def eval_model_kld(self, p, limits, samp, data, EPS=1e-15):
         """Compute the Kullback-Leibler divergence between data and a fit.
@@ -933,20 +926,9 @@ class CMEModel:
         # Python round-trip for histogram indexing and log/sum operations.
         be = self._backend(samp)
         if _HAS_RUST and be.family == "2d":
-            x, f = data
-            x_np = np.asarray(x, dtype=np.int64)
             return _mc.eval_kld_2d(
-                self.bio_model,
-                np.asarray(p, dtype=float).tolist(),
-                [int(v) for v in limits],
-                x_np[:, 0].tolist(),
-                x_np[:, 1].tolist(),
-                np.asarray(f, dtype=float).tolist(),
-                float(self.fixed_quad_T),
-                int(self.quad_order),
-                be.samp,
-                float(EPS),
-                self.seq_model,
+                self.bio_model, *self._rust_2d_args(p, limits, data),
+                float(self.fixed_quad_T), int(self.quad_order), be.samp, float(EPS), self.seq_model,
             )
 
         x, f = data
@@ -1004,12 +986,9 @@ class CMEModel:
         # pure algebra — fast and exact, always preferred over FD.
         # Quadrature-based models (Bursty, CIR) require a quadrature pass in Python
         # which is slower than the Rust FD path; use them only when Rust is unavailable.
-        _FAST_ANALYTIC_MODELS = {"Constitutive", "Extrinsic",
-                                  "Delay", "DelayedSplicing"}
-        _QUAD_ANALYTIC_MODELS = {"Bursty", "CIR"}
         _use_analytic = (
-            self.bio_model in _FAST_ANALYTIC_MODELS
-            or (self.bio_model in _QUAD_ANALYTIC_MODELS and not _HAS_RUST)
+            self.bio_model in _CLOSED_FORM_MODELS
+            or (self.bio_model in _QUADRATURE_MODELS and not _HAS_RUST)
         )
         if (_use_analytic
                 and self.amb_model == "None"):
@@ -1021,20 +1000,9 @@ class CMEModel:
         # (rayon, GIL released), eliminating the Python round-trip per perturbation.
         be = self._backend(samp)
         if _HAS_RUST and be.family == "2d" and self.seq_model in ("None", "Poisson"):
-            x, f_data = data
-            x_np = np.asarray(x, dtype=np.int64)
             kld0, grad_list = _mc.eval_kld_grad_2d(
-                self.bio_model,
-                p.tolist(),
-                [int(v) for v in limits],
-                x_np[:, 0].tolist(),
-                x_np[:, 1].tolist(),
-                np.asarray(f_data, dtype=float).tolist(),
-                float(self.fixed_quad_T),
-                int(self.quad_order),
-                eps,
-                be.samp,
-                float(EPS),
+                self.bio_model, *self._rust_2d_args(p, limits, data),
+                float(self.fixed_quad_T), int(self.quad_order), eps, be.samp, float(EPS),
             )
             return kld0, np.array(grad_list)
 
@@ -1052,8 +1020,7 @@ class CMEModel:
                     np.asarray(f_data, dtype=float).tolist(),
                     bool(self.fit_unspliced),
                     float(self.protein_limit),
-                    float(self.min_fudge),
-                    float(self.max_fudge),
+                    _PROTEIN_FUDGE[0], _PROTEIN_FUDGE[1],
                     float(eps),
                     float(EPS),
                     None if outer is None else [float(x) for x in np.asarray(outer, dtype=float)],
@@ -1127,7 +1094,6 @@ class CMEModel:
 
         Returns (kld, grad) or None to signal fallback to finite differences.
         """
-        LN10 = np.log(10.0)
         p_lin = 10.0 ** p
 
         # Build mesh (reads from cache; no copy needed since g is read-only here).
@@ -1146,141 +1112,34 @@ class CMEModel:
 
         g0, g1 = g[0], g[1]
 
-        # Compute log-PGF (phi) and its gradient w.r.t. each log10 parameter.
-        if self.bio_model == "Constitutive":
-            beta, gamma = p_lin
-            phi = g0 / beta + g1 / gamma
-            dphi = [
-                -g0 / beta * LN10,   # d phi / d log10(beta)
-                -g1 / gamma * LN10,  # d phi / d log10(gamma)
-            ]
-        elif self.bio_model == "Extrinsic":
-            alpha, beta, gamma = p_lin
-            D = 1.0 - g0 / beta - g1 / gamma
-            phi = -alpha * np.log(D)
-            dphi = [
-                phi * LN10,                          # d phi / d log10(alpha)
-                -alpha * g0 / (beta * D) * LN10,    # d phi / d log10(beta)
-                -alpha * g1 / (gamma * D) * LN10,   # d phi / d log10(gamma)
-            ]
-        elif self.bio_model == "DelayedSplicing":
-            b, tauinv, gamma = p_lin
-            tau = 1.0 / tauinv
-            D0 = 1.0 - b * g0
-            D1 = 1.0 - b * g1
-            phi = b * g0 * tau / D0 - np.log(D1) / gamma
-            dphi = [
-                (g0 * tau / D0 ** 2 + g1 / (gamma * D1)) * b * LN10,
-                -b * g0 * tau / D0 * LN10,
-                np.log(D1) / gamma * LN10,
-            ]
-        elif self.bio_model == "Delay":
-            b, beta, tauinv = p_lin
-            tau = 1.0 / tauinv
-            E = np.exp(-beta * tau)
-            U = g1 + (g0 - g1) * E
-            A = 1.0 - b * U
-            B = 1.0 - b * g0
-            C = 1.0 - b * g1
-            phi = -np.log(A) / beta + np.log(A / B) / (beta * C) + tau * b * g1 / C
-            logAB = np.log(A / B)
-            # dA/dbeta via dU/dbeta = (g0-g1)*(-tau)*E
-            dA_dbeta = b * tau * (g0 - g1) * E
-            # dA/dtau  via dU/dtau  = (g0-g1)*(-beta)*E
-            dA_dtau = b * beta * (g0 - g1) * E
-            # d phi / d b  (A, B, C all depend on b; U does not)
-            dphi_db = (
-                U / (A * beta)
-                - U / (A * beta * C)
-                + g0 / (B * beta * C)
-                + logAB * g1 / (beta * C ** 2)
-                + tau * g1 / C
-                + tau * b * g1 ** 2 / C ** 2
-            ) * b * LN10
-            # d phi / d beta  (B, C do not depend on beta)
-            dphi_dbeta = (
-                np.log(A) / beta ** 2
-                - dA_dbeta / (A * beta)
-                + dA_dbeta / (A * beta * C)
-                - logAB / (beta ** 2 * C)
-            ) * beta * LN10
-            # d phi / d tauinv:
-            #   d phi / d tau  = b*g1/C * (dA_dtau/(A*beta) + 1)
-            #   d phi / d tauinv = d phi / d tau * (-tau^2)
-            #   dphi_dtauinv   = d phi / d tauinv * tauinv * LN10
-            #                  = -b*g1*tau/C * (dA_dtau/(A*beta) + 1) * LN10
-            dphi_dtauinv = (
-                -b * g1 * tau / C * (dA_dtau / (A * beta) + 1.0)
-            ) * LN10
-            dphi = [dphi_db, dphi_dbeta, dphi_dtauinv]
-        elif self.bio_model in ("Bursty", "CIR"):
-            # Semi-analytical gradient via the same Gauss-Legendre quadrature used
-            # for the PSS.  phi = integral of integrand(U) dt over [0,T] where
-            #   Bursty:  integrand = U / (1 - U)
-            #   CIR:     integrand = (1/2) * (1 - sqrt(1 - 4*U))
-            # and U(t) = b * (c1*exp(-beta*t) + c2*exp(-gamma*t)).
-            # All three d phi / d log10(param) integrals are accumulated in the
-            # same quadrature loop — no extra function evaluations.
+        # log-PGF phi and d phi / d log10(param) for every parameter.
+        if self.bio_model in _CLOSED_FORM_MODELS:
+            phi, dphi = _closed_form_pgf(self.bio_model, g0, g1, list(p_lin), grad=True)
+        elif self.bio_model in _QUADRATURE_MODELS:
+            # Semi-analytical gradient on the same Gauss-Legendre nodes as the
+            # PSS: phi = integral of the integrand of U(t) over [0, T], and the
+            # three d phi / d log10(param) integrals share the nodes.
             if self.quad_method != "fixed_quad":
                 return None  # quad_vec integration: fall back to FD
             from numpy.polynomial.legendre import leggauss
             b, beta, gamma = p_lin
-            T = self.fixed_quad_T * (1.0 / beta + 1.0 / gamma + 1.0)
-            t_half = T / 2.0
+            t_half = _quadrature_horizon(self.fixed_quad_T, beta, gamma) / 2.0
             xi, wi = leggauss(self.quad_order)
-            x = t_half + t_half * xi   # (Q,) quadrature points in [0, T]
-            w_T = t_half * wi           # (Q,) weights (Jacobian of [0,T] transform)
-
-            # Frequency-mesh arrays g0, g1 have shape (N_freq,); broadcast to
-            # (N_freq, 1) so they multiply cleanly against (Q,) arrays.
-            g0e = g0[:, None]          # (N_freq, 1)
-            g1e = g1[:, None]          # (N_freq, 1)
-            eb = np.exp(-beta  * x)    # (Q,)
-            eg = np.exp(-gamma * x)    # (Q,)
-
-            if np.isclose(beta, gamma):
-                # Limiting form as gamma -> beta to avoid cancellation.
-                # U = b * (g0 * exp(-beta*t) + g1 * beta * t * exp(-gamma*t))
-                U = b * (g0e * eb + g1e * (beta * x * eg))  # (N_freq, Q)
-                # dU/dbeta: differentiate b*(g0*exp(-beta*t) + g1*beta*t*exp(-gamma*t)) w.r.t. beta
-                #   d/dbeta[g0*exp(-beta*t)] = -g0*t*exp(-beta*t)
-                #   d/dbeta[g1*beta*t*exp(-gamma*t)] = g1*t*exp(-gamma*t)  (gamma fixed)
-                dU_dbeta  = b * (-g0e * x * eb + g1e * x * eg)
-                # dU/dgamma = b * g1 * beta * t * (-t) * eg = -b*g1*beta*t^2*eg
-                dU_dgamma = -b * g1e * beta * x**2 * eg
-            else:
-                f  = beta / (beta - gamma)
-                c2 = g1e * f            # (N_freq, 1)
-                c1 = g0e - c2           # (N_freq, 1)
-                U  = b * (c1 * eb + c2 * eg)  # (N_freq, Q)
-                # ∂c2/∂beta = g1 * (-gamma/(beta-gamma)^2)
-                # ∂c1/∂beta = -∂c2/∂beta = g1 * gamma/(beta-gamma)^2
-                bg2 = b * g1e * gamma / (beta - gamma)**2
-                dU_dbeta  = bg2 * (eb - eg) - b * c1 * x * eb
-                # ∂c2/∂gamma = g1 * beta/(beta-gamma)^2
-                # ∂c1/∂gamma = -∂c2/∂gamma
-                bb2 = b * g1e * beta / (beta - gamma)**2
-                dU_dgamma = bb2 * (eg - eb) - b * c2 * x * eg
-
+            x = t_half + t_half * xi                                        # (Q,) nodes in [0, T]
+            w_T = t_half * wi                                               # (Q,) weights
+            U, dU_dbeta, dU_dgamma = _burst_characteristic(x, g0[:, None], g1[:, None], b, beta, gamma, grad=True)
             if self.bio_model == "Bursty":
-                # phi = integral U/(1-U) dt;  d(integrand)/dU = 1/(1-U)^2
-                inv1mU    = 1.0 / (1.0 - U)            # (N_freq, Q)
-                phi       = (U * inv1mU     * w_T).sum(axis=1)  # (N_freq,)
-                d_intg_dU = inv1mU**2                   # (N_freq, Q)
-            else:  # CIR
-                # phi = (1/2) * integral (1 - sqrt(1-4U)) dt;
-                # d(integrand)/dU = 2/sqrt(1-4U)
-                sqrt_term = np.sqrt(1.0 - 4.0 * U)     # (N_freq, Q)
-                phi       = 0.5 * ((1.0 - sqrt_term) * w_T).sum(axis=1)
-                d_intg_dU = 2.0 / sqrt_term             # (N_freq, Q)  [× 1/2 from phi]
-                d_intg_dU = d_intg_dU * 0.5             # absorb the 1/2 prefactor
-
-            # d phi / d log10(param) = param_lin * LN10 * integral d(integrand)/dU * dU/d(param_lin) dt
-            # For b: dU/db = U/b, so param_lin * dU/d(param_lin) = b * (U/b) = U.
-            dphi_db     = LN10         * (d_intg_dU * U         * w_T).sum(axis=1)
-            dphi_dbeta  = beta  * LN10 * (d_intg_dU * dU_dbeta  * w_T).sum(axis=1)
-            dphi_dgamma = gamma * LN10 * (d_intg_dU * dU_dgamma * w_T).sum(axis=1)
-            dphi = [dphi_db, dphi_dbeta, dphi_dgamma]
+                inv1mU = 1.0 / (1.0 - U)
+                phi = (U * inv1mU * w_T).sum(axis=1)
+                d_intg_dU = inv1mU ** 2
+            else:
+                sqrt_term = np.sqrt(1.0 - 4.0 * U)
+                phi = 0.5 * ((1.0 - sqrt_term) * w_T).sum(axis=1)
+                d_intg_dU = 1.0 / sqrt_term                                 # (1/2) * 2 / sqrt
+            # d phi / d log10(param) = param * LN10 * integral d(integrand)/dU * dU/dparam; dU/db = U/b
+            dphi = [_LN10 * (d_intg_dU * U * w_T).sum(axis=1),
+                    beta * _LN10 * (d_intg_dU * dU_dbeta * w_T).sum(axis=1),
+                    gamma * _LN10 * (d_intg_dU * dU_dgamma * w_T).sum(axis=1)]
         else:
             return None  # unsupported model
 
@@ -1626,7 +1485,7 @@ class CMEModel:
             fixed = getattr(self, "_fixed_protein_schedule", None)
             pss_flat, steps = _mc.eval_model_pss_protein_bursty_sched(
                 p.tolist(), [int(x) for x in limits], bool(self.fit_unspliced),
-                float(self.protein_limit), float(self.min_fudge), float(self.max_fudge),
+                float(self.protein_limit), _PROTEIN_FUDGE[0], _PROTEIN_FUDGE[1],
                 None if fixed is None else [float(x) for x in np.asarray(fixed, dtype=float)],
             )
             self._last_protein_schedule = np.asarray(steps, dtype=float)
@@ -1865,51 +1724,18 @@ class CMEModel:
             generating function values at each argument.
         """
         p = 10**p_
-        if self.bio_model == "Constitutive":  # constitutive production
-            beta, gamma = p
-            gf = g[0] / beta + g[1] / gamma
-        elif self.bio_model == "Bursty":  # bursty production
+        if self.bio_model in _CLOSED_FORM_MODELS:
+            gf = _closed_form_pgf(self.bio_model, g[0], g[1], list(p))
+        elif self.bio_model in _QUADRATURE_MODELS:
             b, beta, gamma = p
-            fun = lambda x: self.burst_intfun(x, g, b, beta, gamma)
+            g2 = np.asarray(g)[:, :, None]                                   # a trailing time axis
+            fun = lambda x: _burst_integrand(self.bio_model, _burst_characteristic(x, g2[0], g2[1], b, beta, gamma))
             if self.quad_method == "quad_vec":
-                T = self.quad_vec_T * (1 / beta + 1 / gamma + 1)
-                gf = scipy.integrate.quad_vec(fun, 0, T)[0]
+                gf = scipy.integrate.quad_vec(fun, 0, _quadrature_horizon(self.quad_vec_T, beta, gamma))[0]
             elif self.quad_method == "fixed_quad":
-                T = self.fixed_quad_T * (1 / beta + 1 / gamma + 1)
-                gf = scipy.integrate.fixed_quad(fun, 0, T, n=self.quad_order)[0]
+                gf = scipy.integrate.fixed_quad(fun, 0, _quadrature_horizon(self.fixed_quad_T, beta, gamma), n=self.quad_order)[0]
             else:
                 raise ValueError("Please use one of the specified quadrature methods.")
-        elif (
-            self.bio_model == "Extrinsic"
-        ):  # constitutive production with extrinsic noise
-            alpha, beta, gamma = p
-            gf = -alpha * np.log(1 - g[0] / beta - g[1] / gamma)
-        elif self.bio_model == "Delay":  # bursty production with delayed degradation
-            b, beta, tauinv = p
-            tau = 1 / tauinv
-            U = g[1] + (g[0] - g[1]) * np.exp(-beta * tau)
-            gf = (
-                -1 / beta * np.log(1 - b * U)
-                + 1 / beta / (1 - b * g[1]) * np.log((b * U - 1) / (b * g[0] - 1))
-                + tau * b * g[1] / (1 - b * g[1])
-            )
-        elif self.bio_model == "DelayedSplicing":
-            b, tauinv, gamma = p
-            tau = 1 / tauinv
-            gf = tau * b * g[0] / (1 - b * g[0]) - 1 / gamma * np.log(1 - b * g[1])
-            
-        elif self.bio_model == "CIR":  # CIR-like:
-            b, beta, gamma = p
-            fun = lambda x: self.cir_intfun(x, g, b, beta, gamma)
-            if self.quad_method == "quad_vec":
-                T = self.quad_vec_T * (1 / beta + 1 / gamma + 1)
-                gf = scipy.integrate.quad_vec(fun, 0, T)[0]
-            elif self.quad_method == "fixed_quad":
-                T = self.fixed_quad_T * (1 / beta + 1 / gamma + 1)
-                gf = scipy.integrate.fixed_quad(fun, 0, T, n=self.quad_order)[0]
-            else:
-                raise ValueError("Please use one of the specified quadrature methods.")
-            gf /= 2
 
         elif self.bio_model == "ProteinBursty":  # bursty production
             gf = self.protein_pgf(g, p)
@@ -2051,76 +1877,16 @@ class CMEModel:
         return phi
 
     def cir_intfun(self, x, g, b, beta, gamma):
-        """Evaluates the inverse Gaussian-driven CME process integrand at time x.
-
-        This solution was reported by Gorin*, Vastola*, Fang, and Pachter (2021).
-        It is a helper function for the CIR-like biological model.
-
-        Parameters
-        ----------
-        x: float np.ndarray or float
-            time or array of times to evaluate the integrand at.
-        g: np.ndarray
-            complex PGF arguments, adjusted for sampling.
-        b: float
-            burst size-like parameter.
-        beta: float
-            splicing rate.
-        gamma: float
-            degradation rate.
-
-        Returns
-        -------
-        _: np.ndarray
-            integrand value.
-        """
+        """The CIR log-PGF integrand ``1 - sqrt(1 - 4U)`` at times ``x`` (the
+        half in the log-PGF is applied by the caller); ``g`` the complex mesh
+        arguments.  See :func:`_burst_characteristic`."""
         g = np.asarray(g)[:, :, None]
-        if np.isclose(beta, gamma):  # compute prefactors for the ODE characteristics.
-            c_1 = g[0]  # nascent
-            c_2 = x * beta * g[1]
-        else:
-            f = beta / (beta - gamma)
-            c_2 = g[1] * f
-            c_1 = g[0] - c_2
-
-        U = b * (np.exp(-beta * x) * c_1 + np.exp(-gamma * x) * c_2)
-        return 1 - np.sqrt(1 - 4 * U)
+        return 1 - np.sqrt(1 - 4 * _burst_characteristic(x, g[0], g[1], b, beta, gamma))
 
     def burst_intfun(self, x, g, b, beta, gamma):
-        """Evaluates the bursty CME process integrand at time x.
-
-        This solution was reported by Singh and Bokes (2012).
-        It is a helper function for the bursty biological model.
-
-        Parameters
-        ----------
-        x: float np.ndarray or float
-            time or array of times to evaluate the integrand at.
-        g: np.ndarray
-            complex PGF arguments, adjusted for sampling.
-        b: float
-            burst size.
-        beta: float
-            splicing rate.
-        gamma: float
-            degradation rate.
-
-        Returns
-        -------
-        _: np.ndarray
-            integrand value.
-        """
-        g = np.asarray(g)[:,:,None]
-        if np.isclose(beta, gamma):  # compute prefactors for the ODE characteristics.
-            c_1 = g[0]  # nascent
-            c_2 = x * beta * g[1]
-        else:
-            f = beta / (beta - gamma)
-            c_2 = g[1] * f
-            c_1 = g[0] - c_2
-
-        U = b * (np.exp(-beta * x) * c_1 + np.exp(-gamma * x) * c_2)
-        return U / (1 - U)
+        """The bursty log-PGF integrand ``U / (1 - U)`` at times ``x``."""
+        g = np.asarray(g)[:, :, None]
+        return _burst_integrand("Bursty", _burst_characteristic(x, g[0], g[1], b, beta, gamma))
 
     def get_MoM(self, moments, lb_log, ub_log, samp=None, hist=None, limits=None):
         """Compute method of moments parameter estimates.
@@ -2182,69 +1948,37 @@ class CMEModel:
         S_var, S_mean = moments['MOM_spliced_var'], moments['MOM_spliced_mean']
 
         if self.bio_model == "Bursty" or self.bio_model == "CIR":
-            b = (U_var / U_mean - 1) if U_mean > 0 else 1.0
-            if not np.isfinite(b):
-                b = 1.0
-            
-            if self.seq_model == "Bernoulli":
-                b /= samp[0]
-            elif self.seq_model == "Poisson":
-                b = b / samp[0] - 1
-
-            b = np.clip(b, lb[0], ub[0])
+            b = np.clip(self._mom_burst_size(U_var, U_mean, samp), lb[0], ub[0])
             beta = b / U_mean
             gamma = b / S_mean
             x0 = np.asarray([b, beta, gamma])
             
         elif self.bio_model == "ProteinBursty":
             U_var, U_mean, S_mean, P_mean, UP_covar = moments["MOM_unspliced_var"], moments["MOM_unspliced_mean"], moments["MOM_spliced_mean"], moments["MOM_protein_mean"], moments["MOM_cov_unspliced_protein"]
-            b = (U_var / U_mean - 1) if U_mean > 0 else 1.0
-            if not np.isfinite(b):
-                b = 1.0
-            if self.seq_model == "Bernoulli":
-                b /= samp[0]
-            elif self.seq_model == "Poisson":
-                b = b / samp[0] - 1
-
-            b = np.clip(b, lb[0], ub[0])
+            b = np.clip(self._mom_burst_size(U_var, U_mean, samp), lb[0], ub[0])
             beta = b / U_mean
             gamma = b / S_mean
 
-            # TODO: add protein moments to the list of moments.
             # Define r = k_p/gamma_p
             r = P_mean*gamma/b
             C = UP_covar
             gamma_p = C*(beta + gamma)*beta/(b**2*r - C*(beta + gamma))
             gamma_p = np.clip(gamma_p, lb[4], ub[4])
             k_p = np.clip(r*gamma_p, lb[3], ub[3])
-            gammap = k_p/r
             x0 = np.asarray([b, beta, gamma, k_p, gamma_p])
 
         elif self.bio_model == "Delay":
-            b = U_var / U_mean - 1
-
-            if self.seq_model == "Bernoulli":
-                b /= samp[0]
-            elif self.seq_model == "Poisson":
-                b = b / samp[0] - 1
-
-            b = np.clip(b, lb[0], ub[0])
+            b = np.clip(self._mom_burst_size(U_var, U_mean, samp), lb[0], ub[0])
             beta = b / U_mean
             tauinv = b / S_mean
             x0 = np.asarray([b, beta, tauinv])
 
         elif self.bio_model == "DelayedSplicing":
-            # b = moments["S_var"] / moments["S_mean"] - 1
-            b = (U_var / U_mean - 1) / 2
-            b = np.clip(b, lb[0], ub[0])
+            # the nascent Fano excess splits between the burst and the delay
+            b = np.clip(self._mom_burst_size(U_var, U_mean, samp, half=True), lb[0], ub[0])
             tauinv = b / U_mean
             gamma = b / S_mean
             x0 = np.asarray([b, tauinv, gamma])
-
-            if self.seq_model == "Bernoulli":
-                b /= 2*samp[0]
-            elif self.seq_model == "Poisson":
-                b = b / samp[0] - (1/2)
 
         elif self.bio_model == "Constitutive":
             beta = 1 / U_mean
@@ -2290,7 +2024,22 @@ class CMEModel:
             )  # last resort -- makes it nondeterministic though
         return x0
 
-    # TODO: Add ProteinBursty
+    def _mom_burst_size(self, U_var, U_mean, samp, half=False):
+        """Moments estimate of the burst size from the nascent Fano factor,
+        corrected for the sequencing model (``samp`` linear); ``half`` for the
+        DelayedSplicing model, where the delay takes half of the excess.  A
+        degenerate gene (no nascent counts, or a non-finite ratio) gives 1."""
+        b = (U_var / U_mean - 1) if U_mean > 0 else 1.0
+        if not np.isfinite(b):
+            b = 1.0
+        if half:
+            b = b / 2
+        if self.seq_model == "Bernoulli":
+            b = b / samp[0] / (2 if half else 1)
+        elif self.seq_model == "Poisson":
+            b = b / samp[0] - (0.5 if half else 1)
+        return b
+
     def eval_model_noise(self, p_, samp=None):
         """Compute CV2 fractions due to intrinsic, extrinsic, and technical noise.
 
@@ -2315,39 +2064,21 @@ class CMEModel:
 
         """
         p = 10**p_
-        if self.bio_model == "Constitutive":  # constitutive production
+        # means and the extrinsic CV2 per species, per family
+        if self.bio_model == "Constitutive":
             beta, gamma = p
-            mu = [1 / beta, 1 / gamma]
-        elif self.bio_model == "Bursty":  # bursty production
+            mu, noise_ext = [1 / beta, 1 / gamma], [0, 0]
+        elif self.bio_model in ("Bursty", "CIR"):
             b, beta, gamma = p
-            mu = [b / beta, b / gamma]
-        elif (
-            self.bio_model == "Extrinsic"
-        ):  # constitutive production with extrinsic noise
+            mu, noise_ext = [b / beta, b / gamma], [beta, beta * gamma / (beta + gamma)]
+        elif self.bio_model == "Extrinsic":
             alpha, beta, gamma = p
-            mu = [alpha / beta, alpha / gamma]
-        elif self.bio_model == "Delay":  # bursty production with delayed degradation
-            raise ValueError("Not yet implemented!")
-        elif self.bio_model == "CIR":  # CIR-like:
-            b, beta, gamma = p
-            mu = [b / beta, b / gamma]
-
-        mu = np.asarray(mu)
+            mu, noise_ext = [alpha / beta, alpha / gamma], [1 / alpha, 1 / alpha]
+        else:
+            raise NotImplementedError(f"eval_model_noise is defined for Constitutive, Bursty, CIR and Extrinsic, not {self.bio_model}")
+        mu = np.asarray(mu, dtype=float)
         noise_int = 1 / mu
-
-        if self.bio_model == "Constitutive":  # constitutive production
-            noise_ext = [0, 0]
-        elif self.bio_model == "Bursty":  # bursty production
-            noise_ext = [beta, beta * gamma / (beta + gamma)]
-        elif (
-            self.bio_model == "Extrinsic"
-        ):  # constitutive production with extrinsic noise
-            noise_ext = [1 / alpha, 1 / alpha]
-        elif self.bio_model == "Delay":  # bursty production with delayed degradation
-            raise ValueError("Not yet implemented!")
-        elif self.bio_model == "CIR":  # CIR-like:
-            noise_ext = [beta, beta * gamma / (beta + gamma)]
-        noise_ext = np.asarray(noise_ext)
+        noise_ext = np.asarray(noise_ext, dtype=float)
 
         if self.seq_model == "None":
             noise = noise_int + noise_ext

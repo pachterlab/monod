@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
 from .extract_data import make_dir, log, extract_data, make_histogram, _uns_unpack, _build_sampling_grid, model_from_uns, to_dense
-from .cme_toolbox import CMEModel, _HAS_RUST, _MODELS_2D, _format_direction
+from .cme_toolbox import CMEModel, _HAS_RUST, _MODELS_2D, _format_direction, _PROTEIN_FUDGE
 from .reaction_network import ReactionNetworkWarning, IdentifiabilityWarning
 from ._core import _mc          # None when the compiled extension is not installed
 
@@ -1058,8 +1058,9 @@ class GradientInference:
                     "Please select a technical noise model from {Poisson}, {Bernoulli}, {None}."
                 )
         else:
-            # If no specific lengths given, multiply the unspliced sampling rate by an average length value for all genes.
-            if model.seq_model == "Poisson" and getattr(model, 'fit_unspliced', False):
+            # No lengths given: the protein model's unspliced Poisson channel gets an
+            # average log length (the two-species models use the raw sampling rate).
+            if model.seq_model == "Poisson" and model.bio_model == "ProteinBursty" and model.fit_unspliced:
                 regressor[:, 0] += global_parameters.poisson_average_log_length
             
         self.grid_point = global_parameters.sampl_vals[point_index]
@@ -1392,7 +1393,7 @@ class GradientInference:
             out = _mc.optimize_genes_protein_bursty_sd(
                 search_data, fit_unspliced=bool(model.fit_unspliced),
                 protein_limit=float(model.protein_limit),
-                min_fudge=float(model.min_fudge), max_fudge=float(model.max_fudge),
+                min_fudge=_PROTEIN_FUDGE[0], max_fudge=_PROTEIN_FUDGE[1],
                 **common,
             )
         elif family == "custom":
