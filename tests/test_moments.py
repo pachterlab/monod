@@ -1,6 +1,8 @@
 """
-Tests verifying that monod_core.compute_moments matches the Python
-layer_moments reference implementation (extract_data.py) exactly.
+The per-gene moments a Rust ``SearchData`` carries must match the Python
+``extract_data.layer_moments`` reference exactly.  The Rust side computes them
+once, inside ``searchdata_from_arrays`` (and again when meK-Means partitions a
+``SearchData``), so the tests build a ``SearchData`` and read ``.moments``.
 
 Covers:
   - 1-layer (single modality): mean and population variance (ddof=0)
@@ -14,7 +16,6 @@ Covers:
 """
 
 import os
-import sys
 
 import numpy as np
 import pytest
@@ -56,6 +57,17 @@ def _to_int64_c(arr):
     return np.ascontiguousarray(arr, dtype=np.int64)
 
 
+def _rust_moments(layers, layer_names):
+    """The moments as the Rust ``SearchData`` constructor computes them."""
+    layers = [_to_int64_c(x) for x in layers]
+    n_cells, n_genes = layers[0].shape
+    coords, freqs = _mc.make_state_dist(layers)
+    limits = np.ascontiguousarray(np.stack([x.max(axis=0) + 1 for x in layers]).astype(np.int64))
+    sd = _mc.searchdata_from_arrays(layers, list(layer_names), limits, coords, freqs,
+                                    [f"g{i}" for i in range(n_genes)], n_cells, "unique")
+    return sd.moments
+
+
 def _compare(rust_list, ref_list, tol=1e-10):
     assert len(rust_list) == len(ref_list), "gene count mismatch"
     for g, (rust_d, ref_d) in enumerate(zip(rust_list, ref_list)):
@@ -92,54 +104,41 @@ def _make_layers(n_cells, n_genes, n_layers, high=50):
 # Tests
 # ---------------------------------------------------------------------------
 
-class TestComputeMoments:
+class TestSearchDataMoments:
 
     def test_one_layer(self):
         layers = _make_layers(200, 10, 1)
         names = ["unspliced"]
-        rust = _mc.compute_moments(layers, names)
-        ref = _ref_moments(layers, names)
-        _compare(rust, ref)
+        _compare(_rust_moments(layers, names), _ref_moments(layers, names))
 
     def test_two_layers(self):
         layers = _make_layers(500, 20, 2)
         names = ["unspliced", "spliced"]
-        rust = _mc.compute_moments(layers, names)
-        ref = _ref_moments(layers, names)
-        _compare(rust, ref)
+        _compare(_rust_moments(layers, names), _ref_moments(layers, names))
 
     def test_three_layers(self):
         layers = _make_layers(300, 15, 3)
         names = ["unspliced", "spliced", "protein"]
-        rust = _mc.compute_moments(layers, names)
-        ref = _ref_moments(layers, names)
-        _compare(rust, ref)
+        _compare(_rust_moments(layers, names), _ref_moments(layers, names))
 
     def test_single_gene(self):
         layers = _make_layers(400, 1, 2)
         names = ["unspliced", "spliced"]
-        rust = _mc.compute_moments(layers, names)
-        ref = _ref_moments(layers, names)
-        _compare(rust, ref)
+        _compare(_rust_moments(layers, names), _ref_moments(layers, names))
 
     def test_many_genes_parallel(self):
         """Exercise rayon parallelism across many genes."""
         layers = _make_layers(1000, 200, 2)
         names = ["unspliced", "spliced"]
-        rust = _mc.compute_moments(layers, names)
-        ref = _ref_moments(layers, names)
-        _compare(rust, ref)
+        _compare(_rust_moments(layers, names), _ref_moments(layers, names))
 
     def test_constant_column_variance_zero(self):
         """A gene with constant expression across all cells has variance=0."""
         n_cells, n_genes = 100, 3
-        layer = _to_int64_c(np.ones((n_cells, n_genes), dtype=np.int64) * 5)
-        layer[0, :] = layer[0, :]   # no mutation needed
-        layers = [layer]
+        layers = [_to_int64_c(np.ones((n_cells, n_genes), dtype=np.int64) * 5)]
         names = ["spliced"]
-        rust = _mc.compute_moments(layers, names)
-        ref = _ref_moments(layers, names)
-        _compare(rust, ref)
+        rust = _rust_moments(layers, names)
+        _compare(rust, _ref_moments(layers, names))
         for d in rust:
             assert d["MOM_spliced_var"] == pytest.approx(0.0, abs=1e-12)
 
@@ -148,19 +147,12 @@ class TestComputeMoments:
         layers = [_to_int64_c(np.array([[3, 7]])),
                   _to_int64_c(np.array([[1, 2]]))]
         names = ["unspliced", "spliced"]
-        rust = _mc.compute_moments(layers, names)
-        ref = _ref_moments(layers, names)
-        _compare(rust, ref)
-
-    def test_empty_layers_returns_empty(self):
-        rust = _mc.compute_moments([], [])
-        assert rust == []
+        _compare(_rust_moments(layers, names), _ref_moments(layers, names))
 
     def test_key_names_match_exactly(self):
         """Key strings must use the supplied layer names verbatim."""
         layers = _make_layers(50, 2, 2)
-        names = ["mod1", "mod2"]
-        rust = _mc.compute_moments(layers, names)
+        rust = _rust_moments(layers, ["mod1", "mod2"])
         expected_keys = {
             "MOM_mod1_mean", "MOM_mod1_var",
             "MOM_mod2_mean", "MOM_mod2_var",
@@ -168,16 +160,11 @@ class TestComputeMoments:
         }
         assert set(rust[0].keys()) == expected_keys
 
-    def test_mismatched_lengths_raises(self):
-        layers = _make_layers(50, 5, 2)
-        with pytest.raises(Exception):
-            _mc.compute_moments(layers, ["only_one_name"])
-
     def test_mean_formula(self):
         """Spot-check mean against numpy directly."""
         n_cells, n_genes = 100, 5
         layer = _to_int64_c(RNG.integers(0, 30, size=(n_cells, n_genes)))
-        rust = _mc.compute_moments([layer], ["x"])
+        rust = _rust_moments([layer], ["x"])
         for g in range(n_genes):
             expected = layer[:, g].astype(float).mean()
             assert abs(rust[g]["MOM_x_mean"] - expected) < 1e-12
@@ -186,7 +173,7 @@ class TestComputeMoments:
         """Variance must use ddof=0, not ddof=1."""
         n_cells, n_genes = 50, 3
         layer = _to_int64_c(RNG.integers(0, 20, size=(n_cells, n_genes)))
-        rust = _mc.compute_moments([layer], ["x"])
+        rust = _rust_moments([layer], ["x"])
         for g in range(n_genes):
             col = layer[:, g].astype(float)
             assert abs(rust[g]["MOM_x_var"] - col.var(ddof=0)) < 1e-12
@@ -198,7 +185,7 @@ class TestComputeMoments:
         n_cells, n_genes = 50, 3
         l0 = _to_int64_c(RNG.integers(0, 20, size=(n_cells, n_genes)))
         l1 = _to_int64_c(RNG.integers(0, 20, size=(n_cells, n_genes)))
-        rust = _mc.compute_moments([l0, l1], ["a", "b"])
+        rust = _rust_moments([l0, l1], ["a", "b"])
         for g in range(n_genes):
             expected = np.cov([l0[:, g].astype(float), l1[:, g].astype(float)])[0, 1]
             assert abs(rust[g]["MOM_cov_a_b"] - expected) < 1e-10
@@ -207,12 +194,12 @@ class TestComputeMoments:
 @pytest.fixture(scope="module")
 def adata():
     ad = pytest.importorskip("anndata")
-    if not os.path.exists(TestComputeMomentsRealData.EXAMPLE_PATH):
+    if not os.path.exists(TestSearchDataMomentsRealData.EXAMPLE_PATH):
         pytest.skip("example_adata.h5ad not found")
-    return ad.read_h5ad(TestComputeMomentsRealData.EXAMPLE_PATH)
+    return ad.read_h5ad(TestSearchDataMomentsRealData.EXAMPLE_PATH)
 
 
-class TestComputeMomentsRealData:
+class TestSearchDataMomentsRealData:
     """Round-trip test against example_adata.h5ad."""
 
     EXAMPLE_PATH = os.path.join(
@@ -228,10 +215,7 @@ class TestComputeMomentsRealData:
             if issparse(arr):
                 arr = arr.toarray()
             layers.append(_to_int64_c(arr))
-        rust = _mc.compute_moments(layers, layer_names)
-        ref = _ref_moments(layers, layer_names)
-        _compare(rust, ref, tol=1e-9)
-
+        _compare(_rust_moments(layers, layer_names), _ref_moments(layers, layer_names), tol=1e-9)
 
 
 def test_python_cores_match_the_reference():

@@ -220,7 +220,7 @@ def layer_moments(layers, names):
     Returns one dict per gene with keys ``MOM_<name>_mean``, ``MOM_<name>_var``
     (population variance) and ``MOM_cov_<a>_<b>`` (sample covariance, as
     ``np.cov``), the keys the method-of-moments starts read.  Mirror of the
-    Rust ``compute_moments``."""
+    moments a Rust ``SearchData`` computes when it is built."""
     X = [np.asarray(to_dense(x), dtype=float) for x in layers]
     n_cells, n_genes = X[0].shape
     cols = {}

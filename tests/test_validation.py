@@ -152,8 +152,12 @@ class TestRustEntryPoints:
 
     def test_fortran_order_rejected(self):
         a = np.asfortranarray(np.arange(12, dtype=np.int64).reshape(3, 4))
+        c = np.ascontiguousarray(a)
+        coords, freqs = _mc.make_state_dist([c])
+        limits = np.ascontiguousarray(c.max(axis=0)[None, :] + 1)
         with pytest.raises(ValueError, match="C-contiguous"):
-            _mc.compute_moments([a], ["unspliced"])
+            _mc.searchdata_from_arrays([a], ["unspliced"], limits, coords, freqs,
+                                       list("abcd"), 3, "unique")
         with pytest.raises(ValueError, match="C-contiguous"):
             _mc.make_state_dist([a])
 

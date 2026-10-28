@@ -398,12 +398,13 @@ class TestEndToEnd:
 
 
 # ---------------------------------------------------------------------------
-# Tests: optimize_genes_2d_sd parity with marshal-loop path
+# Tests: optimize_genes_2d_sd reads the histograms the SearchData holds
 # ---------------------------------------------------------------------------
 
 class TestOptimizeGenes2dSd:
-    """optimize_genes_2d_sd must produce the same results as the marshal-loop
-    path through optimize_genes_2d for every supported 2D model."""
+    """optimize_genes_2d_sd extracts each gene's coordinates, frequencies and
+    limits from the SearchData; its reported KLD must equal eval_kld_2d on the
+    same histogram passed as explicit arrays, for every supported 2D model."""
 
     MODELS = ["Bursty", "Constitutive", "Extrinsic", "Delay", "CIR", "DelayedSplicing"]
 
@@ -427,28 +428,15 @@ class TestOptimizeGenes2dSd:
                             gene_names, n_cells, "unique")
         return sd, layers, limits, coords_list, freqs_list
 
-    def _ref_optimize(self, sd, layers, limits, coords_list, freqs_list,
-                      bio_model, x0_all, lb, ub, fixed_quad_t=20.0, quad_order=10):
-        """Run the marshal-loop path through optimize_genes_2d."""
-        n_genes = sd.n_genes
-        u_idx_list, s_idx_list, f_list, limits_list = [], [], [], []
-        for gi in range(n_genes):
-            coords = np.array(coords_list[gi], dtype=np.int64)
-            freqs  = np.array(freqs_list[gi])
-            u_idx_list.append(coords[:, 0].tolist())
-            s_idx_list.append(coords[:, 1].tolist())
-            f_list.append(freqs.tolist())
-            limits_list.append([int(limits[0, gi]), int(limits[1, gi])])
-        return _mc.optimize_genes_2d(
-            bio_model=bio_model, x0_list=x0_all,
-            lb=lb, ub=ub,
-            limits_list=limits_list, u_idx_list=u_idx_list,
-            s_idx_list=s_idx_list, f_list=f_list,
-            fixed_quad_t=fixed_quad_t, quad_order=quad_order,
-        )
+    @staticmethod
+    def _gene_arrays(limits, coords_list, freqs_list, gi):
+        """(limits, u_idx, s_idx, f) of gene gi as explicit lists."""
+        coords = np.array(coords_list[gi], dtype=np.int64)
+        return ([int(limits[0, gi]), int(limits[1, gi])],
+                coords[:, 0].tolist(), coords[:, 1].tolist(), list(freqs_list[gi]))
 
     @pytest.mark.parametrize("bio_model", MODELS)
-    def test_parity_with_marshal_loop(self, bio_model, synthetic_sd):
+    def test_kld_matches_explicit_histograms(self, bio_model, synthetic_sd):
         sd, layers, limits, coords_list, freqs_list = synthetic_sd
         # Use broad bounds to make the test model-agnostic
         lb = [-4.0] * 3
@@ -460,15 +448,16 @@ class TestOptimizeGenes2dSd:
             sd, bio_model=bio_model, x0_list=x0_all,
             lb=lb, ub=ub, fixed_quad_t=20.0, quad_order=10,
         )
-        params_ref, klds_ref = self._ref_optimize(
-            sd, layers, limits, coords_list, freqs_list,
-            bio_model, x0_all, lb, ub,
-        )
 
-        np.testing.assert_allclose(params_sd, params_ref, rtol=1e-10,
-            err_msg=f"{bio_model}: parameter estimates differ")
-        np.testing.assert_allclose(klds_sd, klds_ref, rtol=1e-10,
-            err_msg=f"{bio_model}: KLD values differ")
+        for gi in range(sd.n_genes):
+            args = self._gene_arrays(limits, coords_list, freqs_list, gi)
+            kld_opt = _mc.eval_kld_2d(bio_model, list(params_sd[gi]), *args, 20.0, 10)
+            kld_x0 = _mc.eval_kld_2d(bio_model, x0_all[gi][0], *args, 20.0, 10)
+            assert kld_opt == pytest.approx(klds_sd[gi], rel=1e-8, abs=1e-12), \
+                f"{bio_model} gene {gi}: reported KLD differs from the explicit-array KLD"
+            assert klds_sd[gi] <= kld_x0 + 1e-12, f"{bio_model} gene {gi}: no improvement over x0"
+            assert np.all(np.asarray(params_sd[gi]) >= np.asarray(lb) - 1e-12)
+            assert np.all(np.asarray(params_sd[gi]) <= np.asarray(ub) + 1e-12)
 
     def test_wrong_model_raises(self, synthetic_sd):
         sd = synthetic_sd[0]

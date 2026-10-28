@@ -21,7 +21,7 @@ from ._core import _mc          # None when the compiled extension is not instal
 #:   use_rust_lbfgsb  "auto" (default): run the whole fit in the Rust L-BFGS-B kernel
 #:                    whenever the extension is installed and the model has a kernel;
 #:                    False uses the scipy optimizer
-#: Optional keys: use_batch_optimizer (batched Adam), presearch / presearch_maxiter
+#: Optional keys: presearch / presearch_maxiter
 #: (derivative-free pre-search, on by default for ProteinBursty), check_identifiability
 #: ("auto": numerical rank check of the model at the first grid point for Custom
 #: networks; True for every model; False to skip).
@@ -692,7 +692,8 @@ class InferenceParameters:
                 Rust L-BFGS-B kernel whenever the extension is installed and the model has a
                 kernel, about ten times faster than the scipy loop with the same results;
                 False uses scipy.
-            "num_gene_cores" controls gene-level parallelism per grid point (-1 = all cores). Uses ThreadPoolExecutor + scipy by default; set "use_batch_optimizer"=True to use batch Adam with rayon instead.
+            "num_gene_cores" controls gene-level parallelism per grid point (-1 = all cores)
+                when the scipy optimizer is used (a thread pool with one gene per task).
             "n_jac_jobs" controls joblib parallelism over FD perturbations (-1 = all cores); only
             effective when num_gene_cores=1 to avoid nested parallelism.
         run_meta: str, optional
@@ -1318,8 +1319,8 @@ class GradientInference:
     def _rust_optimizer_family(self, model, search_data):
         """Kernel family of the Rust optimizer that applies, or None.
 
-        Requires the compiled extension, a Rust ``SearchData`` and no batch
-        optimizer. ``gradient_params["use_rust_lbfgsb"]`` is ``"auto"`` by
+        Requires the compiled extension and a Rust ``SearchData``.
+        ``gradient_params["use_rust_lbfgsb"]`` is ``"auto"`` by
         default, which uses the Rust kernel whenever those hold; ``False``
         selects the scipy optimizer. The family itself comes from
         ``CMEModel._kernel_family``.
@@ -1328,7 +1329,6 @@ class GradientInference:
         if (
             _mc is None
             or flag is False
-            or self.gradient_params.get("use_batch_optimizer", False)
             or not isinstance(search_data, _mc.SearchData)
         ):
             return None
@@ -1446,12 +1446,10 @@ class GradientInference:
         t1 = time.time()
 
         n_gene_cores = self.gradient_params.get("num_gene_cores", 1)
-        use_batch = self.gradient_params.get("use_batch_optimizer", False)
 
         # Rust L-BFGS-B: the whole fit runs in Rust with rayon parallelism over
         # genes; the default whenever it applies (gradient_params["use_rust_lbfgsb"]).
         rust_family = self._rust_optimizer_family(model, search_data)
-        _rust_opt_active = rust_family is not None
 
         x0_all_shared = self._starting_points(search_data.n_genes)
         x0_all_shared = self._presearch_x0(model, search_data, x0_all_shared, n_gene_cores)
@@ -1461,30 +1459,23 @@ class GradientInference:
                 rust_family, model, search_data, x0_all_shared, n_gene_cores
             )
         elif n_gene_cores != 1:
-            num_threads = None if n_gene_cores < 0 else n_gene_cores
-            if use_batch and _HAS_RUST:
-                # Explicit opt-in: batch Adam with rayon, all genes in one call.
-                param_estimates, klds = self._iterate_over_genes_batch(
-                    model, search_data, num_threads=num_threads
-                )
-            else:
-                # Default: ThreadPoolExecutor + scipy L-BFGS-B per gene.
-                # Rust PSS fast-path fires automatically inside each thread.
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-                n_workers = os.cpu_count() if num_threads is None else num_threads
-                results_list = [None] * search_data.n_genes
-                with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    futures = {
-                        pool.submit(
-                            self.optimize_gene,
-                            gene_index=i, model=model, search_data=search_data,
-                            x0=x0_all_shared[i],
-                        ): i
-                        for i in range(search_data.n_genes)
-                    }
-                    for f in as_completed(futures):
-                        results_list[futures[f]] = f.result()
-                param_estimates, klds = zip(*results_list)
+            # ThreadPoolExecutor + scipy L-BFGS-B per gene; the Rust PSS
+            # fast-path fires automatically inside each thread.
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            n_workers = os.cpu_count() if n_gene_cores < 0 else n_gene_cores
+            results_list = [None] * search_data.n_genes
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = {
+                    pool.submit(
+                        self.optimize_gene,
+                        gene_index=i, model=model, search_data=search_data,
+                        x0=x0_all_shared[i],
+                    ): i
+                    for i in range(search_data.n_genes)
+                }
+                for f in as_completed(futures):
+                    results_list[futures[f]] = f.result()
+            param_estimates, klds = zip(*results_list)
         else:
             param_estimates, klds = zip(
                 *[
@@ -1502,148 +1493,6 @@ class GradientInference:
         d_time = t2 - t1
 
         return param_estimates, klds, obj_func, d_time
-
-    def _iterate_over_genes_batch(self, model, search_data, num_threads=None):
-        """Vectorized gradient descent over all genes using a single batched Rust PSS call
-        per optimizer step.
-
-        Uses Adam optimizer.  At each step, all genes' PSS evaluations
-        (center + FD perturbations) are computed in one `eval_model_pss_batch`
-        call, releasing the GIL and letting rayon parallelize over genes.
-
-        Parameters
-        ----------
-        num_threads : int or None
-            Rayon thread count passed to `eval_model_pss_batch`. None uses all
-            available cores.
-
-        Note: uses Adam optimizer (not scipy L-BFGS-B), so parameter estimates
-        may differ slightly from the default optimizer.  Key tunables in
-        ``gradient_params``:
-            - ``max_iterations``  : optimizer steps per restart; the batch path
-                                    uses ``4 × max_iterations`` by default to
-                                    compensate for Adam vs L-BFGS-B convergence
-            - ``batch_max_iterations``: override the step count for the batch
-                                        path directly
-            - ``num_restarts``    : random restarts; keep best KLD (default 1)
-            - ``batch_lr``        : Adam base learning rate (default 0.05)
-            - ``batch_fd_eps``    : finite-difference step size (default 1e-4)
-
-        Returns
-        -------
-        param_estimates : np.ndarray, shape (n_genes, n_phys_pars)
-        klds            : np.ndarray, shape (n_genes,)
-        """
-        n_genes   = search_data.n_genes
-        n_params  = self.n_phys_pars
-        EPS       = 1e-15
-        eps_fd    = self.gradient_params.get("batch_fd_eps", 1e-4)
-        # Default: 4× scipy max_iterations so Adam can match L-BFGS-B quality.
-        _scipy_iters = self.gradient_params.get("max_iterations", 100)
-        max_iter  = self.gradient_params.get("batch_max_iterations", 4 * _scipy_iters)
-        restarts  = self.gradient_params.get("num_restarts", 1)
-        lr        = self.gradient_params.get("batch_lr", 0.05)
-        # Adam hyperparameters
-        beta1, beta2, adam_eps = 0.9, 0.999, 1e-8
-
-        lb = np.array(self.phys_lb)
-        ub = np.array(self.phys_ub)
-
-        # Per-gene grid limits and sampling params (fixed across restarts/iters).
-        limits_list = [search_data.M[:, i].tolist() for i in range(n_genes)]
-        if model.seq_model == "None":
-            samp_list = [None] * n_genes
-        else:
-            samp_list = [self.regressor[i] for i in range(n_genes)]
-
-        # ---- KLD helpers -------------------------------------------------- #
-        def _kld_from_pss(pss_flat, gene_idx, limits):
-            """Compute KLD between a flat PSS and the gene's empirical histogram."""
-            pss = np.array(pss_flat).reshape(int(limits[0]), int(limits[1])).squeeze()
-            np.clip(pss, EPS, None, out=pss)
-            x, f = search_data.hist[gene_idx]
-            return float(np.sum(f * np.log(f / pss[tuple(x.T)])))
-
-        def _batch_kld(params_mat):
-            """Evaluate KLD for all genes given params_mat (n_genes, n_params)."""
-            pss_list = model.eval_model_pss_batch(
-                [params_mat[i] for i in range(n_genes)],
-                limits_list,
-                samp_list,
-                num_threads,
-            )
-            return np.array([
-                _kld_from_pss(pss_list[i], i, limits_list[i])
-                for i in range(n_genes)
-            ])
-
-        def _batch_kld_and_grad(params_mat):
-            """One batch call for all genes: center + n_params FD perturbations."""
-            # Build augmented list: n_genes center + n_genes × n_params perturbed.
-            aug_params  = [params_mat[i] for i in range(n_genes)]
-            aug_limits  = list(limits_list)
-            aug_samp    = list(samp_list)
-            for j in range(n_params):
-                p_eps = params_mat.copy()
-                p_eps[:, j] = params_mat[:, j] + eps_fd
-                aug_params.extend([p_eps[i] for i in range(n_genes)])
-                aug_limits.extend(limits_list)
-                aug_samp.extend(samp_list)
-
-            all_pss = model.eval_model_pss_batch(aug_params, aug_limits, aug_samp, num_threads)
-
-            kld0 = np.array([
-                _kld_from_pss(all_pss[i], i, limits_list[i])
-                for i in range(n_genes)
-            ])
-            grad = np.zeros((n_genes, n_params))
-            for j in range(n_params):
-                offset = (j + 1) * n_genes
-                kld_j = np.array([
-                    _kld_from_pss(all_pss[offset + i], i, limits_list[i])
-                    for i in range(n_genes)
-                ])
-                grad[:, j] = (kld_j - kld0) / eps_fd
-
-            return kld0, grad
-
-        # ---- Optimization -------------------------------------------------- #
-        best_params = np.full((n_genes, n_params), np.nan)
-        best_klds   = np.full(n_genes, np.inf)
-
-        starts = np.asarray(self._starting_points(n_genes))          # (n_genes, num_restarts, n_params)
-        for restart in range(restarts):
-            x = np.clip(starts[:, min(restart, starts.shape[1] - 1), :], lb, ub)
-
-            # Adam optimizer state (reset each restart).
-            m_adam = np.zeros_like(x)
-            v_adam = np.zeros_like(x)
-
-            for t in range(1, max_iter + 1):
-                kld0, grad = _batch_kld_and_grad(x)
-                if np.max(np.abs(grad)) < 1e-10:
-                    break
-
-                # Adam update (per-gene, per-parameter adaptive step sizes).
-                m_adam = beta1 * m_adam + (1.0 - beta1) * grad
-                v_adam = beta2 * v_adam + (1.0 - beta2) * grad ** 2
-                m_hat  = m_adam / (1.0 - beta1 ** t)
-                v_hat  = v_adam / (1.0 - beta2 ** t)
-                x = np.clip(x - lr * m_hat / (np.sqrt(v_hat) + adam_eps), lb, ub)
-
-            # Final KLD at converged params.
-            final_klds = _batch_kld(x)
-
-            # Update best per gene (only if strictly better by >1%).
-            improved = final_klds < best_klds * 0.99
-            best_params[improved] = x[improved]
-            best_klds[improved]   = final_klds[improved]
-            # First restart: accept anything finite.
-            uninit = ~np.isfinite(best_klds)
-            best_params[uninit] = x[uninit]
-            best_klds[uninit]   = final_klds[uninit]
-
-        return best_params, best_klds
 
     def fit_all_genes(self, model, search_data, checkpoint=False):
         """Wraps iterate_over_genes and optionally stores the results on disk.

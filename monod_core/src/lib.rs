@@ -1793,66 +1793,6 @@ thread_local! {
     static DENSE_BUF: RefCell<Vec<usize>> = RefCell::new(Vec::new());
 }
 
-/// Compute per-gene expression moments (mean, variance, covariance) in parallel.
-///
-/// Parameters
-/// ----------
-/// layers     : ordered list of 2-D int64 numpy arrays, each (n_cells, n_genes).
-/// layer_names: modality names matching the layer order (e.g. ["unspliced","spliced"]).
-///
-/// Returns
-/// -------
-/// List of length n_genes; each element is a dict with keys:
-///   "MOM_{name}_mean"          — per-layer population mean  (ddof=0)
-///   "MOM_{name}_var"           — per-layer population variance (ddof=0, matches numpy .var())
-///   "MOM_cov_{name_i}_{name_j}"— pairwise sample covariance (ddof=1, matches numpy.cov()[0,1])
-#[pyfunction]
-fn compute_moments(
-    py: Python<'_>,
-    layers: Vec<PyReadonlyArray2<'_, i64>>,
-    layer_names: Vec<String>,
-) -> PyResult<Vec<std::collections::HashMap<String, f64>>> {
-    if layers.is_empty() {
-        return Ok(Vec::new());
-    }
-    if layers.len() != layer_names.len() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "layers and layer_names must have the same length",
-        ));
-    }
-    let _n_layers = layers.len();
-    let n_cells = layers[0].shape()[0];
-    let n_genes = layers[0].shape()[1];
-    for (l, arr) in layers.iter().enumerate() {
-        if !arr.is_c_contiguous() {
-            return verr(format!("compute_moments: layer {l} must be C-contiguous (use np.ascontiguousarray)"));
-        }
-        if arr.shape() != [n_cells, n_genes] {
-            return verr(format!("compute_moments: layer {l} has shape {:?}, expected ({n_cells}, {n_genes})", arr.shape()));
-        }
-    }
-
-    // Transpose each (n_cells, n_genes) row-major numpy array to column-major [g * n_cells + c].
-    let flat_layers: Vec<Vec<f64>> = layers
-        .iter()
-        .map(|arr| {
-            let slice = arr.as_slice().expect("layer array must be C-contiguous");
-            let mut col_major = vec![0.0f64; n_cells * n_genes];
-            for c in 0..n_cells {
-                for g in 0..n_genes {
-                    col_major[g * n_cells + c] = slice[c * n_genes + g] as f64;
-                }
-            }
-            col_major
-        })
-        .collect();
-
-    let result =
-        py.allow_threads(|| compute_moments_inner(&flat_layers, &layer_names, n_cells, n_genes));
-
-    Ok(result)
-}
-
 // ============================================================================
 // SearchData — pure-Rust Stage 3 container
 // ============================================================================
@@ -5882,132 +5822,9 @@ fn eval_kld_and_grad_seq(
     (kld0, fd_gradient(x, fd_eps, kld0, kld_at))
 }
 
-/// Minimize KLD(x) s.t. lb ≤ x ≤ ub using L-BFGS-B.
-///
-/// Delegates to `lbfgsb_rs_pure::LBFGSB` which uses a Moré-Thuente safeguarded
-/// line search (same as scipy's Fortran L-BFGS-B), Cauchy point + subspace
-/// minimization, and compact column-major memory storage.
-///
-
-/// Optimize a single gene with L-BFGS-B using multiple restarts.
-///
-/// x0_list : num_restarts × n_params initial points (log10 scale)
-/// lb / ub : parameter bounds (log10 scale)
-/// Returns (x_opt, kld_min).
-#[pyfunction]
-#[pyo3(signature = (bio_model, x0_list, lb, ub, limits, u_idx, s_idx, f,
-                    fixed_quad_t, quad_order, fd_eps=1e-6, maxiter=1000,
-                    ftol=1e-10, gtol=1e-6, samp_log=None, eps=1e-15, m_lbfgs=10,
-                    seq_model="Poisson"))]
-#[allow(clippy::too_many_arguments)]
-fn optimize_gene_2d(
-    py: Python<'_>,
-    bio_model: String,
-    x0_list: Vec<Vec<f64>>,
-    lb: Vec<f64>,
-    ub: Vec<f64>,
-    limits: Vec<usize>,
-    u_idx: Vec<u64>,
-    s_idx: Vec<u64>,
-    f: Vec<f64>,
-    fixed_quad_t: f64,
-    quad_order: usize,
-    fd_eps: f64,
-    maxiter: usize,
-    ftol: f64,
-    gtol: f64,
-    samp_log: Option<Vec<f64>>,
-    eps: f64,
-    m_lbfgs: usize,
-    seq_model: &str,
-) -> PyResult<(Vec<f64>, f64)> {
-    validate_bio_model_2d(&bio_model, "optimize_gene_2d")?;
-    validate_bounds(&lb, &ub, n_bio_params(&bio_model), "optimize_gene_2d")?;
-    validate_limits(&limits, 2, "optimize_gene_2d")?;
-    validate_coords_2d(&u_idx, &s_idx, limits[0], limits[1], "optimize_gene_2d")?;
-    validate_x0_list(std::slice::from_ref(&x0_list), 1, lb.len(), "optimize_gene_2d")?;
-    let seq_model = seq_model.to_owned();
-
-    let settings = LbfgsbSettings { maxiter, ftol, gtol, m_mem: m_lbfgs };
-    let (best_x, best_kld, _status) = py.allow_threads(|| {
-        let obj = |x: &[f64]| eval_kld_and_grad_seq(
-            &bio_model, x, &limits, &u_idx, &s_idx, &f,
-            fixed_quad_t, quad_order, fd_eps, samp_log.as_deref(), eps, &seq_model,
-        );
-        best_of_restarts(&obj, &x0_list, &lb, &ub, settings)
-    });
-    Ok((best_x, best_kld))
-}
-
-/// Optimize all genes in parallel using L-BFGS-B + rayon.
-///
-/// x0_list : n_genes × num_restarts × n_params initial points
-/// Returns (param_estimates, klds) each of length n_genes.
-#[pyfunction]
-#[pyo3(signature = (bio_model, x0_list, lb, ub, limits_list, u_idx_list, s_idx_list, f_list,
-                    fixed_quad_t, quad_order, fd_eps=1e-6, maxiter=1000,
-                    ftol=1e-10, gtol=1e-6, samp_list=None, eps=1e-15,
-                    m_lbfgs=10, num_threads=None, seq_model="Poisson", return_status=false))]
-#[allow(clippy::too_many_arguments)]
-fn optimize_genes_2d(
-    py: Python<'_>,
-    bio_model: String,
-    x0_list: Vec<Vec<Vec<f64>>>,   // n_genes × num_restarts × n_params
-    lb: Vec<f64>,
-    ub: Vec<f64>,
-    limits_list: Vec<Vec<usize>>,
-    u_idx_list: Vec<Vec<u64>>,
-    s_idx_list: Vec<Vec<u64>>,
-    f_list: Vec<Vec<f64>>,
-    fixed_quad_t: f64,
-    quad_order: usize,
-    fd_eps: f64,
-    maxiter: usize,
-    ftol: f64,
-    gtol: f64,
-    samp_list: Option<Vec<Option<Vec<f64>>>>,
-    eps: f64,
-    m_lbfgs: usize,
-    num_threads: Option<usize>,
-    seq_model: &str,
-    return_status: bool,
-) -> PyResult<PyObject> {
-    validate_bio_model_2d(&bio_model, "optimize_genes_2d")?;
-    validate_bounds(&lb, &ub, n_bio_params(&bio_model), "optimize_genes_2d")?;
-    let seq_model = seq_model.to_owned();
-    let n_genes = x0_list.len();
-    if limits_list.len() != n_genes || u_idx_list.len() != n_genes || s_idx_list.len() != n_genes || f_list.len() != n_genes {
-        return verr(format!("optimize_genes_2d: x0_list, limits_list, u_idx_list, s_idx_list, f_list must all have n_genes={n_genes} entries"));
-    }
-    validate_x0_list(&x0_list, n_genes, lb.len(), "optimize_genes_2d")?;
-    for gi in 0..n_genes {
-        validate_limits(&limits_list[gi], 2, "optimize_genes_2d")?;
-        validate_coords_2d(&u_idx_list[gi], &s_idx_list[gi], limits_list[gi][0], limits_list[gi][1], "optimize_genes_2d")?;
-    }
-    let settings = LbfgsbSettings { maxiter, ftol, gtol, m_mem: m_lbfgs };
-    let results = py.allow_threads(|| {
-        run_with_pool(num_threads, || {
-            optimize_genes_parallel(&x0_list, &lb, &ub, settings, |gi| {
-                let (bm, sm) = (bio_model.as_str(), seq_model.as_str());
-                let samp = samp_list.as_ref().and_then(|sl| sl[gi].as_deref());
-                let (lims, u, s_, f) = (&limits_list[gi], &u_idx_list[gi], &s_idx_list[gi], &f_list[gi]);
-                move |x: &[f64]| eval_kld_and_grad_seq(
-                    bm, x, lims, u, s_, f, fixed_quad_t, quad_order, fd_eps, samp, eps, sm,
-                )
-            })
-        })
-    });
-
-    let (params, klds, status) = split_results(results);
-    Ok(pack_results(py, params, klds, status, return_status))
-}
-
 /// Optimize all genes in parallel using L-BFGS-B, reading histogram data directly
-/// from a Rust `SearchData` — no Python marshal loop required.
-///
-/// Equivalent to `optimize_genes_2d` but the per-gene `u_idx`, `s_idx`, `f`, and
-/// `limits` are extracted from `sd.coords`, `sd.freqs`, and `sd.limits` in Rust,
-/// bypassing the Python loop that converts numpy arrays to lists.
+/// from a Rust `SearchData`: the per-gene `u_idx`, `s_idx`, `f` and `limits` come
+/// from `sd.coords`, `sd.freqs` and `sd.limits`, with no Python marshalling.
 ///
 /// Only supports 2-modality models (coords columns 0 and 1 are the two layers).
 #[pyfunction]
@@ -6741,14 +6558,11 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(chisquare_testing_2d_sd, m)?)?;
     m.add_function(wrap_pyfunction!(eval_kld_grad_2d, m)?)?;
     m.add_function(wrap_pyfunction!(eval_kld_grad_protein_bursty, m)?)?;
-    m.add_function(wrap_pyfunction!(optimize_gene_2d, m)?)?;
-    m.add_function(wrap_pyfunction!(optimize_genes_2d, m)?)?;
     m.add_function(wrap_pyfunction!(optimize_genes_2d_sd, m)?)?;
     m.add_function(wrap_pyfunction!(optimize_genes_protein_bursty_sd, m)?)?;
     m.add_function(wrap_pyfunction!(optimize_genes_2d_amb_sd, m)?)?;
     m.add_function(wrap_pyfunction!(optimize_genes_custom_sd, m)?)?;
     m.add_function(wrap_pyfunction!(e_step_2d, m)?)?;
-    m.add_function(wrap_pyfunction!(compute_moments, m)?)?;
     m.add_class::<PySearchData>()?;
     m.add_function(wrap_pyfunction!(searchdata_from_arrays, m)?)?;
     m.add_function(wrap_pyfunction!(make_state_dist, m)?)?;
