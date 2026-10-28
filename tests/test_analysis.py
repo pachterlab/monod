@@ -225,3 +225,44 @@ def test_fit_line_eiv_degenerate_inputs():
     np.testing.assert_array_equal(analysis._fit_line_eiv(m, m.copy(), fit_slope=True), [0.0, 1.0])
     gf, beta, resid, pval = analysis.diffexp_fpi(m, m.copy(), "x", modeltype="lin", viz=False, nit=3)
     assert not gf.any() and np.isfinite(beta).all()
+
+
+class TestGenePlotHelpers:
+    def test_genes_to_plot_selector(self):
+        from monod.inference import _genes_to_plot
+        np.testing.assert_array_equal(_genes_to_plot(None, 10, 4), [0, 1, 2, 3])
+        np.testing.assert_array_equal(_genes_to_plot(None, 2, 4), [0, 1])
+        np.testing.assert_array_equal(_genes_to_plot(np.array([0, 1, 0, 1, 1], bool), 5, 2), [1, 3])
+        np.testing.assert_array_equal(_genes_to_plot([4, 2], 5, 4), [4, 2])
+
+    def test_gene_pss_grids_and_aliases(self, fit):
+        _, sd, sr = fit
+        joint = sr.gene_pss(sd, 0)
+        assert joint.shape == tuple(int(m) for m in sd.M[:, 0])
+        spliced = sr.gene_pss(sd, 0, "spliced")
+        assert spliced.shape == (int(sd.M[1, 0]),)
+        np.testing.assert_array_equal(sr.gene_pss(sd, 0, "mature"), spliced)
+        assert abs(spliced.sum() - 1) < 0.05
+        with pytest.raises(ValueError, match="modalities"):
+            sr.gene_pss(sd, 0, "protein")
+
+    def test_plot_gene_distributions_honours_a_mask(self, fit):
+        _, sd, sr = fit
+        mask = np.zeros(sr.n_genes, dtype=bool)
+        mask[-1] = True
+        fig = sr.plot_gene_distributions(sd, sz=(1, 2), marg="joint", genes_to_plot=mask, savefig=False)
+        assert fig.axes[0].get_title().startswith(sr.gene_names[-1])
+        plt.close("all")
+
+    def test_diffexp_mean_fold_change_is_second_minus_first(self):
+        from types import SimpleNamespace
+        rng = np.random.default_rng(0)
+        s = rng.poisson(5.0, size=(50, 4))                     # cells x genes
+        a = SimpleNamespace(layers=np.array([s, s]), n_genes=4)
+        b = SimpleNamespace(layers=np.array([s, 4 * s]), n_genes=4)
+        for lognormalize in (True, False):
+            gf, fc = analysis.diffexp_mean(a, b, method="ttest", viz=False, sizefactor=None,
+                                           lognormalize=lognormalize)
+            assert (fc > 0).all() and gf.all()
+        with pytest.raises(ValueError, match="method"):
+            analysis.diffexp_mean(a, b, method="median", viz=False)

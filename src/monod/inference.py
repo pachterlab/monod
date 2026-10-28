@@ -41,8 +41,6 @@ import warnings
 from .plot_aesthetics import aesthetics
 
 from tqdm import tqdm
-code_ver_global = "029"  # bumping up version April 2024
-
 # from tqdm.contrib.concurrent import process_map  # or thread_map
 # warnings.filterwarnings("ignore", category=DeprecationWarning) #let's do more gargeted stuff...
 
@@ -54,10 +52,7 @@ def perform_inference(h5ad_filepath,
     viz=True,
     modality_name_dict=None,
     dataset_string=None,
-    cf=None,
-    code_ver=code_ver_global,
     filt_param=None,
-    exp_filter_threshold=1,
     genes_to_fit=None,
     gradient_params=None,
     use_lengths="auto",
@@ -105,9 +100,6 @@ def perform_inference(h5ad_filepath,
     viz=viz,
     filt_param=filt_param,
     modality_name_dict=modality_name_dict,
-    cf=cf,
-    code_ver=code_ver,
-    exp_filter_threshold=exp_filter_threshold,
     genes_to_fit=genes_to_fit, hist_type=hist_type, mek_means_params=mek_means_params)
     log.info('Data extracted')
     log.debug('hist type is %s',hist_type)
@@ -2396,16 +2388,7 @@ class SearchResults:
             csqarr = []
             hellinger = []
             for gene_index in range(self.n_genes):
-                # lm = search_data.M[:, gene_index]
-                lm = search_data.M[:, gene_index]
-                expect_freq = (
-                    self.model.eval_model_pss(
-                        self.phys_optimum[gene_index],
-                        lm,
-                        self.regressor_optimum[gene_index],
-                    )
-                    * search_data.n_cells
-                )
+                expect_freq = self.gene_pss(search_data, gene_index) * search_data.n_cells
                 # expected_freq[expected_freq < EPS] = EPS
                 # expected_freq /= expected_freq.sum()
                 # PROPOSAL = search_data.n_cells * expected_freq
@@ -2901,6 +2884,19 @@ class SearchResults:
         fig1.tight_layout()
         self._savefig("length_dependence.png")
 
+    def gene_pss(self, search_data, i_, marg="joint"):
+        """The fitted PMF of gene ``i_`` at the sampling optimum over the data's
+        grid ``search_data.M[:, i_]``: the joint PMF for ``marg="joint"``, the
+        marginal of one modality (``'unspliced'``, ``'spliced'``, ...) otherwise."""
+        limits = np.array(search_data.M[:, i_])
+        if marg != "joint":
+            lind = _resolve_marg(marg, self.model.model_modalities)
+            keep = limits[lind]
+            limits[:] = 1
+            limits[lind] = keep
+        samp = None if self.model.seq_model == "None" else self.regressor_optimum[i_]
+        return np.squeeze(self.model.eval_model_pss(self.phys_optimum[i_], limits, samp))
+
     def plot_gene_distributions(
         self,
         search_data,
@@ -2919,19 +2915,21 @@ class SearchResults:
         ----------
         search_data: monod.extract_data.SearchData
             SearchData object with the fit data.
-        szfig: tuple of ints, optional
+        sz: tuple of ints, optional
             dimensions of the figure subplot grid.
         figsize: tuple of floats, optional
             figure dimensions.
         marg: str, optional
-            if 'unspliced', 'spliced', 'protein' etc., plot marginal for this modality.
-            if 'joint': plot the bivariate distribution for spliced or unspliced
-            if tuple of modality strings, plot the bivariate distribution for these modalities.
+            if 'unspliced', 'spliced', 'protein' etc., plot the marginal for this modality.
+            if 'joint': plot the bivariate distribution of the two modalities (for the
+            protein model, of spliced RNA and protein).
         logscale: None or bool, optional
             whether to plot probabilities or log-probabilities.
             by default, True for 'joint', False for marginals.
         title: bool, optional
             whether to report the gene name in each subplot title.
+        show_axes: bool, optional
+            whether to keep the ticks of the outer panels and label the figure axes.
         genes_to_plot: bool or int np.ndarray or None, optional
             if array, which genes to plot.
             if None, plot by internal order.
@@ -2939,86 +2937,34 @@ class SearchResults:
             whether to save the figure to disk.
         """
         search_data = self._search_data_for(search_data)
-
+        joint = marg == "joint"
         if logscale is None:
-            if marg == "joint" or type(marg)==tuple:
-                logscale = True
-            else:
-                logscale = False
+            logscale = joint
+        modalities = list(self.model.model_modalities)
+        if joint and len(modalities) not in (2, 3):
+            raise ValueError("Joint distribution plot only implemented for 2 or 3 modalities")
+        # the two axes of a joint panel: both modalities, or spliced and protein for the protein model
+        ax_x, ax_y = (0, 1) if len(modalities) == 2 else (1, 2)
 
-        (nrows, ncols) = sz
-        fig1, ax1 = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize)
+        fig1, ax1 = plt.subplots(nrows=sz[0], ncols=sz[1], figsize=figsize)
         axes = np.atleast_1d(ax1).ravel()
+        genes_to_plot = _genes_to_plot(genes_to_plot, self.n_genes, np.prod(sz))
 
-        nax = np.prod(sz)
-        if genes_to_plot is None:
-            genes_to_plot = np.arange(nax)
-
-        genes_to_plot = np.asarray(genes_to_plot)
-        if genes_to_plot.dtype == bool:
-            gtp_temp = np.arange(self.n_genes)
-            genes_to_plot = gtp_temp[genes_to_plot]
-
-        number_of_genes_to_plot = len(genes_to_plot)
-        if number_of_genes_to_plot > self.n_genes:
-            number_of_genes_to_plot = self.n_genes
-            genes_to_plot = genes_to_plot[: self.n_genes]
-        if number_of_genes_to_plot > nax:  # This should no longer break...
-            number_of_genes_to_plot = nax
-            genes_to_plot = genes_to_plot[:nax]
-
-        j_ = 0
-
-        for i_ in genes_to_plot:
-            lm = np.copy(search_data.M[:, i_])
-            
-            # TODO: generalize by adding attribute names as attribute of e.g. CMEModel
-            # attributes = ['unspliced', 'spliced', 'protein']
-            self.modalities = self.model.model_modalities
-            num_modalities = len(self.modalities)
-            for i in range(num_modalities):
-                if marg == self.modalities[i]:
-                    lm[:i] = 1
-                    lm[i+1:]=1
-                    
-            ax = axes[j_]
-
-            samp = self.regressor_optimum[i_]
-            Pa = np.squeeze(self.model.eval_model_pss(self.phys_optimum[i_], lm, samp))
-
-            if marg == "joint":
+        for j_, (ax, i_) in enumerate(zip(axes, genes_to_plot)):
+            Pa = self.gene_pss(search_data, i_, marg)
+            if joint:
+                if len(modalities) == 3:
+                    Pa = Pa.sum(axis=0)
                 if logscale:
-                    Pa[Pa < 1e-10] = 1e-10
-                    Pa = np.log10(Pa)
-
-                if num_modalities==2:
-                    ax.imshow(Pa.T, aspect="auto", cmap="summer")
-                # Set so that, for protein model, the joint distribution of protein and spliced is shown.
-                elif num_modalities==3:
-                    ax.imshow(Pa.sum(axis=0).T, aspect="auto", cmap="summer")
-                else:
-                    log.error('Joint distribution plot only implemented for 2 or 3 modalities')
-                    
+                    Pa = np.log10(np.maximum(Pa, 1e-10))
+                ax.imshow(Pa.T, aspect="auto", cmap="summer")
                 ax.invert_yaxis()
-
-                jitter_magn = 0.1
-                jitter = np.random.randn(2, self.n_cells) * jitter_magn
-                if num_modalities==2:
-                    ax.scatter(
-                        *search_data.layers[:2, :, i_] + jitter, c="k", s=1, alpha=0.1)
-                # for protein model, scatter protein and spliced counts.
-                elif num_modalities==3:
-                    ax.scatter(
-                        *search_data.layers[1:, :, i_] + jitter, c="k", s=1, alpha=0.1
-                )
-                if num_modalities==2:
-                    ax.set_xlim([-0.5, search_data.M[0, i_] - 1.5])
-                    ax.set_ylim([-0.5, search_data.M[1, i_] - 1.5])
-                elif num_modalities==3:
-                    ax.set_xlim([-0.5, search_data.M[1, i_] - 1.5])
-                    ax.set_ylim([-0.5, search_data.M[2, i_] - 1.5])
+                jitter = np.random.randn(2, search_data.n_cells) * 0.1
+                ax.scatter(*search_data.layers[ax_x:ax_y + 1, :, i_] + jitter, c="k", s=1, alpha=0.1)
+                ax.set_xlim([-0.5, search_data.M[ax_x, i_] - 1.5])
+                ax.set_ylim([-0.5, search_data.M[ax_y, i_] - 1.5])
             else:
-                plot_hist_and_fit(ax, search_data, i_, Pa, marg, modalities=self.modalities)
+                plot_hist_and_fit(ax, search_data, i_, Pa, marg, modalities=modalities)
                 if logscale:
                     ax.set_yscale("log")
             if title:
@@ -3026,23 +2972,19 @@ class SearchResults:
                 if hasattr(self, "rejected_genes") and self.rejected_genes[i_]:
                     titlestr += " (rej.)"
                 ax.set_title(titlestr, fontdict={"fontsize": 9})
-            if show_axes:
-                row, col = divmod(j_, sz[1])
-                if col != 0:
-                    ax.set_yticks([])
-                if row < sz[0] - 1:
-                    ax.set_xticks([])
-            else:
-                ax.set_xticks([])
+            row, col = divmod(j_, sz[1])
+            if not (show_axes and col == 0):
                 ax.set_yticks([])
-            j_ += 1
+            if not (show_axes and row == sz[0] - 1):
+                ax.set_xticks([])
         if show_axes:
-            fig1.supxlabel(self.modalities[0 if num_modalities == 2 else 1])
-            fig1.supylabel(self.modalities[1 if num_modalities == 2 else 2])
+            fig1.supxlabel(modalities[ax_x])
+            fig1.supylabel(modalities[ax_y])
         fig1.tight_layout(pad=0.02, rect=[0.05, 0.05, 0.98, 0.98])
 
         if savefig:
             self._savefig("gene_distributions_{}.png".format(marg))
+        return fig1
 
     # the next two functions are useful for model selection, but are not currently in use.
     def get_logL(self, search_data, n_cells=None, EPS=1e-20, offs=0):
@@ -3246,6 +3188,18 @@ def _resolve_marg(marg, layer_names):
     if alias in layer_names:
         return layer_names.index(alias)
     raise ValueError(f"marg={marg!r} is not one of the modalities {layer_names}")
+
+
+def _genes_to_plot(genes_to_plot, n_genes, n_axes):
+    """Gene indices for a grid of ``n_axes`` panels: internal order when
+    ``genes_to_plot`` is None, the indices of a boolean mask, or an index
+    array; truncated to the panels and genes available."""
+    if genes_to_plot is None:
+        genes_to_plot = np.arange(n_axes)
+    genes_to_plot = np.asarray(genes_to_plot)
+    if genes_to_plot.dtype == bool:
+        genes_to_plot = np.flatnonzero(genes_to_plot)
+    return genes_to_plot[: min(int(n_genes), int(n_axes))]
 
 
 def plot_hist_and_fit(

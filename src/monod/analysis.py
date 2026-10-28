@@ -1,5 +1,5 @@
 from .cme_toolbox import CMEModel
-from .inference import SearchResults, plot_hist_and_fit, _resolve_marg, searchdata_from_adata, _read_h5, search_result_from_uns, search_result_list_from_uns, aic_values
+from .inference import SearchResults, plot_hist_and_fit, _resolve_marg, _genes_to_plot, searchdata_from_adata, _read_h5, search_result_from_uns, search_result_list_from_uns, aic_values
 from .extract_data import knee_plot, log
 from .plot_aesthetics import aesthetics
 import pickle
@@ -661,6 +661,27 @@ def plot_AIC_weights(
     return w
 
 
+def _param_labels(sr):
+    """Parameter column names: the model's TeX labels minus the log prefix."""
+    return [p.replace(r"\log_{10} ", "") for p in sr.model.get_log_name_str()]
+
+
+def _write_fold_changes(adata, labels, offs, resid, sign=1, suffix="", adjusted=False):
+    """Record per-parameter fold changes ``offs + resid`` in ``adata.var``.
+
+    ``FC_<param><suffix>`` holds the fold change; with ``adjusted`` the
+    offset-free residual goes to ``adj_FC_<param>`` as well.  ``sign`` is -1
+    for the first dataset of a pair, since fold changes are second minus
+    first.  Returns the last ``FC_`` column name written.
+    """
+    for pi, name in enumerate(labels):
+        label = f"FC_{name}{suffix}"
+        adata.var[label] = sign * (offs[pi][0] + resid[pi])
+        if adjusted:
+            adata.var[f"adj_FC_{name}"] = sign * resid[pi]
+    return label
+
+
 def DE_parameters(adata1, adata2=None, modeltype="id",
     gene_filter_=None,
     discard_rejected=True,
@@ -670,100 +691,56 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
     viz=True,
     pval_thr=0.001,
     nit=10, save_cluster_FCs=True):
+    """Differential expression on the fitted parameters.
 
+    With two AnnDatas, compares their ``uns['search_result']`` fits
+    (:func:`diffexp_pars`) and writes ``FC_<param>``, ``adj_FC_<param>`` to
+    both ``.var`` tables and ``adj_<param>`` to the second.  With one AnnData
+    holding a meK-Means ``uns['search_result_list']``, compares every pair of
+    clusters and writes ``FC_<param>_(i, j)`` to its ``.var``.
+
+    Returns the :func:`diffexp_pars` outputs, keyed by cluster pair in the
+    meK-Means case.
+    """
     if modeltype != 'id':
-        raise Exception('Model type not implemented for DE_parameters.')
+        raise ValueError('Only modeltype="id" is implemented for DE_parameters.')
+    fpi_kwargs = dict(modeltype=modeltype, gene_filter_=gene_filter_, discard_rejected=discard_rejected,
+                      use_sigma=use_sigma, figsize=figsize, meta=meta, viz=viz, pval_thr=pval_thr, nit=nit)
 
-    # If 2 dataframes are given, compare two datasets.
     if adata2:
-        mek_means = False
-
         if not (adata1.var_names == adata2.var_names).all():
             raise KeyError('Genes are not the same between datasets')
-            # log.error('Genes are not the same between datasets')
-    
         sr1 = search_result_from_uns(adata1.uns['search_result'])
         sr2 = search_result_from_uns(adata2.uns['search_result'])
-            
-        gn, gf, offs, resid = diffexp_pars(sr1, sr2, modeltype=modeltype,
-        gene_filter_=gene_filter_,
-        discard_rejected=discard_rejected,
-        use_sigma=use_sigma,
-        figsize=figsize,
-        meta=meta,
-        viz=viz,
-        pval_thr=pval_thr,
-        nit=nit)
-        
-        param_strings = sr1.model.get_log_name_str()
-        fold_changes = offs + resid
-    
-        # Save fold changes and adjusted fold changes (with offset removed).
-        for pi, param in enumerate(param_strings):
-            without_log = param.replace(r"\log_{10} ", "")
+        gn, gf, offs, resid = diffexp_pars(sr1, sr2, **fpi_kwargs)
 
-            FC_label = "FC_{}".format(without_log)
-            adata2.var[FC_label] = fold_changes[pi]
-            adata1.var[FC_label] = -fold_changes[pi]
-
-            # Save adjusted parameters, subtracting the offset from adata2
-            adjusted_param_label = "adj_{}".format(without_log)
-            adata2.var[adjusted_param_label] = adata2.var[without_log] - offs[pi]
-        
-            adj_fold_changes = resid[pi]
-
-            adj_FC_label = "adj_FC_{}".format(without_log)
-            adata2.var[adj_FC_label] = adj_fold_changes
-            adata1.var[adj_FC_label] = -adj_fold_changes
+        labels = _param_labels(sr1)
+        FC_label = _write_fold_changes(adata2, labels, offs, resid, adjusted=True)
+        _write_fold_changes(adata1, labels, offs, resid, sign=-1, adjusted=True)
+        for pi, name in enumerate(labels):
+            adata2.var[f"adj_{name}"] = adata2.var[name] - offs[pi][0]
 
         print('Fold changes saved to each dataframe under .var, e.g. ' + FC_label)
-        print('Adjusted parameter values (subtracting the average fold change) saved to the second dataframe under .var, e.g. ' + adjusted_param_label)
-        print('Adjusted fold changes (subtracting the average fold change) saved to each dataframe under .var, e.g. ' + adj_FC_label)
-               
-    else:
-        
-        mek_means = True
-        sr_list = search_result_list_from_uns(adata1.uns['search_result_list'])
-    
-        gn, gf, offs, resid = {}, {}, {}, {}
-    
-        for i in range(len(sr_list)):
-            for j in range(i+1, len(sr_list)):
-                
-                sr1, sr2 = sr_list[i], sr_list[j]
-                cluster1, cluster2 = sr1.assigns, sr2.assigns
-                dict_key = (cluster1, cluster2)
-                print('Clusters:', dict_key)
-                
-                gn_clusts, gf_clusts, offs_clusts, resid_clusts = \
-                    diffexp_pars(sr1, sr2, modeltype=modeltype,
-                                gene_filter_=gene_filter_,
-                                discard_rejected=discard_rejected,
-                                use_sigma=use_sigma,
-                                figsize=figsize,
-                                meta=meta,
-                                viz=viz,
-                                pval_thr=pval_thr,
-                                nit=nit)
-                plt.show()
+        print('Adjusted parameter values (subtracting the average fold change) saved to the second dataframe under .var, e.g. adj_' + labels[-1])
+        print('Adjusted fold changes (subtracting the average fold change) saved to each dataframe under .var, e.g. adj_' + FC_label)
+        return gn, gf, offs, resid
 
-                gn[dict_key], gf[dict_key], offs[dict_key], resid[dict_key] = gn_clusts, gf_clusts, offs_clusts, resid_clusts
-                
-                if save_cluster_FCs:
-                    param_strings = sr1.model.get_log_name_str()
-                    fold_changes = offs_clusts + resid_clusts
-                
-                    # Save fold changes.  (Do not reuse the outer loop index here.)
-                    for pi, param in enumerate(param_strings):
-                        without_log = param.replace(r"\log_{10} ", "")
-                        FC_label = "FC_{}_{}".format(without_log, dict_key)
-                        adata1.var[FC_label] = fold_changes[pi]
-
-                    print('Fold changes between two clusters recorded in .var in form: ' + FC_label + ', where the tuple (i,j) represents the fold change between cluster i and j.')
-    
-
+    sr_list = search_result_list_from_uns(adata1.uns['search_result_list'])
+    gn, gf, offs, resid = {}, {}, {}, {}
+    for i in range(len(sr_list)):
+        for j in range(i + 1, len(sr_list)):
+            sr1, sr2 = sr_list[i], sr_list[j]
+            dict_key = (sr1.assigns, sr2.assigns)
+            print('Clusters:', dict_key)
+            gn[dict_key], gf[dict_key], offs[dict_key], resid[dict_key] = diffexp_pars(sr1, sr2, **fpi_kwargs)
+            plt.show()
+            if save_cluster_FCs:
+                FC_label = _write_fold_changes(adata1, _param_labels(sr1), offs[dict_key], resid[dict_key],
+                                               suffix=f"_{dict_key}")
+                print('Fold changes between two clusters recorded in .var in form: ' + FC_label
+                      + ', where the tuple (i,j) represents the fold change between cluster i and j.')
     return gn, gf, offs, resid
-    
+
 
 def diffexp_pars(
     sr1,
@@ -870,42 +847,25 @@ def diffexp_pars(
         else:
             ax = None
 
-        resid_arr = np.asarray([np.nan] * sr1.n_genes)
-
-        # xl = [sr1.sp.phys_lb[i],sr1.sp.phys_ub[i]]
-        if use_sigma:
-            gf_, offs_, resid_, pval_ = diffexp_fpi(
-                sr1.phys_optimum[gene_filter, i],
-                sr2.phys_optimum[gene_filter, i],
-                parnames[i],
-                modeltype=modeltype,
-                ax1=ax,
-                s1=sr1.sigma[gene_filter, i],
-                s2=sr2.sigma[gene_filter, i],
-                nit=nit,
-                viz=viz,
-                pval_thr=pval_thr,
-            )
-        else:
-            gf_, offs_, resid_, pval_ = diffexp_fpi(
-                sr1.phys_optimum[gene_filter, i],
-                sr2.phys_optimum[gene_filter, i],
-                parnames[i],
-                modeltype=modeltype,
-                ax1=ax,
-                s1=None,
-                s2=None,
-                nit=nit,
-                viz=viz,
-                pval_thr=pval_thr,
-            )
+        sig1 = sr1.sigma[gene_filter, i] if use_sigma else None
+        sig2 = sr2.sigma[gene_filter, i] if use_sigma else None
+        gf_, offs_, resid_, pval_ = diffexp_fpi(
+            sr1.phys_optimum[gene_filter, i],
+            sr2.phys_optimum[gene_filter, i],
+            parnames[i],
+            modeltype=modeltype,
+            ax1=ax,
+            s1=sig1,
+            s2=sig2,
+            nit=nit,
+            viz=viz,
+            pval_thr=pval_thr,
+        )
+        resid_arr = np.full(sr1.n_genes, np.nan)
         resid_arr[gene_filter] = resid_
 
-        filtind = np.arange(sr1.n_genes)
-        filtind = filtind[gene_filter]
-        filtind = filtind[gf_]
         gf__ = np.zeros(sr1.n_genes, dtype=bool)
-        gf__[filtind] = True
+        gf__[np.flatnonzero(gene_filter)[gf_]] = True
         gn_ = np.asarray(sr1.gene_names)[gf__]   # gene_names may be a list (Rust SearchData)
         gn.append(gn_)
         gf.append(gf__)
@@ -1113,7 +1073,7 @@ def compare_gene_distributions(
     sz=(5, 5),
     figsize=(10, 10),
     marg="mature",
-    logscale=None,
+    logscale=False,
     title=True,
     genes_to_plot=None,
 ):
@@ -1137,9 +1097,10 @@ def compare_gene_distributions(
         dimensions of the figure subplot grid.
     figsize: tuple of floats, optional
         figure dimensions.
-    logscale: None or bool, optional
+    marg: str, optional
+        the modality to plot; joint distributions are not supported here.
+    logscale: bool, optional
         whether to plot probabilities or log-probabilities.
-        by default, False for marginals.
     title: bool, optional
         whether to report the gene name in each subplot title.
     genes_to_plot: bool or int np.ndarray or None, optional
@@ -1147,77 +1108,32 @@ def compare_gene_distributions(
         if None, plot by internal order.
 
     """
-    if logscale is None:
-        if marg == "joint":
-            logscale = True
-        else:
-            logscale = False
-    (nrows, ncols) = sz
-
-    fig1, ax1 = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize)
-
-    nax = np.prod(sz)
-    if genes_to_plot is None:
-        genes_to_plot = np.arange(nax)
-
-    genes_to_plot = np.asarray(genes_to_plot)
-    if genes_to_plot.dtype == bool:
-        gtp_temp = np.arange(sr_arr[0].n_genes)
-        genes_to_plot = gtp_temp[genes_to_plot]
-
-    number_of_genes_to_plot = len(genes_to_plot)
-    if number_of_genes_to_plot > sr_arr[0].n_genes:
-        number_of_genes_to_plot = sr_arr[0].n_genes
-        genes_to_plot = genes_to_plot[: sr_arr[0].n_genes]
-    if number_of_genes_to_plot > nax:
-        number_of_genes_to_plot = nax
-        genes_to_plot = genes_to_plot[:nax]
-
     if marg == "joint":
         raise ValueError("compare_gene_distributions plots marginals; joint comparison is not supported.")
     modalities = list(sr_arr[0].model.model_modalities)
     lind = _resolve_marg(marg, modalities)
+
+    fig1, ax1 = plt.subplots(nrows=sz[0], ncols=sz[1], figsize=figsize)
     axes = np.atleast_1d(ax1).ravel()
+    genes_to_plot = _genes_to_plot(genes_to_plot, sr_arr[0].n_genes, np.prod(sz))
 
-    j_ = 0
-    for i_ in genes_to_plot:
-        axloc = j_
-        xlim = 1
-        for j in range(len(sr_arr)):
-            lm = np.copy(sd_arr[j].M[:, i_])
-            lm[:lind] = 1
-            lm[lind + 1:] = 1
-            xlim = np.max([max(lm), xlim])
-            samp = (
-                None
-                if (sr_arr[j].model.seq_model == "None")
-                else sr_arr[j].regressor_optimum[i_]
-            )
-            Pa = np.squeeze(
-                sr_arr[j].model.eval_model_pss(sr_arr[j].phys_optimum[i_], lm, samp)
-            )
-
+    for ax, i_ in zip(axes, genes_to_plot):
+        for j, (sr, sd) in enumerate(zip(sr_arr, sd_arr)):
             plot_hist_and_fit(
-                axes[axloc],
-                sd_arr[j],
-                i_,
-                Pa,
-                marg,
+                ax, sd, i_, sr.gene_pss(sd, i_, marg), marg,
                 modalities=modalities,
                 facealpha=aesthetics["hist_face_alpha_" + str(j + 1)],
                 facecolor=aesthetics["hist_face_color_" + str(j + 1)],
                 fitcolor=aesthetics["hist_fit_color_" + str(j + 1)],
             )
-        axes[axloc].set_xlim([-0.5, max(xlim - 8, 1)])
+        xlim = max(int(sd.M[lind, i_]) for sd in sd_arr)
+        ax.set_xlim([-0.5, max(xlim - 8, 1)])
         if logscale:
-            axes[axloc].set_yscale("log")
+            ax.set_yscale("log")
         if title:
-            axes[axloc].set_title(sr_arr[0].gene_names[i_], fontdict={"fontsize": 9})
-
-        axes[axloc].set_xticks([])
-        axes[axloc].set_yticks([])
-
-        j_ += 1
+            ax.set_title(sr_arr[0].gene_names[i_], fontdict={"fontsize": 9})
+        ax.set_xticks([])
+        ax.set_yticks([])
     fig1.tight_layout(pad=0.02)
     return fig1
 
@@ -1239,6 +1155,15 @@ def _normalize_count_matrix(X, sizefactor="pf", lognormalize=True, pcount=0, log
     if lognormalize:
         X = np.log(X + pcount + 1) / np.log(logbase)
     return X
+
+
+def _volcano(ax, fc, p, gf):
+    """Volcano plot: log2 fold change against -log10 p, DE genes in red."""
+    pv = -np.log10(p)
+    ax.scatter(fc[gf], pv[gf], 5, "r")
+    ax.scatter(fc[~gf], pv[~gf], 3, "darkgray")
+    ax.set_xlabel(r"Fold change ($\log_2$)")
+    ax.set_ylabel(r"$-\log_{10} p$")
 
 
 def diffexp_mean(
@@ -1324,65 +1249,29 @@ def diffexp_mean(
         fig1, ax1 = plt.subplots(1, 1)
 
     if method == "ttest":
-
         if knee_thr is not None:
-            cf1 = knee_plot(s1, thr=knee_thr[0])
-            cf2 = knee_plot(s2, thr=knee_thr[1])
-            s1 = s1[:, cf1]
-            s2 = s2[:, cf2]
-
-        gf = np.zeros(sd1.n_genes, dtype=bool)
+            s1 = s1[:, knee_plot(s1, thr=knee_thr[0])]
+            s2 = s2[:, knee_plot(s2, thr=knee_thr[1])]
         if bonferroni:
             pval_thr /= sd1.n_genes
-        s1 = _normalize_count_matrix(
-            s1, sizefactor=sizefactor, lognormalize=lognormalize, pcount=pcount, logbase=2
-        )
-        s2 = _normalize_count_matrix(
-            s2, sizefactor=sizefactor, lognormalize=lognormalize, pcount=pcount, logbase=2
-        )
-
-        p = np.zeros(sd1.n_genes)
-        for i in range(sd1.n_genes):
-            _, p_ = scipy.stats.ttest_ind(s1[i], s2[i], equal_var=False)
-            if p_ < pval_thr:
-                gf[i] = True
-            p[i] = p_
+        s1 = _normalize_count_matrix(s1, sizefactor=sizefactor, lognormalize=lognormalize, pcount=pcount, logbase=2)
+        s2 = _normalize_count_matrix(s2, sizefactor=sizefactor, lognormalize=lognormalize, pcount=pcount, logbase=2)
+        p = np.asarray(scipy.stats.ttest_ind(s1, s2, axis=1, equal_var=False).pvalue)
         if lognormalize:
             fc = s2.mean(1) - s1.mean(1)
         else:
-            fc = np.log2(s1 + 1).mean(1) - np.log2(s2 + 1).mean(1)
-        gf = gf & (np.abs(fc) > fc_thr)
-
-        if viz:
-            pv = -np.log10(p)
-            ax1.scatter(fc[gf], pv[gf], 5, "r")
-            ax1.scatter(fc[~gf], pv[~gf], 3, "darkgray")
-            ax1.set_xlabel(r"Fold change ($\log_2$)")
-            ax1.set_ylabel(r"$-\log_{10} p$")
-    else:
+            fc = np.log2(s2 + 1).mean(1) - np.log2(s1 + 1).mean(1)
+        gf = (p < pval_thr) & (np.abs(fc) > fc_thr)
+    elif method in ("logmeanfpi", "meanlogfpi"):
         if method == "logmeanfpi":
-            m1 = np.log2(s1.mean(1))
-            m2 = np.log2(s2.mean(1))
-        elif method == "meanlogfpi":
-            m1 = np.log2(s1 + 1).mean(1)
-            m2 = np.log2(s2 + 1).mean(1)
-        gf, offs_, resid_, p = diffexp_fpi(
-            m1,
-            m2,
-            "Spliced mean",
-            modeltype=modeltype,
-            ax1=ax1,
-            s1=None,
-            s2=None,
-            nit=30,
-            viz=viz_resid,
-            pval_thr=pval_thr,
-        )
-        fc = m2 - m1  # ?
-        if viz:
-            pv = -np.log10(p)
-            ax1.scatter(fc[gf], pv[gf], 5, "r")
-            ax1.scatter(fc[~gf], pv[~gf], 3, "darkgray")
-            ax1.set_xlabel(r"Fold change ($\log_2$)")
-            ax1.set_ylabel(r"$-\log_{10} p$")
+            m1, m2 = np.log2(s1.mean(1)), np.log2(s2.mean(1))
+        else:
+            m1, m2 = np.log2(s1 + 1).mean(1), np.log2(s2 + 1).mean(1)
+        gf, _, _, p = diffexp_fpi(m1, m2, "Spliced mean", modeltype=modeltype, ax1=ax1,
+                                  nit=30, viz=viz_resid, pval_thr=pval_thr)
+        fc = m2 - m1
+    else:
+        raise ValueError(f"method must be 'ttest', 'logmeanfpi' or 'meanlogfpi', got {method!r}.")
+    if viz:
+        _volcano(ax1, fc, p, gf)
     return gf, fc

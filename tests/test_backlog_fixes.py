@@ -178,3 +178,19 @@ class TestGradientHessian:
         with pytest.raises(ValueError, match="method must be"):
             sr.compute_sigma(sd, method="exact")
 
+
+
+class TestExtractDataInput:
+    def test_input_untouched_missing_layer_named(self):
+        import anndata as ad, os
+        here = os.path.dirname(__file__)
+        a = ad.read_h5ad(os.path.join(here, "..", "example_h5ad", "example_adata.h5ad"))
+        n_vars, names, layers = a.n_vars, list(a.var_names), set(a.layers)
+        out = ed.extract_data(a, CMEModel("Bursty", "None"), n_genes=2, viz=False)
+        assert 0 < out.n_vars <= 2 and out.raw is None and "selected_genes" not in out.uns
+        assert "M" in out.uns and "model" in out.uns
+        assert a.n_vars == n_vars and list(a.var_names) == names and set(a.layers) == layers
+        assert "M" not in a.uns
+        with pytest.raises(KeyError, match="modality_name_dict"):
+            ed.extract_data(a, CMEModel("Bursty", "None"), n_genes=2, viz=False,
+                            modality_name_dict={"unspliced": "nope", "spliced": "spliced"})
