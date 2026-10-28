@@ -8,14 +8,12 @@ import collections as _collections
 import contextlib
 import threading
 import numpy as np
-from numba import jit
 import scipy
-from scipy import integrate
 
 from scipy.fft import irfftn
 
 # from .nn_toolbox import basic_ml_bivariate, ml_microstate_logP
-from .extract_data import log
+from ._core import log
 from .reaction_network import ReactionNetwork, IdentifiabilityWarning, StepSchedule
 
 _MESH_CACHE: dict = {}
@@ -400,6 +398,7 @@ def _format_direction(direction, min_weight=0.15):
 # thread-local storage keep the plain attribute syntax; the storage is not
 # pickled, so worker processes start unpinned.
 _SCHEDULE_TLS = threading.local()
+_SCHEDULED_MODELS = ("ProteinBursty", "Custom", "Chromatin")   # the adaptive integrators
 
 
 def _tls_get(obj, key):
@@ -510,13 +509,10 @@ class CMEModel:
         :func:`monod.analysis.compare_nested_models` can test the two.
     """
 
-    # per-thread schedule state of the adaptive integrators (see _SCHEDULE_TLS)
-    _fixed_protein_schedule = _tls_property("fixed_protein")
-    _last_protein_schedule = _tls_property("last_protein")
-    _fixed_custom_schedule = _tls_property("fixed_custom")
-    _last_custom_schedule = _tls_property("last_custom")
-    _fixed_chromatin_schedule = _tls_property("fixed_chromatin")
-    _last_chromatin_schedule = _tls_property("last_chromatin")
+    # per-thread schedule state of the adaptive integrators (see _SCHEDULE_TLS):
+    # the schedule pinned for replay, and the one the last evaluation adapted
+    _fixed_schedule = _tls_property("fixed")
+    _last_schedule = _tls_property("last")
 
     # The chromatin integrator's tolerance: the model's value, or the thread's
     # override while inside search_tolerance(), so that one model instance can
@@ -1012,7 +1008,7 @@ class CMEModel:
             x, f_data = data
             x_np = np.asarray(x, dtype=np.int64)
             if x_np.ndim == 2 and x_np.shape[1] == 3:
-                outer = getattr(self, "_fixed_protein_schedule", None)   # an enclosing pinned_schedule block
+                outer = self._fixed_schedule   # an enclosing pinned_schedule block
                 kld0, grad_list = _mc.eval_kld_grad_protein_bursty(
                     p.tolist(),
                     [int(v) for v in limits],
@@ -1029,10 +1025,6 @@ class CMEModel:
 
         # Python fallback: forward finite differences.
         outer_pin = self._schedule_is_pinned()
-        if not outer_pin:
-            self._fixed_protein_schedule = None
-            self._fixed_custom_schedule = None
-            self._fixed_chromatin_schedule = None
         kld0 = self.eval_model_kld(p, limits, samp, data, EPS)
 
         # Custom networks: central differences with a wide step.  Histogram
@@ -1049,10 +1041,9 @@ class CMEModel:
         # jumps (an enclosing ``pinned_schedule`` block already provides one).
         # The pin lives in thread-local state, so a stencil spread over a thread
         # pool carries it into each worker explicitly.
-        pin_attr = {"ProteinBursty": "_fixed_protein_schedule", "Custom": "_fixed_custom_schedule",
-                    "Chromatin": "_fixed_chromatin_schedule"}.get(self.bio_model)
-        if pin_attr is not None and not outer_pin:
-            setattr(self, pin_attr, getattr(self, pin_attr.replace("_fixed_", "_last_"), None))
+        pin_here = self.bio_model in _SCHEDULED_MODELS and not outer_pin
+        if pin_here:
+            self._fixed_schedule = self._last_schedule
         state = self.thread_state()
 
         def _perturbed(i):
@@ -1078,8 +1069,8 @@ class CMEModel:
                     delayed(_perturbed)(i) for i in range(n_params)
                 )
         finally:
-            if not outer_pin and pin_attr is not None:
-                setattr(self, pin_attr, None)
+            if pin_here:
+                self._fixed_schedule = None
         if central:
             grad = np.array([(kp - km) / (2 * eps) for kp, km in klds_eps])
         else:
@@ -1279,9 +1270,7 @@ class CMEModel:
         return _tls_carry(self, state)
 
     def _schedule_is_pinned(self):
-        return (getattr(self, "_fixed_protein_schedule", None) is not None
-                or getattr(self, "_fixed_custom_schedule", None) is not None
-                or getattr(self, "_fixed_chromatin_schedule", None) is not None)
+        return self._fixed_schedule is not None
 
     @contextlib.contextmanager
     def search_tolerance(self):
@@ -1323,22 +1312,15 @@ class CMEModel:
         and the finite-difference gradient keep an outer pin.  No-op for the
         other models.
         """
-        if self.bio_model not in ("ProteinBursty", "Custom", "Chromatin") or self._schedule_is_pinned():
+        if self.bio_model not in _SCHEDULED_MODELS or self._schedule_is_pinned():
             yield
             return
         try:
             self.eval_model_pss(np.asarray(p, dtype=float), limits, samp)
-            if self.bio_model == "ProteinBursty":
-                self._fixed_protein_schedule = getattr(self, "_last_protein_schedule", None)
-            elif self.bio_model == "Chromatin":
-                self._fixed_chromatin_schedule = getattr(self, "_last_chromatin_schedule", None)
-            else:
-                self._fixed_custom_schedule = getattr(self, "_last_custom_schedule", None)
+            self._fixed_schedule = self._last_schedule
             yield
         finally:
-            self._fixed_protein_schedule = None
-            self._fixed_custom_schedule = None
-            self._fixed_chromatin_schedule = None
+            self._fixed_schedule = None
 
     def check_identifiability(self, p, limits, samp=None, h=1e-4, rtol=1e-3, warn=True):
         """Test whether every parameter direction changes the steady state.
@@ -1482,20 +1464,20 @@ class CMEModel:
             )
             return np.array(pss_flat).reshape([int(l) for l in limits]).squeeze()
         if be.kind == "rust" and be.family == "protein":
-            fixed = getattr(self, "_fixed_protein_schedule", None)
+            fixed = self._fixed_schedule
             pss_flat, steps = _mc.eval_model_pss_protein_bursty_sched(
                 p.tolist(), [int(x) for x in limits], bool(self.fit_unspliced),
                 float(self.protein_limit), _PROTEIN_FUDGE[0], _PROTEIN_FUDGE[1],
                 None if fixed is None else [float(x) for x in np.asarray(fixed, dtype=float)],
             )
-            self._last_protein_schedule = np.asarray(steps, dtype=float)
+            self._last_schedule = np.asarray(steps, dtype=float)
             return np.array(pss_flat).reshape([int(l) for l in limits]).squeeze()
         if be.kind == "rust" and be.family == "custom":
             net  = self.network
             topo = net.rust_topology()
             params_d = net._param_map(p)          # name → linear float (frequency form, normalised rate = 1)
             params_linear = [float(params_d[name]) for name in topo["param_names"]]
-            fixed = getattr(self, "_fixed_custom_schedule", None)
+            fixed = self._fixed_schedule
             taus = [1.0 / float(params_d[name]) for name in net.delay_params]
             re_e, im_e, mx_shape, steps = _mc.eval_custom_network_pgf(
                 len(net.species), [int(x) for x in limits],
@@ -1505,7 +1487,7 @@ class CMEModel:
                 None if fixed is None else [float(x) for x in np.asarray(fixed, dtype=float)],
                 None if fixed is None else list(getattr(fixed, "breakpoints", ())),
             )
-            self._last_custom_schedule = StepSchedule(steps, taus)
+            self._last_schedule = StepSchedule(steps, taus)
             exp_phi = (np.array(re_e) + 1j * np.array(im_e)).reshape(mx_shape)
             pss = np.abs(irfftn(exp_phi, s=[int(x) for x in limits]))
             return (pss / pss.sum()).squeeze()
@@ -1587,18 +1569,16 @@ class CMEModel:
         """``(H, A, C)`` of the Chromatin model at log10 parameters ``p``
         (``A`` holds mean production rates; see :meth:`chromatin_burst`)."""
         from . import chromatin as _chromatin
-        n = self.n_sites
-        k = _chromatin.n_rule_params(self.rule, n)
-        lin = np.power(10.0, np.asarray(p, dtype=float))
-        k_on, eps, rates, beta, gamma = lin[:n], float(lin[n]), lin[n + 1:n + 1 + k], float(lin[n + 1 + k]), float(lin[n + 2 + k])
+        k_on, eps, rates, beta, gamma = _chromatin.split_theta(p, self.rule, self.n_sites)
         return _chromatin.nascent_mature_system(k_on, 1.0, eps, self.rule, beta, gamma, periodic=self.periodic, rule_params=rates)
 
     def chromatin_burst(self, p):
         """Mean burst size at log10 parameters ``p`` (the last entry) for a
         bursty Chromatin model, else None."""
-        if not getattr(self, "bursty", False):
+        if not self.bursty:
             return None
-        return float(10.0 ** float(np.asarray(p, dtype=float)[-1]))
+        from . import chromatin as _chromatin
+        return _chromatin.burst_size(p, self.rule, self.n_sites)
 
     def chromatin_dropout(self, samp):
         """Per-open-site dropout probability from the sampling vector (its third
@@ -1625,9 +1605,9 @@ class CMEModel:
         g = self._apply_seq_transform(g, samp)
         H, A, C = self.chromatin_system(p)
         G, sched = _chromatin.eval_joint_pgf(H, A, C, g, tol=self.chromatin_tol,
-                                             fixed_schedule=getattr(self, "_fixed_chromatin_schedule", None),
+                                             fixed_schedule=self._fixed_schedule,
                                              burst=self.chromatin_burst(p))
-        self._last_chromatin_schedule = sched
+        self._last_schedule = sched
         pss = _chromatin.invert_joint_pgf(G, mx, (lu, ls))              # (N, lu, ls)
         p_drop = self.chromatin_dropout(samp)
         if p_drop is not None:
@@ -1744,9 +1724,9 @@ class CMEModel:
             gf = self.network.eval_pgf(
                 p_,
                 [g[i] for i in range(len(self.network.species))],
-                fixed_schedule=getattr(self, "_fixed_custom_schedule", None),
+                fixed_schedule=self._fixed_schedule,
             )
-            self._last_custom_schedule = self.network.last_schedule
+            self._last_schedule = self.network.last_schedule
 
         else:
             raise ValueError(
@@ -1774,8 +1754,8 @@ class CMEModel:
         rule on two half-steps accumulates phi; the step size is controlled by
         comparing one full step with the two half-steps, taking the maximum error
         over all grid points so the whole grid shares one schedule.  The accepted
-        steps are recorded in ``_last_protein_schedule``; setting
-        ``_fixed_protein_schedule`` replays a given sequence (finite-difference
+        steps are recorded in ``_last_schedule``; setting
+        ``_fixed_schedule`` replays a given sequence (finite-difference
         stencils use the base point's).  Mirrors ``monod_core::protein_pgf_sched``.
 
         Parameters
@@ -1833,7 +1813,7 @@ class CMEModel:
         lam_slow = min(beta, gamma, gamma_p)
         t_end = np.log(1.0 / _PROTEIN_ODE_TOL) / lam_slow + max(0.0, np.log(2.0 * k_p / gamma)) / gamma_p
 
-        fixed = getattr(self, "_fixed_protein_schedule", None)
+        fixed = self._fixed_schedule
         v = g0 + 1.0
         w = g1 + 1.0
         phi = np.zeros_like(v)
@@ -1873,7 +1853,7 @@ class CMEModel:
             steps.append(h)
             h *= fac
 
-        self._last_protein_schedule = np.asarray(steps, dtype=float)
+        self._last_schedule = np.asarray(steps, dtype=float)
         return phi
 
     def cir_intfun(self, x, g, b, beta, gamma):

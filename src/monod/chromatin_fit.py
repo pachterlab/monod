@@ -15,8 +15,9 @@ method-of-moments hook needs, which the per-modality moments do not carry:
    fixes ``beta`` (:func:`moment_start`).
 
 The parameter vector is ``log10 [k_on (n), epsilon, rates (k), beta, gamma]``,
-with the burst size ``b`` appended for a bursty model (:func:`split_theta`,
-:func:`burst_size`, :func:`join_theta`); :func:`embed_in_table` maps the
+with the burst size ``b`` appended for a bursty model
+(:func:`monod.chromatin.split_theta`, :func:`monod.chromatin.burst_size`,
+:func:`monod.chromatin.join_theta`); :func:`embed_in_table` maps the
 ``switch`` and ``additive`` rules into the ``table`` rule's space, for nested
 comparisons (:func:`monod.analysis.compare_nested_models`).
 """
@@ -38,32 +39,7 @@ RATE_FLOOR = 1e-4        # a configuration whose nested rate is zero sits here i
 # Parameter vectors
 # ---------------------------------------------------------------------------
 
-def n_params(rule: str, n_sites: int, bursty: bool = False) -> int:
-    return n_sites + 1 + ch.n_rule_params(rule, n_sites) + 2 + int(bursty)
-
-
-def split_theta(theta: np.ndarray, rule: str, n_sites: int):
-    """``theta`` (log10) -> ``(k_on, eps, rates, beta, gamma)`` on the linear
-    scale; a trailing burst size is left to :func:`burst_size`."""
-    n, k = n_sites, ch.n_rule_params(rule, n_sites)
-    lin = 10.0 ** np.asarray(theta, dtype=float)
-    return lin[:n], float(lin[n]), lin[n + 1:n + 1 + k], float(lin[n + 1 + k]), float(lin[n + 2 + k])
-
-
-def burst_size(theta: np.ndarray, rule: str, n_sites: int) -> Optional[float]:
-    """The mean burst size (linear) when ``theta`` carries one, else None."""
-    theta = np.asarray(theta, dtype=float)
-    if theta.size == n_params(rule, n_sites, bursty=True):
-        return float(10.0 ** theta[-1])
-    if theta.size == n_params(rule, n_sites):
-        return None
-    raise ValueError(f"theta has {theta.size} entries; rule {rule!r} with {n_sites} sites takes "
-                     f"{n_params(rule, n_sites)} or {n_params(rule, n_sites, True)}")
-
-
-def join_theta(k_on, eps, rates, beta, gamma, burst: Optional[float] = None) -> np.ndarray:
-    tail = [beta, gamma] if burst is None else [beta, gamma, burst]
-    return np.log10(np.concatenate([np.atleast_1d(k_on), [eps], np.atleast_1d(rates), tail]).astype(float))
+from .chromatin import n_params, split_theta, burst_size, join_theta  # noqa: F401  (the vector layout lives there)
 
 
 def embed_in_table(theta: np.ndarray, rule: str, n_sites: int, floor: float = RATE_FLOOR) -> np.ndarray:

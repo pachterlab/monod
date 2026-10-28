@@ -58,7 +58,7 @@ class TestAccuracy:
         counts = []
         for p in ([3, 0.4, 0.25], [3, 10, 0.01], [3, 100, 0.001], [3, 0.001, 100]):
             m.eval_model_pss(np.log10(p), [40, 50])
-            counts.append(m._last_custom_schedule.size)
+            counts.append(m._last_schedule.size)
         assert max(counts) < 400, counts
 
 
@@ -67,15 +67,15 @@ class TestSchedule:
         m = _custom(UDEG)
         p, lim = np.log10([3, 0.4, 0.25, 0.15]), [30, 40]
         a = m.eval_model_pss(p, lim)
-        sched = m._last_custom_schedule.copy()
+        sched = m._last_schedule.copy()
         assert sched.size > 10 and np.all(np.asarray(sched) > 0)
-        m._fixed_custom_schedule = sched
+        m._fixed_schedule = sched
         try:
             b = m.eval_model_pss(p, lim)
         finally:
-            m._fixed_custom_schedule = None
+            m._fixed_schedule = None
         np.testing.assert_array_equal(a, b)
-        np.testing.assert_array_equal(m._last_custom_schedule, sched)
+        np.testing.assert_array_equal(m._last_schedule, sched)
 
     def test_python_eval_pgf_records_and_replays(self):
         net = ReactionNetwork(BURSTY, normalize_production_rate=True)
@@ -119,22 +119,22 @@ class TestDelays:
         for tau in (1e-1, 1e-2, 1e-3):
             pss = m.eval_model_pss(np.log10([5, 1 / tau, 1, 0.5]), [40, 50])
             diffs.append(np.abs(pss - now).max())
-            assert m._last_custom_schedule.size < 500
+            assert m._last_schedule.size < 500
         assert diffs[0] > diffs[1] > diffs[2] and diffs[2] < 5e-5, diffs
 
     def test_steps_land_on_the_delay(self):
         m = _custom(DELAYED)
         m.eval_model_pss(np.log10([5, 0.5, 1, 0.5]), [20, 20])    # tau = 2
-        times = np.cumsum(m._last_custom_schedule)
+        times = np.cumsum(m._last_schedule)
         assert np.min(np.abs(times - 2.0)) < 1e-9
-        assert m._last_custom_schedule.breakpoints == (2.0,)
+        assert m._last_schedule.breakpoints == (2.0,)
 
     def test_replayed_schedule_is_warped_onto_the_new_delay(self):
         m = _custom(DELAYED)
         p, lim = np.log10([5, 0.5, 1, 0.5]), [20, 20]
         with m.pinned_schedule(p, lim):
             m.eval_model_pss(p + [0, 0.02, 0, 0], lim)            # tau = 2 / 10**0.02
-            times = np.cumsum(m._last_custom_schedule)
+            times = np.cumsum(m._last_schedule)
         assert np.min(np.abs(times - 2.0 / 10 ** 0.02)) < 1e-9
 
     def test_replayed_kld_is_smooth_in_the_delay(self):
@@ -164,11 +164,11 @@ class TestRustParity:
     def test_rust_matches_python(self, net, p, limits, monkeypatch):
         m = CMEModel("Custom", "None", network=net, normalize_production_rate=("B x" in net))
         rust = m.eval_model_pss(p, limits)
-        n_rust = m._last_custom_schedule.size
+        n_rust = m._last_schedule.size
         monkeypatch.setattr(ct, "_HAS_RUST", False)
         py = m.eval_model_pss(p, limits)
         np.testing.assert_allclose(rust, py, rtol=1e-9, atol=1e-12)
-        assert m._last_custom_schedule.size == n_rust
+        assert m._last_schedule.size == n_rust
 
     def test_kernel_returns_schedule_and_replays_it(self):
         net = ReactionNetwork(BURSTY, normalize_production_rate=True)
@@ -187,15 +187,15 @@ class TestPinnedSchedule:
         m = _custom(UDEG)
         p, lim = np.log10([3, 0.4, 0.25, 0.15]), [30, 40]
         with m.pinned_schedule(p, lim):
-            sched = m._fixed_custom_schedule.copy()
+            sched = m._fixed_schedule.copy()
             m.eval_model_pss(p + 0.05, lim)
-            np.testing.assert_array_equal(m._last_custom_schedule, sched)
+            np.testing.assert_array_equal(m._last_schedule, sched)
             data = _synthetic_data(m, p, lim)
             m.eval_model_kld_and_grad(p + 0.02, lim, None, data, 1e-15, eps=1e-6)
-            np.testing.assert_array_equal(m._fixed_custom_schedule, sched)   # the gradient keeps an outer pin
-        assert m._fixed_custom_schedule is None
+            np.testing.assert_array_equal(m._fixed_schedule, sched)   # the gradient keeps an outer pin
+        assert m._fixed_schedule is None
         m.eval_model_pss(p + 0.05, lim)
-        assert m._last_custom_schedule.size != sched.size or not np.array_equal(m._last_custom_schedule, sched)
+        assert m._last_schedule.size != sched.size or not np.array_equal(m._last_schedule, sched)
 
     def test_noop_for_closed_form_models(self):
         m = CMEModel("Bursty", "None")
@@ -231,14 +231,14 @@ class TestDelayAfterDecay:
         tau = 1 / 0.574
         p, lim = np.log10([14.0, 0.574, 10.8, 21.3]), [40, 50]
         pss = m.eval_model_pss(p, lim)
-        times = np.cumsum(m._last_custom_schedule)
+        times = np.cumsum(m._last_schedule)
         assert times[-1] > tau + 0.5, times[-1]
         dense = np.concatenate([np.full(4000, tau / 4000), np.full(6000, (4.0 - tau) / 6000)])
-        m._fixed_custom_schedule = dense
+        m._fixed_schedule = dense
         try:
             ref = m.eval_model_pss(p, lim)
         finally:
-            m._fixed_custom_schedule = None
+            m._fixed_schedule = None
         np.testing.assert_allclose(pss, ref, atol=5e-5)
         # the same parameters on the immediate network give a different joint
         now = _custom(BURSTY).eval_model_pss(p[[0, 2, 3]], lim)
@@ -260,8 +260,8 @@ class TestThreadLocalSchedules:
                 out = []
                 for _ in range(5):
                     out.append(m.eval_model_pss(p + 0.01, lim))
-                    assert m._fixed_custom_schedule is not None
-                    assert m._last_custom_schedule.size == m._fixed_custom_schedule.size
+                    assert m._fixed_schedule is not None
+                    assert m._last_schedule.size == m._fixed_schedule.size
                 return out
         with ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(work, ref))
@@ -269,4 +269,4 @@ class TestThreadLocalSchedules:
             for o in outs:
                 assert o.shape == ref[lim].shape
                 assert np.abs(o - ref[lim]).max() < 1e-2      # a replay of another grid's schedule would not even match in shape
-        assert m._fixed_custom_schedule is None
+        assert m._fixed_schedule is None

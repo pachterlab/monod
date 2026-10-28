@@ -41,14 +41,14 @@ def _python_reference(model, data, monkeypatch_rust_off, h=1e-4):
     def kld(p):
         return model.eval_model_kld(np.asarray(p, float), LIMITS, None, (coords, freqs))
 
-    model._fixed_protein_schedule = None
+    model._fixed_schedule = None
     kld(X)
-    sched = model._last_protein_schedule
-    model._fixed_protein_schedule = sched
+    sched = model._last_schedule
+    model._fixed_schedule = sched
     try:
         ref = np.array([(kld(X + h * e) - kld(X - h * e)) / (2 * h) for e in np.eye(5)])
     finally:
-        model._fixed_protein_schedule = None
+        model._fixed_schedule = None
     return ref, sched
 
 
@@ -60,18 +60,18 @@ class TestPythonPinnedGradient:
     def test_pinned_schedule_is_used_and_restored(self, model, data, monkeypatch):
         monkeypatch.setattr(ct, "_HAS_RUST", False)
         coords, freqs = data
-        model._fixed_protein_schedule = None
+        model._fixed_schedule = None
         model.eval_model_kld(X, LIMITS, None, (coords, freqs))
-        sched = np.array(model._last_protein_schedule)
+        sched = np.array(model._last_schedule)
         assert sched.ndim == 1 and len(sched) > 10 and np.all(sched > 0)
         # replaying a truncated schedule must use exactly that sequence
-        model._fixed_protein_schedule = sched[:-7]
+        model._fixed_schedule = sched[:-7]
         model.eval_model_kld(X, LIMITS, None, (coords, freqs))
-        model._fixed_protein_schedule = None
-        np.testing.assert_array_equal(model._last_protein_schedule, sched[:-7])
+        model._fixed_schedule = None
+        np.testing.assert_array_equal(model._last_schedule, sched[:-7])
         # the gradient path pins and then clears the schedule
         model.eval_model_kld_and_grad(X, LIMITS, None, (coords, freqs))
-        assert model._fixed_protein_schedule is None
+        assert model._fixed_schedule is None
     def test_python_fd_gradient_matches_reference(self, model, data, monkeypatch):
         monkeypatch.setattr(ct, "_HAS_RUST", False)
         ref, _ = _python_reference(model, data, monkeypatch)

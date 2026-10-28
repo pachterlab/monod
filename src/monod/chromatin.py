@@ -38,8 +38,7 @@ loci and loci to genes) follows.
 """
 from __future__ import annotations
 
-import itertools
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.fft import irfftn
@@ -169,6 +168,38 @@ def n_rule_params(rule: str, n_sites: int) -> int:
     if rule == "table":
         return 2 ** n_sites
     raise ValueError(f"unknown transcription rule {rule!r}; choose from {RULES}")
+
+
+def n_params(rule: str, n_sites: int, bursty: bool = False) -> int:
+    """Length of the Chromatin parameter vector
+    ``log10 [k_on (n_sites), epsilon, rates (k), beta, gamma]``, plus one for
+    the burst size of a bursty model."""
+    return n_sites + 1 + n_rule_params(rule, n_sites) + 2 + int(bursty)
+
+
+def split_theta(theta: np.ndarray, rule: str, n_sites: int):
+    """``theta`` (log10) -> ``(k_on, eps, rates, beta, gamma)`` on the linear
+    scale; a trailing burst size is left to :func:`burst_size`."""
+    n, k = n_sites, n_rule_params(rule, n_sites)
+    lin = 10.0 ** np.asarray(theta, dtype=float)
+    return lin[:n], float(lin[n]), lin[n + 1:n + 1 + k], float(lin[n + 1 + k]), float(lin[n + 2 + k])
+
+
+def burst_size(theta: np.ndarray, rule: str, n_sites: int) -> Optional[float]:
+    """The mean burst size (linear) when ``theta`` carries one, else None."""
+    theta = np.asarray(theta, dtype=float)
+    if theta.size == n_params(rule, n_sites, bursty=True):
+        return float(10.0 ** theta[-1])
+    if theta.size == n_params(rule, n_sites):
+        return None
+    raise ValueError(f"theta has {theta.size} entries; rule {rule!r} with {n_sites} sites takes "
+                     f"{n_params(rule, n_sites)} or {n_params(rule, n_sites, True)}")
+
+
+def join_theta(k_on, eps, rates, beta, gamma, burst: Optional[float] = None) -> np.ndarray:
+    """The inverse of :func:`split_theta`: linear parts -> log10 vector."""
+    tail = [beta, gamma] if burst is None else [beta, gamma, burst]
+    return np.log10(np.concatenate([np.atleast_1d(k_on), [eps], np.atleast_1d(rates), tail]).astype(float))
 
 
 def transcription_rates(rule, n_sites: int, params=None) -> np.ndarray:

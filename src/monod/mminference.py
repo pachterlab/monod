@@ -4,7 +4,8 @@ import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
 from scipy.special import logsumexp, softmax
-from .extract_data import make_dir, log, unique_histograms, layer_moments
+from ._core import make_dir, log
+from .extract_data import unique_histograms, layer_moments
 from .cme_toolbox import CMEModel, _MODELS_2D
 from .inference import (
     SearchData,

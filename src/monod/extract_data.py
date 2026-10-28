@@ -2,9 +2,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pickle
 import anndata as ad
-import os
 import warnings
 import pandas as pd
+
+from ._core import log, to_dense
 
 # ---------------------------------------------------------------------------
 # uns legacy reader
@@ -38,33 +39,6 @@ def model_from_uns(v):
         return CMEModel.from_dict(v)
     return _uns_unpack(v)
 
-def _build_sampling_grid(samp_lb, samp_ub, gridsize):
-    """Build a flat meshgrid over the sampling-parameter space.
-
-    Returns (grid_values, sampl_vals, n_grid_points) where grid_values is a
-    list of flattened per-axis arrays, sampl_vals is a list of (v0, v1, ...)
-    tuples, and n_grid_points is the total number of points.
-    """
-    linspaces = [np.linspace(samp_lb[i], samp_ub[i], gridsize[i]) for i in range(len(gridsize))]
-    grid_values = np.meshgrid(*linspaces, indexing="ij")
-    grid_values = [g.flatten() for g in grid_values]
-    sampl_vals = list(zip(*grid_values))
-    return grid_values, sampl_vals, len(grid_values[0])
-
-import logging
-from scipy.sparse import issparse
-
-
-def to_dense(arr):
-    """Return ``arr`` as a dense numpy array, whether it arrived sparse or dense."""
-    return arr.toarray() if issparse(arr) else np.asarray(arr)
-
-# Library logger.  monod does not configure handlers or touch the root logger;
-# messages propagate to whatever logging setup the application has.  To see
-# progress messages: ``logging.getLogger("monod").setLevel(logging.INFO)`` after
-# ``logging.basicConfig()``.
-log = logging.getLogger("monod")
-
 def _plain_string_index(adata):
     """Make obs/var names and string columns plain object dtype so the AnnData writes to h5ad.
 
@@ -81,15 +55,6 @@ def _plain_string_index(adata):
                 df[col] = df[col].astype(object)
     return adata
 
-
-def make_dir(dir_string):
-    """Create *dir_string* (and any missing parents); a no-op if it already exists."""
-    try:
-        os.makedirs(dir_string, exist_ok=True)
-        log.debug("Directory %s ready.", dir_string)
-    except OSError as e:
-        log.error("Directory %s could not be created: %s", dir_string, e)
-        raise
 
 def extract_data(
     h5ad_filepath,

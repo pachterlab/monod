@@ -1,6 +1,7 @@
 from .cme_toolbox import CMEModel
 from .inference import SearchResults, plot_hist_and_fit, _resolve_marg, _genes_to_plot, searchdata_from_adata, _read_h5, search_result_from_uns, search_result_list_from_uns, aic_values
-from .extract_data import knee_plot, log
+from .extract_data import knee_plot
+from ._core import log
 from .plot_aesthetics import aesthetics
 import pickle
 import scipy

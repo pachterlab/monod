@@ -65,7 +65,7 @@ class TestAccuracy:
         idx = rng.choice(g.shape[1], size=6, replace=False)
         idx[0] = g.shape[1] // 2            # include a point far from g = 0
         g = g[:, idx]
-        model._fixed_protein_schedule = None
+        model._fixed_schedule = None
         phi = model.protein_pgf(g, p)
         ref = _reference_phi(g, p)
         # compare on the generating-function scale, where |exp(phi)| <= 1
@@ -74,9 +74,9 @@ class TestAccuracy:
     @pytest.mark.parametrize("regime", list(REGIMES))
     def test_step_count_is_small_in_every_regime(self, model, regime):
         p = 10.0 ** np.asarray(REGIMES[regime])
-        model._fixed_protein_schedule = None
+        model._fixed_schedule = None
         model.protein_pgf(_mesh(LIMITS), p)
-        n = len(model._last_protein_schedule)
+        n = len(model._last_schedule)
         assert 20 < n < 600, f"{regime}: {n} steps"
 
 
@@ -84,16 +84,16 @@ class TestReplay:
     def test_replaying_the_schedule_reproduces_phi(self, model):
         p = 10.0 ** np.asarray(REGIMES["balanced"])
         g = _mesh(LIMITS)
-        model._fixed_protein_schedule = None
+        model._fixed_schedule = None
         phi = model.protein_pgf(g, p)
-        sched = model._last_protein_schedule.copy()
-        model._fixed_protein_schedule = sched
+        sched = model._last_schedule.copy()
+        model._fixed_schedule = sched
         try:
             phi2 = model.protein_pgf(g, p)
         finally:
-            model._fixed_protein_schedule = None
+            model._fixed_schedule = None
         np.testing.assert_array_equal(phi, phi2)
-        np.testing.assert_array_equal(model._last_protein_schedule, sched)
+        np.testing.assert_array_equal(model._last_schedule, sched)
 
 
 @pytest.mark.skipif(_mc is None, reason="monod_core not available")

@@ -64,9 +64,7 @@ class CMEKernel:
         return self.m.eval_model_pss(np.asarray(theta, float), self.limits)
 
     def _last(self):
-        attr = {"Custom": "_last_custom_schedule", "ProteinBursty": "_last_protein_schedule",
-                "Chromatin": "_last_chromatin_schedule"}[self.m.bio_model]
-        last = getattr(self.m, attr, None)
+        last = self.m._last_schedule
         return None if last is None else np.asarray(last, float)
 
     def pss_pinned(self, theta_base, theta_eval):
@@ -237,7 +235,7 @@ class TestOuterPin:
         e = np.zeros(theta.size); e[0] = 1e-2
         h = 1e-4
         with m.pinned_schedule(theta, lim):
-            sched = kernel._last().copy() if m.bio_model != "Custom" else np.asarray(m._fixed_custom_schedule, float).copy()
+            sched = kernel._last().copy() if m.bio_model != "Custom" else np.asarray(m._fixed_schedule, float).copy()
             _, g = m.eval_model_kld_and_grad(theta + e, lim, None, data, 1e-15, eps=1e-6)
             ref = np.zeros(theta.size)
             for i in range(theta.size):
