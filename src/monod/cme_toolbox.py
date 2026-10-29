@@ -680,6 +680,23 @@ class CMEModel:
         if amb_model not in _AMB_MODELS:
             raise ValueError(f"amb_model must be one of {_AMB_MODELS}; got {amb_model!r}")
         self.amb_model = amb_model
+        if self.amb_model != "None":
+            # Ambiguous reads are a third observed channel: each nascent molecule
+            # (or read, under Poisson sampling) is counted as ambiguous with
+            # probability p_N and each mature one with p_M (one p for "Equal").
+            # The channel is a modality like the other two, so extract_data
+            # reads an 'ambiguous' layer, and the probabilities are per-gene
+            # parameters appended to the vector, log10 in [-3, 0].
+            if self.bio_model not in _MODELS_2D:
+                raise ValueError(f"amb_model is only available for the two-species models {sorted(_MODELS_2D)}; "
+                                 f"got bio_model={self.bio_model!r}")
+            n_amb = 1 if self.amb_model == "Equal" else 2
+            self.model_modalities = list(self.model_modalities) + ['ambiguous']
+            self.filter_bounds = {'min_means': list(self.filter_bounds['min_means']) + [0.0],
+                                  'max_maxes': list(self.filter_bounds['max_maxes']) + [350],
+                                  'min_maxes': list(self.filter_bounds['min_maxes']) + [0]}
+            self.bio_bounds = {'phys_lb': list(self.bio_bounds['phys_lb']) + [-3.0] * n_amb,
+                               'phys_ub': list(self.bio_bounds['phys_ub']) + [0.0] * n_amb}
         if seq_model in ["None", None, "Null"]:
             self.seq_model = "None"
         else:
@@ -1232,12 +1249,11 @@ class CMEModel:
         if not np.all(np.isfinite(p)):
             raise ValueError("parameters must be finite log10 values; got {}".format(p))
         limits_arr = np.atleast_1d(np.asarray(limits))
-        n_species = len(self.model_modalities) + (1 if self.amb_model != "None" else 0)
+        n_species = len(self.model_modalities)
         if limits_arr.ndim != 1 or limits_arr.shape[0] != n_species:
             raise ValueError(
                 f"{self.bio_model}: limits must have one grid size per species "
-                f"({n_species} for modalities {self.model_modalities}"
-                f"{' + ambient' if self.amb_model != 'None' else ''}), got {list(limits_arr)}"
+                f"({n_species} for modalities {self.model_modalities}), got {list(limits_arr)}"
             )
         if np.any(limits_arr < 1) or np.any(limits_arr != np.round(limits_arr)):
             raise ValueError(f"limits must be positive integers, got {list(limits_arr)}")
@@ -1930,6 +1946,21 @@ class CMEModel:
         U_var, U_mean = moments['MOM_unspliced_var'], moments['MOM_unspliced_mean']
         S_var, S_mean = moments['MOM_spliced_var'], moments['MOM_spliced_mean']
 
+        p_amb = 0.1                                   # the guess when no ambiguous moments are at hand
+        if self.amb_model != "None" and 'MOM_ambiguous_mean' in moments:
+            # Each count lands in the ambiguous channel with probability p, so the
+            # pooled ambiguous share estimates p, and the observed unspliced and
+            # spliced moments are those of a binomial thinning of the true ones:
+            # E[U] = q E[N], Var(U) = q^2 Var(N) + p q E[N], with q = 1 - p.
+            A_mean = moments['MOM_ambiguous_mean']
+            total = U_mean + S_mean + A_mean
+            if total > 0:
+                p_amb = float(np.clip(A_mean / total, 1e-3, 1 - 1e-3))
+            q = 1.0 - p_amb
+            U_var = max((U_var - p_amb * U_mean) / q ** 2, 1e-12)
+            S_var = max((S_var - p_amb * S_mean) / q ** 2, 1e-12)
+            U_mean, S_mean = U_mean / q, S_mean / q
+
         if self.bio_model == "Bursty" or self.bio_model == "CIR":
             b = np.clip(self._mom_burst_size(U_var, U_mean, samp), lb[0], ub[0])
             beta = b / U_mean
@@ -1992,10 +2023,10 @@ class CMEModel:
             else:
                 x0[1:] = x0[1:] * samp
 
-        if self.amb_model == "Equal":  # basic
-            x0 = np.concatenate((x0, [0.1]))  # just make a guess
+        if self.amb_model == "Equal":
+            x0 = np.concatenate((x0, [p_amb]))
         elif self.amb_model == "Unequal":
-            x0 = np.concatenate((x0, [0.1, 0.1]))  # just make a guess
+            x0 = np.concatenate((x0, [p_amb, p_amb]))     # the pooled share for both channels
 
         for j in range(self.get_num_params()):
             x0[j] = np.clip(x0[j], lb[j], ub[j])

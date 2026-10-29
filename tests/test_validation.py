@@ -268,7 +268,7 @@ class TestLeftoverValidation:
         here = os.path.dirname(__file__)
         model = CMEModel("Bursty", "None")
         madata = extract_data(ad.read_h5ad(os.path.join(here, "..", "example_h5ad", "example_adata.h5ad")),
-                              model, dataset_name="x", n_genes=3, viz=False)
+                              model, dataset_name="x", n_genes=3, viz=False, ambiguous="drop")
         sd = searchdata_from_adata(madata)
         sr = InferenceParameters("x", model, gradient_params={"max_iterations": 5, "num_restarts": 1}).fit_all_grid_points(sd)
         sr.find_sampling_optimum()

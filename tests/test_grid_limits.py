@@ -87,3 +87,27 @@ class TestSelectExpressedGenes:
         out = extract_data(a, CMEModel("Bursty", "None"), dataset_name="gl2", n_genes=len(genes),
                            genes_to_fit=genes, filt_param=PERMISSIVE, viz=False)
         assert list(out.var_names) == genes
+
+
+class TestRenamedLayers:
+    """Moments are keyed by modality, so renamed layers still feed the moments start."""
+
+    def test_moments_follow_the_modalities(self, tmp_path, monkeypatch):
+        warnings.filterwarnings("ignore")
+        monkeypatch.chdir(tmp_path)
+        a = _synthetic(seed=7)
+        a.layers["nascent"] = a.layers.pop("unspliced")
+        a.layers["mature"] = a.layers.pop("spliced")
+        names = {"unspliced": "nascent", "spliced": "mature"}
+        out = extract_data(a, CMEModel("Bursty", "None"), dataset_name="rn", n_genes=4, filt_param=PERMISSIVE,
+                           modality_name_dict=names, viz=False)
+        assert "MOM_unspliced_mean" in out.var.columns and "MOM_nascent_mean" not in out.var.columns
+        assert "M_nascent" in out.var.columns                         # grid limits keep the layer names
+        sd = searchdata_from_adata(out)
+        assert list(sd.layer_names) == ["unspliced", "spliced"]
+        assert "MOM_unspliced_mean" in sd.moments[0]
+        from monod.inference import perform_inference
+        fit = perform_inference(a, CMEModel("Bursty", "None"), n_genes=4, filt_param=PERMISSIVE, modality_name_dict=names,
+                                gradient_params={"max_iterations": 10, "init_pattern": "moments", "num_restarts": 1,
+                                                 "num_gene_cores": 1}, viz=False, dataset_string="rn2")
+        assert np.all(np.isfinite(fit.var["$b$"]))

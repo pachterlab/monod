@@ -86,7 +86,7 @@ def processed_poisson(request, raw_example_adata):
         dataset_name=f"test_{bio_model}_{seq_model}",
         n_genes=1,
         viz=False,
-        hist_type="unique",
+        hist_type="unique", ambiguous="drop"
     )
     return {
         "bio_model": bio_model,
@@ -107,7 +107,7 @@ def processed(request, raw_example_adata):
         dataset_name=f"test_{bio_model}_{seq_model}",
         n_genes=1,
         viz=False,
-        hist_type="unique",
+        hist_type="unique", ambiguous="drop"
     )
     return {
         "bio_model": bio_model,

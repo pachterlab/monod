@@ -74,6 +74,7 @@ def extract_data(
     hist_type='unique',
     padding=None,
     mek_means_params=None,
+    ambiguous=None,
 ):
     """Select the genes to fit and prepare their counts for inference.
 
@@ -110,6 +111,17 @@ def extract_data(
         10 for each species by default.
     mek_means_params: (k, epochs) or None
         recorded in ``uns`` for meK-Means inference.
+    ambiguous: None, 'spliced', 'unspliced', 'drop' or 'model'
+        what to do with an ``ambiguous`` layer (reads that could belong to
+        either transcript; the layer name is ``modality_name_dict['ambiguous']``
+        when given).  ``'spliced'`` / ``'unspliced'`` add its counts to that
+        channel, ``'drop'`` ignores it, ``'model'`` fits it as a third channel
+        and needs a model with ``amb_model`` (the default when the model has
+        one).  When the layer is present and no choice is made, the call
+        fails rather than ignore the reads silently: some quantifications
+        already fold them into ``spliced``, in which case ``'drop'`` is the
+        right choice and folding again would count them twice.  The choice is
+        recorded in ``uns['ambiguous']``.
 
     Returns
     -------
@@ -157,6 +169,9 @@ def extract_data(
     monod_adata = _plain_string_index(ad.AnnData(X=source.X, obs=source.obs.copy(), var=source.var.copy()))
     for layer in layer_names:
         monod_adata.layers[layer] = to_dense(source.layers[layer])
+    ambiguous = _handle_ambiguous(monod_adata, source, model, modality_name_dict, ambiguous)
+    if ambiguous is not None:
+        monod_adata.uns['ambiguous'] = ambiguous
     monod_adata.uns['modality_name_dict'] = modality_name_dict
     monod_adata.uns['model'] = model.to_dict()   # read by threshold_by_expression
 
@@ -196,10 +211,51 @@ def extract_data(
     # Histograms are not stored in uns: searchdata_from_adata rebuilds them from
     # the layers (in Rust when available), which is faster than unpickling and
     # keeps the AnnData writable as a plain h5ad.
-    monod_adata = add_moments(monod_adata)
+    # Moments are keyed by modality (MOM_unspliced_mean, ...), whatever the layers are called:
+    # the method-of-moments starts read them by modality.
+    monod_adata = add_moments(monod_adata, modality_name_dict)
     if mek_means_params:
         monod_adata.uns['k'], monod_adata.uns['epochs'] = mek_means_params
     return _plain_string_index(monod_adata)
+
+
+_AMBIGUOUS_CHOICES = ('model', 'spliced', 'unspliced', 'drop')
+
+
+def _handle_ambiguous(monod_adata, source, model, modality_name_dict, ambiguous):
+    """Apply the ``ambiguous`` choice of :func:`extract_data` and return it
+    (``'model'`` when the model carries ``amb_model``)."""
+    amb_layer = modality_name_dict.get('ambiguous', 'ambiguous')
+    present = amb_layer in source.layers
+    modelled = getattr(model, 'amb_model', 'None') != 'None'
+    if ambiguous is None and modelled:
+        ambiguous = 'model'
+    if ambiguous is not None and ambiguous not in _AMBIGUOUS_CHOICES:
+        raise ValueError(f"ambiguous must be one of {_AMBIGUOUS_CHOICES}; got {ambiguous!r}")
+    if modelled and ambiguous != 'model':
+        raise ValueError(f"the model fits the ambiguous layer (amb_model={model.amb_model!r}); "
+                         f"ambiguous={ambiguous!r} conflicts with that")
+    if ambiguous == 'model' and not modelled:
+        raise ValueError("ambiguous='model' needs a CMEModel with amb_model='Equal' or 'Unequal'")
+    if ambiguous is None and present:
+        raise ValueError(
+            f"the AnnData has an ambiguous layer ({amb_layer!r}); say what to do with it: "
+            "ambiguous='spliced' or 'unspliced' (add its counts to that channel), 'drop' (ignore it), "
+            "or 'model' with a CMEModel(amb_model='Equal' | 'Unequal') (fit the probability that a count "
+            "is reported as ambiguous). If the spliced layer already holds these reads, 'drop' is the choice."
+        )
+    if ambiguous in ('spliced', 'unspliced'):
+        if not present:
+            raise KeyError(f"ambiguous={ambiguous!r} but the AnnData has no {amb_layer!r} layer "
+                           f"(available: {list(source.layers)})")
+        if ambiguous not in modality_name_dict:
+            raise ValueError(f"the model has no {ambiguous!r} modality to fold the ambiguous counts into")
+        target = modality_name_dict[ambiguous]
+        monod_adata.layers[target] = monod_adata.layers[target] + to_dense(source.layers[amb_layer])
+        log.info("Ambiguous counts (%r) added to the %s layer %r.", amb_layer, ambiguous, target)
+    elif ambiguous == 'drop' and present:
+        log.info("Ambiguous layer %r dropped.", amb_layer)
+    return ambiguous
 
 
 def unique_histograms(layers):

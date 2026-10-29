@@ -407,7 +407,7 @@ def test_perform_inference_mek_means_writes_cluster_columns(tmp_path, monkeypatc
     monkeypatch.chdir(tmp_path)
     gp = {"max_iterations": 5, "init_pattern": "moments", "num_restarts": 1, "num_gene_cores": 1}
     adata = perform_inference(example, CMEModel("Bursty", "None"), n_genes=3, viz=False, gradient_params=gp, seed=1,
-                              mek_means_params=(2, 2), exclude_sigma=False)
+                              mek_means_params=(2, 2), exclude_sigma=False, ambiguous="drop")
     names = [p.replace(r"\log_{10} ", "") for p in CMEModel("Bursty", "None").param_str]
     for j in range(2):
         for name in names:

@@ -36,7 +36,7 @@ def fit(tmp_path_factory):
     os.chdir(tmp_path_factory.mktemp("fit"))
     try:
         model = CMEModel("Bursty", "None")
-        madata = extract_data(ad.read_h5ad(EXAMPLE), model, dataset_name="x", n_genes=3, viz=False)
+        madata = extract_data(ad.read_h5ad(EXAMPLE), model, dataset_name="x", n_genes=3, viz=False, ambiguous="drop")
         sd = searchdata_from_adata(madata)
         ip = InferenceParameters("x", model, gradient_params=GP)
         sr = ip.fit_all_grid_points(sd)
@@ -54,8 +54,8 @@ def two_adatas(tmp_path_factory):
     os.chdir(tmp_path_factory.mktemp("pi"))
     try:
         m = CMEModel("Bursty", "None")
-        a1 = perform_inference(EXAMPLE, m, n_genes=3, viz=False, gradient_params=GP, seed=1)
-        a2 = perform_inference(EXAMPLE, m, n_genes=3, viz=False, gradient_params=GP, seed=1)
+        a1 = perform_inference(EXAMPLE, m, n_genes=3, viz=False, gradient_params=GP, seed=1, ambiguous="drop")
+        a2 = perform_inference(EXAMPLE, m, n_genes=3, viz=False, gradient_params=GP, seed=1, ambiguous="drop")
         return a1, a2
     finally:
         os.chdir(cwd)

@@ -183,6 +183,9 @@ class MEKMeansParameters(_BaseInferenceParameters):
         # meK-Means only changes two fitting defaults (one start per gene and
         # the Rust optimizer when available) and adds the clustering settings.
         # Saving waits until those are set, since parameters.h5 holds them too.
+        if getattr(model, "amb_model", "None") != "None":
+            raise NotImplementedError("meK-Means does not support the ambiguous-assignment models (amb_model); "
+                                      "fold the ambiguous layer into one of the two channels first.")
         super().__init__(
             dataset_string, model, use_lengths=use_lengths,
             gradient_params={"num_restarts": 1, "use_rust_lbfgsb": _HAS_RUST, **(gradient_params or {})},

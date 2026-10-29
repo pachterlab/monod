@@ -349,7 +349,7 @@ class TestEndToEnd:
         from monod.cme_toolbox import CMEModel
         model = CMEModel("Bursty", "None")
         processed = extract_data(adata, model, dataset_name="test_sd",
-                                 n_genes=1, viz=False, hist_type="unique")
+                                 n_genes=1, viz=False, hist_type="unique", ambiguous="drop")
         sd = searchdata_from_adata(processed)
         assert isinstance(sd, _mc.SearchData), \
             f"Expected _mc.SearchData, got {type(sd)}"
@@ -360,7 +360,7 @@ class TestEndToEnd:
         from monod.cme_toolbox import CMEModel
         model = CMEModel("Bursty", "None")
         processed = extract_data(adata, model, dataset_name="test_sd2",
-                                 n_genes=1, viz=False, hist_type="unique")
+                                 n_genes=1, viz=False, hist_type="unique", ambiguous="drop")
         sd = searchdata_from_adata(processed)
         # M must match grid_limits(adata)
         np.testing.assert_array_equal(sd.M, grid_limits(processed))
@@ -380,7 +380,7 @@ class TestEndToEnd:
         from monod.cme_toolbox import CMEModel
         model = CMEModel("Bursty", "None")
         processed = extract_data(adata, model, dataset_name="test_sd3",
-                                 n_genes=1, viz=False, hist_type="unique")
+                                 n_genes=1, viz=False, hist_type="unique", ambiguous="drop")
         sd = searchdata_from_adata(processed)
         for col in processed.var.columns:
             if not col.startswith("MOM_"):

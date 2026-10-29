@@ -30,7 +30,7 @@ def example_adata():
 
 class TestExtractDataDefaults:
     def test_no_dataset_name(self, example_adata):
-        out = extract_data(example_adata.copy(), CMEModel("Bursty", "None"), n_genes=3, viz=False)
+        out = extract_data(example_adata.copy(), CMEModel("Bursty", "None"), n_genes=3, viz=False, ambiguous="drop")
         assert out.n_vars >= 1
 
 
@@ -86,7 +86,7 @@ class TestMEKMeansDefaults:
 @pytest.fixture(scope="module")
 def poisson_sd(example_adata):
     m = CMEModel("Bursty", "Poisson")
-    madata = extract_data(example_adata.copy(), m, dataset_name="x", n_genes=3, viz=False)
+    madata = extract_data(example_adata.copy(), m, dataset_name="x", n_genes=3, viz=False, ambiguous="drop")
     sd = searchdata_from_adata(madata)
     if getattr(sd, "gene_log_lengths", None) is not None:
         pytest.skip("example data unexpectedly carries gene lengths")

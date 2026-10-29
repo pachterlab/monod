@@ -63,7 +63,7 @@ class TestHistType:
         here = os.path.dirname(__file__)
         a = ad.read_h5ad(os.path.join(here, "..", "example_h5ad", "example_adata.h5ad"))
         with pytest.raises(ValueError, match="only 'unique'"):
-            ed.extract_data(a, CMEModel("Bursty", "None"), n_genes=2, viz=False, hist_type="grid")
+            ed.extract_data(a, CMEModel("Bursty", "None"), n_genes=2, viz=False, hist_type="grid", ambiguous="drop")
 
 
 class TestDefaults:
@@ -83,7 +83,7 @@ def fit(tmp_path_factory):
         here = os.path.dirname(__file__)
         model = CMEModel("Bursty", "None")
         madata = ed.extract_data(ad.read_h5ad(os.path.join(here, "..", "example_h5ad", "example_adata.h5ad")),
-                                 model, dataset_name="x", n_genes=3, viz=False)
+                                 model, dataset_name="x", n_genes=3, viz=False, ambiguous="drop")
         sd = searchdata_from_adata(madata)
         ip = InferenceParameters("x", model, gradient_params={"max_iterations": 5, "num_restarts": 1})
         sr = ip.fit_all_grid_points(sd)
@@ -186,11 +186,11 @@ class TestExtractDataInput:
         here = os.path.dirname(__file__)
         a = ad.read_h5ad(os.path.join(here, "..", "example_h5ad", "example_adata.h5ad"))
         n_vars, names, layers = a.n_vars, list(a.var_names), set(a.layers)
-        out = ed.extract_data(a, CMEModel("Bursty", "None"), n_genes=2, viz=False)
+        out = ed.extract_data(a, CMEModel("Bursty", "None"), n_genes=2, viz=False, ambiguous="drop")
         assert 0 < out.n_vars <= 2 and out.raw is None and "selected_genes" not in out.uns
         assert "M_unspliced" in out.var and "model" in out.uns
         assert a.n_vars == n_vars and list(a.var_names) == names and set(a.layers) == layers
         assert "M_unspliced" not in a.var
         with pytest.raises(KeyError, match="modality_name_dict"):
             ed.extract_data(a, CMEModel("Bursty", "None"), n_genes=2, viz=False,
-                            modality_name_dict={"unspliced": "nope", "spliced": "spliced"})
+                            modality_name_dict={"unspliced": "nope", "spliced": "spliced"}, ambiguous="drop")

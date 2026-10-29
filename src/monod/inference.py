@@ -70,6 +70,7 @@ def perform_inference(h5ad_filepath,
     poisson_average_log_length=5,
     mek_means_params=None,
     split_by=None, groups=None, batch_by=None, batches=None, shared_samp=True,
+    ambiguous=None,
     num_cores=1, AIC_EPS=1e-20, AIC_offs=0,
     save=False, checkpoint=False):
     '''
@@ -101,6 +102,11 @@ def perform_inference(h5ad_filepath,
     cell types of one experiment only.  ``batches`` restricts and orders the
     experiments like ``groups`` does the cell types; ``batch_by`` on its own
     fits each experiment as a group with its own optimum.
+
+    ``ambiguous`` says what to do with an ``ambiguous`` layer: ``'spliced'`` or
+    ``'unspliced'`` (fold its counts into that channel), ``'drop'``, or
+    ``'model'`` with a model that has ``amb_model`` (see :func:`extract_data`).
+    It is required whenever such a layer is present.
     '''
     splitting = split_by is not None or batch_by is not None
     if splitting and mek_means_params:
@@ -136,7 +142,8 @@ def perform_inference(h5ad_filepath,
     viz=viz,
     filt_param=filt_param,
     modality_name_dict=modality_name_dict,
-    genes_to_fit=genes_to_fit, hist_type=hist_type, mek_means_params=mek_means_params)
+    genes_to_fit=genes_to_fit, hist_type=hist_type, mek_means_params=mek_means_params,
+    ambiguous=ambiguous)
     log.info('Data extracted')
     log.debug('hist type is %s',hist_type)
     
@@ -537,9 +544,11 @@ def searchdata_from_adata(adata):
         rust_layers = [_to_c_int64(adata.layers[ln]) for ln in ordered_layer_names]
         coords_list, freqs_list = _mc.make_state_dist(rust_layers)
         limits_arr  = np.ascontiguousarray(M, dtype=np.int64)
+        # The container names its layers by modality (the moments it computes are keyed
+        # MOM_<modality>_*, which the moments starts read), whatever the AnnData layers are called.
         return _mc.searchdata_from_arrays(
             rust_layers,
-            ordered_layer_names,
+            list(ordered_modalities),
             limits_arr,
             coords_list,
             freqs_list,
@@ -561,7 +570,7 @@ def searchdata_from_adata(adata):
         "M", "hist", "moments", "n_genes", "gene_names",
         "n_cells", "layers", "hist_type", "layer_names"
     ]
-    attr_values = [M, hist, moments, n_genes, gene_names, n_cells, layers, "unique", ordered_layer_names]
+    attr_values = [M, hist, moments, n_genes, gene_names, n_cells, layers, "unique", list(ordered_modalities)]
 
     if gene_log_lengths is not None:
         attr_names  += ['gene_log_lengths']
@@ -1342,8 +1351,10 @@ class GradientInference:
                                   hist=search_data.hist[i], limits=np.asarray(search_data.M[:, i]))
                     for i in range(search_data.n_genes)
                 ])
-            elif _sd_is_rust_sd:
-                # Zero-Python-loop path: Rust computes MoM for all genes at once.
+            elif _sd_is_rust_sd and model.amb_model == "None":
+                # Zero-Python-loop path: Rust computes MoM for all genes at once
+                # (the ambiguous models take the Python start, which uses the
+                # ambiguous moments).
                 samp_list_mom = None
                 if model.seq_model in ("Poisson", "Bernoulli"):
                     samp_list_mom = [
@@ -3062,8 +3073,14 @@ class SearchResults:
         modalities = list(self.model.model_modalities)
         if joint and len(modalities) not in (2, 3):
             raise ValueError("Joint distribution plot only implemented for 2 or 3 modalities")
-        # the two axes of a joint panel: both modalities, or spliced and protein for the protein model
-        ax_x, ax_y = (0, 1) if len(modalities) == 2 else (1, 2)
+        # the two axes of a joint panel: both modalities; spliced and protein for the protein
+        # model; unspliced and spliced, with the ambiguous channel summed out, for the ambiguous models
+        if len(modalities) == 2:
+            ax_x, ax_y, drop = 0, 1, None
+        elif modalities[-1] == 'protein':
+            ax_x, ax_y, drop = 1, 2, 0
+        else:
+            ax_x, ax_y, drop = 0, 1, 2
 
         fig1, ax1 = plt.subplots(nrows=sz[0], ncols=sz[1], figsize=figsize)
         axes = np.atleast_1d(ax1).ravel()
@@ -3072,8 +3089,8 @@ class SearchResults:
         for j_, (ax, i_) in enumerate(zip(axes, genes_to_plot)):
             Pa = self.gene_pss(search_data, i_, marg)
             if joint:
-                if len(modalities) == 3:
-                    Pa = Pa.sum(axis=0)
+                if drop is not None:
+                    Pa = Pa.sum(axis=drop)
                 if logscale:
                     Pa = np.log10(np.maximum(Pa, 1e-10))
                 ax.imshow(Pa.T, aspect="auto", cmap="summer")

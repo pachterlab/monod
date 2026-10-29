@@ -2,7 +2,7 @@
 
 ## Input data
 
-Monod works on an [AnnData](https://anndata.readthedocs.io) object whose `layers` hold integer counts for the model's modalities: `unspliced` and `spliced` by default, as produced by kallisto|bustools, velocyto or similar tools. Layers with other names are mapped with `modality_name_dict`. Gene lengths, if a model uses them, come from a transcriptome file or `adata.var['log_lengths']`.
+Monod works on an [AnnData](https://anndata.readthedocs.io) object whose `layers` hold integer counts for the model's modalities: `unspliced` and `spliced` by default, as produced by kallisto|bustools, velocyto or similar tools. Layers with other names are mapped with `modality_name_dict`. Gene lengths, if a model uses them, come from a transcriptome file or `adata.var['log_lengths']`. An `ambiguous` layer, reads that could belong to either transcript, is never used silently: `extract_data` and `perform_inference` take `ambiguous=` with `'spliced'` or `'unspliced'` (add its counts to that channel), `'drop'`, or `'model'` together with a model that has `amb_model` (fit it as a third channel, see below), and they fail when the layer is present and no choice was made. Some quantifications already fold the ambiguous reads into `spliced`; then `'drop'` is the right choice, and folding again would count them twice. The choice is recorded in `adata.uns['ambiguous']`.
 
 ## Choosing a model
 
@@ -16,7 +16,7 @@ model = CMEModel("Bursty", "Bernoulli", amb_model="Equal")  # plus ambiguous rea
 
 - **Transcription** (`bio_model`): `Constitutive`, `Bursty`, `CIR`, `Extrinsic`, `Delay`, `DelayedSplicing`, `ProteinBursty` (adds a protein layer), or a custom reaction network passed as `network=`, including time-delayed reactions written with `=>`. All of these run on the Rust accelerator when it is installed. `Bursty` is the usual choice for mammalian and bacterial cells.
 - **Sequencing noise** (`seq_model`): `None`, `Poisson`, or `Bernoulli`. The `sequencing_noise` notebook in `demos/` shows what the models do, how the sampling landscape is scanned, and how the fitted variance splits into intrinsic, extrinsic and technical parts.
-- **Ambiguous assignment** (`amb_model`): `None`, `Equal`, or `Unequal`. Models reads that cannot be assigned to the unspliced or spliced transcript and are reported in an `ambiguous` layer; each molecule is counted as ambiguous with a per-gene probability (one shared, or one per species).
+- **Ambiguous assignment** (`amb_model`): `None`, `Equal`, or `Unequal`. Reads that cannot be assigned to the unspliced or the spliced transcript are a third observed channel: each nascent count lands in it with a per-gene probability `p_N` and each mature count with `p_M` (`Unequal`), or both with one `p` (`Equal`). The channel is a modality like the other two, so the AnnData needs an `ambiguous` layer (map other names with `modality_name_dict`, for example `{"unspliced": "nascent", "spliced": "mature", "ambiguous": "ambiguous"}` for `kb count --workflow nac` output), the probabilities are fitted per gene and written to `var` as `$p$` or `$p_N$`, `$p_M$`, and the moments start takes `p` from the pooled ambiguous share. Available for the six two-species models with any sequencing model; not for meK-Means. The alternative is to fold the ambiguous layer into one channel before the fit, which fixes the answer in advance.
 
 The `models`, `reaction_networks` and `protein_bursty` notebooks in `demos/` show each family.
 

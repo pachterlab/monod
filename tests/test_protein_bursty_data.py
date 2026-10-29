@@ -381,7 +381,7 @@ def processed_usp(example_adata, model_usp):
         n_genes=1,
         viz=False,
         genes_to_fit=["PTPRC"],
-        hist_type="unique",
+        hist_type="unique", ambiguous="drop"
     )
 
 
@@ -394,7 +394,7 @@ def processed_sp(example_adata, model_sp):
         n_genes=1,
         viz=False,
         genes_to_fit=["PTPRC"],
-        hist_type="unique",
+        hist_type="unique", ambiguous="drop"
     )
 
 

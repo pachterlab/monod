@@ -67,7 +67,7 @@ class TestCMEModel:
 
     def test_no_pickle_in_uns_after_extract_data(self, tmp_path):
         warnings.filterwarnings("ignore")
-        out = extract_data(ad.read_h5ad(EXAMPLE), CMEModel("Bursty", "None"), n_genes=3, viz=False)
+        out = extract_data(ad.read_h5ad(EXAMPLE), CMEModel("Bursty", "None"), n_genes=3, viz=False, ambiguous="drop")
         assert isinstance(out.uns["model"], dict) and "hist" not in out.uns
         p = str(tmp_path / "x.h5ad")
         out.write_h5ad(p)
@@ -110,7 +110,7 @@ def run(tmp_path_factory):
     cwd = os.getcwd(); os.chdir(tmp_path_factory.mktemp("run"))
     try:
         out = perform_inference(EXAMPLE, CMEModel("Bursty", "None"), n_genes=3, viz=False, gradient_params=GP,
-                                save=True, dataset_string="savetest")
+                                save=True, dataset_string="savetest", ambiguous="drop")
         return out, os.getcwd()
     finally:
         os.chdir(cwd)
@@ -159,13 +159,13 @@ class TestSearchResults:
 
     def test_default_run_touches_no_files(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path); warnings.filterwarnings("ignore")
-        perform_inference(EXAMPLE, CMEModel("Bursty", "None"), n_genes=3, viz=False, gradient_params=GP)
+        perform_inference(EXAMPLE, CMEModel("Bursty", "None"), n_genes=3, viz=False, gradient_params=GP, ambiguous="drop")
         assert os.listdir(tmp_path) == []
 
     def test_checkpoint_round_trip(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path); warnings.filterwarnings("ignore")
         model = CMEModel("Bursty", "Poisson")
-        madata = extract_data(ad.read_h5ad(EXAMPLE), model, dataset_name="x", n_genes=3, viz=False)
+        madata = extract_data(ad.read_h5ad(EXAMPLE), model, dataset_name="x", n_genes=3, viz=False, ambiguous="drop")
         sd = searchdata_from_adata(madata)
         ip = InferenceParameters("x", model, gridsize=[2, 1], gradient_params=GP, save=True)
         sr_ck = ip.fit_all_grid_points(sd, checkpoint=True)
