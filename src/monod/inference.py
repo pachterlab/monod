@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
 from ._core import make_dir, log, _build_sampling_grid, to_dense
-from .extract_data import extract_data, make_histogram, _uns_unpack, model_from_uns
+from .extract_data import extract_data, make_histogram, grid_limits, _uns_unpack, model_from_uns
 from .cme_toolbox import CMEModel, _HAS_RUST, _MODELS_2D, _format_direction, _PROTEIN_ODE, _CUSTOM_ODE
 from .reaction_network import ReactionNetworkWarning, IdentifiabilityWarning
 from ._core import _mc          # None when the compiled extension is not installed
@@ -229,7 +229,7 @@ def perform_inference(h5ad_filepath,
         monod_adata.uns['search_result'] = results[0].to_dict()
 
     # The SearchData is deliberately not stored: it is rebuilt in memory from
-    # the AnnData (layers + uns['M']) via searchdata_from_adata(), which is fast
+    # the AnnData (layers + var['M_<layer>']) via searchdata_from_adata(), which is fast
     # and avoids serialising the (Rust-backed) histogram container.
     log.info('Search data is not stored; rebuild it with searchdata_from_adata(monod_adata).')
 
@@ -256,7 +256,7 @@ def searchdata_from_adata(adata):
     ordered_modalities = model.model_modalities
     ordered_layer_names = [modality_name_dict[modality] for modality in ordered_modalities]
 
-    M = adata.uns['M']
+    M = grid_limits(adata)
     n_cells = adata.n_obs
     gene_names = list(adata.var.index)
 

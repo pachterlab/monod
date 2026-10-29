@@ -364,10 +364,12 @@ def _partition_search_data(search_data, labels, k, padding=None):
         padding = [10] * n_layers
     padding = np.asarray(padding)[:, None]
 
+    # One read: on a Rust SearchData every .layers access densifies the whole array.
+    all_layers = np.asarray(search_data.layers)
     for k in np.unique(max_ks):
         #Select which obs in k 
         obs_inds = max_ks == k
-        layers = search_data.layers[:,obs_inds,:]
+        layers = all_layers[:, obs_inds, :]
         n_cells = np.sum(obs_inds)
 
         new_layers = np.transpose(layers, axes=(0, 2, 1))
@@ -743,6 +745,10 @@ class GradientInference(_BaseGradientInference):
 
         n_cells = search_data.n_cells
         n_genes = search_data.n_genes
+        # Read the counts and limits once: on a Rust SearchData every .layers or
+        # .M access rebuilds the whole array, which dominated the E-step per gene.
+        layers = np.asarray(search_data.layers)
+        M = np.asarray(search_data.M)
         ks_present = sorted(self.theta.keys())
         if not ks_present:
             raise ValueError("E-step called before any cluster has fitted parameters.")
@@ -763,9 +769,9 @@ class GradientInference(_BaseGradientInference):
             and model.quad_method == "fixed_quad"
         ):
             params_per_k = [self.theta[k][0].tolist() for k in ks_present]
-            limits_list = [[int(v) for v in search_data.M[:, g]] for g in range(n_genes)]
-            u_obs = [search_data.layers[0][:, g].astype(int).tolist() for g in range(n_genes)]
-            s_obs = [search_data.layers[1][:, g].astype(int).tolist() for g in range(n_genes)]
+            limits_list = M.T.astype(int).tolist()
+            u_obs = layers[0].T.astype(int).tolist()
+            s_obs = layers[1].T.astype(int).tolist()
             samp_list = None
             if model.seq_model == "Poisson":
                 samp_list = [
@@ -800,10 +806,10 @@ class GradientInference(_BaseGradientInference):
             params, klds, obj_fun, d_time = self.theta[k]
             logL_k = np.zeros(n_cells)
             for gene_index in range(n_genes):
-                S = search_data.layers[1][:,gene_index].astype(int)
-                U = search_data.layers[0][:,gene_index].astype(int)
+                S = layers[1][:, gene_index].astype(int)
+                U = layers[0][:, gene_index].astype(int)
                 x = np.array([U,S])
-                proposal = model.eval_model_pss(params[gene_index], search_data.M[:, gene_index], self.regressor[gene_index])
+                proposal = model.eval_model_pss(params[gene_index], M[:, gene_index], self.regressor[gene_index])
                 proposal[proposal < EPS] = EPS
                 proposal = proposal[tuple(x)]
                 logL_k += np.log(proposal)
@@ -950,6 +956,26 @@ class GradientInference(_BaseGradientInference):
 ########################
 ## Helper functions
 ########################
+
+def cell_assignments(results, n_cells=None):
+    """Per-cell cluster index from the list :meth:`MEKMeansParameters.run_mek_means`
+    returns (or ``search_result_list_from_uns`` rebuilds).
+
+    Each :class:`SearchResults` in the list tracks one cluster: ``assigns`` is
+    its index and ``filt`` the boolean mask of the cells in it.  Clusters that
+    ended empty are not in the list, so their cells, if any, get -1.
+    ``n_cells`` defaults to the length of the masks.
+    """
+    results = list(results)
+    if not results:
+        raise ValueError("cell_assignments needs at least one SearchResults")
+    if n_cells is None:
+        n_cells = len(np.asarray(results[0].filt))
+    out = np.full(int(n_cells), -1, dtype=int)
+    for sr in results:
+        out[np.asarray(sr.filt, dtype=bool)] = int(sr.assigns)
+    return out
+
 
 def mek_means_aic(Q, lower_bound, n_phys_pars, n_genes, n_cells):
     """Per-cell AIC of a fitted meK-Means mixture, as defined in the paper.

@@ -91,7 +91,7 @@ class TestConfiguration:
     def test_build_multiome_adata_end_to_end(self):
         import anndata as ad
         from monod.cme_toolbox import CMEModel
-        from monod.extract_data import extract_data
+        from monod.extract_data import extract_data, grid_limits
         rng = np.random.default_rng(0)
         n_cells = 300
         cells = [f"c{i}" for i in range(n_cells)]
@@ -118,6 +118,6 @@ class TestConfiguration:
         model = CMEModel("Chromatin", "None", n_sites=2, rule="switch")
         m_adata = extract_data(out, model, n_genes=1, viz=False, dataset_name="chrom_data", filt_param={
             "min_means": [0, 0, 0], "max_maxes": [1000, 1000, 4], "min_maxes": [0, 0, 0]})
-        assert m_adata.uns["M"][2, 0] == 4
+        assert grid_limits(m_adata)[2, 0] == 4
         with pytest.raises(ValueError):
             cd.build_multiome_adata(rna, atac, _genes(), rule="tss_window", n_sites=4, window=1500)   # A has three candidates

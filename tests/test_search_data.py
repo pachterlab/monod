@@ -344,7 +344,7 @@ class TestEndToEnd:
         return ad.read_h5ad(EXAMPLE_PATH)
 
     def test_searchdata_from_adata_returns_rust_type(self, adata):
-        from monod.extract_data import extract_data
+        from monod.extract_data import extract_data, grid_limits
         from monod.inference import searchdata_from_adata
         from monod.cme_toolbox import CMEModel
         model = CMEModel("Bursty", "None")
@@ -355,15 +355,15 @@ class TestEndToEnd:
             f"Expected _mc.SearchData, got {type(sd)}"
 
     def test_searchdata_attributes_consistent(self, adata):
-        from monod.extract_data import extract_data
+        from monod.extract_data import extract_data, grid_limits
         from monod.inference import searchdata_from_adata
         from monod.cme_toolbox import CMEModel
         model = CMEModel("Bursty", "None")
         processed = extract_data(adata, model, dataset_name="test_sd2",
                                  n_genes=1, viz=False, hist_type="unique")
         sd = searchdata_from_adata(processed)
-        # M must match adata.uns['M']
-        np.testing.assert_array_equal(sd.M, processed.uns['M'])
+        # M must match grid_limits(adata)
+        np.testing.assert_array_equal(sd.M, grid_limits(processed))
         # n_genes, n_cells
         assert sd.n_genes == processed.n_vars
         assert sd.n_cells == processed.n_obs
@@ -375,7 +375,7 @@ class TestEndToEnd:
 
     def test_moments_match_adata_var(self, adata):
         """Rust moments must match the MOM_* columns written to adata.var."""
-        from monod.extract_data import extract_data
+        from monod.extract_data import extract_data, grid_limits
         from monod.inference import searchdata_from_adata
         from monod.cme_toolbox import CMEModel
         model = CMEModel("Bursty", "None")

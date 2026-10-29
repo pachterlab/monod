@@ -188,9 +188,9 @@ class TestExtractDataInput:
         n_vars, names, layers = a.n_vars, list(a.var_names), set(a.layers)
         out = ed.extract_data(a, CMEModel("Bursty", "None"), n_genes=2, viz=False)
         assert 0 < out.n_vars <= 2 and out.raw is None and "selected_genes" not in out.uns
-        assert "M" in out.uns and "model" in out.uns
+        assert "M_unspliced" in out.var and "model" in out.uns
         assert a.n_vars == n_vars and list(a.var_names) == names and set(a.layers) == layers
-        assert "M" not in a.uns
+        assert "M_unspliced" not in a.var
         with pytest.raises(KeyError, match="modality_name_dict"):
             ed.extract_data(a, CMEModel("Bursty", "None"), n_genes=2, viz=False,
                             modality_name_dict={"unspliced": "nope", "spliced": "spliced"})

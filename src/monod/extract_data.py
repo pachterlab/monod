@@ -5,6 +5,8 @@ import anndata as ad
 import warnings
 import pandas as pd
 
+from scipy.sparse import issparse
+
 from ._core import log, to_dense
 
 # ---------------------------------------------------------------------------
@@ -110,9 +112,11 @@ def extract_data(
     Returns
     -------
     anndata.AnnData
-        the selected genes with the model's layers dense, ``uns['M']`` (grid
-        sizes), ``uns['model']``, ``uns['modality_name_dict']``,
-        ``uns['hist_type']`` and the moments in ``var``.
+        the selected genes with the model's layers dense, the grid limits in
+        ``var['M_<layer>']`` (one column per modality, read back with
+        :func:`grid_limits`, so gene subsets of the AnnData keep them),
+        ``uns['model']``, ``uns['modality_name_dict']``, ``uns['hist_type']``
+        and the moments in ``var``.
     """
     if hist_type != "unique":
         raise ValueError(
@@ -183,7 +187,8 @@ def extract_data(
     if model.bio_model == "Chromatin":
         # the configuration axis is categorical with exactly 2**n_sites states
         M[model.model_modalities.index('configuration'), :] = 2 ** model.n_sites
-    monod_adata.uns['M'] = M.astype(int)
+    for row, layer in zip(M.astype(int), layer_names):
+        monod_adata.var[f'M_{layer}'] = row
     monod_adata.uns['hist_type'] = hist_type
 
     # Histograms are not stored in uns: searchdata_from_adata rebuilds them from
@@ -251,11 +256,51 @@ def add_moments(adata, modality_name_dict=None):
     return adata
 
 
-def _ordered_layers(monod_adata):
-    """The AnnData's layers in the model's modality order."""
+def _ordered_layer_names(monod_adata):
+    """The AnnData's layer names in the model's modality order."""
     modality_name_dict = monod_adata.uns['modality_name_dict']
     model = model_from_uns(monod_adata.uns['model'])
-    return [monod_adata.layers[modality_name_dict[m]] for m in model.model_modalities]
+    return [modality_name_dict[m] for m in model.model_modalities]
+
+
+def _ordered_layers(monod_adata):
+    """The AnnData's layers in the model's modality order."""
+    return [monod_adata.layers[name] for name in _ordered_layer_names(monod_adata)]
+
+
+def grid_limits(monod_adata):
+    """Grid limits of a monod AnnData as an int array of shape (n_layers, n_genes),
+    layers in the model's modality order.
+
+    :func:`extract_data` stores them in ``var['M_<layer>']``, one column per
+    modality, so they follow the genes through any AnnData subset.  Files
+    written by older versions carry them as ``uns['M']`` instead, which is read
+    when the columns are absent.
+    """
+    cols = [f'M_{name}' for name in _ordered_layer_names(monod_adata)]
+    if all(c in monod_adata.var.columns for c in cols):
+        return np.asarray(monod_adata.var[cols].to_numpy().T, dtype=int)
+    if 'M' in monod_adata.uns:
+        return np.asarray(monod_adata.uns['M'], dtype=int)
+    raise KeyError(f"no grid limits in the AnnData: expected var columns {cols} (written by extract_data)")
+
+
+def select_expressed_genes(adata, min_cells=10, n_genes=None, layer='spliced'):
+    """Names of the genes with a nonzero count in at least ``min_cells`` cells,
+    in the AnnData's gene order; the first ``n_genes`` of them when given.
+
+    A deterministic alternative to the seeded random draw of
+    :func:`extract_data`: pass the result as ``genes_to_fit`` (with
+    ``n_genes=len(genes)``).  ``layer`` names the layer to count in, or ``None``
+    for ``X``.  Sparse layers are counted without densifying them.
+    """
+    X = adata.X if layer is None else adata.layers[layer]
+    if issparse(X):
+        n_cells_expr = np.asarray((X != 0).sum(axis=0)).ravel()
+    else:
+        n_cells_expr = np.count_nonzero(np.asarray(X), axis=0)
+    names = adata.var_names[n_cells_expr >= min_cells]
+    return list(names if n_genes is None else names[:n_genes])
 
 
 def make_histogram(monod_adata, hist_type="unique", M=None):

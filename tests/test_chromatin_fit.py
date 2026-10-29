@@ -237,11 +237,11 @@ class TestPipeline:
         return str(path), truths, n_cells
 
     def test_extract_sets_the_configuration_limit(self, synthetic_h5ad):
-        from monod.extract_data import extract_data
+        from monod.extract_data import extract_data, grid_limits
         path, truths, n_cells = synthetic_h5ad
         adata = extract_data(path, _model("switch"), n_genes=2, viz=False, dataset_name="chrom_extract")
         assert adata.n_vars == 2
-        assert np.all(adata.uns["M"][2, :] == 4)                       # M is (n_layers, n_genes)
+        assert np.all(grid_limits(adata)[2, :] == 4)                       # M is (n_layers, n_genes)
         assert adata.uns["model"]["bio_model"] == "Chromatin"
 
     def test_perform_inference_fits_both_genes(self, synthetic_h5ad, tmp_path):

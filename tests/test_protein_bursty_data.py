@@ -30,7 +30,7 @@ import anndata as ad
 
 from conftest import check_snapshot
 from monod.cme_toolbox import CMEModel
-from monod.extract_data import extract_data, make_histogram, model_from_uns
+from monod.extract_data import extract_data, grid_limits, make_histogram, model_from_uns
 
 from monod._core import _mc  # None unless the compiled extension is really installed
 
@@ -45,7 +45,7 @@ def _hist_from_adata(adata):
                   for ln in ordered_layer_names]
         coords_list, freqs_list = _mc.make_state_dist(layers)
         return (np.array(coords_list[0], dtype=np.int64), np.array(freqs_list[0]))
-    return make_histogram(adata, "unique", adata.uns["M"])[0]
+    return make_histogram(adata, "unique", grid_limits(adata))[0]
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -413,22 +413,22 @@ class TestExtractDataPipeline:
         assert processed_sp.n_vars == 1
 
     def test_usp_output_has_uns_M(self, processed_usp):
-        assert "M" in processed_usp.uns
+        assert any(c.startswith("M_") for c in processed_usp.var.columns)
 
     def test_usp_M_shape(self, processed_usp):
-        M = processed_usp.uns["M"]
+        M = grid_limits(processed_usp)
         # M is (n_layers, n_genes), so (3, 1) for ProteinBursty
         assert M.shape == (3, 1)
 
     def test_sp_M_shape(self, processed_sp):
-        M = processed_sp.uns["M"]
+        M = grid_limits(processed_sp)
         assert M.shape == (3, 1)
 
     def test_usp_M_snapshot(self, processed_usp):
-        check_snapshot("extract_data_usp_M", processed_usp.uns["M"])
+        check_snapshot("extract_data_usp_M", grid_limits(processed_usp))
 
     def test_sp_M_snapshot(self, processed_sp):
-        check_snapshot("extract_data_sp_M", processed_sp.uns["M"])
+        check_snapshot("extract_data_sp_M", grid_limits(processed_sp))
 
     def test_usp_has_moments_in_var(self, processed_usp):
         for col in (

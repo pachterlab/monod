@@ -5,6 +5,8 @@ from ._core import log
 from .plot_aesthetics import aesthetics
 import pickle
 import scipy
+from scipy.optimize import linear_sum_assignment
+from sklearn.metrics import adjusted_rand_score
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -312,6 +314,106 @@ def compare_nested_models(model_small, model_big, embed=None, x_small=None, limi
     out.update(aic_small=2 * k_s + 2 * n * kld_small, aic_big=2 * k_b + 2 * n * out["kld_big"],
                bic_small=k_s * np.log(n) + 2 * n * kld_small, bic_big=k_b * np.log(n) + 2 * n * out["kld_big"])
     return out
+
+
+def cluster_confusion(labels_a, labels_b):
+    """Contingency table of two label vectors over the same cells.
+
+    Returns ``(table, values_a, values_b)``: ``table[i, j]`` is the number of
+    cells with ``labels_a == values_a[i]`` and ``labels_b == values_b[j]``, the
+    distinct values of each vector sorted.
+    """
+    a = np.asarray(labels_a)
+    b = np.asarray(labels_b)
+    if a.shape != b.shape:
+        raise ValueError(f"label vectors differ in length: {a.shape} vs {b.shape}")
+    values_a, ia = np.unique(a, return_inverse=True)
+    values_b, ib = np.unique(b, return_inverse=True)
+    table = np.zeros((len(values_a), len(values_b)), dtype=int)
+    np.add.at(table, (ia.ravel(), ib.ravel()), 1)
+    return table, values_a, values_b
+
+
+def match_clusters(reference, labels):
+    """Relabel integer cluster ``labels`` so that each cluster takes the id of the
+    ``reference`` cluster it shares most cells with (a one-to-one assignment on
+    the contingency table).
+
+    Cluster ids are arbitrary, so two clusterings of the same cells, such as two
+    meK-Means runs, are compared cell by cell after this.  Negative labels
+    (unassigned cells) are kept; clusters left without a partner, when
+    ``labels`` has more clusters than ``reference``, get fresh ids above the
+    reference's largest.
+    """
+    ref = np.asarray(reference)
+    lab = np.asarray(labels)
+    keep = (ref >= 0) & (lab >= 0)
+    table, ref_values, lab_values = cluster_confusion(ref[keep], lab[keep])
+    rows, cols = linear_sum_assignment(-table)
+    mapping = {int(lab_values[j]): int(ref_values[i]) for i, j in zip(rows, cols)}
+    next_id = int(ref_values.max()) + 1 if len(ref_values) else 0
+    for v in lab_values:
+        if int(v) not in mapping:
+            mapping[int(v)] = next_id
+            next_id += 1
+    out = lab.copy()
+    for v, new in mapping.items():
+        out[lab == v] = new
+    return out
+
+
+def plot_cluster_confusion(true_labels, assigns, row_names=None, col_names=None, ax=None,
+                           align=True, title=None, cmap="Blues", fontsize=9, colorbar=True):
+    """Annotated confusion matrix of cluster assignments against reference labels,
+    with the adjusted Rand index in the title.
+
+    ``true_labels`` may be strings (cell-type annotations) or integers;
+    ``assigns`` are the integer clusters, e.g. from
+    :func:`monod.mminference.cell_assignments`.  ``row_names`` and
+    ``col_names`` rename the sorted distinct values of each vector (sequences
+    aligned with them, or dicts); by default rows show the values and columns
+    ``Cluster <k>``.  With ``align`` the columns are ordered so that the best
+    one-to-one match with the rows runs down the diagonal; this is cosmetic,
+    the ARI does not depend on it.
+
+    Returns a dict with ``ari``, the plotted ``table``, its ``rows`` and
+    ``cols`` (values in plotted order) and ``ax``.
+    """
+    true_labels = np.asarray(true_labels)
+    assigns = np.asarray(assigns)
+    table, rows, cols = cluster_confusion(true_labels, assigns)
+    if align:
+        r_ind, c_ind = linear_sum_assignment(-table)
+        order = list(c_ind[np.argsort(r_ind)]) + [j for j in range(len(cols)) if j not in set(c_ind)]
+        table, cols = table[:, order], cols[order]
+    ari = float(adjusted_rand_score(true_labels, assigns))
+
+    def _names(values, given, default):
+        if given is None:
+            return [default(v) for v in values]
+        if isinstance(given, dict):
+            return [str(given.get(v, v)) for v in values]
+        lookup = dict(zip(np.unique(values), given))
+        return [str(lookup[v]) for v in values]
+
+    row_text = _names(rows, row_names, str)
+    col_text = _names(cols, col_names, lambda v: f"Cluster {v}")
+    if ax is None:
+        _, ax = plt.subplots(figsize=(1.2 * len(cols) + 2.5, 1.0 * len(rows) + 1.5))
+    im = ax.imshow(table, cmap=cmap)
+    ax.set_xticks(range(len(cols)))
+    ax.set_xticklabels(col_text, rotation=15, ha="right")
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels(row_text)
+    thresh = table.max() * 0.5
+    for i in range(len(rows)):
+        for j in range(len(cols)):
+            ax.text(j, i, f"{table[i, j]:,}", ha="center", va="center", fontsize=fontsize,
+                    color="white" if table[i, j] > thresh else "black")
+    ax.set_title(f"{title}\nARI = {ari:.3f}" if title else f"ARI = {ari:.3f}")
+    if colorbar:
+        ax.figure.colorbar(im, ax=ax, shrink=0.8)
+    return {"ari": ari, "table": table, "rows": rows, "cols": cols, "ax": ax}
 
 
 def run_qc(monod_adata, mek_means_params=None, cluster=0, discard_rejected=True, marg='joint',

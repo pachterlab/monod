@@ -266,3 +266,43 @@ class TestGenePlotHelpers:
             assert (fc > 0).all() and gf.all()
         with pytest.raises(ValueError, match="method"):
             analysis.diffexp_mean(a, b, method="median", viz=False)
+
+
+class TestClusterHelpers:
+    """cluster_confusion, match_clusters and plot_cluster_confusion (no fit needed)."""
+
+    def test_cluster_confusion_counts(self):
+        a = np.array(["T", "B", "T", "NK", "B", "T"])
+        b = np.array([1, 0, 1, 2, 0, 2])
+        table, va, vb = analysis.cluster_confusion(a, b)
+        assert list(va) == ["B", "NK", "T"] and list(vb) == [0, 1, 2]
+        assert table.tolist() == [[2, 0, 0], [0, 0, 1], [0, 2, 1]]
+        with pytest.raises(ValueError):
+            analysis.cluster_confusion(a, b[:-1])
+
+    def test_match_clusters_undoes_a_permutation(self):
+        rng = np.random.default_rng(0)
+        ref = rng.integers(0, 3, 300)
+        perm = np.array([2, 0, 1])
+        lab = perm[ref].copy()
+        lab[:5] = (lab[:5] + 1) % 3                      # a few disagreements survive the relabelling
+        out = analysis.match_clusters(ref, lab)
+        assert np.mean(out == ref) == pytest.approx(295 / 300)
+        # unassigned cells stay -1, an extra cluster gets a fresh id
+        lab2 = lab.copy(); lab2[10:20] = -1; lab2[20:30] = 7
+        out2 = analysis.match_clusters(ref, lab2)
+        assert np.all(out2[10:20] == -1) and np.all(out2[20:30] == 3)
+
+    def test_plot_cluster_confusion_aligns_and_scores(self):
+        truth = np.repeat(["B", "NK", "T"], [50, 20, 30])
+        assigns = np.repeat([2, 0, 1], [50, 20, 30])    # perfect clustering, permuted ids
+        fig, ax = plt.subplots()
+        res = analysis.plot_cluster_confusion(truth, assigns, ax=ax, title="x", col_names=["c0", "c1", "c2"])
+        assert res["ari"] == pytest.approx(1.0) and res["ax"] is ax
+        assert list(res["cols"]) == [2, 0, 1]
+        assert np.all(np.diag(res["table"]) == [50, 20, 30])
+        assert [t.get_text() for t in ax.get_xticklabels()] == ["c2", "c0", "c1"]
+        assert ax.get_title() == "x\nARI = 1.000"
+        unaligned = analysis.plot_cluster_confusion(truth, assigns, align=False)
+        assert list(unaligned["cols"]) == [0, 1, 2]
+        plt.close("all")

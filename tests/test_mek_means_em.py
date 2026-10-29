@@ -417,3 +417,34 @@ def test_perform_inference_mek_means_writes_cluster_columns(tmp_path, monkeypatc
     assert adata.obs["cluster"].notna().all() and set(adata.obs["cluster"].unique()) <= {0, 1}
     srs = search_result_list_from_uns(adata.uns["search_result_list"])
     assert len(srs) == 2 and all(sr.phys_optimum.shape == (adata.n_vars, 3) for sr in srs)   # the example file has one gene
+
+
+# ---------------------------------------------------------------------------
+# cell_assignments: one cluster index per cell from the result list
+# ---------------------------------------------------------------------------
+
+def test_cell_assignments_from_result_list():
+    n = 10
+    filt0 = np.zeros(n, bool); filt0[[0, 1, 2, 7]] = True
+    filt2 = np.zeros(n, bool); filt2[[3, 4, 9]] = True
+    results = [types.SimpleNamespace(filt=filt0, assigns=0), types.SimpleNamespace(filt=filt2, assigns=2)]
+    out = mm.cell_assignments(results)
+    assert out.tolist() == [0, 0, 0, 2, 2, -1, -1, 0, -1, 2]      # cluster 1 ended empty: -1
+    np.testing.assert_array_equal(mm.cell_assignments(results, n_cells=n), out)
+    with pytest.raises(ValueError):
+        mm.cell_assignments([])
+
+
+@needs_rust
+def test_cell_assignments_matches_run_mek_means(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    warnings.filterwarnings("ignore")
+    sd, truth = _two_population_sd()
+    p = mm.MEKMeansParameters("ds", CMEModel("Bursty", "None"), k=2, epochs=3, gradient_params=GP, random_state=0)
+    results = p.run_mek_means(sd)
+    out = mm.cell_assignments(results, sd.n_cells)
+    assert out.shape == (sd.n_cells,) and set(np.unique(out)) <= {0, 1}
+    for sr in results:
+        assert np.all(out[np.asarray(sr.filt, bool)] == int(sr.assigns))
+    agreement = max(np.mean(out == truth), np.mean(out != truth))
+    assert agreement > 0.9

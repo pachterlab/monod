@@ -33,7 +33,7 @@ import anndata as ad
 import monod.cme_toolbox as _cme_toolbox_module
 from conftest import check_snapshot
 from monod.cme_toolbox import CMEModel
-from monod.extract_data import extract_data
+from monod.extract_data import extract_data, grid_limits
 from monod.inference import (
     InferenceParameters,
     searchdata_from_adata,
@@ -147,11 +147,11 @@ class TestGabaExtract:
         assert np.all(np.isfinite(ll))
 
     def test_M_shape(self, gaba_fit):
-        M = gaba_fit["adata"].uns["M"]
+        M = grid_limits(gaba_fit["adata"])
         assert M.shape == (2, len(GENES))
 
     def test_M_positive(self, gaba_fit):
-        assert np.all(gaba_fit["adata"].uns["M"] > 0)
+        assert np.all(grid_limits(gaba_fit["adata"]) > 0)
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +330,7 @@ class TestRustPythonParityGaba:
         lb = np.array(model.bio_bounds["phys_lb"])
         ub = np.array(model.bio_bounds["phys_ub"])
         p = model.get_MoM(moments, lb, ub, samp=_DUMMY_SAMP)
-        limits = adata.uns["M"][:, 0].tolist()
+        limits = grid_limits(adata)[:, 0].tolist()
         samp = _POISSON_SAMP if seq_model == "Poisson" else None
 
         rust = model.eval_model_pss(p, limits, samp=samp)

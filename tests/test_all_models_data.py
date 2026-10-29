@@ -32,7 +32,7 @@ import anndata as ad
 import monod.cme_toolbox as _cme_toolbox_module
 from conftest import check_snapshot
 from monod.cme_toolbox import CMEModel
-from monod.extract_data import extract_data, make_histogram, model_from_uns
+from monod.extract_data import extract_data, grid_limits, make_histogram, model_from_uns
 
 from monod._core import _mc  # None unless the compiled extension is really installed
 _HAS_RUST = _mc is not None
@@ -140,8 +140,8 @@ def _mom_params(model, adata):
 
 
 def _limits(adata):
-    """Return grid limits from adata.uns['M'] for gene 0."""
-    return adata.uns["M"][:, 0].tolist()
+    """Return grid limits from grid_limits(adata) for gene 0."""
+    return grid_limits(adata)[:, 0].tolist()
 
 
 def _histogram(adata):
@@ -154,7 +154,7 @@ def _histogram(adata):
                   for ln in ordered_layer_names]
         coords_list, freqs_list = _mc.make_state_dist(layers)
         return (np.array(coords_list[0], dtype=np.int64), np.array(freqs_list[0]))
-    return make_histogram(adata, "unique", adata.uns["M"])[0]
+    return make_histogram(adata, "unique", grid_limits(adata))[0]
 
 
 def _snap(bio_model, tag):
@@ -175,17 +175,17 @@ class TestExtractDataAllModels:
         assert processed["adata"].n_obs > 0
 
     def test_has_uns_M(self, processed):
-        assert "M" in processed["adata"].uns
+        assert any(c.startswith("M_") for c in processed["adata"].var.columns)
 
     def test_M_shape_2x1(self, processed):
         """2-modality models produce M of shape (2, n_genes)."""
-        M = processed["adata"].uns["M"]
+        M = grid_limits(processed["adata"])
         assert M.shape == (2, 1)
 
     def test_M_snapshot(self, processed):
         check_snapshot(
             _snap(processed["bio_model"], "extract_data_M"),
-            processed["adata"].uns["M"],
+            grid_limits(processed["adata"]),
         )
 
     def test_has_moment_columns(self, processed):
@@ -243,7 +243,7 @@ class TestExtractDataAllModels:
             coords, freqs = _histogram(adata)
             assert coords.ndim == 2 and freqs.ndim == 1
         else:
-            hist = make_histogram(adata, "unique", adata.uns["M"])
+            hist = make_histogram(adata, "unique", grid_limits(adata))
             assert isinstance(hist, list)
             assert len(hist) == 1
 
