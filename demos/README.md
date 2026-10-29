@@ -19,7 +19,7 @@ cortex data and the poly(A) length reference from the
 | [`chromatin.ipynb`](chromatin.ipynb) | The chromatin model: locus configurations driving nascent and mature RNA, the three transcription rules, constitutive versus bursty emission, building the configuration layer from a peak matrix, fitting with ATAC dropout on the grid, and comparing rules and emissions with the nested test | a few minutes |
 | [`mek_means.ipynb`](mek_means.ipynb) | meK-Means clustering on PBMC 10k with a confusion matrix against known cell types | about a minute |
 | [`mek_means_rust.ipynb`](mek_means_rust.ipynb) | The Rust fast paths inside meK-Means, step by step, with timings | minutes |
-| [`mek_means_estep_backends.ipynb`](mek_means_estep_backends.ipynb) | The GPU, Rust and Python backends for the meK-Means E-step | minutes |
+| [`mek_means_estep_backends.ipynb`](mek_means_estep_backends.ipynb) | The Rust and Python backends for the meK-Means E-step, with timings | minutes |
 | [`gpu.ipynb`](gpu.ipynb) | Which backend runs and why; GPU against Rust and Python for one evaluation and for batches of up to 1000 genes | a few minutes, needs a CUDA GPU |
 | [`rust_extension.ipynb`](rust_extension.ipynb) | Checking the Rust accelerator is active and comparing results with and without it | minutes |
 | [`rust_pipeline.ipynb`](rust_pipeline.ipynb) | The all-Rust path from h5ad file to fitted parameters, with and without gene-length correction | minutes |
