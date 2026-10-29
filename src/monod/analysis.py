@@ -1,5 +1,5 @@
 from .cme_toolbox import CMEModel
-from .inference import SearchResults, plot_hist_and_fit, _resolve_marg, _genes_to_plot, searchdata_from_adata, _read_h5, search_result_from_uns, search_result_list_from_uns, aic_values
+from .inference import SearchResults, plot_hist_and_fit, _resolve_marg, _genes_to_plot, searchdata_from_adata, _read_h5, search_result_from_uns, search_result_list_from_uns, aic_values, split_info
 from .extract_data import knee_plot
 from ._core import log
 from .plot_aesthetics import aesthetics
@@ -456,13 +456,54 @@ def plot_pairwise_projections(pss, limits=None, data=None, labels=("Unspliced", 
     return axes
 
 
+def _group_index(adata, group):
+    """Position of ``group`` (a label or table key of a split fit, or a meK-Means
+    cluster index) in ``adata.uns['search_result_list']``."""
+    split = split_info(adata)
+    if split is None:
+        return int(group)
+    _, groups, keys = split
+    g = str(group)
+    if g in groups:
+        return groups.index(g)
+    if g in keys:
+        return keys.index(g)
+    raise KeyError(f"{group!r} is not one of the groups {groups}")
+
+
+def group_result(adata, group):
+    """The SearchResults of one group of a split fit (``perform_inference(split_by=...)``),
+    given its label or table key; for a meK-Means run, the cluster with that index."""
+    return search_result_list_from_uns(adata.uns['search_result_list'])[_group_index(adata, group)]
+
+
+def group_table(adata, group):
+    """The per-gene table of one group of a split fit, ``adata.varm[<key>]``,
+    given the group's label or key."""
+    return adata.varm[split_info(adata)[2][_group_index(adata, group)]]
+
+
+def group_search_data(adata, group, search_data=None):
+    """The SearchData of the cells of one group (or meK-Means cluster), for the
+    functions that take a per-dataset SearchData such as ``diffexp_mean``;
+    ``search_data`` is rebuilt from the AnnData when not given."""
+    sr = group_result(adata, group)
+    if search_data is None:
+        search_data = searchdata_from_adata(adata)
+    return sr._search_data_for(search_data)
+
+
 def run_qc(monod_adata, mek_means_params=None, cluster=0, discard_rejected=True, marg='joint',
-           gene_dist_size=(5, 5), show_axes=False):
+           gene_dist_size=(5, 5), show_axes=False, group=None):
     """Quick look at a finished run: the sampling optimum, the divergence
-    landscape and the fitted distributions of a few genes."""
+    landscape and the fitted distributions of a few genes.  ``group`` picks a
+    group of a split fit (by label) or a meK-Means cluster (by index); the
+    ``mek_means_params``/``cluster`` pair is the older spelling of the latter."""
     # The SearchData is never stored in the AnnData; rebuild it in memory.
     sd = searchdata_from_adata(monod_adata)
-    if not mek_means_params:
+    if group is not None:
+        sr = group_result(monod_adata, group)
+    elif 'search_result' in monod_adata.uns and not mek_means_params:
         sr = search_result_from_uns(monod_adata.uns['search_result'])
     else:
         sr = search_result_list_from_uns(monod_adata.uns['search_result_list'])[cluster]
@@ -809,19 +850,20 @@ def _param_labels(sr):
     return [p.replace(r"\log_{10} ", "") for p in sr.model.get_log_name_str()]
 
 
-def _write_fold_changes(adata, labels, offs, resid, sign=1, suffix="", adjusted=False):
-    """Record per-parameter fold changes ``offs + resid`` in ``adata.var``.
+def _write_fold_changes(table, labels, offs, resid, sign=1, suffix="", adjusted=False):
+    """Record per-parameter fold changes ``offs + resid`` in ``table`` (an
+    ``adata.var`` or a group table from ``adata.varm``).
 
     ``FC_<param><suffix>`` holds the fold change; with ``adjusted`` the
-    offset-free residual goes to ``adj_FC_<param>`` as well.  ``sign`` is -1
-    for the first dataset of a pair, since fold changes are second minus
+    offset-free residual goes to ``adj_FC_<param><suffix>`` as well.  ``sign``
+    is -1 for the first dataset of a pair, since fold changes are second minus
     first.  Returns the last ``FC_`` column name written.
     """
     for pi, name in enumerate(labels):
         label = f"FC_{name}{suffix}"
-        adata.var[label] = sign * (offs[pi][0] + resid[pi])
+        table[label] = sign * (offs[pi][0] + resid[pi])
         if adjusted:
-            adata.var[f"adj_FC_{name}"] = sign * resid[pi]
+            table[f"adj_FC_{name}{suffix}"] = sign * resid[pi]
     return label
 
 
@@ -840,10 +882,14 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
     (:func:`diffexp_pars`) and writes ``FC_<param>``, ``adj_FC_<param>`` to
     both ``.var`` tables and ``adj_<param>`` to the second.  With one AnnData
     holding a meK-Means ``uns['search_result_list']``, compares every pair of
-    clusters and writes ``FC_<param>_(i, j)`` to its ``.var``.
+    clusters and writes ``FC_<param>_(i, j)`` to its ``.var``.  With one
+    AnnData from ``perform_inference(split_by=...)``, compares every pair of
+    groups and writes ``FC_<param>_vs_<other>`` and ``adj_FC_<param>_vs_<other>``
+    into both groups' tables in ``.varm`` (second group minus first, in the
+    order the groups were fitted).
 
-    Returns the :func:`diffexp_pars` outputs, keyed by cluster pair in the
-    meK-Means case.
+    Returns the :func:`diffexp_pars` outputs, keyed by cluster-index pair or by
+    group-name pair in the single-AnnData cases.
     """
     if modeltype != 'id':
         raise ValueError('Only modeltype="id" is implemented for DE_parameters.')
@@ -858,8 +904,8 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
         gn, gf, offs, resid = diffexp_pars(sr1, sr2, **fpi_kwargs)
 
         labels = _param_labels(sr1)
-        FC_label = _write_fold_changes(adata2, labels, offs, resid, adjusted=True)
-        _write_fold_changes(adata1, labels, offs, resid, sign=-1, adjusted=True)
+        FC_label = _write_fold_changes(adata2.var, labels, offs, resid, adjusted=True)
+        _write_fold_changes(adata1.var, labels, offs, resid, sign=-1, adjusted=True)
         for pi, name in enumerate(labels):
             adata2.var[f"adj_{name}"] = adata2.var[name] - offs[pi][0]
 
@@ -869,16 +915,32 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
         return gn, gf, offs, resid
 
     sr_list = search_result_list_from_uns(adata1.uns['search_result_list'])
+    split = split_info(adata1)
     gn, gf, offs, resid = {}, {}, {}, {}
     for i in range(len(sr_list)):
         for j in range(i + 1, len(sr_list)):
             sr1, sr2 = sr_list[i], sr_list[j]
-            dict_key = (sr1.assigns, sr2.assigns)
-            print('Clusters:', dict_key)
+            dict_key = (split[1][i], split[1][j]) if split is not None else (sr1.assigns, sr2.assigns)
+            print('Groups:' if split is not None else 'Clusters:', dict_key)
             gn[dict_key], gf[dict_key], offs[dict_key], resid[dict_key] = diffexp_pars(sr1, sr2, **fpi_kwargs)
             plt.show()
-            if save_cluster_FCs:
-                FC_label = _write_fold_changes(adata1, _param_labels(sr1), offs[dict_key], resid[dict_key],
+            if not save_cluster_FCs:
+                continue
+            labels = _param_labels(sr1)
+            if split is not None:
+                key_i, key_j = split[2][i], split[2][j]
+                tab_j = adata1.varm[key_j]
+                FC_label = _write_fold_changes(tab_j, labels, offs[dict_key], resid[dict_key],
+                                               suffix=f"_vs_{key_i}", adjusted=True)
+                adata1.varm[key_j] = tab_j
+                tab_i = adata1.varm[key_i]
+                _write_fold_changes(tab_i, labels, offs[dict_key], resid[dict_key],
+                                    sign=-1, suffix=f"_vs_{key_j}", adjusted=True)
+                adata1.varm[key_i] = tab_i
+                print(f'Fold changes recorded in .varm[{key_j!r}] and .varm[{key_i!r}], e.g. {FC_label} '
+                      f'(and adj_{FC_label} without the common offset); second group minus first.')
+            else:
+                FC_label = _write_fold_changes(adata1.var, labels, offs[dict_key], resid[dict_key],
                                                suffix=f"_{dict_key}")
                 print('Fold changes between two clusters recorded in .var in form: ' + FC_label
                       + ', where the tuple (i,j) represents the fold change between cluster i and j.')

@@ -1203,7 +1203,7 @@ class SearchResults(_BaseSearchResults):
         self.filt = []
 
     _SERIAL_KIND = "MEKMeansSearchResults"
-    _SERIAL_ATTRS = _BaseSearchResults._SERIAL_ATTRS + ("assigns", "save", "weights", "aic_per_cell", "all_qs", "all_klds", "filt")
+    _SERIAL_ATTRS = _BaseSearchResults._SERIAL_ATTRS + ("save", "weights", "aic_per_cell", "all_qs", "all_klds")
 
     aic = _deprecated_aic_property()
 
@@ -1262,14 +1262,10 @@ class SearchResults(_BaseSearchResults):
     # get_bool_filt, plot_param_marg, plot_KL, chisquare_testing, compute_sigma,
     # resample_opt_viz, resample_opt_mc_viz, plot_param_L_dep, get_noise_decomp.
 
-    def _search_data_for(self, search_data):
-        """The search data restricted to this cluster's cells (label 0 = in the cluster)."""
-        labels = np.where(self.filt, 0, 1)
-        return _partition_search_data(search_data, labels, 2)[0]
-
-    # par_fun_hess, compute_sigma, chisq_best_param_correction, plot_gene_distributions,
-    # plot_param_L_dep, resample_opt_viz and get_logL are inherited; each calls
-    # _search_data_for first, which is where the cluster subset is applied.
+    # _search_data_for (inherited) restricts the search data to this cluster's
+    # cells through filt; par_fun_hess, compute_sigma, chisq_best_param_correction,
+    # plot_gene_distributions, plot_param_L_dep, resample_opt_viz and get_logL
+    # call it first, which is where the cluster subset is applied.
 
     # get_noise_decomp is inherited from _BaseSearchResults.
 

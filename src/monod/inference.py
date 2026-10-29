@@ -1,12 +1,14 @@
 import itertools
 import logging
 import time
+import re
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
 from ._core import make_dir, log, _build_sampling_grid, to_dense
-from .extract_data import extract_data, make_histogram, grid_limits, _uns_unpack, model_from_uns
+from .extract_data import extract_data, make_histogram, grid_limits, import_h5ad, _uns_unpack, model_from_uns
 from .cme_toolbox import CMEModel, _HAS_RUST, _MODELS_2D, _format_direction, _PROTEIN_ODE, _CUSTOM_ODE
 from .reaction_network import ReactionNetworkWarning, IdentifiabilityWarning
 from ._core import _mc          # None when the compiled extension is not installed
@@ -67,12 +69,27 @@ def perform_inference(h5ad_filepath,
     exclude_sigma=True,
     poisson_average_log_length=5,
     mek_means_params=None,
+    split_by=None, groups=None,
     num_cores=1, AIC_EPS=1e-20, AIC_offs=0,
     save=False, checkpoint=False):
     '''
     Load and filter data from h5ad file.
     Run inference procedure for the desired model, save parameters, uncertainty from Hessian and AIC values automatically.
+
+    ``split_by`` names an ``obs`` column whose groups of cells are fitted
+    separately: the genes are selected once on all the cells, then each group
+    gets its own histograms, grid limits, sampling optimum and standard errors.
+    ``groups`` restricts the fit to some of the labels and fixes their order
+    (by default every label, in category order or sorted).  The per-gene table
+    of each group goes to ``adata.varm[<key>]``, where the key is the label
+    with runs of non-alphanumeric characters replaced by ``_``; the result
+    objects to ``adata.uns['search_result_list']``; and ``adata.uns['split_by']``
+    records the column, the labels and the keys.  ``analysis.group_result``
+    returns one group's SearchResults, ``reject_genes`` and
+    ``analysis.DE_parameters`` work on the split object directly.
     '''
+    if split_by is not None and mek_means_params:
+        raise ValueError("split_by and mek_means_params cannot be combined")
     
     if gradient_params is None:
         gradient_params = dict(DEFAULT_GRADIENT_PARAMS)
@@ -92,6 +109,9 @@ def perform_inference(h5ad_filepath,
     if save:
         make_dir(dataset_string)
     
+    if split_by is not None:
+        h5ad_filepath, groups = _select_groups(h5ad_filepath, split_by, groups)
+
     monod_adata = extract_data(h5ad_filepath,
     model,
     dataset_name=dataset_string,
@@ -183,9 +203,12 @@ def perform_inference(h5ad_filepath,
     # One or several SearchResults (one per meK-Means cluster); the var
     # columns of a cluster result carry the prefix c<j>_.  save=False here:
     # with save=True the whole run is written once, as monod_adata.h5ad.
-    fitted = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, checkpoint=checkpoint, save=False)
+    if split_by is not None:
+        results = _fit_groups(inference_parameters, monod_adata, search_data, split_by, groups, num_cores)
+    else:
+        fitted = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, checkpoint=checkpoint, save=False)
+        results = list(fitted) if mek_means_params else [fitted]
     log.info('Grid points fit.')
-    results = list(fitted) if mek_means_params else [fitted]
     prefixes = [f"c{j}_" for j in range(len(results))] if mek_means_params else [""]
     for sr in results:
         sr.find_sampling_optimum(discard_rejected=False)
@@ -196,37 +219,46 @@ def perform_inference(h5ad_filepath,
     if monod_adata.isbacked:
         monod_adata = monod_adata.to_memory()
 
-    for sr, pre in zip(results, prefixes):
-        for i, name in enumerate(names):
-            monod_adata.var[pre + name] = sr.phys_optimum[:, i]
-    log.info('Optimal parameters saved to anndata under .var attributes "%s<parameter>" (log-base 10).',
-             'ci_' if mek_means_params else '')
-
-    if mek_means_params:
-        # AIC values from meK-Means are the same for all clusters.
-        monod_adata.var['AIC'] = get_AIC_mek_means(results, search_data, AIC_EPS=AIC_EPS, AIC_offs=AIC_offs)
+    if split_by is not None:
+        keys = _group_keys(groups)
+        _store_group_tables(monod_adata, results, keys, names, search_data, exclude_sigma, num_cores, AIC_EPS, AIC_offs)
+        monod_adata.uns['split_by'] = {'column': split_by, 'groups': [str(g) for g in groups], 'keys': keys}
+        monod_adata.uns['search_result_list'] = search_result_list_to_uns(results)
+        log.info("Per-group results stored in adata.varm[<key>] (parameters%s, AIC) for keys %s, "
+                 "the result objects in adata.uns['search_result_list'].",
+                 "" if exclude_sigma else ", standard errors", keys)
     else:
-        AIC_per_gene(results[0], monod_adata, search_data)
-    log.info('AIC values calculated and saved under .var attribute: AIC.')
-
-    if not exclude_sigma:
         for sr, pre in zip(results, prefixes):
-            # compute_sigma restricts the search data to the cluster's cells itself.
-            sr.compute_sigma(search_data, num_cores=num_cores)
             for i, name in enumerate(names):
-                monod_adata.var[pre + 'error_' + name] = sr.sigma[:, i]
-            monod_adata.var[pre + 'error_unreliable'] = np.asarray(sr.sigma_fail, dtype=bool)
-        log.info('Uncertainties per gene saved under .var attributes "%serror_<parameter>" (log-base 10).',
+                monod_adata.var[pre + name] = sr.phys_optimum[:, i]
+        log.info('Optimal parameters saved to anndata under .var attributes "%s<parameter>" (log-base 10).',
                  'ci_' if mek_means_params else '')
 
-    if mek_means_params:
-        monod_adata.obs['cluster'] = None
-        for sr in results:
-            monod_adata.obs.loc[sr.filt, 'cluster'] = sr.assigns
-        log.info('Cluster labels added to anndata .obs')
-        monod_adata.uns['search_result_list'] = search_result_list_to_uns(results)
-    else:
-        monod_adata.uns['search_result'] = results[0].to_dict()
+        if mek_means_params:
+            # AIC values from meK-Means are the same for all clusters.
+            monod_adata.var['AIC'] = get_AIC_mek_means(results, search_data, AIC_EPS=AIC_EPS, AIC_offs=AIC_offs)
+        else:
+            AIC_per_gene(results[0], monod_adata, search_data)
+        log.info('AIC values calculated and saved under .var attribute: AIC.')
+
+        if not exclude_sigma:
+            for sr, pre in zip(results, prefixes):
+                # compute_sigma restricts the search data to the cluster's cells itself.
+                sr.compute_sigma(search_data, num_cores=num_cores)
+                for i, name in enumerate(names):
+                    monod_adata.var[pre + 'error_' + name] = sr.sigma[:, i]
+                monod_adata.var[pre + 'error_unreliable'] = np.asarray(sr.sigma_fail, dtype=bool)
+            log.info('Uncertainties per gene saved under .var attributes "%serror_<parameter>" (log-base 10).',
+                     'ci_' if mek_means_params else '')
+
+        if mek_means_params:
+            monod_adata.obs['cluster'] = None
+            for sr in results:
+                monod_adata.obs.loc[sr.filt, 'cluster'] = sr.assigns
+            log.info('Cluster labels added to anndata .obs')
+            monod_adata.uns['search_result_list'] = search_result_list_to_uns(results)
+        else:
+            monod_adata.uns['search_result'] = results[0].to_dict()
 
     # The SearchData is deliberately not stored: it is rebuilt in memory from
     # the AnnData (layers + var['M_<layer>']) via searchdata_from_adata(), which is fast
@@ -243,6 +275,89 @@ def perform_inference(h5ad_filepath,
         log.info('Run stored to %s (load results with analysis.load_search_results).', adata_file_path)
 
     return monod_adata
+
+def _select_groups(source, split_by, groups):
+    """The cells of ``groups`` (all labels of ``obs[split_by]`` when None) as an
+    in-memory AnnData, and the group labels in fitting order."""
+    adata = import_h5ad(source) if isinstance(source, str) else source
+    if adata.isbacked:
+        adata = adata.to_memory()
+    if split_by not in adata.obs.columns:
+        raise KeyError(f"split_by={split_by!r} is not a column of adata.obs")
+    col = adata.obs[split_by]
+    labels = col.astype(str)
+    present = set(labels)
+    if groups is None:
+        if hasattr(col, "cat"):
+            groups = [str(c) for c in col.cat.categories if str(c) in present]
+        else:
+            groups = sorted(present)
+    else:
+        groups = [str(g) for g in groups]
+        missing = [g for g in groups if g not in present]
+        if missing:
+            raise ValueError(f"groups {missing} do not occur in adata.obs[{split_by!r}]")
+        if len(set(groups)) != len(groups):
+            raise ValueError("groups must be distinct")
+        adata = adata[labels.isin(groups).to_numpy()].copy()
+    if len(groups) < 2:
+        raise ValueError(f"split_by={split_by!r} gives a single group; fit without split_by")
+    return adata, groups
+
+
+def _group_keys(groups):
+    """Table keys for the groups: runs of non-alphanumeric characters become ``_``,
+    and a key that would repeat gets its index appended."""
+    keys = []
+    for j, g in enumerate(groups):
+        key = re.sub(r"[^0-9A-Za-z_]+", "_", str(g)).strip("_") or f"group{j}"
+        if key in keys:
+            key = f"{key}_{j}"
+        keys.append(key)
+    return keys
+
+
+def _fit_groups(inference_parameters, monod_adata, search_data, split_by, groups, num_cores):
+    """One fit per group of cells on its own histograms and limits; each result
+    carries the mask of its cells so that later calls restrict to them."""
+    from .mminference import _partition_search_data
+    cell_labels = monod_adata.obs[split_by].astype(str).to_numpy()
+    labels = np.array([groups.index(g) for g in cell_labels])
+    parts = _partition_search_data(search_data, labels, len(groups))
+    results = []
+    for j, name in enumerate(groups):
+        log.info("Fitting group %r (%d cells).", name, int(np.sum(labels == j)))
+        sr = inference_parameters.fit_all_grid_points(parts[j], num_cores=num_cores, checkpoint=False, save=False)
+        sr.filt = labels == j
+        sr.assigns = j
+        sr.group = str(name)
+        results.append(sr)
+    return results
+
+
+def _store_group_tables(monod_adata, results, keys, names, search_data, exclude_sigma, num_cores, AIC_EPS, AIC_offs):
+    """One per-gene DataFrame per group in ``adata.varm``: parameters, AIC and,
+    unless ``exclude_sigma``, the standard errors."""
+    for sr, key in zip(results, keys):
+        tab = pd.DataFrame(index=monod_adata.var_names)
+        for i, name in enumerate(names):
+            tab[name] = np.asarray(sr.phys_optimum[:, i])
+        tab['AIC'] = np.asarray(aic_values(sr, search_data, EPS=AIC_EPS, offs=AIC_offs))
+        if not exclude_sigma:
+            sr.compute_sigma(search_data, num_cores=num_cores)
+            for i, name in enumerate(names):
+                tab['error_' + name] = np.asarray(sr.sigma[:, i])
+            tab['error_unreliable'] = np.asarray(sr.sigma_fail, dtype=bool)
+        monod_adata.varm[key] = tab
+
+
+def split_info(adata):
+    """``(column, groups, keys)`` of a split fit, from ``adata.uns['split_by']``, or None."""
+    info = adata.uns.get('split_by', None)
+    if info is None:
+        return None
+    return str(info['column']), [str(g) for g in info['groups']], [str(k) for k in info['keys']]
+
 
 def searchdata_from_adata(adata):
 
@@ -1715,6 +1830,13 @@ class SearchResults:
             
         self.gene_names = search_data.gene_names
 
+        # Set when the fit covers a subset of the cells (a meK-Means cluster or
+        # one group of perform_inference(split_by=...)): the boolean mask of its
+        # cells, its index among the results and, for a split fit, its label.
+        self.filt = None
+        self.assigns = None
+        self.group = None
+
         self.param_estimates = []
         self.klds = []
         self.obj_func = []
@@ -1806,6 +1928,7 @@ class SearchResults:
         "rejected_genes", "pval", "csq", "hellinger", "rejection_index", "sigma",
         "sigma_fail", "sigma_flat_direction", "sigma_index",
         "analysis_figure_string", "full_result_string",
+        "filt", "assigns", "group",
     )
 
     def to_dict(self):
@@ -2374,12 +2497,17 @@ class SearchResults:
         return (csq, pval, hellinger)
 
     def _search_data_for(self, search_data):
-        """The search data these results describe.
-
-        Subclasses whose fit covers a subset of the cells (meK-Means clusters)
-        override this; every method that takes ``search_data`` calls it first.
+        """The search data these results describe: all of it, or only the cells
+        in ``filt`` when the fit covers a subset (a meK-Means cluster or one
+        group of a split fit).  Every method that takes ``search_data`` calls
+        this first, so the full SearchData is always what gets passed in.
         """
-        return search_data
+        filt = getattr(self, "filt", None)
+        if filt is None or len(np.asarray(filt)) == 0:
+            return search_data
+        from .mminference import _partition_search_data
+        labels = np.where(np.asarray(filt, dtype=bool), 0, 1)
+        return _partition_search_data(search_data, labels, 2)[0]
 
     def par_fun_hess(self, inputs):
         """Helper method for the Hessian parallelization procedure.
@@ -2901,14 +3029,16 @@ def reject_genes(adata, viz=False, EPS=1e-15, threshold=0.05, bonferroni=True,
     see the rejection flags.
 
     Adds to ``adata.var``: ``rejected_genes`` plus ``csq``, ``pval``, ``hellinger``
-    (prefixed ``c<k>_`` per cluster for a meK-Means run).
+    (prefixed ``c<k>_`` per cluster for a meK-Means run); for a split fit
+    (``perform_inference(split_by=...)``) the same columns go into each group's
+    table in ``adata.varm``.
 
     Parameters
     ----------
     adata: AnnData from perform_inference.
     mek_means: tuple or None
-        pass the same ``mek_means_params`` used for the fit (anything truthy
-        selects the per-cluster path).
+        no longer needed: a meK-Means or split fit is recognised from
+        ``adata.uns``; kept for compatibility.
     Other arguments are forwarded to ``SearchResults.chisquare_testing``.
 
     Returns
@@ -2920,10 +3050,9 @@ def reject_genes(adata, viz=False, EPS=1e-15, threshold=0.05, bonferroni=True,
               grouping_thr=grouping_thr, use_hellinger=use_hellinger,
               hellinger_thr=hellinger_thr)
     search_data = searchdata_from_adata(adata)
+    split = split_info(adata)
 
-    if not mek_means:
-        if 'search_result' not in adata.uns:
-            raise KeyError("adata.uns has no 'search_result'; for a meK-Means run pass mek_means=<params>.")
+    if not mek_means and split is None and 'search_result' in adata.uns:
         sr = search_result_from_uns(adata.uns['search_result'])
         csq, pval, hellinger = sr.chisquare_testing(search_data, **kw)
         adata.var['rejected_genes'] = np.asarray(sr.rejected_genes, dtype=bool)
@@ -2936,21 +3065,34 @@ def reject_genes(adata, viz=False, EPS=1e-15, threshold=0.05, bonferroni=True,
         adata.uns['search_result'] = sr.to_dict()
         log.info("Rejected %d/%d genes; flags stored in adata.var['rejected_genes'].",
                  int(np.sum(sr.rejected_genes)), sr.n_genes)
+        return adata
+
+    if 'search_result_list' not in adata.uns:
+        raise KeyError("adata.uns has neither 'search_result' nor 'search_result_list'; "
+                       "run perform_inference first.")
+    srs = search_result_list_from_uns(adata.uns['search_result_list'])
+    keys = split[2] if split is not None else [f'c{int(sr.assigns)}' for sr in srs]
+    for sr, key in zip(srs, keys):
+        csq, pval, hellinger = sr.chisquare_testing(search_data, **kw)   # subsets to the group's cells itself
+        cols = {'rejected_genes': np.asarray(sr.rejected_genes, dtype=bool)}
+        if save_csq:
+            cols['csq'] = np.asarray(csq)
+        if save_pval:
+            cols['pval'] = np.asarray(pval)
+        if save_hellinger:
+            cols['hellinger'] = np.asarray(hellinger)
+        if split is not None:
+            tab = adata.varm[key]
+            for c, v in cols.items():
+                tab[c] = v
+            adata.varm[key] = tab
+        else:
+            for c, v in cols.items():
+                adata.var[f'{key}_{c}'] = v
+    adata.uns['search_result_list'] = search_result_list_to_uns(srs)
+    if split is not None:
+        log.info("Rejection flags stored per group in adata.varm[<key>]['rejected_genes'] for keys %s.", keys)
     else:
-        if 'search_result_list' not in adata.uns:
-            raise KeyError("adata.uns has no 'search_result_list'; this AnnData is not from a meK-Means run.")
-        srs = search_result_list_from_uns(adata.uns['search_result_list'])
-        for sr in srs:
-            k = int(sr.assigns)
-            csq, pval, hellinger = sr.chisquare_testing(search_data, **kw)   # subsets to the cluster itself
-            adata.var[f'c{k}_rejected_genes'] = np.asarray(sr.rejected_genes, dtype=bool)
-            if save_csq:
-                adata.var[f'c{k}_csq'] = np.asarray(csq)
-            if save_pval:
-                adata.var[f'c{k}_pval'] = np.asarray(pval)
-            if save_hellinger:
-                adata.var[f'c{k}_hellinger'] = np.asarray(hellinger)
-        adata.uns['search_result_list'] = search_result_list_to_uns(srs)
         log.info("Rejection flags stored per cluster in adata.var['c<k>_rejected_genes'].")
     return adata
 

@@ -64,16 +64,24 @@ adata = perform_inference("example_h5ad/example_adata.h5ad", model, n_genes=100)
 
 `perform_inference` filters genes, builds the per-gene count histograms, scans a grid of technical-noise parameters, fits every gene by maximum likelihood at each grid point, and writes the results into the returned AnnData. For finer control, the same steps are available individually: `extract_data`, `searchdata_from_adata`, and `InferenceParameters.fit_all_grid_points`; the `rust_pipeline` notebook in `demos/` walks through them.
 
+To fit several groups of cells from one object, name the `obs` column that separates them:
+
+```python
+adata = perform_inference(adata, model, split_by="subclass_label", groups=["Tcells", "Monocytes"], exclude_sigma=False)
+```
+
+The genes are selected once on all the cells, so the groups line up gene for gene; each group is then fitted on its own cells, with its own grid limits, sampling optimum and standard errors. `groups` restricts the fit to some labels and fixes their order (by default every label, in category order). Each group's per-gene table goes to `adata.varm[<key>]`, the label with runs of non-alphanumeric characters replaced by `_`, so `adata.varm["Tcells"]["$b$"]` is the burst size per gene in T cells; the result objects go to `adata.uns["search_result_list"]` and `adata.uns["split_by"]` records the column, the labels and the keys. `analysis.group_result(adata, "Tcells")` returns one group's `SearchResults`, `analysis.group_search_data` the histograms of its cells. `reject_genes(adata)` writes its flags into every group's table and `analysis.DE_parameters(adata)` compares every pair of groups, recording `FC_<param>_vs_<other>` and `adj_FC_<param>_vs_<other>` in both tables (second group minus first), so comparing two cell types needs one object rather than two.
+
 When the Rust accelerator is installed the per-gene fits run in its L-BFGS-B kernel, all genes in parallel; on the paper's GABAergic data a 250-gene scan of the 42-point sampling grid takes 25 s against 250 s with the scipy optimizer, with the same optimum and the same per-gene results to within optimizer noise. `gradient_params={"use_rust_lbfgsb": False}` selects scipy. Each gene's grid is its maximum count plus a padding of 10, rounded up to the next length whose only prime factors are 2, 3 and 5; the inverse FFT that turns the generating function into a distribution is fastest on those lengths and slowest on primes. Standard errors (`exclude_sigma=False`) come from a Hessian built by differencing the model's gradient, six gradient evaluations per gene for a three-parameter model, and use the same `num_cores` as the fit.
 
 ## Reading the results
 
-Per-gene log10 parameter estimates and the AIC land in `adata.var`. Parameter columns are named with the model's TeX labels minus the log prefix, so for the bursty model they are `$b$` (burst size), `$\beta$` (splicing rate) and `$\gamma$` (degradation rate); `model.param_str` lists them for any model. Fold-change columns written by `monod.analysis.DE_parameters` follow the same convention (`FC_$b$`, `adj_FC_$b$`).
+Per-gene log10 parameter estimates and the AIC land in `adata.var`. Parameter columns are named with the model's TeX labels minus the log prefix, so for the bursty model they are `$b$` (burst size), `$\beta$` (splicing rate) and `$\gamma$` (degradation rate); `model.param_str` lists them for any model. Fold-change columns written by `monod.analysis.DE_parameters` follow the same convention (`FC_$b$`, `adj_FC_$b$`). For a fit with `split_by`, the same columns sit in one table per group in `adata.varm`.
 
 The full results objects are stored in `adata.uns`:
 
 - `adata.uns['model']`: the model definition;
-- `adata.uns['search_result']` (or `search_result_list` for meK-Means): fits at every grid point, the chosen optimum, and quality metrics.
+- `adata.uns['search_result']` (or `search_result_list` for meK-Means and split fits, with `split_by` naming the groups): fits at every grid point, the chosen optimum, and quality metrics.
 
 These are nested dictionaries of arrays and scalars, not pickles, so the AnnData writes to a plain `.h5ad` with `adata.write_h5ad()` and reads back anywhere. To get the Python objects back:
 
