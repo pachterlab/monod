@@ -69,7 +69,7 @@ def perform_inference(h5ad_filepath,
     exclude_sigma=True,
     poisson_average_log_length=5,
     mek_means_params=None,
-    split_by=None, groups=None,
+    split_by=None, groups=None, batch_by=None, batches=None, shared_samp=True,
     num_cores=1, AIC_EPS=1e-20, AIC_offs=0,
     save=False, checkpoint=False):
     '''
@@ -86,10 +86,25 @@ def perform_inference(h5ad_filepath,
     objects to ``adata.uns['search_result_list']``; and ``adata.uns['split_by']``
     records the column, the labels and the keys.  ``analysis.group_result``
     returns one group's SearchResults, ``reject_genes`` and
-    ``analysis.DE_parameters`` work on the split object directly.
+    ``analysis.DE_parameters`` work on the split object directly.  With a
+    sequencing-noise model the groups share one sampling optimum by default
+    (``shared_samp``): the capture efficiencies belong to the experiment, not
+    to the cell type, so the grid point is the one that minimises the groups'
+    summed divergence, each weighted by its cell count
+    (:func:`find_shared_sampling_optimum`); ``shared_samp=False`` lets every
+    group choose its own.
+
+    ``batch_by`` names a second ``obs`` column separating experiments in the
+    same object.  The groups are then every (cell type, experiment) pair that
+    occurs, named ``"<type> | <experiment>"`` with key ``<type>__<experiment>``,
+    each fitted on its own cells, and the sampling optimum is shared among the
+    cell types of one experiment only.  ``batches`` restricts and orders the
+    experiments like ``groups`` does the cell types; ``batch_by`` on its own
+    fits each experiment as a group with its own optimum.
     '''
-    if split_by is not None and mek_means_params:
-        raise ValueError("split_by and mek_means_params cannot be combined")
+    splitting = split_by is not None or batch_by is not None
+    if splitting and mek_means_params:
+        raise ValueError("split_by/batch_by and mek_means_params cannot be combined")
     
     if gradient_params is None:
         gradient_params = dict(DEFAULT_GRADIENT_PARAMS)
@@ -109,8 +124,8 @@ def perform_inference(h5ad_filepath,
     if save:
         make_dir(dataset_string)
     
-    if split_by is not None:
-        h5ad_filepath, groups = _select_groups(h5ad_filepath, split_by, groups)
+    if splitting:
+        h5ad_filepath, groups, group_split, group_batch = _select_groups(h5ad_filepath, split_by, groups, batch_by, batches)
 
     monod_adata = extract_data(h5ad_filepath,
     model,
@@ -203,8 +218,9 @@ def perform_inference(h5ad_filepath,
     # One or several SearchResults (one per meK-Means cluster); the var
     # columns of a cluster result carry the prefix c<j>_.  save=False here:
     # with save=True the whole run is written once, as monod_adata.h5ad.
-    if split_by is not None:
-        results = _fit_groups(inference_parameters, monod_adata, search_data, split_by, groups, num_cores)
+    if splitting:
+        results = _fit_groups(inference_parameters, monod_adata, search_data, split_by, batch_by, groups,
+                              group_batch, num_cores, shared_samp)
     else:
         fitted = inference_parameters.fit_all_grid_points(search_data, num_cores=num_cores, checkpoint=checkpoint, save=False)
         results = list(fitted) if mek_means_params else [fitted]
@@ -219,10 +235,14 @@ def perform_inference(h5ad_filepath,
     if monod_adata.isbacked:
         monod_adata = monod_adata.to_memory()
 
-    if split_by is not None:
-        keys = _group_keys(groups)
+    if splitting:
+        keys = _group_keys(groups, group_split, group_batch)
         _store_group_tables(monod_adata, results, keys, names, search_data, exclude_sigma, num_cores, AIC_EPS, AIC_offs)
-        monod_adata.uns['split_by'] = {'column': split_by, 'groups': [str(g) for g in groups], 'keys': keys}
+        # h5ad cannot hold None inside uns: absent columns and labels are ''.
+        monod_adata.uns['split_by'] = {'column': split_by or '', 'batch_column': batch_by or '',
+                                       'groups': [str(g) for g in groups], 'keys': keys,
+                                       'split': [s or '' for s in group_split], 'batch': [b or '' for b in group_batch],
+                                       'shared_samp': bool(shared_samp)}
         monod_adata.uns['search_result_list'] = search_result_list_to_uns(results)
         log.info("Per-group results stored in adata.varm[<key>] (parameters%s, AIC) for keys %s, "
                  "the result objects in adata.uns['search_result_list'].",
@@ -276,53 +296,111 @@ def perform_inference(h5ad_filepath,
 
     return monod_adata
 
-def _select_groups(source, split_by, groups):
-    """The cells of ``groups`` (all labels of ``obs[split_by]`` when None) as an
-    in-memory AnnData, and the group labels in fitting order."""
+def _group_name(split_label, batch_label):
+    """Display name of a group: the cell-type label, the experiment label, or both."""
+    if batch_label is None:
+        return str(split_label)
+    if split_label is None:
+        return str(batch_label)
+    return f"{split_label} | {batch_label}"
+
+
+def _levels(adata, column, wanted, arg):
+    """The labels of ``obs[column]`` to fit, in fitting order: ``wanted`` (checked
+    against the data) or every present label in category order (sorted for a
+    plain column)."""
+    if column not in adata.obs.columns:
+        raise KeyError(f"{arg}={column!r} is not a column of adata.obs")
+    series = adata.obs[column]
+    present = set(series.astype(str))
+    if wanted is None:
+        if hasattr(series, "cat"):
+            return [str(c) for c in series.cat.categories if str(c) in present]
+        return sorted(present)
+    wanted = [str(g) for g in wanted]
+    missing = [g for g in wanted if g not in present]
+    if missing:
+        raise ValueError(f"{missing} do not occur in adata.obs[{column!r}]")
+    if len(set(wanted)) != len(wanted):
+        raise ValueError(f"the labels given for {column!r} must be distinct")
+    return wanted
+
+
+def _select_groups(source, split_by, groups, batch_by=None, batches=None):
+    """The cells to fit as an in-memory AnnData, and the groups in fitting order.
+
+    Groups are the labels of ``obs[split_by]`` (``groups`` restricts and orders
+    them) or, with ``batch_by``, every present (cell type, experiment) pair,
+    experiment-major (``batches`` restricts and orders the experiments).
+    Returns ``(adata, names, split_labels, batch_labels)``; the last two hold
+    each group's labels, None where the column is not used.
+    """
     adata = import_h5ad(source) if isinstance(source, str) else source
     if adata.isbacked:
         adata = adata.to_memory()
-    if split_by not in adata.obs.columns:
-        raise KeyError(f"split_by={split_by!r} is not a column of adata.obs")
-    col = adata.obs[split_by]
-    labels = col.astype(str)
-    present = set(labels)
-    if groups is None:
-        if hasattr(col, "cat"):
-            groups = [str(c) for c in col.cat.categories if str(c) in present]
-        else:
-            groups = sorted(present)
-    else:
-        groups = [str(g) for g in groups]
-        missing = [g for g in groups if g not in present]
-        if missing:
-            raise ValueError(f"groups {missing} do not occur in adata.obs[{split_by!r}]")
-        if len(set(groups)) != len(groups):
-            raise ValueError("groups must be distinct")
-        adata = adata[labels.isin(groups).to_numpy()].copy()
-    if len(groups) < 2:
-        raise ValueError(f"split_by={split_by!r} gives a single group; fit without split_by")
-    return adata, groups
+    if split_by is None and batch_by is None:
+        raise ValueError("give split_by, batch_by or both")
+    split_levels = _levels(adata, split_by, groups, "split_by") if split_by is not None else [None]
+    batch_levels = _levels(adata, batch_by, batches, "batch_by") if batch_by is not None else [None]
+    keep = np.ones(adata.n_obs, dtype=bool)
+    if split_by is not None and groups is not None:
+        keep &= adata.obs[split_by].astype(str).isin(split_levels).to_numpy()
+    if batch_by is not None and batches is not None:
+        keep &= adata.obs[batch_by].astype(str).isin(batch_levels).to_numpy()
+    if not keep.all():
+        adata = adata[keep].copy()
+    s_lab = adata.obs[split_by].astype(str).to_numpy() if split_by is not None else None
+    b_lab = adata.obs[batch_by].astype(str).to_numpy() if batch_by is not None else None
+    names, split_of, batch_of = [], [], []
+    for b in batch_levels:
+        for g in split_levels:
+            mask = np.ones(adata.n_obs, dtype=bool)
+            if g is not None:
+                mask &= s_lab == g
+            if b is not None:
+                mask &= b_lab == b
+            if not mask.any():
+                continue                                     # a combination with no cells
+            names.append(_group_name(g, b))
+            split_of.append(g)
+            batch_of.append(b)
+    if len(names) < 2:
+        raise ValueError("the split gives a single group; fit without split_by/batch_by")
+    return adata, names, split_of, batch_of
 
 
-def _group_keys(groups):
-    """Table keys for the groups: runs of non-alphanumeric characters become ``_``,
-    and a key that would repeat gets its index appended."""
+def _sanitize(label):
+    return re.sub(r"[^0-9A-Za-z_]+", "_", str(label)).strip("_")
+
+
+def _group_keys(groups, split_of=None, batch_of=None):
+    """Table keys for the groups: the label with runs of non-alphanumeric
+    characters replaced by ``_``; ``<type>__<experiment>`` when both columns
+    are used; a key that would repeat gets its index appended."""
     keys = []
     for j, g in enumerate(groups):
-        key = re.sub(r"[^0-9A-Za-z_]+", "_", str(g)).strip("_") or f"group{j}"
+        if split_of is not None and batch_of is not None and split_of[j] is not None and batch_of[j] is not None:
+            key = f"{_sanitize(split_of[j])}__{_sanitize(batch_of[j])}"
+        else:
+            key = _sanitize(g)
+        key = key or f"group{j}"
         if key in keys:
             key = f"{key}_{j}"
         keys.append(key)
     return keys
 
 
-def _fit_groups(inference_parameters, monod_adata, search_data, split_by, groups, num_cores):
+def _fit_groups(inference_parameters, monod_adata, search_data, split_by, batch_by, groups, group_batch,
+                num_cores, shared_samp=True):
     """One fit per group of cells on its own histograms and limits; each result
-    carries the mask of its cells so that later calls restrict to them."""
+    carries the mask of its cells so that later calls restrict to them.  With
+    ``shared_samp`` and more than one grid point, the groups of one experiment
+    (all the groups, without ``batch_by``) get one sampling optimum."""
     from .mminference import _partition_search_data
-    cell_labels = monod_adata.obs[split_by].astype(str).to_numpy()
-    labels = np.array([groups.index(g) for g in cell_labels])
+    s_lab = monod_adata.obs[split_by].astype(str).to_numpy() if split_by is not None else [None] * monod_adata.n_obs
+    b_lab = monod_adata.obs[batch_by].astype(str).to_numpy() if batch_by is not None else [None] * monod_adata.n_obs
+    index = {name: j for j, name in enumerate(groups)}
+    labels = np.array([index[_group_name(g, b)] for g, b in zip(s_lab, b_lab)])
     parts = _partition_search_data(search_data, labels, len(groups))
     results = []
     for j, name in enumerate(groups):
@@ -332,7 +410,49 @@ def _fit_groups(inference_parameters, monod_adata, search_data, split_by, groups
         sr.assigns = j
         sr.group = str(name)
         results.append(sr)
+    if shared_samp and inference_parameters.n_grid_points > 1:
+        for b in dict.fromkeys(group_batch):
+            members = [sr for sr, bb in zip(results, group_batch) if bb == b]
+            if len(members) > 1:
+                find_shared_sampling_optimum(members)
+                log.info("Shared sampling optimum%s: %s", "" if b is None else f" for experiment {b!r}",
+                         list(members[0].samp_optimum))
     return results
+
+
+def find_shared_sampling_optimum(results, discard_rejected=False):
+    """One technical-noise optimum for several fits of cells from the same
+    experiment: the groups of a split fit, or two datasets sequenced together.
+
+    The capture efficiencies are a property of the library, not of the cell
+    type, so the grid point is chosen on the summed divergence of all the fits,
+    each fit's per-gene divergences weighted by its cell count (the sum is then
+    the joint log-likelihood up to a constant).  The point is set on every
+    result and remembered as its ``samp_optimum_shared``, which
+    :meth:`SearchResults.find_sampling_optimum` honours from then on.
+    ``discard_rejected`` leaves each fit's rejected genes out of its sum.
+    Returns the sampling parameters at the shared point.
+    """
+    results = list(results)
+    if not results:
+        raise ValueError("find_shared_sampling_optimum needs at least one result")
+    n_grid = len(results[0].sp.sampl_vals)
+    total = np.zeros(n_grid)
+    for sr in results:
+        klds = np.asarray(sr.klds)
+        if klds.shape[0] != n_grid or not np.allclose(np.asarray(sr.sp.sampl_vals, float),
+                                                        np.asarray(results[0].sp.sampl_vals, float)):
+            raise ValueError("find_shared_sampling_optimum: the results were fitted on different sampling grids")
+        if discard_rejected:
+            rejected = getattr(sr, "rejected_genes", None)
+            if rejected is not None and len(np.asarray(rejected)) == klds.shape[1]:
+                klds = klds[:, ~np.asarray(rejected, dtype=bool)]
+        total += sr.n_cells * klds.sum(axis=1)
+    idx = int(np.argmin(total))
+    for sr in results:
+        sr.samp_optimum_shared = idx
+        sr.set_sampling_optimum(idx)
+    return results[0].samp_optimum
 
 
 def _store_group_tables(monod_adata, results, keys, names, search_data, exclude_sigma, num_cores, AIC_EPS, AIC_offs):
@@ -352,11 +472,28 @@ def _store_group_tables(monod_adata, results, keys, names, search_data, exclude_
 
 
 def split_info(adata):
-    """``(column, groups, keys)`` of a split fit, from ``adata.uns['split_by']``, or None."""
+    """Description of a split fit, from ``adata.uns['split_by']``, or None when the
+    fit was not split: a dict with ``column`` and ``batch_column`` (None when
+    not used), ``groups`` (names in fitting order), ``keys`` (the ``varm``
+    keys), ``split`` and ``batch`` (each group's labels) and ``shared_samp``."""
     info = adata.uns.get('split_by', None)
     if info is None:
         return None
-    return str(info['column']), [str(g) for g in info['groups']], [str(k) for k in info['keys']]
+
+    def opt(v):
+        v = str(v)
+        return v or None
+
+    groups = [str(g) for g in info['groups']]
+    return {
+        'column': opt(info['column']),
+        'batch_column': opt(info.get('batch_column', '')),
+        'groups': groups,
+        'keys': [str(k) for k in info['keys']],
+        'split': [opt(v) for v in info.get('split', groups)],
+        'batch': [opt(v) for v in info.get('batch', [''] * len(groups))],
+        'shared_samp': bool(info.get('shared_samp', True)),
+    }
 
 
 def searchdata_from_adata(adata):
@@ -1928,7 +2065,7 @@ class SearchResults:
         "rejected_genes", "pval", "csq", "hellinger", "rejection_index", "sigma",
         "sigma_fail", "sigma_flat_direction", "sigma_index",
         "analysis_figure_string", "full_result_string",
-        "filt", "assigns", "group",
+        "filt", "assigns", "group", "samp_optimum_shared",
     )
 
     def to_dict(self):
@@ -1997,11 +2134,18 @@ class SearchResults:
         discard_rejected: bool, optional
             whether to omit genes in the rejected_genes attribute during the calculation.
 
+        A result that took part in :func:`find_shared_sampling_optimum` keeps
+        that shared grid point (``samp_optimum_shared``) instead; set the
+        attribute to None to choose from this result's own landscape again.
+
         Returns
         -------
         samp_optimum: list of floats
             estimated value of the technical noise parameters.
         """
+        shared = getattr(self, "samp_optimum_shared", None)
+        if shared is not None:
+            return self.set_sampling_optimum(int(shared))
         if gene_filter is None:
             total_divergence = self.obj_func
         else:
@@ -3071,7 +3215,7 @@ def reject_genes(adata, viz=False, EPS=1e-15, threshold=0.05, bonferroni=True,
         raise KeyError("adata.uns has neither 'search_result' nor 'search_result_list'; "
                        "run perform_inference first.")
     srs = search_result_list_from_uns(adata.uns['search_result_list'])
-    keys = split[2] if split is not None else [f'c{int(sr.assigns)}' for sr in srs]
+    keys = split['keys'] if split is not None else [f'c{int(sr.assigns)}' for sr in srs]
     for sr, key in zip(srs, keys):
         csq, pval, hellinger = sr.chisquare_testing(search_data, **kw)   # subsets to the group's cells itself
         cols = {'rejected_genes': np.asarray(sr.rejected_genes, dtype=bool)}

@@ -457,30 +457,38 @@ def plot_pairwise_projections(pss, limits=None, data=None, labels=("Unspliced", 
 
 
 def _group_index(adata, group):
-    """Position of ``group`` (a label or table key of a split fit, or a meK-Means
-    cluster index) in ``adata.uns['search_result_list']``."""
+    """Position of ``group`` in ``adata.uns['search_result_list']``: a group name
+    or table key of a split fit, a ``(cell type, experiment)`` pair when the fit
+    used ``batch_by``, or a meK-Means cluster index."""
     split = split_info(adata)
     if split is None:
         return int(group)
-    _, groups, keys = split
+    if isinstance(group, (tuple, list)) and len(group) == 2:
+        want = tuple(None if v is None else str(v) for v in group)
+        for i, pair in enumerate(zip(split['split'], split['batch'])):
+            if pair == want:
+                return i
+        raise KeyError(f"{group!r} is not one of the (cell type, experiment) pairs "
+                       f"{list(zip(split['split'], split['batch']))}")
     g = str(group)
-    if g in groups:
-        return groups.index(g)
-    if g in keys:
-        return keys.index(g)
-    raise KeyError(f"{group!r} is not one of the groups {groups}")
+    if g in split['groups']:
+        return split['groups'].index(g)
+    if g in split['keys']:
+        return split['keys'].index(g)
+    raise KeyError(f"{group!r} is not one of the groups {split['groups']}")
 
 
 def group_result(adata, group):
     """The SearchResults of one group of a split fit (``perform_inference(split_by=...)``),
-    given its label or table key; for a meK-Means run, the cluster with that index."""
+    given its name, table key or ``(cell type, experiment)`` pair; for a meK-Means
+    run, the cluster with that index."""
     return search_result_list_from_uns(adata.uns['search_result_list'])[_group_index(adata, group)]
 
 
 def group_table(adata, group):
     """The per-gene table of one group of a split fit, ``adata.varm[<key>]``,
     given the group's label or key."""
-    return adata.varm[split_info(adata)[2][_group_index(adata, group)]]
+    return adata.varm[split_info(adata)['keys'][_group_index(adata, group)]]
 
 
 def group_search_data(adata, group, search_data=None):
@@ -714,7 +722,9 @@ def find_most_concordant_samp(sr1, sr2):
     by _assuming_ they are identical for both datasets and finding the grid point that makes the
     biological parameters most similar.
 
-    This typically works poorly.
+    This typically works poorly: for two cell types from one experiment, prefer
+    ``inference.find_shared_sampling_optimum([sr1, sr2])``, which minimises the
+    summed (cell-weighted) divergence instead of assuming the biology is the same.
 
     Parameters
     ---------
@@ -875,7 +885,7 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
     meta="12",
     viz=True,
     pval_thr=0.001,
-    nit=10, save_cluster_FCs=True):
+    nit=10, save_cluster_FCs=True, pairs=None):
     """Differential expression on the fitted parameters.
 
     With two AnnDatas, compares their ``uns['search_result']`` fits
@@ -886,7 +896,11 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
     AnnData from ``perform_inference(split_by=...)``, compares every pair of
     groups and writes ``FC_<param>_vs_<other>`` and ``adj_FC_<param>_vs_<other>``
     into both groups' tables in ``.varm`` (second group minus first, in the
-    order the groups were fitted).
+    order the groups were fitted).  With several experiments (``batch_by``) the
+    default pairs are the cell types within each experiment and each cell type
+    across experiments, not the mixed pairs; ``pairs`` (a list of
+    ``(group, group)`` names, keys or ``(cell type, experiment)`` tuples)
+    chooses the comparisons explicitly.
 
     Returns the :func:`diffexp_pars` outputs, keyed by cluster-index pair or by
     group-name pair in the single-AnnData cases.
@@ -916,35 +930,52 @@ def DE_parameters(adata1, adata2=None, modeltype="id",
 
     sr_list = search_result_list_from_uns(adata1.uns['search_result_list'])
     split = split_info(adata1)
+    if pairs is not None:
+        if split is None:
+            raise ValueError("pairs are given by group name, which needs a split fit")
+        pair_idx = [(_group_index(adata1, a), _group_index(adata1, b)) for a, b in pairs]
+    else:
+        pair_idx = _default_pairs(split, len(sr_list))
     gn, gf, offs, resid = {}, {}, {}, {}
-    for i in range(len(sr_list)):
-        for j in range(i + 1, len(sr_list)):
-            sr1, sr2 = sr_list[i], sr_list[j]
-            dict_key = (split[1][i], split[1][j]) if split is not None else (sr1.assigns, sr2.assigns)
-            print('Groups:' if split is not None else 'Clusters:', dict_key)
-            gn[dict_key], gf[dict_key], offs[dict_key], resid[dict_key] = diffexp_pars(sr1, sr2, **fpi_kwargs)
-            plt.show()
-            if not save_cluster_FCs:
-                continue
-            labels = _param_labels(sr1)
-            if split is not None:
-                key_i, key_j = split[2][i], split[2][j]
-                tab_j = adata1.varm[key_j]
-                FC_label = _write_fold_changes(tab_j, labels, offs[dict_key], resid[dict_key],
-                                               suffix=f"_vs_{key_i}", adjusted=True)
-                adata1.varm[key_j] = tab_j
-                tab_i = adata1.varm[key_i]
-                _write_fold_changes(tab_i, labels, offs[dict_key], resid[dict_key],
-                                    sign=-1, suffix=f"_vs_{key_j}", adjusted=True)
-                adata1.varm[key_i] = tab_i
-                print(f'Fold changes recorded in .varm[{key_j!r}] and .varm[{key_i!r}], e.g. {FC_label} '
-                      f'(and adj_{FC_label} without the common offset); second group minus first.')
-            else:
-                FC_label = _write_fold_changes(adata1.var, labels, offs[dict_key], resid[dict_key],
-                                               suffix=f"_{dict_key}")
-                print('Fold changes between two clusters recorded in .var in form: ' + FC_label
-                      + ', where the tuple (i,j) represents the fold change between cluster i and j.')
+    for i, j in pair_idx:
+        sr1, sr2 = sr_list[i], sr_list[j]
+        dict_key = (split['groups'][i], split['groups'][j]) if split is not None else (sr1.assigns, sr2.assigns)
+        print('Groups:' if split is not None else 'Clusters:', dict_key)
+        gn[dict_key], gf[dict_key], offs[dict_key], resid[dict_key] = diffexp_pars(sr1, sr2, **fpi_kwargs)
+        plt.show()
+        if not save_cluster_FCs:
+            continue
+        labels = _param_labels(sr1)
+        if split is not None:
+            key_i, key_j = split['keys'][i], split['keys'][j]
+            tab_j = adata1.varm[key_j]
+            FC_label = _write_fold_changes(tab_j, labels, offs[dict_key], resid[dict_key],
+                                           suffix=f"_vs_{key_i}", adjusted=True)
+            adata1.varm[key_j] = tab_j
+            tab_i = adata1.varm[key_i]
+            _write_fold_changes(tab_i, labels, offs[dict_key], resid[dict_key],
+                                sign=-1, suffix=f"_vs_{key_j}", adjusted=True)
+            adata1.varm[key_i] = tab_i
+            print(f'Fold changes recorded in .varm[{key_j!r}] and .varm[{key_i!r}], e.g. {FC_label} '
+                  f'(and adj_{FC_label} without the common offset); second group minus first.')
+        else:
+            FC_label = _write_fold_changes(adata1.var, labels, offs[dict_key], resid[dict_key],
+                                           suffix=f"_{dict_key}")
+            print('Fold changes between two clusters recorded in .var in form: ' + FC_label
+                  + ', where the tuple (i,j) represents the fold change between cluster i and j.')
     return gn, gf, offs, resid
+
+
+def _default_pairs(split, n):
+    """Pairs of result indices to compare: every pair when the groups come from
+    one experiment; with several experiments, the cell types within each
+    experiment and each cell type across experiments (mixed pairs would
+    confound the two)."""
+    all_pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    if split is None or split['batch_column'] is None or split['column'] is None:
+        return all_pairs
+    return [(i, j) for i, j in all_pairs
+            if split['batch'][i] == split['batch'][j] or split['split'][i] == split['split'][j]]
 
 
 def diffexp_pars(
