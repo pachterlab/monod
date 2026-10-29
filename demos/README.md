@@ -23,8 +23,6 @@ cortex data and the poly(A) length reference from the
 | [`gpu.ipynb`](gpu.ipynb) | Which backend runs and why; GPU against Rust and Python for one evaluation and for batches of up to 1000 genes | a few minutes, needs a CUDA GPU |
 | [`rust_extension.ipynb`](rust_extension.ipynb) | Checking the Rust accelerator is active and comparing results with and without it | minutes |
 | [`rust_pipeline.ipynb`](rust_pipeline.ipynb) | The all-Rust path from h5ad file to fitted parameters, with and without gene-length correction | minutes |
-| [`rust_optimizer.ipynb`](rust_optimizer.ipynb) | Benchmarks of the Rust KLD, gradient and L-BFGS-B entry points against scipy, up to 1000 genes | about 20 minutes |
-| [`rust_vs_python_benchmark.ipynb`](rust_vs_python_benchmark.ipynb) | End-to-end speed and result concordance of the Rust and Python paths | over an hour |
-| [`inference_speed_pbmc.ipynb`](inference_speed_pbmc.ipynb) | Inference time against core count, gene count and cell count | about 20 minutes |
+| [`rust_benchmarks.ipynb`](rust_benchmarks.ipynb) | Speed of the Rust KLD kernels and the Rust L-BFGS-B optimizer against scipy and Python, on synthetic genes and on PBMC 10k across gene, core and cell counts, and whether the two optimizers reach the same optima across the sampling grid | about 15 minutes |
 
 Figures are written to `figures/` at the repository root, which is ignored by git.
