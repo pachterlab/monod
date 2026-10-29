@@ -770,8 +770,8 @@ class GradientInference(_BaseGradientInference):
         ):
             params_per_k = [self.theta[k][0].tolist() for k in ks_present]
             limits_list = M.T.astype(int).tolist()
-            u_obs = layers[0].T.astype(int).tolist()
-            s_obs = layers[1].T.astype(int).tolist()
+            u_obs = np.ascontiguousarray(layers[0].T, dtype=np.int64)   # (n_genes, n_cells)
+            s_obs = np.ascontiguousarray(layers[1].T, dtype=np.int64)
             samp_list = None
             if model.seq_model == "Poisson":
                 samp_list = [

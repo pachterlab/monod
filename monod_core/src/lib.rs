@@ -6201,6 +6201,25 @@ fn optimize_genes_custom_sd(
 // E-step for MEK-Means EM algorithm
 // ============================================================================
 
+/// Rows of a C-contiguous (n_genes, n_cells) int64 count array as one Vec<u64> per
+/// gene, rejecting negative counts.
+fn obs_rows(arr: &PyReadonlyArray2<'_, i64>, caller: &str, name: &str) -> PyResult<Vec<Vec<u64>>> {
+    let sh = arr.shape();
+    let (n_genes, n_cells) = (sh[0], sh[1]);
+    let flat = arr
+        .as_slice()
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err(format!("{caller}: {name} must be C-contiguous (np.ascontiguousarray)")))?;
+    let mut out = Vec::with_capacity(n_genes);
+    for g in 0..n_genes {
+        let row = &flat[g * n_cells..(g + 1) * n_cells];
+        if row.iter().any(|&v| v < 0) {
+            return verr(format!("{caller}: {name} has a negative count in gene {g}"));
+        }
+        out.push(row.iter().map(|&v| v as u64).collect());
+    }
+    Ok(out)
+}
+
 /// Compute the E-step for the MEK-Means EM algorithm in Rust with rayon parallelism.
 ///
 /// For each cluster k, evaluates eval_model_pss_2d_seq for every gene (in parallel),
@@ -6213,8 +6232,8 @@ fn optimize_genes_custom_sd(
 /// bio_model     : one of the six supported 2D models
 /// params_per_k  : n_k × n_genes × n_params (log10 param vectors)
 /// limits_list   : n_genes × 2 grid bounds [m_u, m_s]
-/// u_obs         : n_genes × n_cells unspliced count observations
-/// s_obs         : n_genes × n_cells spliced count observations
+/// u_obs         : (n_genes, n_cells) C-contiguous int64 array of unspliced counts
+/// s_obs         : (n_genes, n_cells) C-contiguous int64 array of spliced counts
 /// weights       : n_k mixture weights (must sum to ~1)
 /// fixed_quad_t  : quadrature time-scale multiplier
 /// quad_order    : Gauss-Legendre quadrature order
@@ -6237,8 +6256,8 @@ fn e_step_2d(
     bio_model: String,
     params_per_k: Vec<Vec<Vec<f64>>>,
     limits_list: Vec<Vec<usize>>,
-    u_obs: Vec<Vec<u64>>,
-    s_obs: Vec<Vec<u64>>,
+    u_obs: PyReadonlyArray2<'_, i64>,
+    s_obs: PyReadonlyArray2<'_, i64>,
     weights: Vec<f64>,
     fixed_quad_t: f64,
     quad_order: usize,
@@ -6248,6 +6267,10 @@ fn e_step_2d(
     seq_model: &str,
 ) -> PyResult<(Vec<Vec<f64>>, f64, f64)> {
     validate_bio_model_2d(&bio_model, "e_step_2d")?;
+    // (n_genes, n_cells) int64 arrays straight from NumPy: one contiguous copy per
+    // array instead of a Python list per gene.
+    let u_obs = obs_rows(&u_obs, "e_step_2d", "u_obs")?;
+    let s_obs = obs_rows(&s_obs, "e_step_2d", "s_obs")?;
     let seq_model = seq_model.to_owned();
     let n_k = params_per_k.len();
     let n_genes = limits_list.len();

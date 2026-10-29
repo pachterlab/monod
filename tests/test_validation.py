@@ -224,8 +224,10 @@ class TestLeftoverValidation:
         n_genes = 3
         params = [[[0.3, 0.0, -0.1]] * n_genes] * 2
         lims = [[int(limits[0, g]), int(limits[1, g])] for g in range(n_genes)]
-        u = [layers[0][:, g].tolist() for g in range(n_genes)]
-        s = [layers[1][:, g].tolist() for g in range(n_genes)]
+        u = np.ascontiguousarray(layers[0].T, dtype=np.int64)      # (n_genes, n_cells)
+        s = np.ascontiguousarray(layers[1].T, dtype=np.int64)
+        with pytest.raises(ValueError, match="negative count"):
+            _mc.e_step_2d("Bursty", params, lims, -u, s, [0.5, 0.5], 10.0, 60, seq_model="None")
         with pytest.raises(ValueError, match="weights has 1 entries"):
             _mc.e_step_2d("Bursty", params, lims, u, s, [1.0], 10.0, 60, seq_model="None")
         with pytest.raises(ValueError, match=r"params_per_k\[0\] has 1 genes"):

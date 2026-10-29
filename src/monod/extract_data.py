@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 import pickle
 import anndata as ad
 import warnings
+import zlib
+from pathlib import Path
 import pandas as pd
 
 from scipy.sparse import issparse
@@ -417,6 +419,23 @@ def threshold_by_expression(adata, filt_param=None):
     
     return adata
     
+
+def combine_chunks(chunk_dir, output_file):
+    """Reassemble an h5ad file shipped as zlib-compressed chunks.
+
+    The `monod_examples <https://github.com/pachterlab/monod_examples>`_
+    repository stores each example AnnData as ``chunk_0000.gz``,
+    ``chunk_0001.gz``, ... in one directory.  The chunks are decompressed in
+    name order and concatenated into ``output_file``, whose path is returned.
+    """
+    chunks = sorted(Path(chunk_dir).glob('chunk_*.gz'))
+    if not chunks:
+        raise FileNotFoundError(f"no chunk_*.gz files in {chunk_dir}")
+    with open(output_file, 'wb') as out:
+        for chunk in chunks:
+            out.write(zlib.decompress(chunk.read_bytes()))
+    return output_file
+
 
 def import_h5ad(filename):
     """Read an h5ad file in backed mode, making duplicate gene names unique."""

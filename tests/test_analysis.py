@@ -306,3 +306,22 @@ class TestClusterHelpers:
         unaligned = analysis.plot_cluster_confusion(truth, assigns, align=False)
         assert list(unaligned["cols"]) == [0, 1, 2]
         plt.close("all")
+
+
+class TestProjections:
+    def test_plot_pairwise_projections(self):
+        rng = np.random.default_rng(0)
+        pss = rng.random((4, 5, 6)); pss /= pss.sum()
+        axes = analysis.plot_pairwise_projections(pss, title="t")
+        assert len(axes) == 3
+        assert axes[0].get_xlabel() == "Unspliced count" and axes[2].get_ylabel() == "Protein count"
+        assert axes[1].images[0].get_array().shape == (6, 4)          # U x P marginal, transposed
+        np.testing.assert_allclose(axes[0].images[0].get_array().sum(), 1.0)
+        coords = np.array([[0, 1, 2], [3, 4, 5]]); freqs = np.array([0.5, 0.5])
+        fig, axs = plt.subplots(1, 3)
+        out = analysis.plot_pairwise_projections(pss, limits=[4, 5, 6], data=(coords, freqs), axes=axs,
+                                                 labels=("A", "B", "C"), colorbar=True)
+        assert out is axs and len(axs[0].collections) == 1 and axs[0].get_title() == "A vs B"
+        with pytest.raises(ValueError):
+            analysis.plot_pairwise_projections(pss[0])
+        plt.close("all")

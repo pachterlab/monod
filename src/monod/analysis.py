@@ -9,6 +9,7 @@ from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import adjusted_rand_score
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 
 
 ########################
@@ -414,6 +415,45 @@ def plot_cluster_confusion(true_labels, assigns, row_names=None, col_names=None,
     if colorbar:
         ax.figure.colorbar(im, ax=ax, shrink=0.8)
     return {"ari": ari, "table": table, "rows": rows, "cols": cols, "ax": ax}
+
+
+def plot_pairwise_projections(pss, limits=None, data=None, labels=("Unspliced", "Spliced", "Protein"),
+                              axes=None, cmap="Blues", title=None, scatter_scale=150, colorbar=False):
+    """The three pairwise marginals of a three-species distribution, each as a heat
+    map on a power-law colour scale, with the observed counts scattered on top
+    when ``data`` is given.
+
+    ``pss`` is the joint PMF of shape (n0, n1, n2), as ``eval_model_pss``
+    returns it for the protein model or a three-species network; ``limits``
+    are its grid limits (default: its shape); ``data`` is the ``(coords, freqs)``
+    unique histogram of the gene, drawn with marker area proportional to
+    frequency; ``labels`` names the three species in axis order.  Draws on
+    ``axes`` (three of them) or a new 1 x 3 figure, and returns the axes.
+    """
+    pss = np.asarray(pss)
+    if pss.ndim != 3:
+        raise ValueError(f"pss must be three-dimensional, got shape {pss.shape}")
+    limits = list(pss.shape) if limits is None else [int(m) for m in limits]
+    if axes is None:
+        _, axes = plt.subplots(1, 3, figsize=(15, 4))
+    for ax, (i, j) in zip(axes, [(0, 1), (0, 2), (1, 2)]):
+        pss2 = pss.sum(axis=3 - i - j)
+        im = ax.imshow(pss2.T, origin="lower", aspect="auto", cmap=cmap,
+                       norm=mcolors.PowerNorm(gamma=0.4, vmin=0),
+                       extent=[-0.5, limits[i] - 0.5, -0.5, limits[j] - 0.5])
+        if data is not None:
+            coords, freqs = data
+            coords = np.asarray(coords)
+            ax.scatter(coords[:, i], coords[:, j], s=np.asarray(freqs) * scatter_scale,
+                       c="red", alpha=0.35, linewidths=0)
+        ax.set_xlabel(f"{labels[i]} count")
+        ax.set_ylabel(f"{labels[j]} count")
+        ax.set_title(f"{labels[i]} vs {labels[j]}")
+        if colorbar:
+            ax.figure.colorbar(im, ax=ax, shrink=0.8)
+    if title:
+        axes[0].figure.suptitle(title, y=1.02, fontsize=12)
+    return axes
 
 
 def run_qc(monod_adata, mek_means_params=None, cluster=0, discard_rejected=True, marg='joint',
