@@ -212,6 +212,15 @@ class TestAmbiguousHandling:
         modelled = extract_data(a, amb, n_genes=3, filt_param=PERMISSIVE3, viz=False)
         assert modelled.uns["ambiguous"] == "model" and "ambiguous" in modelled.layers
 
+    def test_custom_network_folds_into_a_species(self):
+        a = _three_layer_adata()
+        net = CMEModel("Custom", "None", network="0 -> B x U -> S -> 0")
+        names = {"U": "unspliced", "S": "spliced", "ambiguous": "ambiguous"}
+        out = extract_data(a, net, n_genes=3, filt_param=PERMISSIVE2, viz=False, modality_name_dict=names, ambiguous="S")
+        np.testing.assert_array_equal(out.layers["spliced"], np.asarray(a.layers["spliced"]) + np.asarray(a.layers["ambiguous"]))
+        with pytest.raises(ValueError, match="fold into"):
+            extract_data(a, net, n_genes=3, filt_param=PERMISSIVE2, viz=False, modality_name_dict=names, ambiguous="spliced")
+
     def test_perform_inference_passes_the_choice(self, tmp_path, monkeypatch):
         warnings.filterwarnings("ignore")
         monkeypatch.chdir(tmp_path)

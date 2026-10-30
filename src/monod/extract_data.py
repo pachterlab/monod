@@ -111,11 +111,12 @@ def extract_data(
         10 for each species by default.
     mek_means_params: (k, epochs) or None
         recorded in ``uns`` for meK-Means inference.
-    ambiguous: None, 'spliced', 'unspliced', 'drop' or 'model'
+    ambiguous: None, a modality name, 'drop' or 'model'
         what to do with an ``ambiguous`` layer (reads that could belong to
         either transcript; the layer name is ``modality_name_dict['ambiguous']``
-        when given).  ``'spliced'`` / ``'unspliced'`` add its counts to that
-        channel, ``'drop'`` ignores it, ``'model'`` fits it as a third channel
+        when given).  A modality name (``'spliced'`` or ``'unspliced'`` for the
+        built-in models, a species name for a custom network) adds its counts
+        to that channel, ``'drop'`` ignores it, ``'model'`` fits it as a third channel
         and needs a model with ``amb_model`` (the default when the model has
         one).  When the layer is present and no choice is made, the call
         fails rather than ignore the reads silently: some quantifications
@@ -172,7 +173,8 @@ def extract_data(
     ambiguous = _handle_ambiguous(monod_adata, source, model, modality_name_dict, ambiguous)
     if ambiguous is not None:
         monod_adata.uns['ambiguous'] = ambiguous
-    monod_adata.uns['modality_name_dict'] = modality_name_dict
+    # only the model's modalities: an 'ambiguous' entry used for folding is not a channel of the fit
+    monod_adata.uns['modality_name_dict'] = {m: modality_name_dict[m] for m in model.model_modalities}
     monod_adata.uns['model'] = model.to_dict()   # read by threshold_by_expression
 
     if transcriptome_filepath:
@@ -219,9 +221,6 @@ def extract_data(
     return _plain_string_index(monod_adata)
 
 
-_AMBIGUOUS_CHOICES = ('model', 'spliced', 'unspliced', 'drop')
-
-
 def _handle_ambiguous(monod_adata, source, model, modality_name_dict, ambiguous):
     """Apply the ``ambiguous`` choice of :func:`extract_data` and return it
     (``'model'`` when the model carries ``amb_model``)."""
@@ -230,8 +229,10 @@ def _handle_ambiguous(monod_adata, source, model, modality_name_dict, ambiguous)
     modelled = getattr(model, 'amb_model', 'None') != 'None'
     if ambiguous is None and modelled:
         ambiguous = 'model'
-    if ambiguous is not None and ambiguous not in _AMBIGUOUS_CHOICES:
-        raise ValueError(f"ambiguous must be one of {_AMBIGUOUS_CHOICES}; got {ambiguous!r}")
+    fold_targets = [m for m in model.model_modalities if m != 'ambiguous']
+    if ambiguous is not None and ambiguous not in ('model', 'drop') and ambiguous not in fold_targets:
+        raise ValueError(f"ambiguous must be one of 'model', 'drop' or a modality to fold into {fold_targets}; "
+                         f"got {ambiguous!r}")
     if modelled and ambiguous != 'model':
         raise ValueError(f"the model fits the ambiguous layer (amb_model={model.amb_model!r}); "
                          f"ambiguous={ambiguous!r} conflicts with that")
@@ -240,16 +241,14 @@ def _handle_ambiguous(monod_adata, source, model, modality_name_dict, ambiguous)
     if ambiguous is None and present:
         raise ValueError(
             f"the AnnData has an ambiguous layer ({amb_layer!r}); say what to do with it: "
-            "ambiguous='spliced' or 'unspliced' (add its counts to that channel), 'drop' (ignore it), "
+            f"ambiguous=<modality> with one of {fold_targets} (add its counts to that channel), 'drop' (ignore it), "
             "or 'model' with a CMEModel(amb_model='Equal' | 'Unequal') (fit the probability that a count "
             "is reported as ambiguous). If the spliced layer already holds these reads, 'drop' is the choice."
         )
-    if ambiguous in ('spliced', 'unspliced'):
+    if ambiguous in fold_targets:
         if not present:
             raise KeyError(f"ambiguous={ambiguous!r} but the AnnData has no {amb_layer!r} layer "
                            f"(available: {list(source.layers)})")
-        if ambiguous not in modality_name_dict:
-            raise ValueError(f"the model has no {ambiguous!r} modality to fold the ambiguous counts into")
         target = modality_name_dict[ambiguous]
         monod_adata.layers[target] = monod_adata.layers[target] + to_dense(source.layers[amb_layer])
         log.info("Ambiguous counts (%r) added to the %s layer %r.", amb_layer, ambiguous, target)

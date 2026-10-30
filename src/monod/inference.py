@@ -103,8 +103,8 @@ def perform_inference(h5ad_filepath,
     experiments like ``groups`` does the cell types; ``batch_by`` on its own
     fits each experiment as a group with its own optimum.
 
-    ``ambiguous`` says what to do with an ``ambiguous`` layer: ``'spliced'`` or
-    ``'unspliced'`` (fold its counts into that channel), ``'drop'``, or
+    ``ambiguous`` says what to do with an ``ambiguous`` layer: a modality name
+    such as ``'spliced'`` (fold its counts into that channel), ``'drop'``, or
     ``'model'`` with a model that has ``amb_model`` (see :func:`extract_data`).
     It is required whenever such a layer is present.
     '''
