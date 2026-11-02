@@ -50,8 +50,7 @@ class TestModel:
             m.eval_model_pss(np.log10([5, 0.5, 0.3, 0.1, 0.4]), [20, 30])
         e = CMEModel("Bursty", "None", amb_model="Equal")
         assert e.model_modalities[-1] == "ambiguous" and e.get_num_params() == 4
-        with pytest.raises(ValueError, match="two-species"):
-            CMEModel("ProteinBursty", "None", amb_model="Equal")
+        assert CMEModel("ProteinBursty", "None", amb_model="Equal").model_modalities == ["unspliced", "spliced", "protein", "ambiguous"]
 
     def test_moments_start_uses_the_ambiguous_share(self):
         m = CMEModel("Bursty", "None", amb_model="Equal")
@@ -230,3 +229,105 @@ class TestAmbiguousHandling:
         with pytest.raises(ValueError, match="ambiguous layer"):
             perform_inference(_three_layer_adata(), CMEModel("Bursty", "None"), n_genes=3, filt_param=PERMISSIVE2,
                               gradient_params=GP, viz=False, dataset_string="h2")
+
+
+def _total_count_pmf(pss, axes):
+    """Distribution of the sum of the counts on ``axes`` (the other axes summed out)."""
+    P = pss.sum(axis=tuple(k for k in range(pss.ndim) if k not in axes))
+    P = np.moveaxis(P, [axes.index(a) for a in sorted(axes)], range(len(axes)))
+    grids = np.meshgrid(*[np.arange(n) for n in P.shape], indexing="ij")
+    return np.bincount(sum(grids).ravel(), weights=P.ravel())
+
+
+class TestAnyModel:
+    """The ambiguous channel on every model family: the generic split equals the
+    two-species Rust kernel, and preserves total counts for the others."""
+
+    @pytest.mark.parametrize("seq,samp", [("None", None), ("Poisson", np.log10([0.6, 0.9]))])
+    @pytest.mark.parametrize("amb", ["Equal", "Unequal"])
+    def test_generic_split_matches_the_kernel(self, amb, seq, samp):
+        from monod._core import _mc
+        if _mc is None:
+            pytest.skip("needs the Rust kernel to compare against")
+        m = CMEModel("Bursty", seq, amb_model=amb)
+        # a grid wide enough to hold the whole distribution: the kernel evaluates the observed
+        # generating function by FFT and wraps mass beyond the grid around, the generic route
+        # truncates it, so they agree only where that mass is negligible
+        theta = np.log10([2.0, 0.5, 0.3] + ([0.15] if amb == "Equal" else [0.1, 0.25]))
+        limits = [30, 36, 26]
+        kernel = m.eval_model_pss(theta, limits, samp)
+        generic = m._eval_pss_ambiguous(theta, limits, samp)
+        assert kernel.shape == generic.shape == (30, 36, 26)
+        np.testing.assert_allclose(generic, kernel, atol=1e-6)
+
+    def test_custom_network_matches_the_builtin(self):
+        theta = np.log10([3.0, 0.4, 0.25, 0.1, 0.3])
+        ref = CMEModel("Bursty", "None", amb_model="Unequal").eval_model_pss(theta, [30, 40, 36])   # wide enough to hold the mass
+        net = CMEModel("Custom", "None", network="0 -> B x U -> S -> 0", normalize_production_rate=True,
+                       amb_model="Unequal", amb_species=("U", "S"))
+        assert net.model_modalities == ["U", "S", "ambiguous"]
+        assert [n.replace(r"\log_{10} ", "") for n in net.param_str][-2:] == ["$p_{U}$", "$p_{S}$"]
+        pss = net.eval_model_pss(theta, [30, 40, 36])
+        np.testing.assert_allclose(pss, ref, atol=5e-6)
+        with pytest.raises(ValueError, match="amb_species"):
+            CMEModel("Custom", "None", network="0 -> B x U -> S -> 0", amb_model="Equal")
+
+    def test_protein_model(self):
+        m = CMEModel("ProteinBursty", "None", protein_limit=8, amb_model="Equal")
+        assert m.model_modalities == ["unspliced", "spliced", "protein", "ambiguous"] and m.get_num_params() == 6
+        theta = np.log10([1.5, 1.0, 0.5, 1.0, 0.5, 0.2])
+        limits = [18, 18, 10, 12]
+        pss = m.eval_model_pss(theta, limits)
+        assert pss.shape == tuple(limits) and pss.sum() == pytest.approx(1.0)
+        # the split moves counts between channels: the total RNA count distribution is the latent one
+        latent = m._latent().eval_model_pss(theta[:-1], [29, 29, 10])
+        tot_obs = _total_count_pmf(pss, [0, 1, 3])
+        tot_lat = _total_count_pmf(latent, [0, 1])
+        n = min(len(tot_obs), len(tot_lat), 12)
+        np.testing.assert_allclose(tot_obs[:n], tot_lat[:n], atol=5e-4)      # grids wide enough that little mass is cut
+        # gradient through the generic route is finite and pins the integration schedule
+        coords = np.array([[1, 2, 0, 0], [0, 1, 1, 1], [3, 2, 2, 0]]); freqs = np.array([0.5, 0.3, 0.2])
+        kld, grad = m.eval_model_kld_and_grad(theta, limits, None, (coords, freqs))
+        assert np.isfinite(kld) and grad.shape == (6,) and np.all(np.isfinite(grad))
+        back = CMEModel.from_dict(m.to_dict())
+        assert back.model_modalities == m.model_modalities and back.amb_species == ("unspliced", "spliced")
+
+    def test_chromatin_model(self):
+        m = CMEModel("Chromatin", "None", n_sites=2, rule="switch", amb_model="Equal")
+        assert m.model_modalities == ["unspliced", "spliced", "configuration", "ambiguous"]
+        n_lat = m.get_num_params() - 1
+        theta = np.concatenate([np.log10([0.5, 0.8, 1.0, 2.0, 0.7, 0.3])[:n_lat], [np.log10(0.25)]])
+        limits = [16, 20, 4, 8]
+        pss = m.eval_model_pss(theta, limits)
+        assert pss.shape == tuple(limits) and pss.sum() == pytest.approx(1.0)
+        latent = m._latent().eval_model_pss(theta[:-1], [23, 27, 4])
+        np.testing.assert_allclose(pss.sum(axis=(0, 1, 3)), latent.sum(axis=(0, 1)), atol=5e-4)   # configuration untouched (up to grid truncation)
+
+    def test_protein_moments_start_uses_the_corrected_moments(self):
+        m = CMEModel("ProteinBursty", "None", amb_model="Unequal")
+        moments = {"MOM_unspliced_mean": 3.0, "MOM_unspliced_var": 12.0, "MOM_spliced_mean": 6.0, "MOM_spliced_var": 20.0,
+                   "MOM_protein_mean": 10.0, "MOM_protein_var": 50.0, "MOM_cov_unspliced_protein": 2.0,
+                   "MOM_cov_unspliced_spliced": 3.0, "MOM_cov_spliced_protein": 4.0,
+                   "MOM_ambiguous_mean": 1.0, "MOM_ambiguous_var": 2.0}
+        lb, ub = np.array(m.bio_bounds["phys_lb"]), np.array(m.bio_bounds["phys_ub"])
+        x0 = m.get_MoM(moments, lb, ub, samp=np.zeros(2))
+        assert x0.shape == (7,) and np.all(np.isfinite(x0))
+        np.testing.assert_allclose(10 ** x0[-2:], 0.1)
+
+    def test_custom_network_end_to_end(self, tmp_path, monkeypatch):
+        warnings.filterwarnings("ignore")
+        monkeypatch.chdir(tmp_path)
+        sim = CMEModel("Bursty", "None", amb_model="Equal")
+        a = _simulated(sim, [np.log10([5.0, 0.5, 0.3, 0.25]), np.log10([3.0, 0.6, 0.4, 0.25])], n_cells=2500, seed=4)
+        a.layers["U"] = a.layers.pop("unspliced"); a.layers["S"] = a.layers.pop("spliced")
+        net = CMEModel("Custom", "None", network="0 -> B x U -> S -> 0", normalize_production_rate=True,
+                       amb_model="Equal", amb_species=("U", "S"))
+        out = perform_inference(a, net, n_genes=2, filt_param=PERMISSIVE3, gradient_params=GP, viz=False,
+                                dataset_string="amb_custom", modality_name_dict={"U": "U", "S": "S", "ambiguous": "ambiguous"})
+        p_hat = 10 ** out.var["$p$"].to_numpy()
+        assert np.all(np.abs(p_hat - 0.25) < 0.08), p_hat
+        sr = search_result_from_uns(out.uns["search_result"])
+        sd = searchdata_from_adata(out)
+        sr.plot_gene_distributions(sd, sz=(1, 2), marg="joint", savefig=False)
+        sr.plot_gene_distributions(sd, sz=(1, 2), marg="ambiguous", savefig=False)
+        plt.close("all")

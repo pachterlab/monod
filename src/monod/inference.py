@@ -3071,16 +3071,15 @@ class SearchResults:
         if logscale is None:
             logscale = joint
         modalities = list(self.model.model_modalities)
-        if joint and len(modalities) not in (2, 3):
-            raise ValueError("Joint distribution plot only implemented for 2 or 3 modalities")
-        # the two axes of a joint panel: both modalities; spliced and protein for the protein
-        # model; unspliced and spliced, with the ambiguous channel summed out, for the ambiguous models
-        if len(modalities) == 2:
-            ax_x, ax_y, drop = 0, 1, None
-        elif modalities[-1] == 'protein':
-            ax_x, ax_y, drop = 1, 2, 0
+        if joint and len(modalities) < 2:
+            raise ValueError("Joint distribution plot needs at least two modalities")
+        # the two axes of a joint panel: the first two modalities, or spliced and protein for
+        # the protein model; every other axis (configuration, ambiguous) is summed out
+        if 'protein' in modalities:
+            ax_x, ax_y = modalities.index('spliced'), modalities.index('protein')
         else:
-            ax_x, ax_y, drop = 0, 1, 2
+            ax_x, ax_y = 0, 1
+        drop = tuple(k for k in range(len(modalities)) if k not in (ax_x, ax_y))
 
         fig1, ax1 = plt.subplots(nrows=sz[0], ncols=sz[1], figsize=figsize)
         axes = np.atleast_1d(ax1).ravel()
@@ -3089,14 +3088,14 @@ class SearchResults:
         for j_, (ax, i_) in enumerate(zip(axes, genes_to_plot)):
             Pa = self.gene_pss(search_data, i_, marg)
             if joint:
-                if drop is not None:
+                if drop:
                     Pa = Pa.sum(axis=drop)
                 if logscale:
                     Pa = np.log10(np.maximum(Pa, 1e-10))
                 ax.imshow(Pa.T, aspect="auto", cmap="summer")
                 ax.invert_yaxis()
                 jitter = np.random.randn(2, search_data.n_cells) * 0.1
-                ax.scatter(*search_data.layers[ax_x:ax_y + 1, :, i_] + jitter, c="k", s=1, alpha=0.1)
+                ax.scatter(*np.asarray(search_data.layers)[[ax_x, ax_y], :, i_] + jitter, c="k", s=1, alpha=0.1)
                 ax.set_xlim([-0.5, search_data.M[ax_x, i_] - 1.5])
                 ax.set_ylim([-0.5, search_data.M[ax_y, i_] - 1.5])
             else:

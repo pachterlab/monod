@@ -27,6 +27,36 @@ def clear_mesh_cache():
     _MESH_CACHE_ENTRIES[0] = 0
 
 
+def _ambiguous_split(pss, src_axes, probs, la):
+    """Split the counts of ``src_axes`` of the latent PMF ``pss`` into their own
+    channel and an ambiguous channel of length ``la`` (appended as the last
+    axis): each count moves with its species' probability in ``probs``,
+    independently, so a latent count ``n`` of a source species becomes ``n - j``
+    in its channel and ``j`` ambiguous with probability ``Binomial(j; n, p)``,
+    and the ambiguous counts of all sources add up.  Along a source axis the
+    latent grid must extend ``la - 1`` beyond the observed one.
+    """
+    from scipy.stats import binom
+    k = len(src_axes)
+    cur = np.moveaxis(np.asarray(pss, dtype=float), list(src_axes), list(range(k)))
+    cur = cur[..., None] * np.concatenate([[1.0], np.zeros(la - 1)])          # ambiguous count 0 so far
+    for i, prob in enumerate(probs):
+        L = cur.shape[i]
+        obs = L - la + 1
+        if obs < 1:
+            raise ValueError("the latent grid must extend la - 1 beyond the observed one along a source axis")
+        n = np.arange(L)
+        new = np.zeros(cur.shape[:i] + (obs,) + cur.shape[i + 1:])
+        for j in range(la):
+            w = binom.pmf(j, n[j:j + obs], prob)                            # n = u + j -> u, moving j
+            shape = [1] * new.ndim
+            shape[i] = obs
+            src = np.take(cur, np.arange(j, j + obs), axis=i)[..., :la - j]
+            new[..., j:] += w.reshape(shape) * src
+        cur = new
+    return np.moveaxis(cur, list(range(k)), list(src_axes))
+
+
 def _build_mesh(limits_tuple, mx_tuple):
     """Build and cache the complex evaluation mesh for eval_model_pss.
 
@@ -551,6 +581,7 @@ class CMEModel:
         chromatin_search_tol = 1e-4,
         dropout_bounds = (-2.0, -0.05, 3),
         bursty = False,
+        amb_species = None,
     ):
         """Initialize the CMEModel instance.
 
@@ -568,7 +599,13 @@ class CMEModel:
         seq_model: str
             type of sequencing model describing technical variation.
         amb_model: str, optional
-            type of model describing ambiguity in RNA assignments.
+            type of model describing ambiguity in RNA assignments: "Equal" (one
+            probability that a count is reported as ambiguous) or "Unequal" (one
+            per source species).  Adds the modality 'ambiguous' to any model.
+        amb_species: tuple of str, optional
+            the species whose counts can be reported as ambiguous; 'unspliced'
+            and 'spliced' when the model has them (every built-in model), and
+            required for a custom network (e.g. ("U", "S")).
         quad_method: str, optional
             quadrature method to use.
             if 'fixed_quad', use Gaussian quadrature via scipy.integrate.fixed_quad.
@@ -680,18 +717,28 @@ class CMEModel:
         if amb_model not in _AMB_MODELS:
             raise ValueError(f"amb_model must be one of {_AMB_MODELS}; got {amb_model!r}")
         self.amb_model = amb_model
+        self.amb_species = ()
         if self.amb_model != "None":
-            # Ambiguous reads are a third observed channel: each nascent molecule
-            # (or read, under Poisson sampling) is counted as ambiguous with
-            # probability p_N and each mature one with p_M (one p for "Equal").
-            # The channel is a modality like the other two, so extract_data
-            # reads an 'ambiguous' layer, and the probabilities are per-gene
-            # parameters appended to the vector, log10 in [-3, 0].
-            if self.bio_model not in _MODELS_2D:
-                raise ValueError(f"amb_model is only available for the two-species models {sorted(_MODELS_2D)}; "
-                                 f"got bio_model={self.bio_model!r}")
-            n_amb = 1 if self.amb_model == "Equal" else 2
-            self.model_modalities = list(self.model_modalities) + ['ambiguous']
+            # Ambiguous reads are one more observed channel: each count of a source
+            # species (a molecule, or a read under Poisson sampling) is reported as
+            # ambiguous with probability p_<species> ("Unequal") or a shared p
+            # ("Equal").  The channel is a modality like the others, appended
+            # last, so extract_data reads an 'ambiguous' layer; the probabilities
+            # are per-gene parameters appended to the vector, log10 in [-3, 0].
+            base = list(self.model_modalities)
+            if amb_species is None:
+                if 'unspliced' in base and 'spliced' in base:
+                    amb_species = ('unspliced', 'spliced')
+                else:
+                    raise ValueError("amb_species is needed to say which species the ambiguous reads are drawn "
+                                     f"from, e.g. amb_species=('U', 'S'); the model's species are {base}")
+            amb_species = tuple(str(x) for x in np.atleast_1d(np.asarray(amb_species, dtype=object)).ravel())
+            unknown = [x for x in amb_species if x not in base]
+            if unknown or len(set(amb_species)) != len(amb_species) or not amb_species:
+                raise ValueError(f"amb_species must be distinct species of the model {base}; got {amb_species}")
+            self.amb_species = amb_species
+            n_amb = 1 if self.amb_model == "Equal" else len(amb_species)
+            self.model_modalities = base + ['ambiguous']
             self.filter_bounds = {'min_means': list(self.filter_bounds['min_means']) + [0.0],
                                   'max_maxes': list(self.filter_bounds['max_maxes']) + [350],
                                   'min_maxes': list(self.filter_bounds['min_maxes']) + [0]}
@@ -812,8 +859,17 @@ class CMEModel:
         if self.amb_model == "Equal":
             param_str += [r"$\log_{10} p$"]
         elif self.amb_model == "Unequal":
-            param_str += [r"$\log_{10} p_N$", r"$\log_{10} p_M$"]
+            if tuple(self.amb_species) == ('unspliced', 'spliced'):
+                param_str += [r"$\log_{10} p_N$", r"$\log_{10} p_M$"]
+            else:
+                param_str += [r"$\log_{10} p_{%s}$" % x for x in self.amb_species]
         return param_str
+
+    def _n_amb(self):
+        """Number of ambiguous-assignment parameters: 0, 1 ("Equal") or one per source species."""
+        if self.amb_model == "None":
+            return 0
+        return 1 if self.amb_model == "Equal" else len(self.amb_species)
 
     # ------------------------------------------------------------------
     # Structured (pickle-free) serialisation
@@ -823,6 +879,7 @@ class CMEModel:
         "quad_vec_T", "protein_limit", "fit_unspliced", "min_fudge", "max_fudge",
         "network", "normalize_production_rate", "burst_mean_rate",
         "n_sites", "rule", "periodic", "chromatin_tol", "chromatin_search_tol", "dropout_bounds", "bursty",
+        "amb_species",
     )
 
     def to_dict(self):
@@ -853,6 +910,8 @@ class CMEModel:
                      chromatin_tol=float(self._chromatin_tol), chromatin_search_tol=float(self.chromatin_search_tol),
                      dropout_bounds=[float(self.dropout_bounds[0]), float(self.dropout_bounds[1]), int(self.dropout_bounds[2])],
                      bursty=bool(self.bursty))
+        if self.amb_model != "None":
+            d["amb_species"] = [str(x) for x in self.amb_species]
         return d
 
     @classmethod
@@ -867,6 +926,8 @@ class CMEModel:
             kwargs["network"] = None
         if "dropout_bounds" in kwargs:
             kwargs["dropout_bounds"] = tuple(np.asarray(kwargs["dropout_bounds"]).tolist())
+        if "amb_species" in kwargs:
+            kwargs["amb_species"] = tuple(str(x) for x in np.atleast_1d(np.asarray(kwargs["amb_species"], dtype=object)).ravel())
         return cls(**kwargs)
 
     def get_num_params(self):
@@ -1239,7 +1300,7 @@ class CMEModel:
         """
         p = np.asarray(p, dtype=float)
         n_total = self.get_num_params()          # biological + ambient parameters
-        n_amb = {"None": 0, "Equal": 1, "Unequal": 2}.get(self.amb_model, 0)
+        n_amb = self._n_amb()
         if p.ndim != 1 or p.shape[0] != n_total:
             raise ValueError(
                 f"{self.bio_model}/{self.seq_model}/{self.amb_model}: expected {n_total} log10 "
@@ -1439,7 +1500,9 @@ class CMEModel:
         """
 
         p, limits = self._check_pss_args(p, limits)
-
+        if self.amb_model != "None" and self.bio_model not in _MODELS_2D:
+            # protein, chromatin and custom networks: latent model, then the split
+            return self._eval_pss_ambiguous(p, limits, samp)
         if self.bio_model == "Chromatin":
             return self._eval_model_pss_chromatin(p, limits, samp)
 
@@ -1507,9 +1570,6 @@ class CMEModel:
             pss = np.abs(irfftn(exp_phi, s=[int(x) for x in limits]))
             return (pss / pss.sum()).squeeze()
 
-        if (self.amb_model != "None") and (len(limits) == 2):
-            raise ValueError("Please specify a limit for the ambiguous species.")
-
         mx = np.copy(limits)
 
         ### if protein model, then decrease the grids of pgf
@@ -1524,7 +1584,8 @@ class CMEModel:
         mx[-1] = mx[-1] // 2 + 1
         g = _build_mesh(tuple(limits), tuple(mx))
 
-        
+        # two-species models without the Rust kernel: the ambiguous channel mixed into the
+        # generating-function arguments, the mirror of the Rust kernel
         if self.amb_model == "Unequal":
             g_ = np.zeros((2, g.shape[1]), dtype=np.complex128)
             p_amb = np.power(10, p[-2:])
@@ -1540,6 +1601,8 @@ class CMEModel:
             g = g_
             p = np.copy(p[:-1])
 
+
+        
         g = self._apply_seq_transform(g, samp)
             
         gf = self.eval_model_pgf(p, g) # this gf is actually phi
@@ -1549,6 +1612,55 @@ class CMEModel:
         Pss = np.abs(Pss) / np.sum(np.abs(Pss))
         Pss = Pss.squeeze()
         return Pss
+
+    def _latent(self):
+        """The same model without the ambiguous channel (cached): the counts the
+        ambiguous split acts on are its counts."""
+        d = self.to_dict()
+        d["amb_model"] = "None"
+        d.pop("amb_species", None)
+        key = repr(sorted((k, str(v)) for k, v in d.items()))
+        cached = getattr(self, "_latent_twin", None)
+        if cached is None or cached[0] != key:
+            cached = self._latent_twin = (key, CMEModel.from_dict(d))
+        return cached[1]
+
+    def _eval_pss_ambiguous(self, p, limits, samp):
+        """Observed PMF of any model with the ambiguous channel.
+
+        The latent model is evaluated on a grid enlarged by the ambiguous range
+        along each source species, then every count is split between its own
+        channel and the ambiguous one with the per-gene probabilities
+        (:func:`_ambiguous_split`).  Under Poisson sampling the split acts on
+        reads, as the two-species kernels do; those models (Rust kernel, or the
+        mixing of the generating-function arguments in the Python path) do not
+        take this route.  Pinned integration schedules and the search tolerance
+        are carried over to the latent model.
+        """
+        n_amb = self._n_amb()
+        # a finite-difference stencil can step past log10 p = 0; a probability stays a probability
+        probs = np.clip(10.0 ** np.asarray(p[-n_amb:], dtype=float), 0.0, 1.0)
+        if self.amb_model == "Equal":
+            probs = np.repeat(probs, len(self.amb_species))
+        mods = list(self.model_modalities)
+        a_ax = mods.index('ambiguous')
+        la = int(limits[a_ax])
+        latent_mods = [m for m in mods if m != 'ambiguous']
+        src_axes = [latent_mods.index(x) for x in self.amb_species]
+        lat_limits = [int(l) for i, l in enumerate(limits) if i != a_ax]
+        for ax in src_axes:
+            lat_limits[ax] += la - 1
+        twin = self._latent()
+        snap = {(id(twin), k[1]): v for k, v in _tls_snapshot(self).items()}
+        with _tls_carry(twin, snap):
+            pss = twin.eval_model_pss(np.asarray(p[:len(p) - n_amb], dtype=float), lat_limits, samp)
+            self._last_schedule = twin._last_schedule
+        pss = np.asarray(pss, dtype=float).reshape(lat_limits)
+        out = _ambiguous_split(pss, src_axes, probs, la)
+        total = out.sum()
+        if total > 0:
+            out = out / total
+        return out.squeeze()
 
     def _apply_seq_transform(self, g, samp):
         """Technical-noise transform of the PGF arguments.  ``samp`` holds one
@@ -1915,17 +2027,50 @@ class CMEModel:
         x0: np.ndarray
             log10 biological parameter estimates.
         """
+        n_amb = self._n_amb()
+        p_amb = 0.1                                   # the guess when no ambiguous moments are at hand
+        if n_amb and moments is not None and 'MOM_ambiguous_mean' in moments:
+            # Each count lands in the ambiguous channel with probability p, so the
+            # pooled ambiguous share estimates p, and the observed moments of the
+            # source species are those of a binomial thinning of the true ones:
+            # E[U] = q E[N], Var(U) = q^2 Var(N) + p q E[N], with q = 1 - p.
+            moments = dict(moments)
+            A_mean = float(moments['MOM_ambiguous_mean'])
+            total = A_mean + sum(float(moments.get(f'MOM_{x}_mean', 0.0)) for x in self.amb_species)
+            if total > 0:
+                p_amb = float(np.clip(A_mean / total, 1e-3, 1 - 1e-3))
+            q = 1.0 - p_amb
+            for x in self.amb_species:
+                mk, vk = f'MOM_{x}_mean', f'MOM_{x}_var'
+                if mk in moments:
+                    m = float(moments[mk])
+                    moments[mk] = m / q
+                    if vk in moments:
+                        moments[vk] = max((float(moments[vk]) - p_amb * m) / q ** 2, 1e-12)
         if self.bio_model == "Chromatin":
-            mid = 0.5 * (np.asarray(lb_log, float) + np.asarray(ub_log, float))[: self.get_num_params()]
+            lb_log = np.asarray(lb_log, float); ub_log = np.asarray(ub_log, float)
+            n_lat = self.get_num_params() - n_amb
+            mid = 0.5 * (lb_log + ub_log)[: self.get_num_params()]
             if hist is None or limits is None:
                 return mid
             from . import chromatin_fit as _cf
             try:
-                x0 = _cf.chromatin_start(self, hist, limits, samp, lb_log, ub_log)
+                if n_amb:
+                    # the chain and the RNA rates from the histogram with the ambiguous axis summed out
+                    dense = _cf.dense_histogram(hist, limits)
+                    tot = dense.sum()
+                    counts = [np.tensordot(dense, np.arange(dense.shape[ax]), axes=([ax], [0])).sum() for ax in range(dense.ndim)]
+                    a_share = counts[-1] / max(sum(counts[:2]) + counts[-1], 1e-12)
+                    p_amb = float(np.clip(a_share, 1e-3, 1 - 1e-3)) if tot > 0 else p_amb
+                    x0 = _cf.chromatin_start(self._latent(), dense.sum(axis=-1), list(limits)[:-1], samp,
+                                             lb_log[:n_lat], ub_log[:n_lat])
+                    x0 = np.concatenate([x0, np.log10([p_amb] * n_amb)])
+                else:
+                    x0 = _cf.chromatin_start(self, hist, limits, samp, lb_log, ub_log)
             except Exception as exc:                      # a start is a convenience, never a failure
                 log.info("Chromatin moments start failed (%s); starting from the middle of the box", exc)
                 return mid
-            return np.clip(x0, np.asarray(lb_log, float), np.asarray(ub_log, float))
+            return np.clip(x0, lb_log, ub_log)
         if self.bio_model == "Custom":
             # No moment estimator for an arbitrary network: start every fit from
             # the middle of the parameter box (log scale).
@@ -1945,21 +2090,6 @@ class CMEModel:
         # These can be defined per model (just happen to be shared by multiple models here).
         U_var, U_mean = moments['MOM_unspliced_var'], moments['MOM_unspliced_mean']
         S_var, S_mean = moments['MOM_spliced_var'], moments['MOM_spliced_mean']
-
-        p_amb = 0.1                                   # the guess when no ambiguous moments are at hand
-        if self.amb_model != "None" and 'MOM_ambiguous_mean' in moments:
-            # Each count lands in the ambiguous channel with probability p, so the
-            # pooled ambiguous share estimates p, and the observed unspliced and
-            # spliced moments are those of a binomial thinning of the true ones:
-            # E[U] = q E[N], Var(U) = q^2 Var(N) + p q E[N], with q = 1 - p.
-            A_mean = moments['MOM_ambiguous_mean']
-            total = U_mean + S_mean + A_mean
-            if total > 0:
-                p_amb = float(np.clip(A_mean / total, 1e-3, 1 - 1e-3))
-            q = 1.0 - p_amb
-            U_var = max((U_var - p_amb * U_mean) / q ** 2, 1e-12)
-            S_var = max((S_var - p_amb * S_mean) / q ** 2, 1e-12)
-            U_mean, S_mean = U_mean / q, S_mean / q
 
         if self.bio_model == "Bursty" or self.bio_model == "CIR":
             b = np.clip(self._mom_burst_size(U_var, U_mean, samp), lb[0], ub[0])
@@ -2023,10 +2153,8 @@ class CMEModel:
             else:
                 x0[1:] = x0[1:] * samp
 
-        if self.amb_model == "Equal":
-            x0 = np.concatenate((x0, [p_amb]))
-        elif self.amb_model == "Unequal":
-            x0 = np.concatenate((x0, [p_amb, p_amb]))     # the pooled share for both channels
+        if n_amb:
+            x0 = np.concatenate((x0, [p_amb] * n_amb))     # the pooled share for every source species
 
         for j in range(self.get_num_params()):
             x0[j] = np.clip(x0[j], lb[j], ub[j])
