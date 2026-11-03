@@ -146,7 +146,17 @@ def _kernels():
     table_b = CMEKernel("chromatin-table-bursty", m_tb, cf.join_theta([0.5, 0.8], 0.6, [cf.RATE_FLOOR, 3.0, 3.0, 3.0], 0.8, 0.3, 2.0),
                         [40, 50, 4], step=0.15, nested=(switch_b, lambda th: cf.embed_in_table(th, "switch", 2)),
                         bounds=list(zip(m_tb.bio_bounds["phys_lb"], m_tb.bio_bounds["phys_ub"])))
-    return [udeg, meanrate, protein, switch, table, switch_b, table_b]
+    # the protein layer (docs/chromatin-protein-design.md): NumPy only, 0.3 s per evaluation on this
+    # small grid, a minute or two per fit
+    m_sp, m_tp = chrom("switch", bursty=True, protein=True), chrom("table", bursty=True, protein=True)
+    switch_p = CMEKernel("chromatin-switch-protein", m_sp, cf.join_theta([1.0, 1.5], 0.6, [1.0], 1.0, 0.8, 1.2, (0.6, 1.0)),
+                         [10, 10, 10, 4], step=0.15,
+                         bounds=list(zip(m_sp.bio_bounds["phys_lb"], m_sp.bio_bounds["phys_ub"])))
+    table_p = CMEKernel("chromatin-table-protein", m_tp,
+                        cf.join_theta([1.0, 1.5], 0.6, [cf.RATE_FLOOR, 1.0, 1.0, 1.0], 1.0, 0.8, 1.2, (0.6, 1.0)), [10, 10, 10, 4],
+                        step=0.15, nested=(switch_p, lambda th: cf.embed_in_table(th, "switch", 2, protein=True)),
+                        bounds=list(zip(m_tp.bio_bounds["phys_lb"], m_tp.bio_bounds["phys_ub"])))
+    return [udeg, meanrate, protein, switch, table, switch_b, table_b, switch_p, table_p]
 
 
 KERNELS = _kernels()

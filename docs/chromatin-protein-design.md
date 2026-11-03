@@ -1,9 +1,9 @@
 # Design: a joint chromatin, RNA and protein model
 
-Status: stages 1 and 2 built, 2026-11-02 (NumPy kernel, model definition, limit
+Status: stages 1 to 3 built, 2026-11-02 (NumPy kernel, model definition, limit
 tests in `tests/test_chromatin_protein.py`; protein reactions in the chromatin
-simulator, generative checks in `tests/test_generative_checks.py`); stages 3 to
-5 pending. The "Why the kernel composes" section describes the design; "How
+simulator, generative checks in `tests/test_generative_checks.py`; the kernel
+in the contract suite `tests/test_kernel_contract.py`); stages 4 and 5 pending. The "Why the kernel composes" section describes the design; "How
 stage 1 does it" what was built.
 
 ## What the model is
@@ -215,10 +215,12 @@ real data feasible.
    with `MONOD_SLOW_TESTS=1`: a pinned gradient costs about 45 s on the NumPy
    kernel, so the run takes about 27 minutes. It passed on 2026-11-02;
    stage 5 is what makes it a routine test.
-3. **Contract tests.** Register the kernel in the contract suite: replay
-   equality under a pinned schedule, finite-difference gradient against a
-   displaced evaluation, thread-pool consistency, MLE recovery on simulated
-   data, nesting of `switch` and `additive` in `table` with protein present.
+3. **Contract tests.** Done. `chromatin-switch-protein` and
+   `chromatin-table-protein` (bursty, two sites, a 10 x 10 x 10 grid, the
+   switch embedded in the table by `embed_in_table(..., protein=True)`) run
+   every contract: replay, gradient, thread pool, outer pin, the fit from a
+   displaced start and the nesting. About 10 minutes for the pair, most of it
+   the thread-pool gradients and the fits.
 4. **Pipeline.** `perform_inference` on a synthetic four-layer AnnData with a
    three-point dropout grid and Poisson capture; the ambiguous channel on top
    through the generic route; h5ad round trip of the model definition.
