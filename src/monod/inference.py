@@ -1339,9 +1339,10 @@ class GradientInference:
 
         if self.gradient_params["init_pattern"] == "moments":
             _sd_is_rust_sd = _mc is not None and isinstance(search_data, _mc.SearchData)
-            if model.bio_model == "Custom":
+            if model.bio_model == "Custom" and getattr(model, "composition", None) is None:
                 # No moment estimator for an arbitrary network: every gene starts
-                # from the middle of the parameter box (see CMEModel.get_MoM).
+                # from the middle of the parameter box (see CMEModel.get_MoM); the
+                # network form of a composed model takes its family's start below.
                 mid = 0.5 * (np.asarray(global_parameters.phys_lb, float) + np.asarray(global_parameters.phys_ub, float))
                 self.param_MoM = np.tile(mid, (search_data.n_genes, 1))
             elif model.bio_model == "Chromatin":
@@ -1351,10 +1352,10 @@ class GradientInference:
                                   hist=search_data.hist[i], limits=np.asarray(search_data.M[:, i]))
                     for i in range(search_data.n_genes)
                 ])
-            elif _sd_is_rust_sd and model.amb_model == "None":
+            elif _sd_is_rust_sd and model.amb_model == "None" and model.bio_model != "Custom":
                 # Zero-Python-loop path: Rust computes MoM for all genes at once
-                # (the ambiguous models take the Python start, which uses the
-                # ambiguous moments).
+                # (the ambiguous models and composed networks take the Python
+                # start, which uses the ambiguous moments and the composition).
                 samp_list_mom = None
                 if model.seq_model in ("Poisson", "Bernoulli"):
                     samp_list_mom = [

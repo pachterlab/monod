@@ -8,6 +8,7 @@ inference         InferenceParameters / SearchResults: per-gene grid-scan infere
 mminference       MEKMeansParameters: meK-Means mixture-model inference
 analysis          QC and differential-expression helpers on fitted results
 reaction_network  ReactionNetwork: user-defined CME networks for CMEModel("Custom")
+simulate          cells drawn from a model's generative process, kernel-free
 
 Submodules are imported lazily: ``import monod.inference`` and ``monod.inference``
 both work, and ``import monod`` alone stays cheap.
@@ -27,6 +28,7 @@ __all__ = [
     "mminference",
     "analysis",
     "reaction_network",
+    "simulate",
     "plot_aesthetics",
 ]
 

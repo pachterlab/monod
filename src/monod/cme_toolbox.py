@@ -795,6 +795,109 @@ class CMEModel:
         self.quad_vec_T = quad_vec_T
         self.quad_method = quad_method
 
+    # ------------------------------------------------------------------
+    # Compositional constructor
+    # ------------------------------------------------------------------
+    _TRANSCRIPTION = ("constitutive", "bursty")
+    _REGULATION = (None, "cir", "extrinsic")
+    _LIFETIME = ("exponential", "delayed_splicing", "delayed_degradation")
+
+    @classmethod
+    def compose(cls, transcription="bursty", regulation=None, lifetime="exponential", protein=False,
+                locus=None, seq_model="None", amb_model="None", amb_species=None, prefer_network=False, **kwargs):
+        """Build a model from its mechanism, piece by piece, and pick the kernel.
+
+        The pieces are orthogonal in the interface; underneath, each
+        combination maps onto the family that has a kernel for it, or onto a
+        reaction network when a general integrator is the only option.
+
+        Parameters
+        ----------
+        transcription: "constitutive" or "bursty"
+            single molecules at a steady rate, or geometric bursts of mean size b.
+        regulation: None, "cir" or "extrinsic"
+            what modulates bursty transcription: nothing, a burst frequency
+            that follows a CIR process, or cell-to-cell rate variation.
+        lifetime: "exponential", "delayed_splicing" or "delayed_degradation"
+            exponential steps, or a fixed delay before splicing or before the
+            mature RNA is removed (bursty transcription only; these are fixed
+            lifetimes, not the committed-then-delayed reactions a network's
+            ``=>`` writes, which leave the steady state unchanged when the
+            delayed step has no product).
+        protein: bool or dict
+            translation from the mature RNA and protein degradation; a dict
+            passes ``protein_limit`` and ``fit_unspliced``.
+        locus: dict or None
+            a chromatin locus upstream of transcription, with the ``Chromatin``
+            options ``n_sites``, ``rule``, ``periodic``, ``dropout_bounds``,
+            ``chromatin_tol``, ``chromatin_search_tol``; its configuration
+            sets the transcription rate through the rule.
+        seq_model, amb_model, amb_species:
+            technical noise and the ambiguous channel, as for the constructor.
+        prefer_network: bool
+            build the reaction-network form even when a dedicated kernel
+            exists (one integrator for everything, slower).
+        kwargs:
+            passed to the constructor (quadrature options and the like).
+
+        Returns the :class:`CMEModel`; its ``composition`` attribute records the
+        request.  Modalities are ``unspliced``, ``spliced`` (``protein``,
+        ``configuration``, ``ambiguous``) in every form, so one
+        ``modality_name_dict`` serves all of them.
+        """
+        if transcription not in cls._TRANSCRIPTION:
+            raise ValueError(f"transcription must be one of {cls._TRANSCRIPTION}; got {transcription!r}")
+        if regulation not in cls._REGULATION:
+            raise ValueError(f"regulation must be one of {cls._REGULATION}; got {regulation!r}")
+        if lifetime not in cls._LIFETIME:
+            raise ValueError(f"lifetime must be one of {cls._LIFETIME}; got {lifetime!r}")
+        protein_opts = dict(protein) if isinstance(protein, dict) else {}
+        want_protein = bool(protein)
+        bursty = transcription == "bursty"
+        spec = dict(transcription=transcription, regulation=regulation, lifetime=lifetime,
+                    protein=dict(protein_opts) if want_protein else False, locus=None if locus is None else dict(locus),
+                    seq_model=seq_model, amb_model=amb_model)
+        common = dict(seq_model=seq_model, amb_model=amb_model, amb_species=amb_species, **kwargs)
+
+        def done(model):
+            model.composition = spec
+            return model
+
+        if locus is not None:
+            if regulation is not None:
+                raise ValueError("a chromatin locus and CIR or extrinsic regulation cannot be combined")
+            if lifetime != "exponential":
+                raise ValueError("the chromatin model has exponential splicing and degradation only")
+            if want_protein:
+                raise NotImplementedError("a chromatin locus with a protein layer is designed but not built yet "
+                                          "(docs/chromatin-protein-design.md)")
+            return done(cls("Chromatin", bursty=bursty, **dict(locus), **common))
+        if regulation is not None:
+            if not bursty or lifetime != "exponential" or want_protein:
+                raise ValueError(f"regulation={regulation!r} is available for bursty transcription with exponential "
+                                 "lifetimes and no protein layer")
+            return done(cls("CIR" if regulation == "cir" else "Extrinsic", **common))
+        if not prefer_network:
+            if not want_protein:
+                family = {("constitutive", "exponential"): "Constitutive", ("bursty", "exponential"): "Bursty",
+                          ("bursty", "delayed_splicing"): "DelayedSplicing",
+                          ("bursty", "delayed_degradation"): "Delay"}.get((transcription, lifetime))
+                if family is not None:
+                    return done(cls(family, **common))
+            elif bursty and lifetime == "exponential":
+                return done(cls("ProteinBursty", **protein_opts, **common))
+        if lifetime != "exponential":
+            raise ValueError(f"lifetime={lifetime!r} is a fixed lifetime, which only the bursty two-species kernels "
+                             "implement; a reaction network's '=>' is a committed-then-delayed step, not the same model")
+        # the general integrator: a reaction network with layer-named species
+        production = "0 -> B x unspliced" if bursty else "0 -> unspliced"
+        network = f"{production} -> spliced -> 0"
+        if want_protein:
+            network += "; spliced -> spliced + protein; protein -> 0"
+        if amb_model != "None" and amb_species is None:
+            common["amb_species"] = ("unspliced", "spliced")
+        return done(cls("Custom", network=network, normalize_production_rate=True, **common))
+
     def get_log_name_str(self):
         """Return the names of log-parameters for the model instance.
 
@@ -2071,11 +2174,6 @@ class CMEModel:
                 log.info("Chromatin moments start failed (%s); starting from the middle of the box", exc)
                 return mid
             return np.clip(x0, lb_log, ub_log)
-        if self.bio_model == "Custom":
-            # No moment estimator for an arbitrary network: start every fit from
-            # the middle of the parameter box (log scale).
-            return 0.5 * (np.asarray(lb_log, float) + np.asarray(ub_log, float))[: self.get_num_params()]
-
         lb = 10**lb_log
         ub = 10**ub_log
         if self.seq_model in ("Poisson", "Bernoulli"):
@@ -2086,6 +2184,15 @@ class CMEModel:
                     )
                 )
             samp = 10 ** np.asarray(samp, dtype=float)
+
+        composed = None
+        if self.bio_model == "Custom":
+            composed = self._composed_start(moments, samp)
+            if composed is None:
+                # No moment estimator for an arbitrary network: start every fit from
+                # the middle of the parameter box (log scale).
+                return 0.5 * (np.asarray(lb_log, float) + np.asarray(ub_log, float))[: self.get_num_params()]
+            x0 = composed
 
         # These can be defined per model (just happen to be shared by multiple models here).
         U_var, U_mean = moments['MOM_unspliced_var'], moments['MOM_unspliced_mean']
@@ -2140,12 +2247,14 @@ class CMEModel:
             beta = alpha / U_mean
             gamma = alpha / S_mean
             x0 = np.asarray([alpha, beta, gamma])
-        else:
+        elif composed is None:
             raise ValueError("Please select from implemented models.")
 
 
         if self.seq_model in ("Bernoulli", "Poisson"):
-            if self.bio_model == "Constitutive":
+            if composed is not None:
+                pass                                   # the capture rates are already on the RNA rates
+            elif self.bio_model == "Constitutive":
                 x0 *= samp
             elif self.bio_model == "ProteinBursty":
                 x0[[1,2]] *= samp[:2]
@@ -2164,6 +2273,59 @@ class CMEModel:
             x0 = (
                 np.random.rand(self.get_num_params()) * (ub_log - lb_log) + lb_log
             )  # last resort -- makes it nondeterministic though
+        return x0
+
+    def _composed_start(self, moments, samp):
+        """Moments start for the network form of a composed model (see
+        :meth:`compose`): its species are the layers and its reactions the
+        family's, so the family's estimator applies, the capture rates
+        (``samp``, linear) going onto the RNA rates as there.  None for any
+        other network, or when the moments it needs are missing, in which case
+        the fit starts from the middle of the box."""
+        comp = getattr(self, "composition", None)
+        if comp is None or moments is None:
+            return None
+        try:
+            U_var, U_mean = float(moments["MOM_unspliced_var"]), float(moments["MOM_unspliced_mean"])
+            S_mean = float(moments["MOM_spliced_mean"])
+        except KeyError:
+            return None
+        if not (U_mean > 0 and S_mean > 0):
+            return None
+        bursty = comp["transcription"] == "bursty"
+        b = max(float(self._mom_burst_size(U_var, U_mean, samp)), 1e-3) if bursty else 1.0
+        beta, gamma = b / U_mean, b / S_mean
+        x0 = [b, beta, gamma] if bursty else [beta, gamma]
+        if comp["protein"] is not False:
+            # the ratio k_p / gamma_p from the protein mean; the protein lifetime
+            # from the nascent-protein covariance as ProteinBursty does when the
+            # transcription is bursty, and from the protein Fano factor when it is
+            # constitutive (nascent and protein counts are then uncorrelated, and
+            # Fano - 1 = k_p / (gamma + gamma_p) for a Poisson mRNA)
+            P_mean = max(float(moments.get("MOM_protein_mean", 0.0)), 1e-3)
+            r = P_mean * gamma / b
+            gamma_p = gamma
+            cand = np.nan
+            if bursty:
+                C = moments.get("MOM_cov_unspliced_protein")
+                if C is not None:
+                    C = float(C)
+                    den = b ** 2 * r - C * (beta + gamma)
+                    cand = C * (beta + gamma) * beta / den if den != 0 else np.nan
+            else:
+                F = float(moments.get("MOM_protein_var", 0.0)) / P_mean - 1.0
+                cand = F * gamma / (r - F) if 0 < F < r else np.nan
+            if np.isfinite(cand) and cand > 0:
+                gamma_p = cand
+            x0 += [r * gamma_p, gamma_p]
+        x0 = np.asarray(x0, float)
+        if x0.size != self.get_num_params() - self._n_amb():
+            return None
+        if self.seq_model in ("Poisson", "Bernoulli"):          # samp is linear here; the pipeline passes zeros otherwise
+            i = 1 if bursty else 0
+            x0[i:i + 2] *= np.asarray(samp[:2], float)
+            if comp["protein"] is not False and len(samp) > 2:
+                x0[-1] *= samp[2] / samp[1]
         return x0
 
     def _mom_burst_size(self, U_var, U_mean, samp, half=False):
