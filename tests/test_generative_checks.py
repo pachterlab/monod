@@ -20,6 +20,8 @@ from monod.simulate import simulate_adata, simulate_counts
 N_CELLS = 20000
 Z_MAX = 4.5
 GP = {"max_iterations": 50, "init_pattern": "moments", "num_restarts": 1, "num_gene_cores": 1}
+slow = pytest.mark.skipif(not os.environ.get("MONOD_SLOW_TESTS"),
+                          reason="minutes per gene on the NumPy chromatin-protein kernel; set MONOD_SLOW_TESTS=1")
 
 
 def _permissive(model):
@@ -130,23 +132,39 @@ class TestFamilies:
         theta = np.log10([0.5, 0.8, 1.0, 2.0, 0.7, 0.3, 2.0])            # k_on x2, eps, rate, beta, gamma, b
         check_family(m, theta, np.log10([0.7, 0.9, 0.1]), n_cells=12000)
 
+    def test_chromatin_protein_with_ambiguous_channel(self):
+        m = CMEModel("Chromatin", "Poisson", n_sites=2, rule="switch", bursty=True, protein=True, amb_model="Equal")
+        theta = np.log10([0.5, 0.8, 1.0, 2.0, 0.7, 0.3, 2.0, 0.5, 0.5, 0.15])
+        check_family(m, theta, np.log10([0.7, 0.9, 0.1]), n_cells=12000)
+
     def test_chromatin_additive_constitutive(self):
         m = CMEModel("Chromatin", "None", n_sites=2, rule="additive")
         theta = np.log10([0.5, 1.5, 0.7, 1.0, 2.0, 0.7, 0.4])            # k_on x2, eps, rates x2, beta, gamma
         check_family(m, theta, None, n_cells=12000)
+
+    def test_chromatin_protein_poisson_dropout(self):
+        # capture on the two RNA channels, dropout on the locus, nothing on the protein
+        m = CMEModel("Chromatin", "Poisson", n_sites=2, rule="switch", bursty=True, protein=True)
+        theta = np.log10([0.5, 0.8, 1.0, 2.0, 0.7, 0.3, 2.0, 0.5, 0.5])  # ..., b, k_p, gamma_p
+        check_family(m, theta, np.log10([0.7, 0.9, 0.1]), n_cells=12000)
+
+    def test_chromatin_protein_with_ambiguous_channel(self):
+        m = CMEModel("Chromatin", "Poisson", n_sites=2, rule="switch", bursty=True, protein=True, amb_model="Equal")
+        theta = np.log10([0.5, 0.8, 1.0, 2.0, 0.7, 0.3, 2.0, 0.5, 0.5, 0.15])
+        check_family(m, theta, np.log10([0.7, 0.9, 0.1]), n_cells=12000)
 
     def test_cir_is_not_a_finite_rate_process(self):
         with pytest.raises(NotImplementedError, match="inverse-Gaussian"):
             simulate_counts(CMEModel("CIR", "None"), np.log10([3.0, 0.5, 0.3]), 10)
 
 
-def _fit(model, thetas, n_cells, samp=None, tmp_path=None, **kw):
+def _fit(model, thetas, n_cells, samp=None, tmp_path=None, gp=GP, **kw):
     warnings.filterwarnings("ignore")
     a = simulate_adata(model, thetas, n_cells, samp, seed=1)
     extra = {}
     if model.seq_model != "None":
         extra = dict(samp_lb=list(samp[:2]), samp_ub=list(samp[:2]), gridsize=[1, 1])
-    out = perform_inference(a, model, n_genes=len(thetas), filt_param=_permissive(model), gradient_params=GP, viz=False,
+    out = perform_inference(a, model, n_genes=len(thetas), filt_param=_permissive(model), gradient_params=gp, viz=False,
                             dataset_string="gen", **extra, **kw)
     names = [p.replace(r"\log_{10} ", "") for p in model.param_str]
     return out, np.column_stack([out.var[n].to_numpy() for n in names])
@@ -190,3 +208,14 @@ class TestRecovery:
         thetas = np.log10([[0.5, 0.8, 1.0, 2.0, 0.7, 0.3, 2.0], [1.2, 0.4, 1.0, 1.5, 0.5, 0.4, 3.0]])
         _, est = _fit(m, thetas, 4000, samp=np.array([0.0, 0.0, p_drop]))
         np.testing.assert_allclose(est, thetas, atol=0.25)
+
+    @slow
+    def test_chromatin_protein(self, tmp_path, monkeypatch):
+        # the NumPy kernel costs seconds per evaluation, so one gene and a short run
+        monkeypatch.chdir(tmp_path)
+        p_drop = np.log10(0.1)
+        m = CMEModel("Chromatin", "None", n_sites=2, rule="switch", bursty=True, protein=True, dropout_bounds=(p_drop, p_drop, 1))
+        thetas = np.log10([[0.5, 0.8, 1.0, 1.5, 0.7, 0.4, 1.5, 0.4, 0.8]])
+        _, est = _fit(m, thetas, 4000, samp=np.array([0.0, 0.0, p_drop]), gp=dict(GP, max_iterations=30))
+        np.testing.assert_allclose(est[:, :7], thetas[:, :7], atol=0.25)
+        np.testing.assert_allclose(est[:, 7] - est[:, 8], thetas[:, 7] - thetas[:, 8], atol=0.25)   # k_p / gamma_p

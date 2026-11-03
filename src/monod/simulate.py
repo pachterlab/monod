@@ -101,9 +101,6 @@ def _latent_counts(model, theta, n_cells, rng):
         b, beta, gamma, k_p, gamma_p = lin
         return _lifelines(n_cells, rng, np.ones(n_cells), b, ("exp", beta), ("exp", gamma), protein=(k_p, gamma_p))
     if bio == "Chromatin":
-        if getattr(model, "protein", False):
-            raise NotImplementedError("the chromatin model's protein layer is not in the simulator yet "
-                                      "(docs/chromatin-protein-design.md, stage 2)")
         return _chromatin_ssa(model, theta, n_cells, rng)
     if bio == "Custom":
         return _network_ssa(model, theta, n_cells, rng)
@@ -165,21 +162,25 @@ def _lifelines(n_cells, rng, event_rate, burst_mean, nascent, mature, protein=No
 
 def _chromatin_ssa(model, theta, n_cells, rng):
     """Gillespie simulation of the locus chain with nascent and mature RNA,
-    vectorised over cells, from the stationary chain and no RNA to a burn-in
-    horizon of thirty times the slowest timescale."""
+    and with ``model.protein`` the translation and degradation of a protein
+    from the mature RNA, vectorised over cells, from the stationary chain and
+    no molecules to a burn-in horizon of thirty times the slowest timescale."""
     n = model.n_sites
+    protein = bool(getattr(model, "protein", False))
     k_on, eps, rates, beta, gamma = _ch.split_theta(theta, model.rule, n)
-    burst = _ch.burst_size(theta, model.rule, n)
+    burst = _ch.burst_size(theta, model.rule, n, protein)
+    k_p, gamma_p = _ch.protein_rates(theta) if protein else (0.0, 1.0)
     H, A, _ = _ch.nascent_mature_system(k_on, 1.0, eps, model.rule, beta, gamma, periodic=model.periodic, rule_params=rates)
     N = H.shape[0]
     w = _ch.stationary_distribution(H)
     Hoff = H.copy()
     np.fill_diagonal(Hoff, 0.0)
-    slowest = min(beta, gamma, float(np.min(k_on)), 1.0)
+    slowest = min(beta, gamma, float(np.min(k_on)), 1.0, gamma_p if protein else 1.0)
     t_end = _WINDOW_FOLDS / slowest
     state = rng.choice(N, size=n_cells, p=w)
     U = np.zeros(n_cells, dtype=np.int64)
     S = np.zeros(n_cells, dtype=np.int64)
+    P = np.zeros(n_cells, dtype=np.int64)
     t = np.zeros(n_cells)
     while True:
         act = np.flatnonzero(t < t_end)
@@ -187,7 +188,10 @@ def _chromatin_ssa(model, theta, n_cells, rng):
             break
         s = state[act]
         prod = A[s, 0] if burst is None else A[s, 0] / burst
-        props = np.column_stack([Hoff[s], prod, beta * U[act], gamma * S[act]])     # (n_act, N + 3)
+        cols = [Hoff[s], prod, beta * U[act], gamma * S[act]]
+        if protein:
+            cols += [k_p * S[act], gamma_p * P[act]]
+        props = np.column_stack(cols)                                       # (n_act, N + 3 (+ 2))
         total = props.sum(axis=1)
         t_new = t[act] + rng.exponential(1.0 / total)
         crossed = t_new > t_end                     # the state at t_end is the one before this event
@@ -208,7 +212,14 @@ def _chromatin_ssa(model, theta, n_cells, rng):
         U[act[is_spl]] -= 1
         S[act[is_spl]] += 1
         S[act[which == N + 2]] -= 1
-    return {"unspliced": U, "spliced": S, "configuration": state}
+        if protein:
+            P[act[which == N + 3]] += 1
+            P[act[which == N + 4]] -= 1
+    out = {"unspliced": U, "spliced": S}
+    if protein:
+        out["protein"] = P
+    out["configuration"] = state
+    return out
 
 
 def _network_ssa(model, theta, n_cells, rng):
@@ -332,6 +343,8 @@ def _observe(model, latent, samp, theta_amb, rng):
         if samp is None:
             raise ValueError(f"seq_model={model.seq_model!r} needs samp")
         sequenced = [m for m in mods if m not in ("configuration", "ambiguous")]
+        if model.bio_model == "Chromatin":
+            sequenced = sequenced[:2]                   # samp[2] is the ATAC dropout; the protein is not captured
         for m, s in zip(sequenced, samp):
             lam = 10.0 ** s
             if model.seq_model == "Poisson":

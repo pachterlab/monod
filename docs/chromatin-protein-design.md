@@ -1,8 +1,10 @@
 # Design: a joint chromatin, RNA and protein model
 
-Status: stage 1 built, 2026-11-02 (NumPy kernel, model definition, limit tests in
-`tests/test_chromatin_protein.py`); stages 2 to 5 pending. The "Why the kernel
-composes" section describes the design; "How stage 1 does it" what was built.
+Status: stages 1 and 2 built, 2026-11-02 (NumPy kernel, model definition, limit
+tests in `tests/test_chromatin_protein.py`; protein reactions in the chromatin
+simulator, generative checks in `tests/test_generative_checks.py`); stages 3 to
+5 pending. The "Why the kernel composes" section describes the design; "How
+stage 1 does it" what was built.
 
 ## What the model is
 
@@ -203,10 +205,16 @@ real data feasible.
    reproduces `Chromatin` with a delta at protein zero; `gamma_p -> infinity`
    with `k_p / gamma_p` fixed gives a protein that tracks the mature count
    (its conditional mean `(k_p / gamma_p) S`).
-2. **Simulation.** Add the protein reactions to the chromatin simulator in
-   `monod.simulate` and register the model in `tests/test_generative_checks.py`:
-   moments, histogram divergence and parameter recovery against cells drawn
-   from the process with capture, dropout and the ambiguous split on.
+2. **Simulation.** Done. `simulate._chromatin_ssa` carries translation and
+   degradation as two more reactions of the vectorised Gillespie loop (the
+   burn-in horizon counts the protein lifetime); the observation layer leaves
+   the protein uncaptured and reads the dropout from the third sampling entry.
+   `tests/test_generative_checks.py` checks moments and histogram divergence
+   with capture, dropout and the ambiguous split on. The pipeline recovery
+   (`TestRecovery::test_chromatin_protein`, one gene, 30 iterations) runs only
+   with `MONOD_SLOW_TESTS=1`: a pinned gradient costs about 45 s on the NumPy
+   kernel, so the run takes about 27 minutes. It passed on 2026-11-02;
+   stage 5 is what makes it a routine test.
 3. **Contract tests.** Register the kernel in the contract suite: replay
    equality under a pinned schedule, finite-difference gradient against a
    displaced evaluation, thread-pool consistency, MLE recovery on simulated

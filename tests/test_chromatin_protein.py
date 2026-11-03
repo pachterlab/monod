@@ -60,10 +60,14 @@ class TestLayout:
         with pytest.raises(ValueError, match="fit_unspliced"):
             CMEModel.compose("bursty", locus=dict(n_sites=1), protein=dict(fit_unspliced=False))
 
-    def test_simulator_says_not_yet(self):
+    def test_simulator_draws_the_four_modalities(self):
+        # the agreement with the kernel is test_generative_checks' business; here the layout
         from monod.simulate import simulate_counts
-        with pytest.raises(NotImplementedError, match="stage 2"):
-            simulate_counts(_model(), THETA, 10)
+        c = simulate_counts(_model(seq="Poisson"), THETA, 2000, np.log10([0.7, 0.9, 0.1]), seed=0)
+        assert list(c) == ["unspliced", "spliced", "protein", "configuration"]
+        assert all(v.dtype == np.int64 and v.size == 2000 for v in c.values())
+        assert c["protein"].mean() > 0.5 * c["spliced"].mean() / 0.9          # k_p / gamma_p = 1, mature capture 0.9
+        assert c["configuration"].max() == 3
 
 
 class TestKernel:
