@@ -4552,6 +4552,221 @@ struct ChromatinSys<'a> {
     /// u[j][b * B + i]: PGF argument of species j at point i of block b (zero-padded)
     ur: Vec<Vec<f64>>,
     ui: Vec<Vec<f64>>,
+    /// the protein layer's characteristics, when there is one
+    protein: Option<ProtTable>,
+}
+
+// ---------------------------------------------------------------------------
+// The protein layer (mirrors `monod.chromatin._ProteinCharacteristics`)
+// ---------------------------------------------------------------------------
+//
+// With a protein downstream of the mature RNA the characteristics of the
+// nascent/mature pair are no longer exp(C s) u.  In v = 1 + u_U, w = 1 + u_S,
+//
+//     u_P(s) = u_P exp(-gamma_p s),  w' = a(s) w + gamma,  a(s) = -gamma + k_p u_P(s),  v' = beta (w - v),
+//
+// and the Python kernel tabulates (v, w) over [0, T] at every mesh point with
+// the protein integrator's step, then reads them by cubic Hermite
+// interpolation between the half-step nodes.  Every step of that integrator
+// is affine in (v, w), with coefficients that depend on the mesh point only
+// through u_P, so the table here holds the affine map from s = 0 to each node
+// per distinct u_P (the protein axis of the mesh, a handful of values) and the
+// value at a point is m11 v0 + m12 w0 + b1: the same numbers at a fraction of
+// the memory.  The schedule is decided as in Python, by the exact maximum over
+// the mesh points of the full-step/half-step difference and of the Hermite
+// midpoint check.
+
+/// One row of the affine map: `cv · v0 + cw · w0 + b`.
+#[derive(Clone, Copy)]
+struct ProtRow { cv: Complex64, cw: Complex64, b: Complex64 }
+
+impl ProtRow {
+    #[inline(always)]
+    fn at(&self, v0: Complex64, w0: Complex64) -> Complex64 { self.cv * v0 + self.cw * w0 + self.b }
+    fn add(&self, o: &ProtRow) -> ProtRow { ProtRow { cv: self.cv + o.cv, cw: self.cw + o.cw, b: self.b + o.b } }
+    fn sub(&self, o: &ProtRow) -> ProtRow { ProtRow { cv: self.cv - o.cv, cw: self.cw - o.cw, b: self.b - o.b } }
+    fn scale(&self, k: f64) -> ProtRow { ProtRow { cv: k * self.cv, cw: k * self.cw, b: k * self.b } }
+    fn cscale(&self, k: Complex64) -> ProtRow { ProtRow { cv: k * self.cv, cw: k * self.cw, b: k * self.b } }
+    fn shift(&self, k: f64) -> ProtRow { ProtRow { cv: self.cv, cw: self.cw, b: self.b + k } }
+}
+
+/// The map (v, w) -> (m11 v + m12 w + b1, m22 w + b2) from s = 0 to a node.
+#[derive(Clone, Copy)]
+struct ProtAff { m11: f64, m12: Complex64, m22: Complex64, b1: Complex64, b2: Complex64 }
+
+impl ProtAff {
+    fn identity() -> ProtAff {
+        let z = Complex64::new(0.0, 0.0);
+        ProtAff { m11: 1.0, m12: z, m22: Complex64::new(1.0, 0.0), b1: z, b2: z }
+    }
+    /// `self` applied after `inner`.
+    fn after(&self, inner: &ProtAff) -> ProtAff {
+        ProtAff {
+            m11: self.m11 * inner.m11,
+            m12: self.m11 * inner.m12 + self.m12 * inner.m22,
+            m22: self.m22 * inner.m22,
+            b1: self.m11 * inner.b1 + self.m12 * inner.b2 + self.b1,
+            b2: self.m22 * inner.b2 + self.b2,
+        }
+    }
+    fn v_row(&self) -> ProtRow { ProtRow { cv: Complex64::new(self.m11, 0.0), cw: self.m12, b: self.b1 } }
+    fn w_row(&self) -> ProtRow { ProtRow { cv: Complex64::new(0.0, 0.0), cw: self.m22, b: self.b2 } }
+}
+
+/// exp(z) - 1 without cancellation near zero.
+fn cexpm1(z: Complex64) -> Complex64 {
+    let (x, y) = (z.re, z.im);
+    Complex64::new(x.exp_m1() * y.cos() - 2.0 * (0.5 * y).sin().powi(2), x.exp() * y.sin())
+}
+
+/// (exp(z) - 1) / z with the series near zero (the Python `_phi1`).
+fn cphi1(z: Complex64) -> Complex64 {
+    if z.norm() > 1e-4 { cexpm1(z) / z } else { 1.0 + z * 0.5 + z * z * (1.0 / 6.0) }
+}
+
+struct ProtParams { beta: f64, gamma: f64, k_p: f64, gamma_p: f64 }
+
+/// One step of the protein integrator from time `t` over `h` as an affine map
+/// (the homogeneous part of w exact, the forcing and the v coupling with the
+/// step-average coefficient), for protein argument `u_p`.
+fn prot_step(p: &ProtParams, u_p: Complex64, t: f64, h: f64) -> ProtAff {
+    let (beta, gamma, k_p, gamma_p) = (p.beta, p.gamma, p.k_p, p.gamma_p);
+    let da = (k_p / gamma_p) * (-gamma_p * t).exp() * (-((-gamma_p * h).exp_m1())) * u_p - gamma * h;
+    let e = da.exp();
+    let abar = da / h;
+    let s_ = abar + beta;
+    let eb = (-beta * h).exp();
+    let i0 = h * cphi1(Complex64::new(-beta * h, 0.0)).re;
+    let z = s_ * h;
+    let i1 = if z.norm() > 1e-3 { (e - eb) / s_ } else { (1.0 + z * 0.5 + z * z * (1.0 / 6.0)) * (h * eb) };
+    let goa = gamma / abar;
+    ProtAff { m11: eb, m12: i1 * beta, m22: e, b1: (goa * i1 - goa * i0) * beta, b2: cphi1(da) * (gamma * h) }
+}
+
+struct ProtTable {
+    p: ProtParams,
+    u_p: Vec<Complex64>,          // per distinct protein argument
+    group_of: Vec<usize>,         // per padded mesh point
+    nodes: Vec<f64>,
+    coef: Vec<Vec<ProtAff>>,      // [group][node]
+    t_end: f64,
+}
+
+impl ProtTable {
+    fn a_at(&self, g: usize, t: f64) -> Complex64 {
+        -self.p.gamma + self.p.k_p * self.u_p[g] * (-self.p.gamma_p * t).exp()
+    }
+
+    /// (v, w) derivative rows at node `k` from the equations.
+    fn derivatives(&self, g: usize, k: usize) -> (ProtRow, ProtRow) {
+        let (v, w) = (self.coef[g][k].v_row(), self.coef[g][k].w_row());
+        (w.sub(&v).scale(self.p.beta), w.cscale(self.a_at(g, self.nodes[k])).shift(self.p.gamma))
+    }
+
+    /// The (v, w) rows at time-to-go `s`: cubic Hermite between the nodes.
+    fn rows_at(&self, g: usize, s: f64) -> (ProtRow, ProtRow) {
+        let last = self.nodes.len() - 1;
+        if s <= 0.0 { return (self.coef[g][0].v_row(), self.coef[g][0].w_row()); }
+        if s >= self.t_end { return (self.coef[g][last].v_row(), self.coef[g][last].w_row()); }
+        let k = self.nodes.partition_point(|&n| n <= s) - 1;
+        let h = self.nodes[k + 1] - self.nodes[k];
+        let x = (s - self.nodes[k]) / h;
+        let h00 = (1.0 + 2.0 * x) * (1.0 - x) * (1.0 - x);
+        let h10 = x * (1.0 - x) * (1.0 - x);
+        let h01 = x * x * (3.0 - 2.0 * x);
+        let h11 = x * x * (x - 1.0);
+        let (dv0, dw0) = self.derivatives(g, k);
+        let (dv1, dw1) = self.derivatives(g, k + 1);
+        let (v0, w0) = (self.coef[g][k].v_row(), self.coef[g][k].w_row());
+        let (v1, w1) = (self.coef[g][k + 1].v_row(), self.coef[g][k + 1].w_row());
+        let v = v0.scale(h00).add(&dv0.scale(h10 * h)).add(&v1.scale(h01)).add(&dv1.scale(h11 * h));
+        let w = w0.scale(h00).add(&dw0.scale(h10 * h)).add(&w1.scale(h01)).add(&dw1.scale(h11 * h));
+        (v, w)
+    }
+
+    /// Simpson's nodes over `[tau_a, tau_a + delta]`: weight and rows per group.
+    fn simpson(&self, tau_a: f64, delta: f64) -> Vec<(f64, Vec<(ProtRow, ProtRow)>)> {
+        let nodes = [(tau_a, delta / 6.0), (tau_a + 0.5 * delta, 4.0 * delta / 6.0), (tau_a + delta, delta / 6.0)];
+        nodes.iter().map(|&(s_, w)| (w, (0..self.u_p.len()).map(|g| self.rows_at(g, s_)).collect())).collect()
+    }
+}
+
+/// Tabulate the protein characteristics over `[0, t_end]` with step doubling,
+/// the error taken exactly over the mesh points (`u`: the three PGF rows).
+fn prot_tabulate(p: ProtParams, u: &[Vec<Complex64>], n_grid: usize, n_pad: usize,
+                 t_end: f64, h_first: f64, h_min: f64, tol: f64) -> ProtTable {
+    let one = Complex64::new(1.0, 0.0);
+    let mut u_p: Vec<Complex64> = Vec::new();
+    let mut group_of = vec![0usize; n_pad];
+    let mut members: Vec<Vec<usize>> = Vec::new();
+    for q in 0..n_grid {
+        let z = u[2][q];
+        let g = match u_p.iter().position(|&x| x == z) {
+            Some(g) => g,
+            None => { u_p.push(z); members.push(Vec::new()); u_p.len() - 1 }
+        };
+        group_of[q] = g;
+        members[g].push(q);
+    }
+    let v0: Vec<Complex64> = (0..n_grid).map(|q| u[0][q] + one).collect();
+    let w0: Vec<Complex64> = (0..n_grid).map(|q| u[1][q] + one).collect();
+    let ng = u_p.len();
+    let max_over = |rows: &[(ProtRow, ProtRow)]| -> f64 {
+        let mut e = 0.0_f64;
+        for g in 0..ng {
+            let (rv, rw) = rows[g];
+            for &q in &members[g] {
+                e = e.max(rv.at(v0[q], w0[q]).norm());
+                e = e.max(rw.at(v0[q], w0[q]).norm());
+            }
+        }
+        e
+    };
+    let mut cur = vec![ProtAff::identity(); ng];
+    let mut nodes = vec![0.0_f64];
+    let mut coef: Vec<Vec<ProtAff>> = (0..ng).map(|g| vec![cur[g]]).collect();
+    let mut t = 0.0_f64;
+    let mut h = h_first;
+    let mut n_steps = 0usize;
+    while t < t_end && n_steps < CHROMATIN_MAX_STEPS {
+        h = h.min(t_end - t);
+        let mut mid = Vec::with_capacity(ng);
+        let mut two = Vec::with_capacity(ng);
+        let mut diff = Vec::with_capacity(ng);
+        let mut cubic = Vec::with_capacity(ng);
+        for g in 0..ng {
+            let f = prot_step(&p, u_p[g], t, h).after(&cur[g]);
+            let m = prot_step(&p, u_p[g], t, 0.5 * h).after(&cur[g]);
+            let t2 = prot_step(&p, u_p[g], t + 0.5 * h, 0.5 * h).after(&m);
+            diff.push((t2.v_row().sub(&f.v_row()), t2.w_row().sub(&f.w_row())));
+            // the cubic through the step's ends at its middle, against the half-step value
+            let a0 = -p.gamma + p.k_p * u_p[g] * (-p.gamma_p * t).exp();
+            let a2 = -p.gamma + (a0 + p.gamma) * (-p.gamma_p * h).exp();
+            let (cv, cw) = (cur[g].v_row(), cur[g].w_row());
+            let (v2, w2) = (t2.v_row(), t2.w_row());
+            let v_mid = cv.add(&v2).scale(0.5).add(&cw.sub(&cv).scale(p.beta).sub(&w2.sub(&v2).scale(p.beta)).scale(0.125 * h));
+            let w_mid = cw.add(&w2).scale(0.5).add(&cw.cscale(a0).sub(&w2.cscale(a2)).scale(0.125 * h));
+            cubic.push((v_mid.sub(&m.v_row()), w_mid.sub(&m.w_row())));
+            mid.push(m); two.push(t2);
+        }
+        let err = max_over(&diff).max(max_over(&cubic));
+        let fac = match control_step(err, h, h_min, tol) {
+            StepControl::Retry(h_new) => { h = h_new; continue; }
+            StepControl::Accept(f) => f,
+        };
+        nodes.push(t + 0.5 * h);
+        nodes.push(t + h);
+        for g in 0..ng {
+            coef[g].push(mid[g]);
+            coef[g].push(two[g]);
+            cur[g] = two[g];
+        }
+        t += h;
+        n_steps += 1;
+        h *= fac;
+    }
+    let t_end = *nodes.last().unwrap();
+    ProtTable { p, u_p, group_of, nodes, coef, t_end }
 }
 
 /// The diagonal sub-flow's operator for one half of a step, in the form the
@@ -4562,7 +4777,13 @@ enum DiagOps { General(Vec<f64>), Shared(Vec<f64>), Factored(Vec<f64>) }
 /// `x(p) = M u(p)` (single molecules, `M = ∫ e^{Cs} ds` folded into `coef`)
 /// or, with bursts, `x(p) = Σ_k w_k φ(e^{C s_k} u(p))`, `φ(U) = U / (1 - b U)`,
 /// Simpson's nodes and weights in `quad`.
-struct DiagFlow { coef: DiagOps, quad: Option<Vec<(SmallMat, f64)>> }
+struct DiagFlow {
+    coef: DiagOps,
+    quad: Option<Vec<(SmallMat, f64)>>,
+    /// protein layer: Simpson weights and, per node, the (v, w) rows of the
+    /// characteristics' affine map per distinct protein argument
+    pquad: Option<Vec<(f64, Vec<(ProtRow, ProtRow)>)>>,
+}
 
 /// Step operators for a Strang step from time-to-go `tau` to `tau - h`:
 /// d1 over [tau - h/2, tau], E = exp(H^T h), d2 over [tau - h, tau - h/2].
@@ -4599,12 +4820,16 @@ fn chromatin_diag_ops(sys: &ChromatinSys, mm: &SmallMat) -> DiagOps {
 
 /// The diagonal flow over `[tau_a, tau_a + delta]`.
 fn chromatin_diag_flow(sys: &ChromatinSys, tau_a: f64, delta: f64) -> DiagFlow {
+    if let Some(pt) = &sys.protein {
+        // the characteristics come from the table; Simpson on the interval, with or without bursts
+        return DiagFlow { coef: chromatin_diag_ops(sys, &SmallMat::eye(sys.m)), quad: None, pquad: Some(pt.simpson(tau_a, delta)) };
+    }
     match sys.burst {
-        None => DiagFlow { coef: chromatin_diag_ops(sys, &chromatin_char_integral(&sys.c, tau_a, delta)), quad: None },
+        None => DiagFlow { coef: chromatin_diag_ops(sys, &chromatin_char_integral(&sys.c, tau_a, delta)), quad: None, pquad: None },
         Some(_) => {
             let nodes = [(tau_a, delta / 6.0), (tau_a + 0.5 * delta, 4.0 * delta / 6.0), (tau_a + delta, delta / 6.0)];
             let quad = nodes.iter().map(|&(s, w)| (sys.c.scaled(s).expm(), w)).collect();
-            DiagFlow { coef: chromatin_diag_ops(sys, &SmallMat::eye(sys.m)), quad: Some(quad) }
+            DiagFlow { coef: chromatin_diag_ops(sys, &SmallMat::eye(sys.m)), quad: Some(quad), pquad: None }
         }
     }
 }
@@ -4640,8 +4865,34 @@ fn chromatin_diag(sys: &ChromatinSys, d: &DiagFlow, b0: usize, gr: &mut [f64], g
     // the burst integral Σ_k w_k φ(e^{C s_k} u) with φ(U) = U / (1 - b U)
     let mut xr = vec![0.0; m * bw];
     let mut xi = vec![0.0; m * bw];
-    match (&d.quad, sys.burst) {
-        (Some(quad), Some(b)) => {
+    match (&d.pquad, &sys.protein, &d.quad, sys.burst) {
+        (Some(pq), Some(pt), _, burst) => {
+            // the protein layer: U_j(s) at the point from the affine rows of its group
+            for (wk, rows) in pq.iter() {
+                for i in 0..bw {
+                    let q = b0 + i;
+                    let (rv, rw) = rows[pt.group_of[q]];
+                    let v0 = Complex64::new(sys.ur[0][q] + 1.0, sys.ui[0][q]);
+                    let w0 = Complex64::new(sys.ur[1][q] + 1.0, sys.ui[1][q]);
+                    let us = [rv.at(v0, w0) - 1.0, rw.at(v0, w0) - 1.0];
+                    for j in 0..2 {
+                        let (ur_, ui_) = (us[j].re, us[j].im);
+                        let (pr, pi) = match burst {
+                            Some(b) => {
+                                let (dr, di) = (1.0 - b * ur_, -b * ui_);
+                                let den = dr * dr + di * di;
+                                let (pr, pi) = cmul(ur_, ui_, dr, -di);
+                                (pr / den, pi / den)
+                            }
+                            None => (ur_, ui_),
+                        };
+                        xr[j * bw + i] += wk * pr;
+                        xi[j * bw + i] += wk * pi;
+                    }
+                }
+            }
+        }
+        (_, _, Some(quad), Some(b)) => {
             for (ek, wk) in quad.iter() {
                 for j in 0..m {
                     for i in 0..bw {
@@ -4907,10 +5158,14 @@ fn chromatin_pgf(
 /// that A = S W for the 0/1 site matrix S; `independent` (k_on_j, k_off_j
 /// per site) that H is the Kronecker sum of independent sites.  `burst`
 /// makes the emission geometric bursts of that mean size (`a` stays the
-/// mean production rate).  Returns `(re, im, mesh_shape, steps)` with G
-/// point-major: index `p * n_states + c`.
+/// mean production rate).  `protein = (k_p, gamma_p, h_first, h_min, tol)`
+/// adds the protein layer downstream of the mature RNA: `c` must be the
+/// nascent/mature scheme, `u_re`/`u_im` carry a third row (the protein's
+/// argument), and the characteristics are tabulated with the protein
+/// integrator's step under those three controls.  Returns `(re, im,
+/// mesh_shape, steps)` with G point-major: index `p * n_states + c`.
 #[pyfunction]
-#[pyo3(signature = (n_states, n_species, h, a, c, limits, w, t_horizon, h_first, h_min, tol, fixed_schedule=None, site_weights=None, independent=None, u_re=None, u_im=None, burst=None))]
+#[pyo3(signature = (n_states, n_species, h, a, c, limits, w, t_horizon, h_first, h_min, tol, fixed_schedule=None, site_weights=None, independent=None, u_re=None, u_im=None, burst=None, protein=None))]
 fn eval_chromatin_pgf(
     py:             Python<'_>,
     n_states:       usize,
@@ -4930,6 +5185,7 @@ fn eval_chromatin_pgf(
     u_re:           Option<Vec<f64>>,
     u_im:           Option<Vec<f64>>,
     burst:          Option<f64>,
+    protein:        Option<(f64, f64, f64, f64, f64)>,
 ) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>, Vec<f64>)> {
     let (n, m) = (n_states, n_species);
     if let Some(b) = burst {
@@ -4937,12 +5193,24 @@ fn eval_chromatin_pgf(
             return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: burst must be a positive number"));
         }
     }
+    let rows = m + if protein.is_some() { 1 } else { 0 };
     if let (Some(ur), Some(ui)) = (&u_re, &u_im) {
-        if ur.len() != ui.len() || ur.len() % m != 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: u_re/u_im must be n_species × n_grid"));
+        if ur.len() != ui.len() || ur.len() % rows != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: u_re/u_im must be n_species (+1 with a protein) × n_grid"));
         }
     } else if u_re.is_some() != u_im.is_some() {
         return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: give both u_re and u_im or neither"));
+    }
+    if let Some((k_p, gamma_p, hf, hm, ptol)) = protein {
+        if u_re.is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: the protein layer needs u_re/u_im with the protein row"));
+        }
+        if m != 2 || c.len() != 4 || c[2] != 0.0 || c[1] != -c[0] {
+            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: the protein layer needs the nascent/mature scheme c = [[-beta, beta], [0, -gamma]]"));
+        }
+        if !(k_p > 0.0 && gamma_p > 0.0 && hf > 0.0 && hm > 0.0 && ptol > 0.0) {
+            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: protein = (k_p, gamma_p, h_first, h_min, tol), all positive"));
+        }
     }
     if h.len() != n * n || a.len() != n * m || c.len() != m * m || w.len() != n || limits.len() != m {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -4966,8 +5234,8 @@ fn eval_chromatin_pgf(
         // (already transformed by a sequencing-noise model)
         let mesh = match (&u_re, &u_im) {
             (Some(ur), Some(ui)) => {
-                let n_grid = ur.len() / m;
-                let u: Vec<Vec<Complex64>> = (0..m)
+                let n_grid = ur.len() / rows;
+                let u: Vec<Vec<Complex64>> = (0..rows)
                     .map(|j| (0..n_grid).map(|p| Complex64::new(ur[j * n_grid + p], ui[j * n_grid + p])).collect())
                     .collect();
                 Arc::new((u, vec![n_grid], n_grid))
@@ -4977,8 +5245,12 @@ fn eval_chromatin_pgf(
         let (u, mx, n_grid) = (&mesh.0, mesh.1.clone(), mesh.2);
         let bw = CHROMATIN_BLOCK;
         let n_blocks = (n_grid + bw - 1) / bw;
-        let ur: Vec<Vec<f64>> = u.iter().map(|uj| (0..n_blocks * bw).map(|p| if p < n_grid { uj[p].re } else { 0.0 }).collect()).collect();
-        let ui: Vec<Vec<f64>> = u.iter().map(|uj| (0..n_blocks * bw).map(|p| if p < n_grid { uj[p].im } else { 0.0 }).collect()).collect();
+        let ur: Vec<Vec<f64>> = u.iter().take(m).map(|uj| (0..n_blocks * bw).map(|p| if p < n_grid { uj[p].re } else { 0.0 }).collect()).collect();
+        let ui: Vec<Vec<f64>> = u.iter().take(m).map(|uj| (0..n_blocks * bw).map(|p| if p < n_grid { uj[p].im } else { 0.0 }).collect()).collect();
+        let prot = protein.map(|(k_p, gamma_p, hf, hm, ptol)| {
+            let p = ProtParams { beta: -c[0], gamma: -c[3], k_p, gamma_p };
+            prot_tabulate(p, u, n_grid, n_blocks * bw, t_horizon, hf, hm, ptol)
+        });
         let chain = match &independent {
             Some(ind) => ChromatinChain::Kron((0..n_sites).map(|j| {
                 let (kon, koff) = (ind[2 * j], ind[2 * j + 1]);
@@ -5013,7 +5285,7 @@ fn eval_chromatin_pgf(
             }
         };
         let cm = SmallMat { n: m, a: c.clone() };
-        let sys = ChromatinSys { n, m, chain, a: &a, c: cm, diag, burst, ur, ui };
+        let sys = ChromatinSys { n, m, chain, a: &a, c: cm, diag, burst, ur, ui, protein: prot };
         let (gr, gi, steps) = chromatin_pgf(&sys, &w, n_blocks, t_horizon, h_first, h_min, tol, fixed_schedule.as_deref());
         // back to point-major (p * n + c)
         let mut re = vec![0.0; n_grid * n];

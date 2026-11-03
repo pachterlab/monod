@@ -291,8 +291,14 @@ def _char_integral(C: np.ndarray, tau_a: float, delta: float) -> np.ndarray:
     return _expm(C * tau_a) @ _phi_ops(C, delta, 1)[1]
 
 
-def _rust_available() -> bool:
-    return _mc is not None and hasattr(_mc, "eval_chromatin_pgf")
+def _rust_available(protein: bool = False) -> bool:
+    """Whether ``monod_core.eval_chromatin_pgf`` is installed (and, with
+    ``protein``, whether it is a build that takes the protein layer)."""
+    if _mc is None or not hasattr(_mc, "eval_chromatin_pgf"):
+        return False
+    if not protein:
+        return True
+    return "protein" in (getattr(_mc.eval_chromatin_pgf, "__text_signature__", None) or "")
 
 
 class _LinearCharacteristics:
@@ -532,7 +538,9 @@ def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
     protein's argument, and the characteristics come from
     :class:`_ProteinCharacteristics` instead of ``exp(C s) u``.  The locus
     still only sets the nascent production rate, so the stepper is otherwise
-    unchanged.  NumPy backend only for now."""
+    unchanged.  The Rust kernel tabulates the same characteristics as an
+    affine map per distinct protein argument (``monod_core.eval_chromatin_pgf``
+    with ``protein=``)."""
     H = np.asarray(H, dtype=float); A = np.asarray(A, dtype=float); C = np.asarray(C, dtype=float)
     u = np.asarray(u, dtype=np.complex128)
     N, m = A.shape
@@ -546,6 +554,8 @@ def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
     lam_fast = max(float(lam.max()), float(np.abs(np.diag(H)).max()), float(2.0 * np.abs(A).max()), 1e-300)
     if protein is not None:
         k_p, gamma_p = (float(x) for x in protein)
+        if not (k_p > 0.0 and gamma_p > 0.0):
+            raise ValueError(f"protein=(k_p, gamma_p) must be positive, got {protein!r}")
         if m != 2 or C[1, 0] != 0.0 or C[0, 1] != -C[0, 0]:
             raise ValueError("the protein layer needs the nascent/mature scheme C = [[-beta, beta], [0, -gamma]]")
         beta, gamma = -C[0, 0], -C[1, 1]
@@ -559,13 +569,16 @@ def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
     h_first = _C0 / lam_fast
     h_min = 1e-12 / lam_fast
     if backend is None:
-        backend = "rust" if _rust_available() and protein is None else "python"
-    if backend == "rust" and protein is not None:
-        raise NotImplementedError("the protein layer of the chromatin kernel runs in NumPy only (no Rust branch yet)")
+        backend = "rust" if _rust_available(protein is not None) else "python"
     if backend == "rust":
-        if not _rust_available():
-            raise RuntimeError("monod_core with eval_chromatin_pgf is not installed")
+        if not _rust_available(protein is not None):
+            raise RuntimeError("monod_core with eval_chromatin_pgf" + (" taking the protein layer" if protein is not None else "")
+                               + " is not installed")
         site_weights, independent = locus_structure(H, A) if structure is None else structure
+        prot = None
+        if protein is not None:
+            lam_p = max(beta, gamma + 2.0 * k_p, gamma_p)              # the tabulation's own controls, as in Python
+            prot = (k_p, gamma_p, _C0 / lam_p, 1e-12 / lam_p, 0.1 * tol)
         re, im, _, steps = _mc.eval_chromatin_pgf(
             N, m, H.ravel().tolist(), A.ravel().tolist(), C.ravel().tolist(),
             [1] * m, w.tolist(), float(T), float(h_first), float(h_min), float(tol),
@@ -573,7 +586,8 @@ def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
             None if site_weights is None else np.asarray(site_weights, dtype=float).ravel().tolist(),
             independent,
             u.real.ravel().tolist(), u.imag.ravel().tolist(),
-            None if burst is None else float(burst))
+            None if burst is None else float(burst),
+            prot)
         G = (np.asarray(re) + 1j * np.asarray(im)).reshape(P, N).T
         steps = list(steps)
     elif backend == "python":

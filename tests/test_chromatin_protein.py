@@ -229,6 +229,54 @@ class TestPipeline:
         assert CMEModel.from_dict(dict(out.uns["model"])).amb_model == "Equal"
 
 
+needs_rust_protein = pytest.mark.skipif(not ch._rust_available(True), reason="monod_core without the protein layer of eval_chromatin_pgf")
+
+
+@needs_rust_protein
+class TestRustBackend:
+    """The Rust kernel (design doc, stage 5) follows the NumPy one step for step:
+    the same tabulation schedule for the characteristics and the same stepper
+    schedule, through the affine-map table instead of a table over the mesh."""
+
+    def _system(self, rule, rates, bursty, k_p=0.5, gamma_p=0.5, beta=0.8, gamma=0.3, k_on=(0.5, 0.8), eps=0.6):
+        H, A, C = ch.nascent_mature_system(list(k_on), 1.0, eps, rule, beta, gamma, rule_params=rates)
+        return H, A, C, (2.0 if bursty else None), (k_p, gamma_p)
+
+    @pytest.mark.parametrize("case", ["switch-bursty", "table", "additive-bursty", "independent"])
+    def test_matches_numpy_in_every_mode(self, case):
+        rule, bursty = {"switch-bursty": ("switch", True), "table": ("table", False),
+                        "additive-bursty": ("additive", True), "independent": ("additive", False)}[case]
+        rates = {"switch": [1.5], "table": [0.3, 2.0, 1.0, 1.5], "additive": [1.5, 0.8]}[rule]
+        H, A, C, burst, protein = self._system(rule, rates, bursty, eps=1.0 if case == "independent" else 0.6)
+        lim = [14, 16, 14, 4][:3]
+        p_py, s_py = ch.eval_joint_pss(H, A, C, lim, burst=burst, protein=protein, backend="python", return_schedule=True)
+        p_rs, s_rs = ch.eval_joint_pss(H, A, C, lim, burst=burst, protein=protein, backend="rust", return_schedule=True)
+        assert s_rs.size == s_py.size
+        np.testing.assert_allclose(np.asarray(s_rs), np.asarray(s_py), rtol=1e-6)
+        np.testing.assert_allclose(p_rs, p_py, atol=1e-11)
+        replay = ch.eval_joint_pss(H, A, C, lim, burst=burst, protein=protein, fixed_schedule=s_py, backend="rust")
+        np.testing.assert_allclose(replay, p_py, atol=1e-11)
+
+    def test_small_grid_runs_the_sequential_path(self):
+        H, A, C, burst, protein = self._system("switch", [1.5], True, k_on=(0.7,), eps=1.0)
+        lim = [8, 8, 6]                                                   # 2 states x 8 x 8 x 4 points < 4096
+        p_py = ch.eval_joint_pss(H, A, C, lim, burst=burst, protein=protein, backend="python")
+        p_rs = ch.eval_joint_pss(H, A, C, lim, burst=burst, protein=protein, backend="rust")
+        np.testing.assert_allclose(p_rs, p_py, atol=1e-11)
+
+    def test_model_takes_the_rust_path_with_capture_and_a_coarse_protein_axis(self):
+        m = _model(seq="Poisson", protein_limit=10)
+        samp = np.log10([0.6, 0.8, 0.1])
+        lim = [16, 18, 30, 4]
+        fast = m.eval_model_pss(THETA, lim, samp)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(ch, "_rust_available", lambda protein=False: False)
+            slow = m.eval_model_pss(THETA, lim, samp)
+        np.testing.assert_allclose(fast, slow, atol=1e-11)
+        with pytest.raises(ValueError):
+            ch.eval_joint_pss(*self._system("switch", [1.5], False)[:3], [8, 8, 6], protein=(-1.0, 0.5), backend="rust")
+
+
 class TestStart:
     def test_moments_start_from_the_kernel_histogram(self):
         m = _model(dropout_bounds=(0.0, 0.0, 1))

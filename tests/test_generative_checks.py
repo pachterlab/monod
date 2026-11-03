@@ -7,7 +7,6 @@ sampling error, the divergence of the empirical histogram from the kernel at
 the level a multinomial sample produces, and for a subset of families the
 parameters recovered through the inference pipeline.
 """
-import os
 import warnings
 
 import numpy as np
@@ -20,8 +19,6 @@ from monod.simulate import simulate_adata, simulate_counts
 N_CELLS = 20000
 Z_MAX = 4.5
 GP = {"max_iterations": 50, "init_pattern": "moments", "num_restarts": 1, "num_gene_cores": 1}
-slow = pytest.mark.skipif(not os.environ.get("MONOD_SLOW_TESTS"),
-                          reason="minutes per gene on the NumPy chromatin-protein kernel; set MONOD_SLOW_TESTS=1")
 
 
 def _permissive(model):
@@ -209,9 +206,8 @@ class TestRecovery:
         _, est = _fit(m, thetas, 4000, samp=np.array([0.0, 0.0, p_drop]))
         np.testing.assert_allclose(est, thetas, atol=0.25)
 
-    @slow
     def test_chromatin_protein(self, tmp_path, monkeypatch):
-        # the NumPy kernel costs seconds per evaluation, so one gene and a short run
+        # one gene and a short run: a few minutes on the Rust kernel, half an hour on the NumPy fallback
         monkeypatch.chdir(tmp_path)
         p_drop = np.log10(0.1)
         m = CMEModel("Chromatin", "None", n_sites=2, rule="switch", bursty=True, protein=True, dropout_bounds=(p_drop, p_drop, 1))

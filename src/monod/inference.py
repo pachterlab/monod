@@ -1540,7 +1540,13 @@ class GradientInference:
         """
         mode = self.gradient_params.get("presearch", "auto")
         if mode == "auto":
-            mode = "nelder-mead" if model.bio_model == "ProteinBursty" else None
+            # the k_p / gamma_p valley: ProteinBursty, and the chromatin model's protein layer
+            # once its Rust kernel is there to pay for the search
+            protein_chromatin = model.bio_model == "Chromatin" and bool(getattr(model, "protein", False))
+            if protein_chromatin:
+                from . import chromatin as _chromatin
+                protein_chromatin = _chromatin._rust_available(True)
+            mode = "nelder-mead" if model.bio_model == "ProteinBursty" or protein_chromatin else None
         if not mode:
             return x0_all
         if mode != "nelder-mead":
@@ -1555,7 +1561,8 @@ class GradientInference:
             x0 = np.asarray(x0_all[gi][0], dtype=float)
 
             def kld(x):
-                return model.eval_model_kld(np.asarray(x, dtype=float), limits, samp, data)
+                with model.search_tolerance():                      # a pre-search: the coarse tolerance where a model has one
+                    return model.eval_model_kld(np.asarray(x, dtype=float), limits, samp, data)
 
             res = scipy.optimize.minimize(
                 kld, x0, method="Nelder-Mead", bounds=bounds,

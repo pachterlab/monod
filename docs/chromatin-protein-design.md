@@ -1,10 +1,11 @@
 # Design: a joint chromatin, RNA and protein model
 
-Status: stages 1 to 4 built, 2026-11-02 (NumPy kernel, model definition, limit
-tests in `tests/test_chromatin_protein.py`; protein reactions in the chromatin
-simulator, generative checks in `tests/test_generative_checks.py`; the kernel
-in the contract suite `tests/test_kernel_contract.py`; the pipeline and the
-`protein` layer of `build_multiome_adata`); stage 5, the Rust port, pending. The "Why the kernel composes" section describes the design; "How
+Status: all five stages built, 2026-11-02 to 2026-11-03 (NumPy kernel, model
+definition, limit tests in `tests/test_chromatin_protein.py`; protein
+reactions in the chromatin simulator, generative checks in
+`tests/test_generative_checks.py`; the kernel in the contract suite
+`tests/test_kernel_contract.py`; the pipeline and the `protein` layer of
+`build_multiome_adata`; the Rust kernel, "How stage 5 does it" below). The "Why the kernel composes" section describes the design; "How
 stage 1 does it" what was built.
 
 ## What the model is
@@ -112,9 +113,43 @@ central-difference gradient matches a wide plain difference.
 
 Cost in NumPy: 5 to 15 s per evaluation on a two-site locus with a 20 x 24 x 40
 grid (about 350 steps); the table holds `2 x nodes x P` complex numbers, some
-hundred megabytes on that grid. The Rust port should tabulate per chunk of
-mesh points under a pinned schedule, or adopt the adjoint form (one vector per
-configuration, no table, `N` times the work).
+hundred megabytes on that grid. The Rust kernel avoids the table by the
+affine-map form ("How stage 5 does it"); the NumPy path stays as the
+reference.
+
+## How stage 5 does it
+
+Every step of the protein integrator is affine in `(v, w)`, with coefficients
+that depend on the mesh point only through the protein argument `u_P`, and
+the Hermite read is linear in the node values and derivatives. The Rust
+kernel (`eval_chromatin_pgf(..., protein=(k_p, gamma_p, h_first, h_min,
+tol))`) therefore tabulates the affine map from `s = 0` to each node, five
+numbers per node per distinct `u_P` (the protein axis of the mesh, a handful
+of values), and reads `v(s) = m11 v0 + m12 w0 + b1` at the point inside the
+diagonal flow: the same numbers as the NumPy table over every mesh point, at a
+negligible fraction of the memory. The tabulation schedule is decided as in
+NumPy, by the exact maximum over the mesh points of the step-doubling
+difference and of the Hermite midpoint check, so both kernels take the same
+steps; they agree to 1e-16 at every mesh point in every mode (bursty and
+constitutive, switch, additive, table, independent sites, Poisson capture,
+coarse protein axis, replayed schedules; `TestRustBackend`). The stepper is
+untouched: the protein enters only through the production exponent's three
+Simpson nodes, so the structured paths (distinct rates, factored rates,
+Kronecker chain) and the parallel blocks all apply.
+
+Timing on bio (24 cores), bursty two-site switch, Poisson capture and dropout:
+
+| grid | Rust | NumPy |
+|---|---|---|
+| 32 x 42 x 35 x 4 | 0.53 s | 11.1 s |
+| 23 x 27 x 21 x 4 | 0.17 s | 2.9 s |
+| 10 x 10 x 10 x 4 | 0.09 s | 0.45 s |
+| 81 x 44 x 86 x 4, `protein_limit=20` (PTPRC-like) | 0.68 s | |
+
+A pinned gradient on the 23 x 27 x 21 grid takes 3.5 s against 44 s. The
+Nelder-Mead pre-search (`presearch="auto"`) is on for this model when the
+Rust kernel is installed, as for `ProteinBursty`; without it the model falls
+back to NumPy and the pre-search stays off.
 
 ## Model definition
 
@@ -153,7 +188,7 @@ CMEModel.compose("bursty", locus=dict(n_sites=2, rule="switch"), protein=dict(pr
   schedules, as for `Chromatin` today. The Nelder-Mead pre-search that
   `ProteinBursty` uses by default (`presearch="auto"`) would suit
   `protein=True` too, because the `k_p`/`gamma_p` valley is the same valley;
-  it waits for the Rust kernel (stage 5).
+  it is on when the Rust kernel is installed (stage 5).
 - Moments start, in `chromatin_fit.chromatin_start`:
   1. chain from the configuration marginal (sum over the three count axes),
      dropout fixed from the sampling vector, as now;
@@ -213,10 +248,10 @@ real data feasible.
    the protein uncaptured and reads the dropout from the third sampling entry.
    `tests/test_generative_checks.py` checks moments and histogram divergence
    with capture, dropout and the ambiguous split on. The pipeline recovery
-   (`TestRecovery::test_chromatin_protein`, one gene, 30 iterations) runs only
-   with `MONOD_SLOW_TESTS=1`: a pinned gradient costs about 45 s on the NumPy
-   kernel, so the run takes about 27 minutes. It passed on 2026-11-02;
-   stage 5 is what makes it a routine test.
+   (`TestRecovery::test_chromatin_protein`, one gene, 30 iterations) took 27
+   minutes on the NumPy kernel (a pinned gradient about 45 s) and was gated
+   until stage 5; on the Rust kernel it takes a few minutes and runs with the
+   suite.
 3. **Contract tests.** Done. `chromatin-switch-protein` and
    `chromatin-table-protein` (bursty, two sites, a 10 x 10 x 10 grid, the
    switch embedded in the table by `embed_in_table(..., protein=True)`) run
@@ -237,14 +272,15 @@ real data feasible.
    the NumPy kernel even with one to three optimiser iterations (the fixed
    cost is the gradients and the fine-tolerance evaluations per grid point),
    and one gene cannot tell dropout from its own opening rates, so the grid
-   is checked as plumbing; the recovery proper is the slow-gated generative
-   test. The Nelder-Mead pre-search stays off for this model
+   is checked as plumbing; the recovery proper is the generative test. The Nelder-Mead pre-search stays off for this model
    until the Rust kernel exists (the design above said on; at seconds per
-   evaluation it is not affordable).
-5. **Rust.** Port the protein characteristic into `eval_chromatin_pgf` under a
-   flag, Python against Rust at every mesh point, then the timing.
+   evaluation it is not affordable). Stage 5 turned it on.
+5. **Rust.** Done ("How stage 5 does it"): the protein characteristics as an
+   affine-map table per distinct protein argument inside `eval_chromatin_pgf`,
+   Python against Rust at every mesh point to 1e-16 in every mode, 17 to 20
+   times faster on fitting grids.
 
-Stages 1 to 4 are Python only and self-contained; stage 5 is the port.
+Stages 1 to 4 were Python only and self-contained; stage 5 was the port.
 
 ## Open decisions
 

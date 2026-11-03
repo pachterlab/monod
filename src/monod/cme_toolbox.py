@@ -1899,7 +1899,7 @@ class CMEModel:
         k_on, eps, rates, _, _ = _chromatin.split_theta(p, self.rule, self.n_sites)
         structure = _chromatin.rule_structure(H, A, k_on, 1.0, eps, self.rule, rates)
         protein = self.chromatin_protein(p)
-        backend = "rust" if _HAS_RUST and _chromatin._rust_available() and protein is None else "python"
+        backend = "rust" if _HAS_RUST and _chromatin._rust_available(protein is not None) else "python"
         G, sched = _chromatin.eval_joint_pgf(H, A, C, g, tol=self.chromatin_tol,
                                              fixed_schedule=self._fixed_schedule,
                                              burst=self.chromatin_burst(p), structure=structure,
