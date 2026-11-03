@@ -1,9 +1,10 @@
 # Design: a joint chromatin, RNA and protein model
 
-Status: stages 1 to 3 built, 2026-11-02 (NumPy kernel, model definition, limit
+Status: stages 1 to 4 built, 2026-11-02 (NumPy kernel, model definition, limit
 tests in `tests/test_chromatin_protein.py`; protein reactions in the chromatin
 simulator, generative checks in `tests/test_generative_checks.py`; the kernel
-in the contract suite `tests/test_kernel_contract.py`); stages 4 and 5 pending. The "Why the kernel composes" section describes the design; "How
+in the contract suite `tests/test_kernel_contract.py`; the pipeline and the
+`protein` layer of `build_multiome_adata`); stage 5, the Rust port, pending. The "Why the kernel composes" section describes the design; "How
 stage 1 does it" what was built.
 
 ## What the model is
@@ -150,8 +151,9 @@ CMEModel.compose("bursty", locus=dict(n_sites=2, rule="switch"), protein=dict(pr
 
 - Optimiser: the scipy path with central finite differences and pinned
   schedules, as for `Chromatin` today. The Nelder-Mead pre-search that
-  `ProteinBursty` uses by default (`presearch="auto"`) is enabled for
-  `protein=True`, because the `k_p`/`gamma_p` valley is the same valley.
+  `ProteinBursty` uses by default (`presearch="auto"`) would suit
+  `protein=True` too, because the `k_p`/`gamma_p` valley is the same valley;
+  it waits for the Rust kernel (stage 5).
 - Moments start, in `chromatin_fit.chromatin_start`:
   1. chain from the configuration marginal (sum over the three count axes),
      dropout fixed from the sampling vector, as now;
@@ -221,9 +223,24 @@ real data feasible.
    every contract: replay, gradient, thread pool, outer pin, the fit from a
    displaced start and the nesting. About 10 minutes for the pair, most of it
    the thread-pool gradients and the fits.
-4. **Pipeline.** `perform_inference` on a synthetic four-layer AnnData with a
-   three-point dropout grid and Poisson capture; the ambiguous channel on top
-   through the generic route; h5ad round trip of the model definition.
+4. **Pipeline.** Done (`tests/test_chromatin_protein.py::TestPipeline`,
+   `tests/test_chromatin_data.py`). `perform_inference` on simulated four-layer
+   data with a three-point dropout grid under Poisson capture picks the true
+   dropout and recovers the chain and `k_p / gamma_p`; the ambiguous channel
+   runs through the generic route with its probability in `var`; the model
+   definition (protein flag, dropout grid, ambiguous model) survives the h5ad
+   round trip. `build_multiome_adata(protein=, protein_map=)` writes the
+   `protein` layer, intersects the cells with the antibody data, drops genes
+   without an antibody with a log message and records the antibody in `var`.
+   Nothing in `extract_data` or `inference` needed a change: the modality
+   list drives both. The two pipeline tests take about two minutes each on
+   the NumPy kernel even with one to three optimiser iterations (the fixed
+   cost is the gradients and the fine-tolerance evaluations per grid point),
+   and one gene cannot tell dropout from its own opening rates, so the grid
+   is checked as plumbing; the recovery proper is the slow-gated generative
+   test. The Nelder-Mead pre-search stays off for this model
+   until the Rust kernel exists (the design above said on; at seconds per
+   evaluation it is not affordable).
 5. **Rust.** Port the protein characteristic into `eval_chromatin_pgf` under a
    flag, Python against Rust at every mesh point, then the timing.
 

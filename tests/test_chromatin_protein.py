@@ -172,6 +172,63 @@ class TestKernel:
         np.testing.assert_allclose(pss.sum(axis=(0, 1, 4)), ref.sum(axis=(0, 1)), atol=2e-5)    # the split leaves protein and locus alone
 
 
+class TestPipeline:
+    """perform_inference on simulated four-layer data (design doc, stage 4): a three-point
+    dropout grid under Poisson capture, the ambiguous channel through the generic route,
+    the model definition through h5ad."""
+    TRUTH = cf.join_theta([1.0, 1.5], 0.6, [1.0], 1.0, 0.8, 1.2, (0.6, 1.0))    # the contract suite's point: 0.3 s per evaluation
+    CAPTURE = np.log10([0.7, 0.9])
+    P_DROP = 0.1
+
+    def _adata(self, model, theta, n_cells, seed):
+        from monod.simulate import simulate_adata
+        return simulate_adata(model, [theta], n_cells, np.append(self.CAPTURE, np.log10(self.P_DROP)), seed=seed, gene_names=["geneA"])
+
+    def test_dropout_grid_poisson_capture_and_h5ad_round_trip(self, tmp_path, monkeypatch):
+        import anndata as ad
+        from monod.inference import perform_inference
+        monkeypatch.chdir(tmp_path)
+        grid = np.log10([0.05, 0.1, 0.2])
+        m = _model(seq="Poisson", dropout_bounds=(grid[0], grid[-1], 3))
+        path = tmp_path / "four_layers.h5ad"
+        self._adata(m, self.TRUTH, 2000, 7).write_h5ad(path)
+        gp = {"max_iterations": 3, "init_pattern": "moments", "num_restarts": 1, "num_gene_cores": 1, "check_identifiability": False}
+        out = perform_inference(str(path), m, n_genes=1, viz=False, gradient_params=gp, dataset_string="chrom_prot", exclude_sigma=True,
+                                filt_param={"min_means": [0] * 4, "max_maxes": [10_000] * 4, "min_maxes": [0] * 4},
+                                samp_lb=list(self.CAPTURE) + [grid[0]], samp_ub=list(self.CAPTURE) + [grid[-1]], gridsize=[1, 1, 3])
+        assert list(out.layers) == ["unspliced", "spliced", "protein", "configuration"]
+        names = [p.replace(r"\log_{10} ", "") for p in m.param_str]
+        est = np.array([float(out.var[n].iloc[0]) for n in names])
+        assert est.size == 9 and np.all(np.isfinite(est))
+        np.testing.assert_allclose(est[:3], self.TRUTH[:3], atol=0.3)                       # the chain
+        assert abs((est[-2] - est[-1]) - (self.TRUTH[-2] - self.TRUTH[-1])) < 0.3          # k_p / gamma_p
+        # one gene cannot tell dropout from its opening rates (the two-site marginal is saturated by the chain),
+        # so the grid is checked as plumbing: three dropout points scanned, capture held, a grid value reported
+        sr = out.uns["search_result"]
+        assert list(np.asarray(sr["sp"]["gridsize"])) == [1, 1, 3] and 0 <= int(sr["samp_optimum_ind"]) < 3
+        opt = np.asarray(sr["samp_optimum"], dtype=float)
+        np.testing.assert_allclose(opt[:2], self.CAPTURE)
+        assert np.any(np.isclose(opt[2], grid))
+        out.write_h5ad(tmp_path / "fitted.h5ad")                                            # the model definition survives the disk
+        m2 = CMEModel.from_dict(dict(ad.read_h5ad(tmp_path / "fitted.h5ad").uns["model"]))
+        assert m2.protein and m2.bursty and m2.model_modalities == m.model_modalities and m2.dropout_bounds[2] == 3
+
+    def test_ambiguous_channel_through_the_pipeline(self, tmp_path, monkeypatch):
+        from monod.inference import perform_inference
+        monkeypatch.chdir(tmp_path)
+        m = _model(seq="Poisson", amb_model="Equal", dropout_bounds=(np.log10(self.P_DROP), np.log10(self.P_DROP), 1))
+        theta = np.append(self.TRUTH, np.log10(0.15))
+        a = self._adata(m, theta, 2000, 8)
+        assert list(a.layers) == ["unspliced", "spliced", "protein", "configuration", "ambiguous"]
+        gp = {"max_iterations": 1, "init_pattern": "moments", "num_restarts": 1, "num_gene_cores": 1, "check_identifiability": False}
+        out = perform_inference(a, m, n_genes=1, viz=False, gradient_params=gp, dataset_string="chrom_prot_amb", exclude_sigma=True,
+                                filt_param={"min_means": [0] * 5, "max_maxes": [10_000] * 5, "min_maxes": [0] * 5},
+                                samp_lb=list(self.CAPTURE) + [np.log10(self.P_DROP)], samp_ub=list(self.CAPTURE) + [np.log10(self.P_DROP)],
+                                gridsize=[1, 1, 1])
+        assert "$p$" in out.var.columns and abs(float(out.var["$p$"].iloc[0]) - np.log10(0.15)) < 0.3
+        assert CMEModel.from_dict(dict(out.uns["model"])).amb_model == "Equal"
+
+
 class TestStart:
     def test_moments_start_from_the_kernel_histogram(self):
         m = _model(dropout_bounds=(0.0, 0.0, 1))

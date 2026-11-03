@@ -30,16 +30,21 @@ layer from a peak-by-cell ATAC matrix and a gene annotation:
 per peak, and returns the AnnData that :func:`monod.extract_data.extract_data`
 and :func:`monod.inference.perform_inference` take.  The assignment table is
 kept in ``uns["chromatin_sites"]`` so a fitted ``k_on`` can be read back to a
-peak.
+peak.  With a protein AnnData (antibody counts on the same cells, as TEA-seq
+or DOGMA-seq produce) and a gene-to-antibody map it also writes the
+``protein`` layer the model with ``protein=True`` fits.
 """
 from __future__ import annotations
 
 import gzip
+import logging
 import re
 from typing import Iterable, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+
+log = logging.getLogger(__name__)
 
 ASSIGNMENT_RULES = ("tss_window", "gene_body", "loci_promoter")
 _PEAK_NAME = re.compile(r"^(?P<chrom>[^:\s]+?)[:\-](?P<start>\d+)[\-:](?P<end>\d+)$")
@@ -240,7 +245,7 @@ def configuration_layer(atac, assignments: pd.DataFrame, n_sites: int, threshold
 
 def build_multiome_adata(rna, atac, genes, rule: str = "tss_window", n_sites: int = 2, threshold: int = 1,
                          layers: Sequence[str] = ("unspliced", "spliced"), min_open_fraction: float = 0.0,
-                         **rule_kwargs):
+                         protein=None, protein_map: Optional[dict] = None, **rule_kwargs):
     """The AnnData the Chromatin model fits, from an RNA AnnData (cells by
     genes, with ``layers``) and an ATAC AnnData (cells by peaks, fragment
     counts, coordinates in ``var`` or in the peak names).  Cells are the
@@ -250,16 +255,38 @@ def build_multiome_adata(rna, atac, genes, rule: str = "tss_window", n_sites: in
     is set, every site open in at least that fraction of cells.  The result
     has the RNA layers, an integer ``configuration`` layer, ``X`` equal to the
     spliced layer, the assignment table in ``uns["chromatin_sites"]`` and
-    the settings in ``uns["chromatin_data"]``."""
+    the settings in ``uns["chromatin_data"]``.
+
+    ``protein`` is an AnnData of antibody counts (cells by antibodies, counts
+    in ``X``) on the same cells, for the model with ``protein=True``;
+    ``protein_map`` maps gene name to antibody name (``{"CD14": "CD14"}``;
+    by default a gene's antibody is the one with its name).  Cells are then
+    the intersection of all three, and genes without an antibody are dropped
+    with a log message, since a protein model needs a protein count.  The
+    integer ``protein`` layer sits next to the RNA layers."""
     import anndata as ad
     import scipy.sparse as sp
     cells = [c for c in rna.obs_names if c in set(atac.obs_names)]
+    if protein is not None:
+        in_protein = set(protein.obs_names)
+        cells = [c for c in cells if c in in_protein]
     if not cells:
-        raise ValueError("the RNA and ATAC data share no cell names")
+        raise ValueError("the RNA and ATAC data share no cell names" + (" with the protein data" if protein is not None else ""))
     rna_c = rna[cells]
     atac_c = atac[cells]
     assignments = assign_peaks(peaks_from_var(atac.var), genes, rule=rule, n_sites=n_sites, **rule_kwargs)
     assignments = assignments[assignments["gene"].isin(set(rna.var_names))]
+    antibody = None
+    if protein is not None:
+        candidates = sorted(set(assignments["gene"]))
+        protein_map = dict(protein_map or {})
+        have = set(protein.var_names)
+        antibody = {g: protein_map.get(g, g) for g in candidates if protein_map.get(g, g) in have}
+        missing = [g for g in candidates if g not in antibody]
+        if missing:
+            log.info("%d gene(s) with assigned peaks but no antibody in the protein data are left out: %s",
+                     len(missing), ", ".join(missing[:10]) + (", ..." if len(missing) > 10 else ""))
+        assignments = assignments[assignments["gene"].isin(set(antibody))]
     gene_names, config = configuration_layer(atac_c, assignments, n_sites, threshold)
     if min_open_fraction > 0 and gene_names:
         bits = (config[:, :, None] >> np.arange(n_sites)) & 1                      # (cells, genes, sites)
@@ -275,6 +302,10 @@ def build_multiome_adata(rna, atac, genes, rule: str = "tss_window", n_sites: in
             raise ValueError(f"the RNA data has no layer {name!r}")
         L = rna_g.layers[name]
         new_layers[name] = L.copy() if sp.issparse(L) else np.asarray(L).copy()
+    if protein is not None:
+        prot = protein[cells, [antibody[g] for g in gene_names]].X
+        prot = prot.toarray() if sp.issparse(prot) else np.asarray(prot)
+        new_layers["protein"] = np.rint(prot).astype(np.int64)
     new_layers["configuration"] = config.astype(np.int64)
     X = new_layers[layers[-1]]
     out = ad.AnnData(X=X.copy() if sp.issparse(X) else np.asarray(X, dtype=float).copy(), layers=new_layers,
@@ -282,6 +313,8 @@ def build_multiome_adata(rna, atac, genes, rule: str = "tss_window", n_sites: in
     out.uns["chromatin_sites"] = assignments[assignments["gene"].isin(gene_names)].reset_index(drop=True)
     out.uns["chromatin_data"] = dict(rule=rule, n_sites=int(n_sites), threshold=int(threshold),
                                      **{k: (int(v) if isinstance(v, (int, np.integer)) else v) for k, v in rule_kwargs.items()})
+    if protein is not None:
+        out.var["antibody"] = [antibody[g] for g in gene_names]
     return out
 
 

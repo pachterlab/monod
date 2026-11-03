@@ -121,3 +121,35 @@ class TestConfiguration:
         assert grid_limits(m_adata)[2, 0] == 4
         with pytest.raises(ValueError):
             cd.build_multiome_adata(rna, atac, _genes(), rule="tss_window", n_sites=4, window=1500)   # A has three candidates
+
+    def test_protein_layer_from_antibody_counts(self, caplog):
+        import logging
+        import anndata as ad
+        from monod.cme_toolbox import CMEModel
+        from monod.extract_data import extract_data, grid_limits
+        rng = np.random.default_rng(1)
+        n_cells = 300
+        cells = [f"c{i}" for i in range(n_cells)]
+        peaks = _peaks()
+        atac = ad.AnnData(X=rng.poisson(0.6, size=(n_cells, len(peaks))).astype(float),
+                          obs=pd.DataFrame(index=cells), var=pd.DataFrame(index=peaks.index))
+        rna = ad.AnnData(X=np.zeros((n_cells, 3)), obs=pd.DataFrame(index=cells), var=pd.DataFrame(index=["A", "B", "C"]),
+                         layers={"unspliced": rng.poisson(3, size=(n_cells, 3)), "spliced": rng.poisson(8, size=(n_cells, 3))})
+        # one-site loci so A, B and C all qualify; the protein data lacks the last cell and antibody for C
+        prot = ad.AnnData(X=rng.poisson(20, size=(n_cells - 1, 2)).astype(float),
+                          obs=pd.DataFrame(index=cells[:-1]), var=pd.DataFrame(index=["A", "anti-B"]))
+        with caplog.at_level(logging.INFO, logger="monod.chromatin_data"):
+            out = cd.build_multiome_adata(rna, atac, _genes(), rule="tss_window", n_sites=1, window=1500,
+                                          protein=prot, protein_map={"B": "anti-B"})
+        assert list(out.var_names) == ["A", "B"] and out.n_obs == n_cells - 1
+        assert "C" in caplog.text and "no antibody" in caplog.text
+        assert set(out.layers) == {"unspliced", "spliced", "protein", "configuration"}
+        assert out.layers["protein"].dtype == np.int64
+        np.testing.assert_array_equal(out.layers["protein"][:, 1], prot[out.obs_names, "anti-B"].X.ravel().astype(int))
+        assert list(out.var["antibody"]) == ["A", "anti-B"]
+        model = CMEModel("Chromatin", "None", n_sites=1, rule="switch", protein=True)
+        m_adata = extract_data(out, model, n_genes=2, viz=False, dataset_name="chrom_prot_data", filt_param={
+            "min_means": [0, 0, 0, 0], "max_maxes": [1000, 1000, 1000, 2], "min_maxes": [0, 0, 0, 0]})
+        assert list(grid_limits(m_adata)[3, :]) == [2, 2] and grid_limits(m_adata)[2, 0] > 20
+        with pytest.raises(ValueError, match="protein"):
+            cd.build_multiome_adata(rna, atac, _genes(), rule="tss_window", n_sites=1, window=1500, protein=prot[:0])
