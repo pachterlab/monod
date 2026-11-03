@@ -1,6 +1,8 @@
 # Design: a joint chromatin, RNA and protein model
 
-Status: design, 2026-11-02. Nothing in this document is implemented yet.
+Status: stage 1 built, 2026-11-02 (NumPy kernel, model definition, limit tests in
+`tests/test_chromatin_protein.py`); stages 2 to 5 pending. The "Why the kernel
+composes" section describes the design; "How stage 1 does it" what was built.
 
 ## What the model is
 
@@ -80,6 +82,36 @@ Consequences:
   `C` and builds `exp(C s)`; it would take `(beta, gamma, k_p, gamma_p)` and the
   protein mesh row, and run the protein characteristic update inside its step.
   The Python mirror comes first.
+
+## How stage 1 does it
+
+The stepper walks from the horizon `T` down to zero, so it needs the
+characteristics at the far end first, while they are known at `s = 0` (the mesh
+point). Advancing them alongside the step, as the design above assumed, is
+therefore not possible: `chromatin._ProteinCharacteristics` tabulates `v(s)`,
+`w(s)` once over `[0, T]` with the protein integrator's step under step
+doubling, and the stepper reads them at any `s` by cubic Hermite interpolation
+between the half-step nodes with the derivatives the equations give. The step
+control measures the interpolation error too (the half-step value against the
+cubic through the step's ends): when `k_p` vanishes every step is exact for the
+equations and the control would otherwise take steps far too long for the
+cubic. `_LinearCharacteristics` wraps `exp(C s) u` for the plain model, so
+`_production_exponent` reads one interface.
+
+Checked: the (RNA, configuration) marginal equals the `Chromatin` kernel to
+3e-8; a one-site `table` with equal rates equals `ProteinBursty` to 5e-8 and,
+constitutive, the `compose("constitutive", protein=True)` network to 6e-8;
+`k_p -> 0` puts the protein at zero; `gamma_p = 300` gives `E[P | S] = r S`
+within 5%; Poisson capture, dropout, `protein_limit` (the same truncation as
+`ProteinBursty`, equal to it under the same setting) and the ambiguous channel
+go through the existing routes; pinned schedules replay to 1e-13 and the
+central-difference gradient matches a wide plain difference.
+
+Cost in NumPy: 5 to 15 s per evaluation on a two-site locus with a 20 x 24 x 40
+grid (about 350 steps); the table holds `2 x nodes x P` complex numbers, some
+hundred megabytes on that grid. The Rust port should tabulate per chunk of
+mesh points under a pinned schedule, or adopt the adjoint form (one vector per
+configuration, no table, `N` times the work).
 
 ## Model definition
 
@@ -164,12 +196,13 @@ real data feasible.
 
 ## Validation plan, in order
 
-1. **Python kernel, limits.** A one-site `switch` locus with `k_on >> 1`
-   (always open) and `bursty=True` must reproduce `ProteinBursty(b, beta,
-   gamma, k_p, gamma_p)` on the protein-coarse grid to the integrator's
-   tolerance; `k_p -> 0` must reproduce `Chromatin` with a delta at protein
-   zero; `gamma_p -> infinity` with `k_p / gamma_p` fixed must give a protein
-   that tracks the mature count (its conditional mean `(k_p / gamma_p) S`).
+1. **Python kernel, limits.** Done. A one-site `table` locus transcribing at the
+   same rate in both configurations (the locus invisible; `k_on >> 1` would
+   leave a closed share of `1 / (1 + k_on)`) reproduces `ProteinBursty(b, beta,
+   gamma, k_p, gamma_p)` and, constitutive, the network form; `k_p -> 0`
+   reproduces `Chromatin` with a delta at protein zero; `gamma_p -> infinity`
+   with `k_p / gamma_p` fixed gives a protein that tracks the mature count
+   (its conditional mean `(k_p / gamma_p) S`).
 2. **Simulation.** Add the protein reactions to the chromatin simulator in
    `monod.simulate` and register the model in `tests/test_generative_checks.py`:
    moments, histogram divergence and parameter recovery against cells drawn

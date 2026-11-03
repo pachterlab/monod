@@ -42,12 +42,14 @@ RATE_FLOOR = 1e-4        # a configuration whose nested rate is zero sits here i
 from .chromatin import n_params, split_theta, burst_size, join_theta  # noqa: F401  (the vector layout lives there)
 
 
-def embed_in_table(theta: np.ndarray, rule: str, n_sites: int, floor: float = RATE_FLOOR) -> np.ndarray:
+def embed_in_table(theta: np.ndarray, rule: str, n_sites: int, floor: float = RATE_FLOOR,
+                   protein: bool = False) -> np.ndarray:
     """The parameters of ``rule`` as a point of the ``table`` rule's space
-    (a burst size is carried over)."""
+    (a burst size and a protein pair are carried over)."""
     k_on, eps, rates, beta, gamma = split_theta(theta, rule, n_sites)
     tab = ch.rule_as_table(rule, n_sites, rates)
-    return join_theta(k_on, eps, np.maximum(tab, floor), beta, gamma, burst_size(theta, rule, n_sites))
+    return join_theta(k_on, eps, np.maximum(tab, floor), beta, gamma, burst_size(theta, rule, n_sites, protein),
+                      ch.protein_rates(theta) if protein else None)
 
 
 # ---------------------------------------------------------------------------

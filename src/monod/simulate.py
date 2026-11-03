@@ -101,6 +101,9 @@ def _latent_counts(model, theta, n_cells, rng):
         b, beta, gamma, k_p, gamma_p = lin
         return _lifelines(n_cells, rng, np.ones(n_cells), b, ("exp", beta), ("exp", gamma), protein=(k_p, gamma_p))
     if bio == "Chromatin":
+        if getattr(model, "protein", False):
+            raise NotImplementedError("the chromatin model's protein layer is not in the simulator yet "
+                                      "(docs/chromatin-protein-design.md, stage 2)")
         return _chromatin_ssa(model, theta, n_cells, rng)
     if bio == "Custom":
         return _network_ssa(model, theta, n_cells, rng)

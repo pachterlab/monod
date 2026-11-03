@@ -34,8 +34,8 @@ class TestFamilies:
         assert m.bio_model == "Chromatin" and m.bursty and m.n_sites == 2 and m.rule == "switch"
         c = CMEModel.compose("constitutive", locus=dict(n_sites=1, rule="additive", periodic=True))
         assert c.bio_model == "Chromatin" and not c.bursty and c.periodic
-        with pytest.raises(NotImplementedError, match="designed"):
-            CMEModel.compose("bursty", locus=dict(n_sites=2), protein=True)
+        j = CMEModel.compose("bursty", locus=dict(n_sites=2), protein=True)      # the joint model (NumPy kernel)
+        assert j.bio_model == "Chromatin" and j.protein and j.model_modalities == ["unspliced", "spliced", "protein", "configuration"]
         with pytest.raises(ValueError, match="cannot be combined"):
             CMEModel.compose("bursty", locus=dict(n_sites=2), regulation="cir")
 

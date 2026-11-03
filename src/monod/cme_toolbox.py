@@ -581,6 +581,7 @@ class CMEModel:
         chromatin_search_tol = 1e-4,
         dropout_bounds = (-2.0, -0.05, 3),
         bursty = False,
+        protein = False,
         amb_species = None,
     ):
         """Initialize the CMEModel instance.
@@ -632,6 +633,13 @@ class CMEModel:
             shared mean size ``b`` (one more parameter, last) instead of single
             molecules.  The rule's rates stay mean production rates, so the
             constitutive model is the small-``b`` limit.
+        protein: bool
+            ``bio_model="Chromatin"`` only: add the protein layer of
+            ``ProteinBursty`` downstream of the mature RNA (translation at
+            ``k_p``, degradation at ``gamma_p``, the two parameters last).
+            Modalities become ``unspliced, spliced, protein, configuration``;
+            ``protein_limit`` coarse-grains the protein axis as there.  NumPy
+            kernel only for now (see docs/chromatin-protein-design.md).
         chromatin_tol, chromatin_search_tol: float
             step tolerance of the chromatin integrator for reported values and
             during the search (see :meth:`search_tolerance`).
@@ -672,6 +680,11 @@ class CMEModel:
             self.chromatin_search_tol = float(chromatin_search_tol)
             self.dropout_bounds = tuple(dropout_bounds)
             self.bursty = bool(bursty)
+            self.protein = bool(protein)
+            if self.protein:
+                if not fit_unspliced:
+                    raise ValueError("the chromatin model fits the nascent channel: fit_unspliced=False is not offered")
+                self.protein_limit = protein_limit
 
         # Modalities (in order), expression filter and parameter box: from the
         # family table for the built-in models, from the structure otherwise.
@@ -708,6 +721,14 @@ class CMEModel:
             if self.bursty:
                 self.bio_bounds['phys_lb'].append(-3.0)
                 self.bio_bounds['phys_ub'].append(2.0)
+            if self.protein:
+                # the protein sits where ProteinBursty puts it, before the configuration;
+                # its filter entry and the box of k_p, gamma_p are ProteinBursty's
+                self.model_modalities = ['unspliced', 'spliced', 'protein', 'configuration']
+                for key, val in (('min_means', 1), ('max_maxes', 1000), ('min_maxes', 10)):
+                    self.filter_bounds[key].insert(2, val)
+                self.bio_bounds['phys_lb'] += [-1.8, -1.8]
+                self.bio_bounds['phys_ub'] += [3.5, 3.5]
         else:
             raise ValueError(f"Please select a biological noise model from {_BIO_MODELS}; got {bio_model!r}")
         log.debug("Modalities for %s: %s", self.bio_model, self.model_modalities)
@@ -866,11 +887,15 @@ class CMEModel:
         if locus is not None:
             if regulation is not None:
                 raise ValueError("a chromatin locus and CIR or extrinsic regulation cannot be combined")
+            # the joint chromatin + RNA + protein model is the Chromatin kernel with the protein
+            # characteristic (docs/chromatin-protein-design.md); NumPy only so far
             if lifetime != "exponential":
                 raise ValueError("the chromatin model has exponential splicing and degradation only")
             if want_protein:
-                raise NotImplementedError("a chromatin locus with a protein layer is designed but not built yet "
-                                          "(docs/chromatin-protein-design.md)")
+                if protein_opts.get("fit_unspliced", True) is False:
+                    raise ValueError("the chromatin model fits the nascent channel: fit_unspliced=False is not offered")
+                opts = {k: v for k, v in protein_opts.items() if k != "fit_unspliced"}
+                return done(cls("Chromatin", bursty=bursty, protein=True, **opts, **dict(locus), **common))
             return done(cls("Chromatin", bursty=bursty, **dict(locus), **common))
         if regulation is not None:
             if not bursty or lifetime != "exponential" or want_protein:
@@ -951,6 +976,8 @@ class CMEModel:
             param_str += [r"$\log_{10} \beta$", r"$\log_{10} \gamma$"]
             if self.bursty:
                 param_str += [r"$\log_{10} b$"]
+            if self.protein:
+                param_str += [r"$\log_{10} k_p$", r"$\log_{10} \gamma_p$"]
 
         else:
             raise ValueError(
@@ -982,7 +1009,7 @@ class CMEModel:
         "quad_vec_T", "protein_limit", "fit_unspliced", "min_fudge", "max_fudge",
         "network", "normalize_production_rate", "burst_mean_rate",
         "n_sites", "rule", "periodic", "chromatin_tol", "chromatin_search_tol", "dropout_bounds", "bursty",
-        "amb_species",
+        "protein", "amb_species",
     )
 
     def to_dict(self):
@@ -1012,7 +1039,9 @@ class CMEModel:
             d.update(n_sites=int(self.n_sites), rule=self.rule, periodic=bool(self.periodic),
                      chromatin_tol=float(self._chromatin_tol), chromatin_search_tol=float(self.chromatin_search_tol),
                      dropout_bounds=[float(self.dropout_bounds[0]), float(self.dropout_bounds[1]), int(self.dropout_bounds[2])],
-                     bursty=bool(self.bursty))
+                     bursty=bool(self.bursty), protein=bool(self.protein))
+            if self.protein:
+                d["protein_limit"] = float(self.protein_limit)
         if self.amb_model != "None":
             d["amb_species"] = [str(x) for x in self.amb_species]
         return d
@@ -1728,6 +1757,21 @@ class CMEModel:
             cached = self._latent_twin = (key, CMEModel.from_dict(d))
         return cached[1]
 
+    def _chromatin_rna_twin(self):
+        """A Chromatin model without its protein layer (cached): the chain and
+        the RNA rates of a protein model start from the histogram with the
+        protein summed out, under this twin's divergence."""
+        if not getattr(self, "protein", False):
+            return self
+        d = self.to_dict()
+        d["protein"] = False
+        d.pop("protein_limit", None)
+        key = repr(sorted((k, str(v)) for k, v in d.items()))
+        cached = getattr(self, "_rna_twin", None)
+        if cached is None or cached[0] != key:
+            cached = self._rna_twin = (key, CMEModel.from_dict(d))
+        return cached[1]
+
     def _eval_pss_ambiguous(self, p, limits, samp):
         """Observed PMF of any model with the ambiguous channel.
 
@@ -1808,7 +1852,15 @@ class CMEModel:
         if not self.bursty:
             return None
         from . import chromatin as _chromatin
-        return _chromatin.burst_size(p, self.rule, self.n_sites)
+        return _chromatin.burst_size(p, self.rule, self.n_sites, self.protein)
+
+    def chromatin_protein(self, p):
+        """``(k_p, gamma_p)`` at log10 parameters ``p`` (the last two entries)
+        for a Chromatin model with a protein layer, else None."""
+        if not getattr(self, "protein", False):
+            return None
+        from . import chromatin as _chromatin
+        return _chromatin.protein_rates(p)
 
     def chromatin_dropout(self, samp):
         """Per-open-site dropout probability from the sampling vector (its third
@@ -1827,26 +1879,37 @@ class CMEModel:
         from . import chromatin as _chromatin
         n = self.n_sites
         N = 2 ** n
-        if int(limits[2]) != N:
+        if int(limits[-1]) != N:
             raise ValueError(f"Chromatin: the configuration axis must have {N} = 2**n_sites states, got limits {limits}")
-        lu, ls = int(limits[0]), int(limits[1])
-        mx = (lu, ls // 2 + 1)
-        g = _build_mesh((lu, ls), mx)
-        g = self._apply_seq_transform(g, samp)
+        counts = tuple(int(l) for l in limits[:-1])                     # (lu, ls) or (lu, ls, lp)
+        if len(counts) != (3 if self.protein else 2):
+            raise ValueError(f"Chromatin: expected limits for {self.model_modalities}, got {limits}")
+        mx = list(counts)
+        if self.protein:
+            # the protein axis coarse-grained as in ProteinBursty: the mesh keeps
+            # the low frequencies, the inverse transform zero-pads back to lp
+            scale = mx[-1] // self.protein_limit + 1
+            mx[-1] = (mx[-1] + scale - 1) // scale
+        mx[-1] = mx[-1] // 2 + 1
+        mx = tuple(int(x) for x in mx)
+        g = _build_mesh(counts, mx)
+        # capture acts on the two RNA rows; the third sampling entry is the ATAC dropout, not a protein rate
+        g = self._apply_seq_transform(g, None if samp is None else np.asarray(samp, dtype=float).ravel()[:2])
         H, A, C = self.chromatin_system(p)
         k_on, eps, rates, _, _ = _chromatin.split_theta(p, self.rule, self.n_sites)
         structure = _chromatin.rule_structure(H, A, k_on, 1.0, eps, self.rule, rates)
-        backend = "rust" if _HAS_RUST and _chromatin._rust_available() else "python"
+        protein = self.chromatin_protein(p)
+        backend = "rust" if _HAS_RUST and _chromatin._rust_available() and protein is None else "python"
         G, sched = _chromatin.eval_joint_pgf(H, A, C, g, tol=self.chromatin_tol,
                                              fixed_schedule=self._fixed_schedule,
                                              burst=self.chromatin_burst(p), structure=structure,
-                                             backend=backend)
+                                             backend=backend, protein=protein)
         self._last_schedule = sched
-        pss = _chromatin.invert_joint_pgf(G, mx, (lu, ls))              # (N, lu, ls)
+        pss = _chromatin.invert_joint_pgf(G, mx, counts)                # (N, lu, ls[, lp])
         p_drop = self.chromatin_dropout(samp)
         if p_drop is not None:
             pss = _chromatin.apply_dropout(pss, n, p_drop)
-        return np.moveaxis(pss, 0, -1)                                  # (lu, ls, N)
+        return np.moveaxis(pss, 0, -1)                                  # (lu, ls[, lp], N)
 
     def eval_model_pss_batch(self, params_list, limits_list, samp_list=None, num_threads=None):
         """Evaluate PSS for N genes in one batched call.
@@ -2158,18 +2221,37 @@ class CMEModel:
                 return mid
             from . import chromatin_fit as _cf
             try:
+                dense = _cf.dense_histogram(hist, limits)
+                lims = [int(l) for l in limits]
+                tot = max(float(dense.sum()), 1e-300)
+                lb_lat, ub_lat = lb_log[:n_lat], ub_log[:n_lat]
+                tail = []
+                twin = self
                 if n_amb:
                     # the chain and the RNA rates from the histogram with the ambiguous axis summed out
-                    dense = _cf.dense_histogram(hist, limits)
-                    tot = dense.sum()
                     counts = [np.tensordot(dense, np.arange(dense.shape[ax]), axes=([ax], [0])).sum() for ax in range(dense.ndim)]
                     a_share = counts[-1] / max(sum(counts[:2]) + counts[-1], 1e-12)
-                    p_amb = float(np.clip(a_share, 1e-3, 1 - 1e-3)) if tot > 0 else p_amb
-                    x0 = _cf.chromatin_start(self._latent(), dense.sum(axis=-1), list(limits)[:-1], samp,
-                                             lb_log[:n_lat], ub_log[:n_lat])
-                    x0 = np.concatenate([x0, np.log10([p_amb] * n_amb)])
+                    p_amb = float(np.clip(a_share, 1e-3, 1 - 1e-3))
+                    dense, lims = dense.sum(axis=-1), lims[:-1]
+                    tail = [np.log10(p_amb)] * n_amb
+                    twin = self._latent()
+                if self.protein:
+                    # the chain and the RNA rates from the histogram with the protein axis summed out;
+                    # k_p / gamma_p from the protein and mature means, gamma_p = gamma to start (the
+                    # pair is a valley, which the pre-search walks)
+                    P_mean = np.tensordot(dense, np.arange(dense.shape[2]), axes=([2], [0])).sum() / tot
+                    S_mean = np.tensordot(dense, np.arange(dense.shape[1]), axes=([1], [0])).sum() / tot
+                    if self.seq_model in ("Poisson", "Bernoulli") and samp is not None:
+                        S_mean /= 10.0 ** float(np.asarray(samp, dtype=float).ravel()[1])
+                    dense, lims = dense.sum(axis=2), lims[:2] + lims[3:]
+                    n_rna = n_lat - 2
+                    x0 = _cf.chromatin_start(twin._chromatin_rna_twin(), dense, lims, samp, lb_lat[:n_rna], ub_lat[:n_rna])
+                    gamma = _cf.split_theta(x0, self.rule, self.n_sites)[4]
+                    r = max(P_mean, 1e-3) / max(S_mean, 1e-3)
+                    x0 = np.concatenate([x0, np.log10([r * gamma, gamma])])
                 else:
-                    x0 = _cf.chromatin_start(self, hist, limits, samp, lb_log, ub_log)
+                    x0 = _cf.chromatin_start(twin, dense, lims, samp, lb_lat, ub_lat)
+                x0 = np.concatenate([x0, tail])
             except Exception as exc:                      # a start is a convenience, never a failure
                 log.info("Chromatin moments start failed (%s); starting from the middle of the box", exc)
                 return mid

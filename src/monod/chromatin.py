@@ -170,11 +170,12 @@ def n_rule_params(rule: str, n_sites: int) -> int:
     raise ValueError(f"unknown transcription rule {rule!r}; choose from {RULES}")
 
 
-def n_params(rule: str, n_sites: int, bursty: bool = False) -> int:
+def n_params(rule: str, n_sites: int, bursty: bool = False, protein: bool = False) -> int:
     """Length of the Chromatin parameter vector
     ``log10 [k_on (n_sites), epsilon, rates (k), beta, gamma]``, plus one for
-    the burst size of a bursty model."""
-    return n_sites + 1 + n_rule_params(rule, n_sites) + 2 + int(bursty)
+    the burst size of a bursty model, plus ``k_p, gamma_p`` (last) with a
+    protein layer."""
+    return n_sites + 1 + n_rule_params(rule, n_sites) + 2 + int(bursty) + 2 * int(protein)
 
 
 def split_theta(theta: np.ndarray, rule: str, n_sites: int):
@@ -185,20 +186,33 @@ def split_theta(theta: np.ndarray, rule: str, n_sites: int):
     return lin[:n], float(lin[n]), lin[n + 1:n + 1 + k], float(lin[n + 1 + k]), float(lin[n + 2 + k])
 
 
-def burst_size(theta: np.ndarray, rule: str, n_sites: int) -> Optional[float]:
-    """The mean burst size (linear) when ``theta`` carries one, else None."""
+def burst_size(theta: np.ndarray, rule: str, n_sites: int, protein: bool = False) -> Optional[float]:
+    """The mean burst size (linear) when ``theta`` carries one, else None
+    (``protein``: the vector ends with ``k_p, gamma_p``, which sit after it)."""
     theta = np.asarray(theta, dtype=float)
-    if theta.size == n_params(rule, n_sites, bursty=True):
-        return float(10.0 ** theta[-1])
-    if theta.size == n_params(rule, n_sites):
+    tail = 2 if protein else 0
+    if theta.size == n_params(rule, n_sites, bursty=True, protein=protein):
+        return float(10.0 ** theta[-1 - tail])
+    if theta.size == n_params(rule, n_sites, protein=protein):
         return None
     raise ValueError(f"theta has {theta.size} entries; rule {rule!r} with {n_sites} sites takes "
-                     f"{n_params(rule, n_sites)} or {n_params(rule, n_sites, True)}")
+                     f"{n_params(rule, n_sites, protein=protein)} or {n_params(rule, n_sites, True, protein)}")
 
 
-def join_theta(k_on, eps, rates, beta, gamma, burst: Optional[float] = None) -> np.ndarray:
-    """The inverse of :func:`split_theta`: linear parts -> log10 vector."""
+def protein_rates(theta: np.ndarray) -> Tuple[float, float]:
+    """``(k_p, gamma_p)`` on the linear scale: the last two entries of a
+    protein model's vector."""
+    theta = np.asarray(theta, dtype=float)
+    return float(10.0 ** theta[-2]), float(10.0 ** theta[-1])
+
+
+def join_theta(k_on, eps, rates, beta, gamma, burst: Optional[float] = None,
+               protein: Optional[Sequence[float]] = None) -> np.ndarray:
+    """The inverse of :func:`split_theta`: linear parts -> log10 vector
+    (``protein`` is the pair ``(k_p, gamma_p)``, appended last)."""
     tail = [beta, gamma] if burst is None else [beta, gamma, burst]
+    if protein is not None:
+        tail = tail + [float(protein[0]), float(protein[1])]
     return np.log10(np.concatenate([np.atleast_1d(k_on), [eps], np.atleast_1d(rates), tail]).astype(float))
 
 
@@ -281,6 +295,156 @@ def _rust_available() -> bool:
     return _mc is not None and hasattr(_mc, "eval_chromatin_pgf")
 
 
+class _LinearCharacteristics:
+    """The RNA characteristics of a first-order scheme, ``U(s) = exp(C s) u``,
+    at the mesh points ``u`` (shape ``(m, P)``): what the production exponent
+    of the Strang step reads.  ``values(s)`` is ``U(s)``; ``integral(tau_a,
+    delta)`` is ``∫_{tau_a}^{tau_a+delta} U(s) ds``, in closed form here."""
+
+    def __init__(self, C: np.ndarray, u: np.ndarray):
+        self.C = np.asarray(C, dtype=float)
+        self.u = u
+
+    def values(self, s: float) -> np.ndarray:
+        return _expm(self.C * s) @ self.u
+
+    def integral(self, tau_a: float, delta: float) -> np.ndarray:
+        return _char_integral(self.C, tau_a, delta) @ self.u
+
+
+def _phi1(z: np.ndarray) -> np.ndarray:
+    """``(exp(z) - 1) / z`` with the series near zero (vectorised, complex)."""
+    z = np.asarray(z)
+    out = np.empty_like(z)
+    big = np.abs(z) > 1e-4
+    out[big] = np.expm1(z[big]) / z[big]
+    zs = z[~big]
+    out[~big] = 1.0 + zs * 0.5 + zs * zs * (1.0 / 6.0)
+    return out
+
+
+class _ProteinCharacteristics:
+    """Characteristics of nascent RNA, mature RNA and protein, the system of
+    ``CMEModel.protein_pgf``, for a locus whose configuration sets only the
+    nascent production rate.  In ``v = 1 + u_U``, ``w = 1 + u_S`` and the
+    protein argument ``u_P`` (``s`` = time to go)::
+
+        u_P(s) = u_P exp(-gamma_p s)
+        w'     = a(s) w + gamma,        a(s) = -gamma + k_p u_P(s)
+        v'     = beta (w - v)
+
+    The stepper of :func:`eval_joint_pgf` walks from the horizon ``T`` down
+    to zero and so needs the characteristics at the far end first, while
+    they are known at ``s = 0`` (the mesh point): they are therefore
+    tabulated once over ``[0, T]`` with the protein integrator's step (the
+    homogeneous part of ``w`` exact per step, the forcing and the coupling
+    with the step-average coefficient) under step doubling, and read at any
+    ``s`` by cubic Hermite interpolation between the accepted nodes with the
+    derivatives the equations give there.  The step control measures the
+    interpolation error as well (the half-step value against the cubic
+    through the step's ends), since a step that is exact for the equations,
+    as every step is when ``k_p`` vanishes, can still be too long for the
+    cubic; the nodes are the half steps, so what the stepper reads is
+    accurate to a sixteenth of that.  Only the two RNA rows are returned:
+    the locus does not make protein.
+
+    The table costs ``2 x nodes x P`` complex numbers; a Rust port would
+    tabulate per chunk of mesh points under a pinned schedule.
+    """
+
+    def __init__(self, beta: float, gamma: float, k_p: float, gamma_p: float, u: np.ndarray, T: float, tol: float):
+        self.beta, self.gamma, self.k_p, self.gamma_p = float(beta), float(gamma), float(k_p), float(gamma_p)
+        u = np.asarray(u, dtype=np.complex128)
+        if u.shape[0] != 3:
+            raise ValueError(f"protein characteristics need (u_U, u_S, u_P) rows, got shape {u.shape}")
+        self.u_P = u[2]
+        self._tabulate(u[0] + 1.0, u[1] + 1.0, float(T), float(tol))
+
+    # one step of the protein integrator from time ``t`` over ``h``
+    def _step(self, t, h, v, w):
+        beta, gamma, k_p, gamma_p = self.beta, self.gamma, self.k_p, self.gamma_p
+        da = -gamma * h + (k_p / gamma_p) * np.exp(-gamma_p * t) * (-np.expm1(-gamma_p * h)) * self.u_P
+        e = np.exp(da)
+        w_new = e * w + _phi1(da) * (gamma * h)
+        abar = da / h
+        s_ = abar + beta
+        eb = np.exp(-beta * h)
+        i0 = h * float(_phi1(np.array([-beta * h]))[0].real)
+        z = s_ * h
+        i1 = np.empty_like(z)
+        big = np.abs(z) > 1e-3
+        i1[big] = (e[big] - eb) / s_[big]
+        zs = z[~big]
+        i1[~big] = (1.0 + zs * 0.5 + zs * zs * (1.0 / 6.0)) * (h * eb)
+        goa = gamma / abar
+        v_new = v * eb + ((w + goa) * i1 - goa * i0) * beta
+        return v_new, w_new
+
+    def _tabulate(self, v, w, T, tol):
+        lam_fast = max(self.beta, self.gamma + 2.0 * self.k_p, self.gamma_p)
+        h = _C0 / lam_fast
+        h_min = 1e-12 / lam_fast
+        nodes, V, W = [0.0], [v], [w]
+        t = 0.0
+        n_steps = 0
+        while t < T and n_steps < _MAX_STEPS:
+            h = min(h, T - t)
+            v1, w1 = self._step(t, h, v, w)
+            vm, wm = self._step(t, 0.5 * h, v, w)
+            v2, w2 = self._step(t + 0.5 * h, 0.5 * h, vm, wm)
+            err = max(float(np.abs(v2 - v1).max()), float(np.abs(w2 - w1).max()))
+            # the cubic through the step's ends at its middle, against the half-step value
+            a0 = -self.gamma + self.k_p * self.u_P * np.exp(-self.gamma_p * t)
+            a2 = -self.gamma + (a0 + self.gamma) * np.exp(-self.gamma_p * h)
+            v_mid = 0.5 * (v + v2) + 0.125 * h * (self.beta * (w - v) - self.beta * (w2 - v2))
+            w_mid = 0.5 * (w + w2) + 0.125 * h * ((a0 * w + self.gamma) - (a2 * w2 + self.gamma))
+            err = max(err, float(np.abs(v_mid - vm).max()), float(np.abs(w_mid - wm).max()))
+            accept, fac = step_control(err, h, h_min, tol)
+            if not accept:
+                h = fac
+                continue
+            nodes += [t + 0.5 * h, t + h]
+            V += [vm, v2]
+            W += [wm, w2]
+            v, w = v2, w2
+            t += h
+            n_steps += 1
+            h *= fac
+        self.nodes = np.asarray(nodes, dtype=float)
+        self.V = np.asarray(V)
+        self.W = np.asarray(W)
+        self.T = float(self.nodes[-1])
+
+    def _derivatives(self, k):
+        """``(v', w')`` at node ``k`` from the equations."""
+        a = -self.gamma + self.k_p * self.u_P * np.exp(-self.gamma_p * self.nodes[k])
+        return self.beta * (self.W[k] - self.V[k]), a * self.W[k] + self.gamma
+
+    def values(self, s: float) -> np.ndarray:
+        s = float(s)
+        if s <= 0.0:
+            v, w = self.V[0], self.W[0]
+        elif s >= self.T:
+            v, w = self.V[-1], self.W[-1]
+        else:
+            k = int(np.searchsorted(self.nodes, s, side="right")) - 1
+            h = self.nodes[k + 1] - self.nodes[k]
+            x = (s - self.nodes[k]) / h
+            h00 = (1.0 + 2.0 * x) * (1.0 - x) ** 2
+            h10 = x * (1.0 - x) ** 2
+            h01 = x * x * (3.0 - 2.0 * x)
+            h11 = x * x * (x - 1.0)
+            dv0, dw0 = self._derivatives(k)
+            dv1, dw1 = self._derivatives(k + 1)
+            v = h00 * self.V[k] + h10 * h * dv0 + h01 * self.V[k + 1] + h11 * h * dv1
+            w = h00 * self.W[k] + h10 * h * dw0 + h01 * self.W[k + 1] + h11 * h * dw1
+        return np.vstack([v - 1.0, w - 1.0])
+
+    def integral(self, tau_a: float, delta: float) -> np.ndarray:
+        """Simpson on the interval; the stepper's step doubling covers it."""
+        return (delta / 6.0) * (self.values(tau_a) + 4.0 * self.values(tau_a + 0.5 * delta) + self.values(tau_a + delta))
+
+
 def locus_structure(H: np.ndarray, A: np.ndarray, rtol: float = 1e-12):
     """Structure the Rust kernel can exploit, read off the matrices.
 
@@ -345,7 +509,7 @@ def rule_structure(H: np.ndarray, A: np.ndarray, k_on, k_off, epsilon: float, ru
 def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
                    tol: float = _TOL, fixed_schedule: Optional[StepSchedule] = None,
                    backend: Optional[str] = None, burst: Optional[float] = None,
-                   structure=None):
+                   structure=None, protein: Optional[Tuple[float, float]] = None):
     """Vector generating function ``G[c, p] = E[prod_j (1+u_j)^{x_j}; state c]``
     at the PGF arguments ``u`` (shape ``(m, P)``), returned with the accepted
     :class:`StepSchedule`.  This is the kernel proper; :func:`eval_joint_pss`
@@ -360,24 +524,44 @@ def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
     ``structure`` is the ``(site_weights, independent)`` pair of
     :func:`locus_structure` when the caller already knows it
     (:func:`rule_structure`); the Rust kernel exploits it, and it is detected
-    from the matrices when not given."""
+    from the matrices when not given.
+
+    ``protein=(k_p, gamma_p)`` adds the protein layer of ``ProteinBursty``
+    downstream of the mature RNA (``C`` must be the nascent/mature scheme
+    ``[[-beta, beta], [0, -gamma]]``): ``u`` then has a third row, the
+    protein's argument, and the characteristics come from
+    :class:`_ProteinCharacteristics` instead of ``exp(C s) u``.  The locus
+    still only sets the nascent production rate, so the stepper is otherwise
+    unchanged.  NumPy backend only for now."""
     H = np.asarray(H, dtype=float); A = np.asarray(A, dtype=float); C = np.asarray(C, dtype=float)
     u = np.asarray(u, dtype=np.complex128)
     N, m = A.shape
-    if u.shape[0] != m:
-        raise ValueError(f"u must have one row per RNA species ({m}), got shape {u.shape}")
+    if u.shape[0] != m + (1 if protein is not None else 0):
+        raise ValueError(f"u must have one row per RNA species ({m}){' plus the protein' if protein is not None else ''}, "
+                         f"got shape {u.shape}")
     P = u.shape[1]
     w = stationary_distribution(H)
     lam = np.abs(np.linalg.eigvals(C).real)
     lam_slow = float(lam[lam > 0].min()) if np.any(lam > 0) else 1.0
     lam_fast = max(float(lam.max()), float(np.abs(np.diag(H)).max()), float(2.0 * np.abs(A).max()), 1e-300)
+    if protein is not None:
+        k_p, gamma_p = (float(x) for x in protein)
+        if m != 2 or C[1, 0] != 0.0 or C[0, 1] != -C[0, 0]:
+            raise ValueError("the protein layer needs the nascent/mature scheme C = [[-beta, beta], [0, -gamma]]")
+        beta, gamma = -C[0, 0], -C[1, 1]
+        lam_slow = min(lam_slow, gamma_p)
+        lam_fast = max(lam_fast, gamma + 2.0 * k_p, gamma_p)
     T = (np.log(1.0 / tol) + np.log1p(2.0 * float(np.abs(A).max()) / lam_slow)) / lam_slow
+    if protein is not None:
+        T += max(0.0, np.log(2.0 * k_p / gamma)) / gamma_p          # as the protein integrator's horizon
     if fixed_schedule is not None:
         T = float(np.sum(np.asarray(fixed_schedule, dtype=float)))   # replay over the schedule's own horizon
     h_first = _C0 / lam_fast
     h_min = 1e-12 / lam_fast
     if backend is None:
-        backend = "rust" if _rust_available() else "python"
+        backend = "rust" if _rust_available() and protein is None else "python"
+    if backend == "rust" and protein is not None:
+        raise NotImplementedError("the protein layer of the chromatin kernel runs in NumPy only (no Rust branch yet)")
     if backend == "rust":
         if not _rust_available():
             raise RuntimeError("monod_core with eval_chromatin_pgf is not installed")
@@ -395,7 +579,11 @@ def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
     elif backend == "python":
         HT = H.T
         G = np.repeat(w[:, None].astype(np.complex128), P, axis=1)
-        G, steps = _integrate_numpy(HT, A, C, u, G, T, h_first, h_min, tol, fixed_schedule,
+        if protein is None:
+            chars = _LinearCharacteristics(C, u)
+        else:
+            chars = _ProteinCharacteristics(beta, gamma, k_p, gamma_p, u, T, 0.1 * tol)
+        G, steps = _integrate_numpy(HT, A, chars, G, T, h_first, h_min, tol, fixed_schedule,
                                     None if burst is None else float(burst))
     else:
         raise ValueError(f"backend must be 'rust', 'python' or None, got {backend!r}")
@@ -415,7 +603,7 @@ def invert_joint_pgf(G: np.ndarray, mesh_shape: Sequence[int], limits: Sequence[
 def eval_joint_pss(H: np.ndarray, A: np.ndarray, C: np.ndarray, limits: Sequence[int],
                    tol: float = _TOL, fixed_schedule: Optional[StepSchedule] = None,
                    return_schedule: bool = False, backend: Optional[str] = None,
-                   burst: Optional[float] = None):
+                   burst: Optional[float] = None, protein: Optional[Tuple[float, float]] = None):
     """Joint steady-state distribution ``P[c, x_1, ..., x_m]`` of the chromatin
     configuration and the RNA counts on the grid ``limits``.
 
@@ -433,42 +621,47 @@ def eval_joint_pss(H: np.ndarray, A: np.ndarray, C: np.ndarray, limits: Sequence
     backend : ``"rust"``, ``"python"`` or ``None`` (Rust when installed).
     burst : mean size of geometric transcription bursts (``A`` stays the mean
         production rate); ``None`` for single molecules.
+    protein : ``(k_p, gamma_p)`` for a protein layer; ``limits`` then has a
+        third RNA-side entry, the protein axis.
     """
     u, mx = _mesh(limits)
-    G, sched = eval_joint_pgf(H, A, C, u, tol=tol, fixed_schedule=fixed_schedule, backend=backend, burst=burst)
+    G, sched = eval_joint_pgf(H, A, C, u, tol=tol, fixed_schedule=fixed_schedule, backend=backend, burst=burst,
+                              protein=protein)
     pss = invert_joint_pgf(G, mx, limits)
     if return_schedule:
         return pss, sched
     return pss
 
 
-def _production_exponent(A, C, u, tau_a, delta, burst):
+def _production_exponent(A, chars, tau_a, delta, burst):
     """``X[c, p] = Σ_j A[c, j] ∫_{tau_a}^{tau_a+delta} φ(U_j(s, p)) ds`` with
-    ``U(s) = e^{Cs} u`` the characteristic: the diagonal sub-flow over the
+    ``U(s)`` the characteristic (``chars``, a :class:`_LinearCharacteristics`
+    or :class:`_ProteinCharacteristics`): the diagonal sub-flow over the
     interval multiplies ``G[c, p]`` by ``exp(X[c, p])``.  Constitutive
-    production has ``φ(U) = U`` and the integral in closed form; geometric
-    bursts of mean size ``burst`` at mean production rate ``A`` have
+    production has ``φ(U) = U`` and the provider's integral; geometric bursts
+    of mean size ``burst`` at mean production rate ``A`` have
     ``φ(U) = U / (1 - burst U)`` (burst frequency ``A / burst``), integrated
     by Simpson's rule on the interval, which the step-doubling error control
     covers like the splitting error."""
     if burst is None:
-        return (A @ _char_integral(C, tau_a, delta)) @ u
+        return A @ chars.integral(tau_a, delta)
     nodes = (tau_a, tau_a + 0.5 * delta, tau_a + delta)
     weights = (delta / 6.0, 4.0 * delta / 6.0, delta / 6.0)
-    I = np.zeros_like(u)
+    I = None
     for s, w in zip(nodes, weights):
-        U = _expm(C * s) @ u
-        I += w * (U / (1.0 - burst * U))
+        U = chars.values(s)
+        term = w * (U / (1.0 - burst * U))
+        I = term if I is None else I + term
     return A @ I
 
 
-def _ops(A, C, u, tau, h, E, burst):
+def _ops(A, chars, tau, h, E, burst):
     """Operators of the Strang step from time-to-go ``tau`` to ``tau - h``: the
     production exponents over ``[tau-h/2, tau]`` and ``[tau-h, tau-h/2]`` and
     ``E = exp(H^T h)`` between them."""
     hh = 0.5 * h
-    X1 = _production_exponent(A, C, u, tau - hh, hh, burst)
-    X2 = _production_exponent(A, C, u, tau - h, hh, burst)
+    X1 = _production_exponent(A, chars, tau - hh, hh, burst)
+    X2 = _production_exponent(A, chars, tau - h, hh, burst)
     return X1, E, X2
 
 
@@ -479,11 +672,12 @@ def _step(G, ops):
     return np.exp(X2) * G
 
 
-def _integrate_numpy(HT, A, C, u, G, T, h_first, h_min, tol, fixed_schedule, burst=None):
+def _integrate_numpy(HT, A, chars, G, T, h_first, h_min, tol, fixed_schedule, burst=None):
     """NumPy mirror of ``monod_core.eval_chromatin_pgf``: Strang steps with step
     doubling and Richardson extrapolation; returns ``(G, steps)``.  The two
     half steps share one ``exp(H^T h/2)``, the full step uses its square, and
-    when the step doubles the previous full-step exponential is reused."""
+    when the step doubles the previous full-step exponential is reused.
+    ``chars`` provides the RNA characteristics (see :func:`_production_exponent`)."""
     adaptive = fixed_schedule is None
     steps = []
     tau = T
@@ -500,9 +694,9 @@ def _integrate_numpy(HT, A, C, u, G, T, h_first, h_min, tol, fixed_schedule, bur
             h = float(np.asarray(fixed_schedule)[len(steps)])
         hh = 0.5 * h
         E_half = last_E[1] if last_E is not None and last_E[0] == hh else _expm(HT * hh)
-        full = _ops(A, C, u, tau, h, E_half @ E_half, burst)
-        half1 = _ops(A, C, u, tau, hh, E_half, burst)
-        half2 = _ops(A, C, u, tau - hh, hh, E_half, burst)
+        full = _ops(A, chars, tau, h, E_half @ E_half, burst)
+        half1 = _ops(A, chars, tau, hh, E_half, burst)
+        half2 = _ops(A, chars, tau - hh, hh, E_half, burst)
         G1 = _step(G, full)
         G2 = _step(_step(G, half1), half2)
         diff = G2 - G1
