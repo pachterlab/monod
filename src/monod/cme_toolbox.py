@@ -582,6 +582,7 @@ class CMEModel:
         dropout_bounds = (-2.0, -0.05, 3),
         bursty = False,
         protein = False,
+        protein_background = None,
         amb_species = None,
     ):
         """Initialize the CMEModel instance.
@@ -648,6 +649,13 @@ class CMEModel:
             scanned on the grid like the sequencing parameters: log10 bounds and
             grid size of the per-open-site dropout probability.  A value of 0
             (the null sampling vector) means no dropout.
+        protein_background: (float, float, int) or None
+            Chromatin with ``protein=True`` only.  A Poisson background on the
+            protein channel (nonspecific antibody binding, one to two counts per
+            cell on a CITE-seq panel), shared by every gene and scanned on the
+            grid as the fourth sampling parameter: log10 bounds and grid size of
+            the background rate per cell.  None (default) fits without one; an
+            entry of ``-inf`` in a sampling vector also means none.
         """
         self.bio_model = bio_model
         self.available_biomodels = _BIO_MODELS
@@ -681,10 +689,18 @@ class CMEModel:
             self.dropout_bounds = tuple(dropout_bounds)
             self.bursty = bool(bursty)
             self.protein = bool(protein)
+            self.protein_background = None
             if self.protein:
                 if not fit_unspliced:
                     raise ValueError("the chromatin model fits the nascent channel: fit_unspliced=False is not offered")
                 self.protein_limit = protein_limit
+                if protein_background is not None:
+                    lo, hi, ng = protein_background
+                    if int(ng) < 1 or float(hi) < float(lo):
+                        raise ValueError(f"protein_background must be (log10 low, log10 high, grid points >= 1), got {protein_background!r}")
+                    self.protein_background = (float(lo), float(hi), int(ng))
+            elif protein_background is not None:
+                raise ValueError("protein_background needs protein=True")
 
         # Modalities (in order), expression filter and parameter box: from the
         # family table for the built-in models, from the structure otherwise.
@@ -716,18 +732,24 @@ class CMEModel:
             self.model_modalities = ['unspliced', 'spliced', 'configuration']
             self.filter_bounds = {'min_means': [0.01, 0.01, 0.0], 'max_maxes': [350, 350, 2 ** self.n_sites],
                                   'min_maxes': [4, 4, 0]}
-            self.bio_bounds = {'phys_lb': [-2.0] * self.n_sites + [-1.5] + [-4.0] * k + [-1.8, -1.8],
+            # The box is in the locus clock (k_off = 1): on the DOGMA-seq CD4 T
+            # cells the RNA beta, gamma land at -1 to -1.8 and the protein lifetime
+            # below that, so the RNA rates reach down to -2.5 and gamma_p to -3.0
+            # (Bursty's -1.8 is in units of the burst frequency). Cost grows as
+            # 1 / (slowest rate): the horizon is log(1/tol) / min(gamma, gamma_p).
+            self.bio_bounds = {'phys_lb': [-2.0] * self.n_sites + [-1.5] + [-4.0] * k + [-2.5, -2.5],
                                'phys_ub': [2.0] * self.n_sites + [0.5] + [2.0] * k + [2.5, 3.5]}
             if self.bursty:
                 self.bio_bounds['phys_lb'].append(-3.0)
                 self.bio_bounds['phys_ub'].append(2.0)
             if self.protein:
                 # the protein sits where ProteinBursty puts it, before the configuration;
-                # its filter entry and the box of k_p, gamma_p are ProteinBursty's
+                # its filter entry is ProteinBursty's, its box the same width but with
+                # gamma_p reaching down to -3.0 in the locus clock (see above)
                 self.model_modalities = ['unspliced', 'spliced', 'protein', 'configuration']
                 for key, val in (('min_means', 1), ('max_maxes', 1000), ('min_maxes', 10)):
                     self.filter_bounds[key].insert(2, val)
-                self.bio_bounds['phys_lb'] += [-1.8, -1.8]
+                self.bio_bounds['phys_lb'] += [-1.8, -3.0]
                 self.bio_bounds['phys_ub'] += [3.5, 3.5]
         else:
             raise ValueError(f"Please select a biological noise model from {_BIO_MODELS}; got {bio_model!r}")
@@ -789,6 +811,12 @@ class CMEModel:
             self.seq_bounds['samp_lb'].append(float(lo))
             self.seq_bounds['samp_ub'].append(float(hi))
             self.seq_bounds['gridsize'].append(int(ng))
+            if self.protein_background is not None:
+                # a fourth: log10 Poisson background rate on the protein channel
+                lo, hi, ng = self.protein_background
+                self.seq_bounds['samp_lb'].append(lo)
+                self.seq_bounds['samp_ub'].append(hi)
+                self.seq_bounds['gridsize'].append(ng)
         
         # Get all biological and technical parameters.
         self.param_str = self.get_log_name_str()
@@ -1009,7 +1037,7 @@ class CMEModel:
         "quad_vec_T", "protein_limit", "fit_unspliced", "min_fudge", "max_fudge",
         "network", "normalize_production_rate", "burst_mean_rate",
         "n_sites", "rule", "periodic", "chromatin_tol", "chromatin_search_tol", "dropout_bounds", "bursty",
-        "protein", "amb_species",
+        "protein", "protein_background", "amb_species",
     )
 
     def to_dict(self):
@@ -1042,6 +1070,9 @@ class CMEModel:
                      bursty=bool(self.bursty), protein=bool(self.protein))
             if self.protein:
                 d["protein_limit"] = float(self.protein_limit)
+                if self.protein_background is not None:
+                    lo, hi, ng = self.protein_background
+                    d["protein_background"] = [float(lo), float(hi), int(ng)]
         if self.amb_model != "None":
             d["amb_species"] = [str(x) for x in self.amb_species]
         return d
@@ -1058,6 +1089,8 @@ class CMEModel:
             kwargs["network"] = None
         if "dropout_bounds" in kwargs:
             kwargs["dropout_bounds"] = tuple(np.asarray(kwargs["dropout_bounds"]).tolist())
+        if kwargs.get("protein_background") is not None:
+            kwargs["protein_background"] = tuple(np.asarray(kwargs["protein_background"]).tolist())
         if "amb_species" in kwargs:
             kwargs["amb_species"] = tuple(str(x) for x in np.atleast_1d(np.asarray(kwargs["amb_species"], dtype=object)).ravel())
         return cls(**kwargs)
@@ -1872,6 +1905,17 @@ class CMEModel:
             return None
         return float(10.0 ** samp[2])
 
+    def chromatin_background(self, samp):
+        """Poisson background rate on the protein channel from the sampling
+        vector (its fourth entry, log10), or None when the model has no
+        background grid, the entry is absent, or it is ``-inf``."""
+        if getattr(self, "protein_background", None) is None or samp is None:
+            return None
+        samp = np.asarray(samp, dtype=float).ravel()
+        if samp.size < 4 or not np.isfinite(samp[3]):
+            return None
+        return float(10.0 ** samp[3])
+
     def _eval_model_pss_chromatin(self, p, limits, samp):
         """Joint distribution over (unspliced, spliced, configuration): the
         chromatin kernel on the RNA mesh, transformed by the sequencing model,
@@ -1905,6 +1949,11 @@ class CMEModel:
                                              burst=self.chromatin_burst(p), structure=structure,
                                              backend=backend, protein=protein)
         self._last_schedule = sched
+        lam_bg = self.chromatin_background(samp)
+        if lam_bg is not None:
+            # background counts add independently: the PGF gains the Poisson
+            # factor exp(lambda (g_P - 1)) at every protein frequency kept
+            G = G * np.exp(lam_bg * g[2])[None, :]
         pss = _chromatin.invert_joint_pgf(G, mx, counts)                # (N, lu, ls[, lp])
         p_drop = self.chromatin_dropout(samp)
         if p_drop is not None:
@@ -2247,6 +2296,9 @@ class CMEModel:
                     n_rna = n_lat - 2
                     x0 = _cf.chromatin_start(twin._chromatin_rna_twin(), dense, lims, samp, lb_lat[:n_rna], ub_lat[:n_rna])
                     gamma = _cf.split_theta(x0, self.rule, self.n_sites)[4]
+                    lam_bg = self.chromatin_background(samp)
+                    if lam_bg is not None:
+                        P_mean -= lam_bg
                     r = max(P_mean, 1e-3) / max(S_mean, 1e-3)
                     x0 = np.concatenate([x0, np.log10([r * gamma, gamma])])
                 else:

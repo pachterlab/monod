@@ -43,6 +43,8 @@ class TestLayout:
         assert m.get_num_params() == 9
         assert m.param_str[-2:] == [r"$\log_{10} k_p$", r"$\log_{10} \gamma_p$"]
         assert len(m.bio_bounds["phys_lb"]) == 9 and m.bio_bounds["phys_ub"][-2:] == [3.5, 3.5]
+        # the box is in the locus clock (k_off = 1), not Bursty's burst clock: beta, gamma and gamma_p reach lower
+        assert m.bio_bounds["phys_lb"][4:6] == [-2.5, -2.5] and m.bio_bounds["phys_lb"][-2:] == [-1.8, -3.0]
         assert m.filter_bounds["min_means"] == [0.01, 0.01, 1, 0.0]
         assert len(m.seq_bounds["samp_lb"]) == 3                        # two capture rates and the dropout
         d = m.to_dict()
@@ -52,6 +54,23 @@ class TestLayout:
         assert not CMEModel("Chromatin", "None").protein
         with pytest.raises(ValueError, match="fit_unspliced"):
             CMEModel("Chromatin", "None", protein=True, fit_unspliced=False)
+
+    def test_protein_background_is_a_fourth_sampling_parameter(self):
+        m = _model(protein_background=(-1.0, 0.5, 4))
+        assert m.protein_background == (-1.0, 0.5, 4)
+        assert m.seq_bounds["samp_lb"] == [0, 0, -2.0, -1.0] and m.seq_bounds["gridsize"] == [1, 1, 3, 4]
+        assert m.chromatin_background([0, 0, 0, np.log10(1.5)]) == pytest.approx(1.5)
+        assert m.chromatin_background([0, 0, 0]) is None and m.chromatin_background([0, 0, 0, -np.inf]) is None
+        assert _model().chromatin_background([0, 0, 0, 0.0]) is None            # no grid, no background
+        m2 = CMEModel.from_dict(m.to_dict())
+        assert m2.protein_background == (-1.0, 0.5, 4) and len(m2.seq_bounds["samp_lb"]) == 4
+        assert "protein_background" not in _model().to_dict()
+        c = CMEModel.compose("bursty", locus=dict(n_sites=2, rule="switch"), protein=dict(protein_limit=20, protein_background=(-1.0, 0.5, 2)))
+        assert c.protein_background == (-1.0, 0.5, 2)
+        with pytest.raises(ValueError, match="protein=True"):
+            CMEModel("Chromatin", "None", protein_background=(-1.0, 0.5, 2))
+        with pytest.raises(ValueError, match="grid points"):
+            _model(protein_background=(-1.0, 0.5, 0))
 
     def test_compose(self):
         c = CMEModel.compose("bursty", locus=dict(n_sites=2, rule="switch"), protein=dict(protein_limit=20), seq_model="Poisson")
@@ -68,6 +87,19 @@ class TestLayout:
         assert all(v.dtype == np.int64 and v.size == 2000 for v in c.values())
         assert c["protein"].mean() > 0.5 * c["spliced"].mean() / 0.9          # k_p / gamma_p = 1, mature capture 0.9
         assert c["configuration"].max() == 3
+
+    def test_simulator_adds_the_protein_background(self):
+        from monod.simulate import simulate_counts
+        lam = 2.5
+        plain = simulate_counts(_model(), THETA, 4000, np.array([0.0, 0.0, 0.0]), seed=3)
+        m = _model(protein_background=(-1.0, 1.0, 3))
+        bg = simulate_counts(m, THETA, 4000, np.array([0.0, 0.0, 0.0, np.log10(lam)]), seed=3)
+        none = simulate_counts(m, THETA, 4000, np.array([0.0, 0.0, 0.0, -np.inf]), seed=3)
+        assert np.array_equal(none["protein"], plain["protein"])                  # -inf: no background
+        for k in ("unspliced", "spliced", "configuration"):
+            assert np.array_equal(bg[k], plain[k])                                  # the same latent cells
+        extra = bg["protein"] - plain["protein"]
+        assert extra.min() >= 0 and abs(extra.mean() - lam) < 0.1 and abs(extra.var() - lam) < 0.3
 
 
 class TestKernel:
@@ -130,6 +162,21 @@ class TestKernel:
         np.testing.assert_allclose(pss.sum(axis=2), ref, atol=2e-6)
         plain = _model().eval_model_pss(THETA, L)                         # the protein is not captured
         np.testing.assert_allclose(pss.sum(axis=(0, 1, 3)), plain.sum(axis=(0, 1, 3)), atol=2e-6)
+
+    def test_background_is_a_poisson_convolution_on_the_protein_axis(self):
+        from scipy.stats import poisson
+        lam = 1.5
+        m = _model(protein_background=(-1.0, 1.0, 3))
+        pss = m.eval_model_pss(THETA, L, np.array([0.0, 0.0, 0.0, np.log10(lam)]))
+        plain = _model().eval_model_pss(THETA, L)
+        np.testing.assert_allclose(pss.sum(axis=2), plain.sum(axis=2), atol=2e-6)     # RNA and locus untouched
+        lp = L[2]
+        pmf = poisson.pmf(np.arange(lp), lam)
+        conv = np.zeros_like(plain)
+        for k in range(lp):                                                       # P_obs = P + background, truncated
+            conv[:, :, k:, :] += pmf[k] * plain[:, :, :lp - k, :]
+        np.testing.assert_allclose(pss, conv, atol=2e-6)
+        assert m.eval_model_pss(THETA, L, np.array([0.0, 0.0, 0.0, -np.inf])) == pytest.approx(plain, abs=1e-12)
 
     def test_coarse_protein_grid_is_protein_burstys(self):
         # protein_limit keeps the low protein frequencies and zero-pads the inverse transform, the
@@ -212,6 +259,44 @@ class TestPipeline:
         out.write_h5ad(tmp_path / "fitted.h5ad")                                            # the model definition survives the disk
         m2 = CMEModel.from_dict(dict(ad.read_h5ad(tmp_path / "fitted.h5ad").uns["model"]))
         assert m2.protein and m2.bursty and m2.model_modalities == m.model_modalities and m2.dropout_bounds[2] == 3
+        # the fitted PMF, its marginals and the rejection test on four modalities (the Mimitou pass-2
+        # fit crashed here: the test indexed two or three modalities, and the protein marginal
+        # collapsed the configuration axis, which the kernel refuses)
+        from monod.inference import search_result_from_uns, searchdata_from_adata
+        sr_ = search_result_from_uns(out.uns["search_result"]); sd = searchdata_from_adata(out)
+        limits = np.asarray(sd.M[:, 0])
+        joint = sr_.gene_pss(sd, 0)
+        assert joint.shape == tuple(limits) and abs(joint.sum() - 1) < 1e-6
+        np.testing.assert_allclose(joint, m2.eval_model_pss(sr_.phys_optimum[0], limits, sr_.regressor_optimum[0]), rtol=0, atol=1e-12)
+        other = np.array(sr_.regressor_optimum[0], dtype=float); other[2] = -4.0             # the dropout optimum is part of the PMF
+        assert np.abs(joint - m2.eval_model_pss(sr_.phys_optimum[0], limits, other)).max() > 1e-6
+        for k, mod in enumerate(m2.model_modalities):
+            marg = sr_.gene_pss(sd, 0, marg=mod)
+            assert marg.shape == (limits[k],)
+            np.testing.assert_allclose(marg, joint.sum(axis=tuple(j for j in range(4) if j != k)), atol=1e-12)
+        csq, pval, hel = sr_.chisquare_testing(sd, reject_at_bounds=True)
+        assert np.all(np.isfinite(csq)) and 0 <= hel[0] < 1.5 and sr_.rejected_genes.shape == (1,)
+
+    def test_extract_warns_when_an_aggregate_sets_the_protein_limit(self, tmp_path, monkeypatch, caplog):
+        import logging
+        from monod.extract_data import extract_data, grid_limits
+        monkeypatch.chdir(tmp_path)
+        m = _model(seq="Poisson")
+        a = self._adata(m, self.TRUTH, 500, 3)
+        prot = np.asarray(a.layers["protein"]).copy()
+        prot[0, 0] = 2000                                                                    # one antibody aggregate
+        a.layers["protein"] = prot
+        path = tmp_path / "aggregate.h5ad"; a.write_h5ad(path)
+        filt = {"min_means": [0] * 4, "max_maxes": [10_000] * 4, "min_maxes": [0] * 4}
+        with caplog.at_level(logging.WARNING, logger="monod"):
+            out = extract_data(str(path), m, n_genes=1, viz=False, dataset_name="agg", filt_param=filt)
+        assert grid_limits(out)[2, 0] == 2010                                               # the aggregate sets the limit
+        assert any("aggregate" in r.getMessage() and "geneA" in r.getMessage() for r in caplog.records)
+        caplog.clear()
+        prot[0, 0] = 0; a.layers["protein"] = prot; a.write_h5ad(path)
+        with caplog.at_level(logging.WARNING, logger="monod"):
+            extract_data(str(path), m, n_genes=1, viz=False, dataset_name="agg", filt_param=filt)
+        assert not any("aggregate" in r.getMessage() for r in caplog.records)
 
     def test_ambiguous_channel_through_the_pipeline(self, tmp_path, monkeypatch):
         from monod.inference import perform_inference

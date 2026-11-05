@@ -209,6 +209,27 @@ def extract_data(
     for row, layer in zip(M.astype(int), layer_names):
         monod_adata.var[f'M_{layer}'] = row
     monod_adata.uns['hist_type'] = hist_type
+    if 'protein' in layer_names:
+        # The grid limit is the largest count, so one antibody aggregate inflates the protein
+        # axis; and when the axis is coarse-grained (a finite protein_limit) it also leaves the
+        # bulk of the distribution below the resolution of the mesh (DOGMA-seq CD4 T cells,
+        # 2026-11-04: a 99th percentile of 19 counts under a maximum of 1,829).
+        prot = layers[layer_names.index('protein')]                              # (n_genes, n_cells)
+        q99 = np.quantile(prot, 0.99, axis=1)
+        outlying = prot.max(axis=1) > 10 * np.maximum(q99, 1)                  # an order of magnitude out
+        if np.any(outlying):
+            worst = int(np.argmax(prot.max(axis=1) / np.maximum(q99, 1)))
+            plim = getattr(model, 'protein_limit', np.inf)
+            resolution = ("" if not np.isfinite(plim) else
+                          f", and with protein_limit={plim:g} the mesh resolves the bulk of the distribution "
+                          f"at {int(prot[worst].max() // plim + 1)} counts per step")
+            log.warning(
+                "%d of %d genes have a protein maximum above ten times their 99th percentile "
+                "(%s: %d against %.0f); those cells set the protein grid limit%s. Remove the "
+                "aggregate cells before fitting.",
+                int(outlying.sum()), prot.shape[0], monod_adata.var_names[worst], int(prot[worst].max()),
+                q99[worst], resolution,
+            )
 
     # Histograms are not stored in uns: searchdata_from_adata rebuilds them from
     # the layers (in Rust when available), which is faster than unpickling and

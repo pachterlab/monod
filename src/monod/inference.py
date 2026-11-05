@@ -2529,18 +2529,12 @@ class SearchResults:
                 counts = np.concatenate(
                     (search_data.n_cells * search_data.hist[gene_index][1], [0])
                 )
-                number_of_modalities = len(search_data.hist[gene_index][0][0])
-                if number_of_modalities == 2:
-                    expect_freq = expect_freq[
-                        search_data.hist[gene_index][0][:, 0],
-                        search_data.hist[gene_index][0][:, 1],
-                    ]
-                elif number_of_modalities == 3:
-                    expect_freq = expect_freq[
-                        search_data.hist[gene_index][0][:, 0],
-                        search_data.hist[gene_index][0][:, 1],
-                        search_data.hist[gene_index][0][:, 2]
-                    ]
+                # One index column per modality (2 for RNA, 3 with a locus or a
+                # protein, 4 for the chromatin model with a protein layer).
+                state_idx = np.asarray(search_data.hist[gene_index][0])
+                expect_freq = expect_freq[
+                    tuple(state_idx[:, k] for k in range(state_idx.shape[1]))
+                ]
                 expect_freq = np.concatenate(
                     (expect_freq, [search_data.n_cells - expect_freq.sum()])
                 )
@@ -3027,12 +3021,21 @@ class SearchResults:
         grid ``search_data.M[:, i_]``: the joint PMF for ``marg="joint"``, the
         marginal of one modality (``'unspliced'``, ``'spliced'``, ...) otherwise."""
         limits = np.array(search_data.M[:, i_])
-        if marg != "joint":
-            lind = _resolve_marg(marg, self.model.model_modalities)
-            keep = limits[lind]
-            limits[:] = 1
-            limits[lind] = keep
-        samp = None if self.model.seq_model == "None" else self.regressor_optimum[i_]
+        chromatin = self.model.bio_model == "Chromatin"
+        # The sampling vector matters without a sequencing model only for the
+        # Chromatin model (dropout, protein background); the others ignore it.
+        samp = None if (self.model.seq_model == "None" and not chromatin) else self.regressor_optimum[i_]
+        if marg == "joint":
+            return np.squeeze(self.model.eval_model_pss(self.phys_optimum[i_], limits, samp))
+        lind = _resolve_marg(marg, self.model.model_modalities)
+        if chromatin:
+            # The configuration axis cannot be collapsed before the evaluation (it
+            # must hold all 2**n_sites states), so marginalise the joint PMF.
+            pss = np.asarray(self.model.eval_model_pss(self.phys_optimum[i_], limits, samp))
+            return pss.sum(axis=tuple(k for k in range(pss.ndim) if k != lind))
+        keep = limits[lind]
+        limits[:] = 1
+        limits[lind] = keep
         return np.squeeze(self.model.eval_model_pss(self.phys_optimum[i_], limits, samp))
 
     def plot_gene_distributions(

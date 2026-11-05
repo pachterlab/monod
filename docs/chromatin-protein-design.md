@@ -172,8 +172,11 @@ CMEModel.compose("bursty", locus=dict(n_sites=2, rule="switch"), protein=dict(pr
 - Parameters: `[k_on_1..n, epsilon, rule rates, beta, gamma, (b), k_p, gamma_p]`,
   log10. The protein pair goes last so that every existing chromatin index is
   unchanged; `split_theta`, `join_theta`, `n_params`, `burst_size` and
-  `embed_in_table` take a `protein` flag. Bounds for `k_p`, `gamma_p` as in
-  `ProteinBursty` (`[-1.8, 3.5]`).
+  `embed_in_table` take a `protein` flag. Bounds for `k_p` as in
+  `ProteinBursty` (`[-1.8, 3.5]`); `gamma_p` reaches down to -3.0, and `beta`,
+  `gamma` to -2.5, because the chromatin box is in the locus clock (`k_off =
+  1`) while Bursty's -1.8 is in units of the burst frequency (see validation
+  item 6 for the data that forced this and the cost it carries).
 - `protein_limit` coarse-grains the protein axis of the mesh exactly as
   `ProteinBursty` does; the inversion reuses the protein model's zero-padded
   3-D inverse transform, applied per configuration.
@@ -282,21 +285,137 @@ real data feasible.
 
 Stages 1 to 4 were Python only and self-contained; stage 5 was the port.
 
+6. **Real data, first pass.** DOGMA-seq DIG control (Mimitou 2021,
+   GSE156478), CD4 T cells, every gene with an antibody and a two-site
+   `tss_window` locus open in at least 2% of cells: 8,526 cells, 28 genes,
+   switch rule, bursty, dropout grid of four points, 60 iterations.
+   Chromatin without protein 10 min, `ProteinBursty` 13 min, the joint model
+   6 h on 12 cores of bio (about 1 h per grid point on an idle machine). The
+   locus parameters do not move when the protein is added (`k_on`, `epsilon`
+   within 0.02 log10 of the chromatin-only fit); `a`, `beta`, `gamma` move
+   0.2 to 0.3 log10 on the fifteen genes with a mean mature count above 0.05
+   and 0.5 to 0.6 on the rest. `k_p / gamma_p` agrees with `ProteinBursty`
+   to 0.03 log10 on the covered genes (CD4 4.1, CD27 3.0, ITGB7 2.7, ICOS
+   2.6, ITGA4 and IL2RA 2.0, PTPRC 0.35). The dropout is not identified
+   here: the summed divergence is flat over dropout 0.001 to 0.1 and worse
+   only at 0.9. Two things to fix before the next pass. `gamma_p` sits at
+   its lower bound of -1.8 for 18 of the 28 genes: the protein box is
+   `ProteinBursty`'s, whose clock is the burst frequency, while the chromatin
+   clock is `k_off = 1`, under which the RNA `gamma` itself lands at -1 to
+   -1.8, so protein lifetimes need room down to about -3 (the pass-2 box:
+   `beta`, `gamma` from -2.5, `gamma_p` from -3.0). The price is the horizon,
+   `log(1 / tol) / min(gamma, gamma_p)`: one Rust evaluation on a 40 x 30 x
+   50 x 4 mesh took 2.0 s at `gamma_p = -1.8`, 5.5 s at -2.5, 12 s at -3.0
+   and 64 s at -3.5 (8 to 21 s with `beta, gamma` at -2.5, -2.8). The Strang
+   error does not shrink with the forcing's slow decay, so the step count
+   scales with the horizon; an integrator that treats the slow protein tail
+   with longer steps is the next kernel item if the fits keep going to the
+   low end. Pass 2 therefore fixes the dropout at the chromatin-only optimum
+   (an 8-point grid on the cheap model sets it; the protein does not inform
+   it) and runs with standard errors and the rejection test. And the fit script
+   must write its tables before any reporting line (the first attempt lost
+   four hours to a `KeyError` on a rejection count that only exists after
+   the rejection test; `perform_inference(checkpoint=True)` now keeps every
+   grid point).
+
+   **Pass 2 (2026-11-04, wider box, errors, rejection test).** Chromatin on
+   the 8-point dropout grid 37 min (optimum 0.43, the divergence flat below
+   it), `ProteinBursty` 5 min, the joint model 2 h 40 min with dropout fixed.
+   The locus parameters again do not move (0.01 log10); `gamma_p` now reaches
+   -3.0 on six genes, so the slow tail is real. The chromatin-only fit passes
+   the rejection test on 22 genes (Hellinger 0.004 to 0.07; the six failures
+   are five at a bound and one at Hellinger 0.052) but every gene fails under
+   both protein models, with Hellinger 0.3 to 1.1 and the fitted protein mean
+   10 to 200 times the observed one. That was the data, not the optimiser:
+   the protein axis is coarse-grained relative to the grid limit, the limit
+   is the largest count in the panel, and the largest count is an antibody
+   aggregate (CCR10: 99th percentile 19, maximum 1829, so at
+   `protein_limit=20` the model resolved the protein at 92 counts per step and
+   could only smear). Dropping the cells with any antibody above three times
+   its 99th percentile removes 155 of 8,526 cells (1.8%) and takes the Fano
+   factor of the lineage-negative antibodies from 30 to 400 down to 1.4 to 3,
+   which is what a Poisson background with a little biology looks like;
+   `protein_limit=50` then resolves 23 of the 28 antibodies at full
+   resolution and CD4 (mean 824) at 50 counts, at about 2.4 times the mesh.
+   Pass 2b reruns the three fits so. Two fixes came out of the pass:
+   `chisquare_testing` indexed two or three modalities and could not take
+   four, and `SearchResults.gene_pss` collapsed the configuration axis for a
+   marginal (the kernel needs all `2**n_sites` states) and dropped the
+   chromatin sampling vector; both now go through the joint PMF. The standard
+   errors were flagged unreliable on 27 of 28 genes under the joint model (8
+   of 28 without the protein). The flattest Hessian direction says why: the
+   burst size alone on the RNA-poor genes (CCR10, CCR2, CCR4, CD63, CD79A,
+   LAG3, NCR3, PDCD1), and on the rest an equal-weight combination of `a`,
+   `beta`, `gamma`, `k_p`, `gamma_p`, the common speed of RNA and protein
+   against the locus clock, which the data constrain only when that speed is
+   comparable to the switching. Treat the flagged genes' error columns as
+   missing; the reported values are the mean over the unflagged genes.
+
+   **Pass 2b (2026-11-05, aggregate-free cells, `protein_limit=50`).**
+   Chromatin 38 min (dropout optimum unchanged), `ProteinBursty` 7 min, the
+   joint model 7.7 h (the wider protein mesh, and the full test suite shared
+   the machine for part of it). The summed divergence of the protein models
+   fell from 47 and 50 to 13 and 18, and the rejection test now separates the
+   genes: the joint model passes on nine (CCR2, CCR4, CD226, CD79A, CTLA4,
+   FASLG, LAG3, NOTCH1, PDCD1), `ProteinBursty` on six, and the two agree on
+   `k_p / gamma_p` to 0.05 log10 wherever neither sits at a bound. The genes
+   that pass are the low-abundance antibodies whose counts are background,
+   and on them the joint fit moves `a`, `beta`, `gamma` a full decade from
+   the chromatin-only values (median 1.0 log10, against 0.01 for `b`): the
+   model is spending the RNA parameters to translate background counts,
+   which is the case for the background term pass 3 scans. The genes that
+   fail (Hellinger 0.4 to 0.7) are the abundant antibodies, CD4, CD27, ICOS,
+   IL2RA, ITGA4, ITGB7, CD52, CD63, CD9: real signal whose spread the model
+   does not produce (CD4 has a Fano factor of 290 with the aggregates gone),
+   so after the background the open question is extrinsic protein
+   variation. Standard errors unreliable on 16 of 28 (10 under
+   `ProteinBursty`, 8 without protein); where they are reliable, `k_p` and
+   `gamma_p` carry 0.1 to 0.4 log10.
+
 ## Open decisions
 
 - **Protein measurement noise.** `ProteinBursty` has none, and ADT counts carry
-  a known ambient background. A per-dataset background rate on the protein
-  channel would be a fourth sampling parameter on the grid, in the mould of the
-  ATAC dropout. Deferred unless a dataset shows it matters.
+  a known background. The DOGMA-seq DIG control shows it matters for the
+  low-abundance antibodies: in CD4 T cells the rat isotype controls average
+  0.05 and 1.1 counts, antibodies against targets the cells do not carry
+  (CD79a, CD68, CD146, PD-1) 1.1 to 2.4 counts with medians of 0 to 2, so for
+  the dozen antibodies whose mean is 1 to 3 the whole signal is background,
+  for CD25 (mean 9) it is about a fifth, for CD49d, integrin beta7, CD27 and
+  CD4 it is negligible. The level does not follow the ambient pool's
+  composition (empty droplets are 22% CD4, 7% CD8a; a composition-scaled
+  ambient would put 0.3 counts of CD79a on a cell, not 1.9), so it is
+  nonspecific binding, antibody-specific and roughly uniform at one to two
+  counts, with heavy tails from aggregates (Fano factors 6 to 400, single
+  cells at hundreds of counts). The aggregates are cell-level outliers and
+  must go before the fit: they set the protein grid limit, and the coarse
+  protein axis then loses the bulk of the distribution (validation item 6,
+  pass 2). Without them the background's Fano factor is 1.4 to 3. A
+  shared background rate as a fourth sampling parameter on the grid, in the
+  mould of the ATAC dropout, is therefore the right first model: the
+  low-abundance antibodies pin it across genes. Per-antibody rates would need
+  a negative population per antibody, which a 210-plex panel with two isotype
+  controls does not give. Built 2026-11-04 as `protein_background=(log10 low,
+  log10 high, grid points)` on `CMEModel("Chromatin", protein=True)`: the
+  fourth sampling entry, scanned on the grid like the dropout. In the kernel
+  it is one factor `exp(lambda (g_P - 1))` on the protein frequencies the
+  mesh keeps (the counts add independently, so the generating functions
+  multiply; the coarse protein axis is unaffected), the simulator adds a
+  Poisson draw to the protein, the moments start takes `lambda` off the
+  protein mean. Pass 2 ran without it; pass 3 scans it on the aggregate-free
+  cells.
 - **Emission default.** The BMMC analysis made `bursty=True` the sensible
   default for real data; the constitutive emission stays available for the
   limits and the nested comparisons.
 - **Name.** A flag on `Chromatin` (`protein=True`) keeps one family and one
   parameter convention; a separate `bio_model` name would duplicate the
   chromatin options.
-- **Fitting the protein pair at all.** On loci where the configuration carries
-  no information about the RNA, the protein adds a layer downstream of an
-  uninformative one. The first fits should be on genes with a surface-protein
-  readout and a locus that switches slowly, and they should start with the
-  check the chromatin notebook recommends: mean RNA and mean protein per
-  configuration before any fit.
+- **Fitting the protein pair at all.** Decided 2026-11-03: no prior selection.
+  Fit every gene that has an antibody and a locus, and let the identifiability
+  checks (the valley flag, the standard errors, the rejection tests) say where
+  the protein pair is not determined. The alternative was to start with genes
+  whose locus switches slowly compared with the protein lifetime, where the
+  configuration can inform the protein through the mature RNA; on other loci
+  the protein adds a layer downstream of an uninformative one. With the Rust
+  kernel at under a second per evaluation a panel of tens of antibodies is
+  affordable either way, and the per-configuration means the chromatin
+  notebook recommends remain the right first look at each gene.

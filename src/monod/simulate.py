@@ -370,4 +370,8 @@ def _observe(model, latent, samp, theta_amb, rng):
             keep = rng.random(cfg.shape) >= p_drop
             observed = cfg & keep
             counts["configuration"] = observed @ (2 ** np.arange(model.n_sites))
+        # protein background: nonspecific antibody counts, Poisson with the shared rate
+        lam_bg = model.chromatin_background(samp)
+        if lam_bg is not None:
+            counts["protein"] = counts["protein"] + rng.poisson(lam_bg, size=counts["protein"].shape)
     return {m: np.asarray(counts[m], dtype=np.int64) for m in mods}
