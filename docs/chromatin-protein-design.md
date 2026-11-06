@@ -372,6 +372,109 @@ Stages 1 to 4 were Python only and self-contained; stage 5 was the port.
    `ProteinBursty`, 8 without protein); where they are reliable, `k_p` and
    `gamma_p` carry 0.1 to 0.4 log10.
 
+   **Pass 3 (2026-11-05, shared Poisson background on the grid).** Joint
+   model only, background scanned at 1, 1.6 and 2.5 counts, 5.2 h on an idle
+   bio (1.9 h per grid point). The grid picks 1.6, inside the box and at the
+   lineage-negative level, but the summed divergence does not move (18.08
+   without, 18.23 with) and the rejection test gets worse (25 of 28 fail, 19
+   before). Ten genes improve by more than 0.1 nats (CCR10, FAS, TNFRSF4,
+   NCR3, TNFSF10 among them) and ten worsen by as much (CCR2, LAG3, NOTCH1,
+   PDCD1, CD4). The hypothesis that the background would hand the RNA
+   parameters back to the chromatin-only values fails: on the sixteen
+   antibodies below three counts the median distance of `a`, `beta`, `gamma`
+   from the chromatin-only fit goes from 1.0, 0.8, 0.9 to 0.9, 1.3, 1.4
+   log10, and `gamma_p` runs to its upper bound on the antibodies whose
+   counts are all background (CCR2, CD79A, CTLA4, LAG3, TNFRSF4), where the
+   protein channel then says nothing and `k_p / gamma_p` is free. Two
+   readings. One shared rate is the wrong shape: the nonspecific level is
+   antibody-specific (0.5 to 3 counts on this panel), so a single value
+   over-corrects half the antibodies and under-corrects the other half, and
+   the per-gene result follows that split. And the RNA parameters on these
+   genes are not set by the RNA at all: with a mature mean of 0.01 to 0.05
+   the chain's common-speed direction is flat, so whatever the protein
+   channel says, background or not, decides `a`, `beta`, `gamma`. Standard
+   errors unreliable on 20 of 28. The background term stays in the code (it
+   is correct and tested) but is not the fix for this panel; what would be is
+   a per-antibody rate held fixed per gene, read off a cell type in the same
+   run that does not carry the target (the sample has B cells, CD8 T cells
+   and pDCs), and that is the next design decision, together with extrinsic
+   protein variation for the abundant antibodies.
+
+   **Pass-4 diagnostics (2026-11-05).** Both candidates were tested before
+   building. The background by cell type (mean count per antibody on each
+   type with ≥ 150 cells, aggregates removed within the type) is
+   antibody-specific and large where it matters: the CD4 antibody puts 243
+   counts on B cells and 287 on CD8 T cells, a third of the CD4 T mean; CD27
+   26, CD49d 17, integrin beta7 15, ICOS 9, CD25 5; the low antibodies 0.5 to
+   3. That is a per-gene constant, not a grid axis: `adata.var
+   ['log10_protein_background']` now rides on the background entry of every
+   gene's sampling vector (`InferenceParameters(gene_samp_offsets=...)`,
+   filled by `perform_inference`), the grid scanning a shared factor on top.
+   Where the least-expressing type still carries over half the CD4 T level
+   and the antibody is abundant (CD45, CD52, CD63, DNAM-1, Notch1, Fas, and
+   CD25, CD49d, integrin beta7, which the "other" cluster does not resolve)
+   there is no negative population and the floor of one count stands in;
+   the table is `adt_background_used.csv` next to the data. The abundant
+   antibodies' misfit turned out not to be extrinsic noise. The pass-2b
+   protein marginals are qualitatively wrong (CD27: quantiles 1, 11, 144,
+   396, 415, 416 against 14, 41, 65, 91, 147, 208 in the data, mean 193
+   against 71, a tenth of the mass piled in the last grid bins by the
+   transform's wrap-around). The reason is RNA capture: with `seq_model=
+   "None"` the observed mature count, 0.09 per cell, is the true one, so
+   each rare long-lived mRNA makes one giant protein burst and the protein
+   is bimodal whatever `gamma_p` does. Poisson capture at 0.1 on the RNA
+   channels (true mRNA ten times the observed), `a` raised and `k_p` lowered
+   to hold the means, gives CD27 quantiles 15, 39, 63, 95, 152, 205, mean 71,
+   Fano 28 against 26, divergence 0.15 against 1.5, at `gamma_p = -3.0`;
+   capture 0.3 needs `gamma_p` below -3 for the same. The protein channel
+   therefore identifies the RNA capture that the RNA alone cannot (`a` and
+   the capture are degenerate there), and the joint fit must run with the
+   Poisson sequencing model and a capture grid. The slow end has a hard
+   limit: the chromatin stepper's cap of 20,000 steps is reached at
+   `gamma_p = -3.5` on CD27's grid (10,565 steps at -3.0), and a capped
+   integration returns a truncated distribution without saying so (at -4.0
+   the divergence jumps to 3.8); the kernel now warns when it hits the cap,
+   and the `gamma_p` box stays at -3.0 until the slow-tail integrator exists.
+   The same marginals showed a third defect, in the cells rather than the
+   model: the CD4 antibody is bimodal within the "CD4 T" cluster, with a
+   fifth of the cells at 60 to 130 counts against a mode near 900, and those
+   cells carry CD8a at a median of 270 against 28 (mislabelled CD8 T cells
+   and a few NK cells), so every fit so far ran on a mixture. The refined set
+   keeps CD4 at or above 250 and CD8a below 250 ADT counts (6,508 cells; the
+   CD4 Fano factor falls from 288 to 127). A
+   left-skewed marginal under a model that can only skew right is the
+   signature to look for. Pass 4: the refined cells, chromatin-only on the
+   dropout grid first, then the joint model with Poisson capture on a tied
+   grid (c_U = c_S at 0.1, 0.3, 0.03, one fit each), per-antibody background
+   fixed, `protein_limit` 50.
+
+   **Pass 4 (2026-11-06) and the start that was not one.** The chromatin-only
+   stage on the refined cells reproduces pass 2b (dropout optimum -0.371,
+   shared rates within 0.2 decades). The joint fit at capture 0.1 brought the
+   summed divergence from 18.1 to 12.6 and the median Hellinger from 0.27 to
+   0.07, with twelve genes below 0.02 and `gamma_p` off its bound on every
+   gene; capture 0.3 gave 14.6. But the abundant antibodies got worse (CD4
+   Hellinger 0.46 to 0.97, CD27 0.67 to 0.72, CD45 0.11 to 0.67) and sat in
+   the fast-protein regime (CD27: `k_p` -1.7, `gamma_p` -0.1). Evaluating the
+   divergence at the fitted optimum, at the moments start and at candidate
+   slow points (chromatin-only RNA rates, `a` raised by the capture factor,
+   `k_p` from the protein mean less the background, `gamma_p` swept) showed
+   why: every gene's moments start was the middle of the box. The RNA twin
+   that `get_MoM` builds for a protein model dropped the protein layer but
+   kept `protein_background`, the constructor refused it, and the `except`
+   that makes the start "a convenience, never a failure" swallowed the error
+   into a `log.info`. From the middle of the box the optimizer only reaches
+   the fast basin (CD27 divergence 3.2 to 2.6), while the slow candidates
+   sit at 0.24 (CD27, `gamma_p` -2.5), 0.82 (CD4, -2.5), 0.58 (CD45, -1.0)
+   and 0.15 (Fas, -1.0): the model fits these antibodies, the search did
+   not. CD49d and CD25 are the exception: no slow candidate beats the fit
+   (0.74, 0.62), their marginals being broader than any single-rate protein
+   layer with the floor background allows. Fixed (the twin drops the
+   background; `TestStart::test_moments_start_with_a_protein_background`
+   checks the start is not the box centre and that the background comes off
+   `k_p`). Pass 5 reruns the three joint fits with the real start, dropout
+   fixed at -0.371, everything else as pass 4.
+
 ## Open decisions
 
 - **Protein measurement noise.** `ProteinBursty` has none, and ADT counts carry
@@ -401,8 +504,11 @@ Stages 1 to 4 were Python only and self-contained; stage 5 was the port.
   mesh keeps (the counts add independently, so the generating functions
   multiply; the coarse protein axis is unaffected), the simulator adds a
   Poisson draw to the protein, the moments start takes `lambda` off the
-  protein mean. Pass 2 ran without it; pass 3 scans it on the aggregate-free
-  cells.
+  protein mean. Pass 3 scanned it on the aggregate-free cells and it did not
+  help (validation item 6): one rate shared across antibodies is the wrong
+  shape. The open choice is a per-antibody rate fixed per gene from a
+  negative cell type in the same run, which the model would take as a
+  per-gene constant rather than a grid axis.
 - **Emission default.** The BMMC analysis made `bursty=True` the sensible
   default for real data; the constitutive emission stays available for the
   limits and the nested comparisons.

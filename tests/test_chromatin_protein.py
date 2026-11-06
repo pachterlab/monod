@@ -1,6 +1,8 @@
 """The Chromatin model's protein layer (docs/chromatin-protein-design.md, stage 1,
 2026-11-02): the chromatin stepper fed by the protein characteristics, checked
 at the limits where another kernel gives the answer."""
+import warnings
+
 import numpy as np
 import pytest
 
@@ -208,6 +210,19 @@ class TestKernel:
                        for e in np.eye(SMALL.size)])
         np.testing.assert_allclose(grad, fd, rtol=0.02, atol=1e-4)
 
+    def test_step_cap_is_reported(self):
+        # a protein a hundred thousand times slower than the locus needs more than the 20,000 steps the
+        # stepper allows; the truncated result must not pass silently (the Mimitou fits found a divergence
+        # of 3.8 at gamma_p = -4 where -3.5 gave 0.5)
+        m = _model()                                                                        # join_theta takes linear rates
+        slow = cf.join_theta([0.22, 0.05], 0.63, [0.02], 0.32, 0.003, 0.25, (0.08, 1e-4))   # CD27-like, gamma_p a decade below the box
+        with pytest.warns(RuntimeWarning, match="cap of"):
+            pss = m.eval_model_pss(slow, [4, 4, 6, 4])
+        assert pss.shape == (4, 4, 6, 4)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            m.eval_model_pss(cf.join_theta([0.22, 0.05], 0.63, [0.02], 0.32, 0.003, 0.25, (0.08, 1e-2)), [4, 4, 6, 4])
+
     def test_ambiguous_channel_goes_through_the_generic_route(self):
         m = _model(amb_model="Equal")
         assert m.model_modalities == ["unspliced", "spliced", "protein", "configuration", "ambiguous"]
@@ -276,6 +291,38 @@ class TestPipeline:
             np.testing.assert_allclose(marg, joint.sum(axis=tuple(j for j in range(4) if j != k)), atol=1e-12)
         csq, pval, hel = sr_.chisquare_testing(sd, reject_at_bounds=True)
         assert np.all(np.isfinite(csq)) and 0 <= hel[0] < 1.5 and sr_.rejected_genes.shape == (1,)
+
+    def test_per_gene_protein_background_rides_on_the_sampling_vector(self, tmp_path, monkeypatch):
+        import anndata as ad
+        from monod.inference import perform_inference, search_result_from_uns, searchdata_from_adata, InferenceParameters
+        monkeypatch.chdir(tmp_path)
+        lam = np.log10(2.0)
+        m = _model(seq="Poisson", dropout_bounds=(np.log10(0.1), np.log10(0.1), 1), protein_background=(0.0, 0.0, 1))
+        a = self._adata(m, self.TRUTH, 1500, 11)
+        a.var["log10_protein_background"] = [lam]                                           # the antibody's measured level
+        path = tmp_path / "bg.h5ad"; a.write_h5ad(path)
+        gp = {"max_iterations": 2, "init_pattern": "moments", "num_restarts": 1, "num_gene_cores": 1, "check_identifiability": False}
+        kw = dict(viz=False, gradient_params=gp, exclude_sigma=True, n_genes=1,
+                  filt_param={"min_means": [0] * 4, "max_maxes": [10_000] * 4, "min_maxes": [0] * 4})
+        out = perform_inference(str(path), m, dataset_string="bg_fixed", samp_lb=list(self.CAPTURE) + [np.log10(0.1), 0.0],
+                                samp_ub=list(self.CAPTURE) + [np.log10(0.1), 0.0], gridsize=[1, 1, 1, 1], **kw)
+        sr = search_result_from_uns(out.uns["search_result"])
+        np.testing.assert_allclose(sr.regressor_optimum[0], list(self.CAPTURE) + [np.log10(0.1), lam])      # grid value + per-gene offset
+        assert np.asarray(sr.sp.gene_samp_offsets).shape == (1, 4)                           # survives the h5ad round trip
+        sd = searchdata_from_adata(out)
+        np.testing.assert_allclose(sr.gene_pss(sd, 0), m.eval_model_pss(sr.phys_optimum[0], np.asarray(sd.M[:, 0]), sr.regressor_optimum[0]), atol=1e-12)
+        # a shared factor scanned on top of the per-gene level
+        m2 = _model(seq="Poisson", dropout_bounds=(np.log10(0.1), np.log10(0.1), 1), protein_background=(-0.3, 0.3, 3))
+        out2 = perform_inference(str(path), m2, dataset_string="bg_scan", samp_lb=list(self.CAPTURE) + [np.log10(0.1), -0.3],
+                                 samp_ub=list(self.CAPTURE) + [np.log10(0.1), 0.3], gridsize=[1, 1, 1, 3], **kw)
+        sr2 = search_result_from_uns(out2.uns["search_result"])
+        assert np.any(np.isclose(sr2.regressor_optimum[0][3] - lam, [-0.3, 0.0, 0.3]))
+        # the column without a background model is an error; a wrong shape is an error
+        with pytest.raises(ValueError):
+            perform_inference(str(path), _model(seq="Poisson"), dataset_string="bg_wrong", **kw)
+        with pytest.raises(ValueError):
+            InferenceParameters("x", m, gene_samp_offsets=np.zeros((2, 3)), samp_lb=[0, 0, -1, 0], samp_ub=[0, 0, -1, 0], gridsize=[1, 1, 1, 1]) \
+                .fit_all_grid_points(searchdata_from_adata(out), num_cores=1)
 
     def test_extract_warns_when_an_aggregate_sets_the_protein_limit(self, tmp_path, monkeypatch, caplog):
         import logging
@@ -373,3 +420,21 @@ class TestStart:
         np.testing.assert_allclose(x0[:3], THETA[:3], atol=0.3)          # the chain from the configuration marginal
         assert abs((x0[-2] - x0[-1]) - (THETA[-2] - THETA[-1])) < 0.2    # k_p / gamma_p from the means
         assert np.all(x0 >= lb) and np.all(x0 <= ub)
+
+    def test_moments_start_with_a_protein_background(self):
+        # the RNA twin used for the chain and RNA rates must drop the background with the
+        # protein layer; it used to refuse it, and every gene then started from the middle
+        # of the box without any sign of it (pass 4 on the DOGMA-seq cells)
+        m = _model(dropout_bounds=(0.0, 0.0, 1), protein_background=(0.0, 0.0, 1))
+        lam = 3.0
+        samp = np.array([0.0, 0.0, 0.0, np.log10(lam)])
+        P = m.eval_model_pss(THETA, L, samp)
+        hist = cf.sparse_histogram(P)
+        lb, ub = np.array(m.bio_bounds["phys_lb"]), np.array(m.bio_bounds["phys_ub"])
+        x0 = m.get_MoM(None, lb, ub, samp, hist=hist, limits=L)
+        mid = 0.5 * (lb + ub)
+        assert not np.allclose(x0, mid), "the start fell back to the middle of the box"
+        np.testing.assert_allclose(x0[:3], THETA[:3], atol=0.3)
+        assert abs((x0[-2] - x0[-1]) - (THETA[-2] - THETA[-1])) < 0.2    # background taken off the protein mean
+        no_bg = _model(dropout_bounds=(0.0, 0.0, 1)).get_MoM(None, lb, ub, samp[:3], hist=hist, limits=L)
+        assert x0[-2] < no_bg[-2]                                        # ignoring the background would overstate k_p

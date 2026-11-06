@@ -1799,6 +1799,7 @@ class CMEModel:
         d = self.to_dict()
         d["protein"] = False
         d.pop("protein_limit", None)
+        d.pop("protein_background", None)         # the background lives on the protein channel; without it the constructor refuses it
         key = repr(sorted((k, str(v)) for k, v in d.items()))
         cached = getattr(self, "_rna_twin", None)
         if cached is None or cached[0] != key:
@@ -1949,6 +1950,15 @@ class CMEModel:
                                              burst=self.chromatin_burst(p), structure=structure,
                                              backend=backend, protein=protein)
         self._last_schedule = sched
+        n_steps = len(getattr(sched, "steps", sched))
+        if n_steps >= _chromatin._MAX_STEPS:
+            # the stepper stopped short of the horizon: the slow tail (gamma or
+            # gamma_p below about -3 in units of k_off) is cut off and the
+            # distribution is wrong without any other sign of it
+            warnings.warn(
+                f"Chromatin integrator reached its cap of {n_steps} steps before the horizon; the "
+                "distribution is truncated. Keep gamma and gamma_p above about -3 (units of k_off) "
+                "or raise monod.chromatin._MAX_STEPS.", RuntimeWarning, stacklevel=2)
         lam_bg = self.chromatin_background(samp)
         if lam_bg is not None:
             # background counts add independently: the PGF gains the Poisson
@@ -2305,7 +2315,7 @@ class CMEModel:
                     x0 = _cf.chromatin_start(twin, dense, lims, samp, lb_lat, ub_lat)
                 x0 = np.concatenate([x0, tail])
             except Exception as exc:                      # a start is a convenience, never a failure
-                log.info("Chromatin moments start failed (%s); starting from the middle of the box", exc)
+                log.warning("Chromatin moments start failed (%s); starting from the middle of the box", exc)
                 return mid
             return np.clip(x0, lb_log, ub_log)
         lb = 10**lb_log

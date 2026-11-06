@@ -47,6 +47,31 @@ from tqdm import tqdm
 # from tqdm.contrib.concurrent import process_map  # or thread_map
 # warnings.filterwarnings("ignore", category=DeprecationWarning) #let's do more gargeted stuff...
 
+def _gene_samp_offsets(monod_adata, model):
+    """Per-gene log10 offsets on the sampling vector, or None.  The chromatin model
+    with a protein background reads ``adata.var['log10_protein_background']`` (the
+    nonspecific level of each gene's antibody, measured on cells that do not carry
+    the target) into the background entry; the grid then scans a shared factor on
+    top of it (``protein_background=(0, 0, 1)`` holds the per-gene levels as they are)."""
+    col = "log10_protein_background"
+    if col not in monod_adata.var.columns:
+        return None
+    if not getattr(model, "protein", False):
+        log.info("adata.var[%r] ignored: the model has no protein layer.", col)
+        return None
+    if getattr(model, "protein_background", None) is None:
+        raise ValueError(f"adata.var[{col!r}] is present but the model has no protein background; "
+                         "construct it with protein_background=(0, 0, 1) to hold the per-gene levels")
+    n_samp = len(model.seq_bounds["samp_lb"])
+    offsets = np.zeros((monod_adata.n_vars, n_samp))
+    vals = np.asarray(monod_adata.var[col], dtype=float)
+    if not np.all(np.isfinite(vals)):
+        raise ValueError(f"adata.var[{col!r}] must be finite log10 rates (use a small value, not -inf, for none)")
+    offsets[:, 3] = vals
+    log.info("Per-gene protein background from adata.var[%r]: %d genes, log10 range %.2f to %.2f.", col, len(vals), vals.min(), vals.max())
+    return offsets
+
+
 def perform_inference(h5ad_filepath,
     model,
     transcriptome_filepath=None,
@@ -157,6 +182,8 @@ def perform_inference(h5ad_filepath,
             use_lengths = None
             log.info('Lengths have not been given so are not being used')
 
+    gene_samp_offsets = _gene_samp_offsets(monod_adata, model)
+
     if not mek_means_params:
         inference_parameters = InferenceParameters(
             dataset_string,
@@ -169,7 +196,8 @@ def perform_inference(h5ad_filepath,
             samp_lb=samp_lb,
             samp_ub=samp_ub,
             gridsize=gridsize,
-            poisson_average_log_length=poisson_average_log_length)
+            poisson_average_log_length=poisson_average_log_length,
+            gene_samp_offsets=gene_samp_offsets)
 
     else:
         from . import mminference
@@ -911,6 +939,7 @@ class InferenceParameters:
         gridsize=None,
         poisson_average_log_length=5,
         save=False,
+        gene_samp_offsets=None,
     ):
         """Initialize the InferenceParameters instance.
 
@@ -959,6 +988,11 @@ class InferenceParameters:
             effective when num_gene_cores=1 to avoid nested parallelism.
         run_meta: str, optional
             any additional metadata to append to the run directory name.
+        gene_samp_offsets: float np.ndarray or None, optional
+            per-gene offsets added to the sampling vector at every grid point, an
+            n_genes x n_samp_pars array in log10. The grid then scans a shared
+            value on top of a known per-gene level: ``perform_inference`` fills
+            the protein-background entry from ``adata.var['log10_protein_background']``.
         """
         # Set biophysical parameter values to defaults.
         if phys_lb is None:
@@ -985,6 +1019,7 @@ class InferenceParameters:
         self.grad_bnd = scipy.optimize.Bounds(phys_lb, phys_ub)
 
         self.poisson_average_log_length = poisson_average_log_length
+        self.gene_samp_offsets = None if gene_samp_offsets is None else np.asarray(gene_samp_offsets, dtype=float)
 
         self.samp_lb = np.array(samp_lb)
         self.samp_ub = np.array(samp_ub)
@@ -1053,13 +1088,15 @@ class InferenceParameters:
             "gridsize": np.asarray(self.gridsize, dtype=int),
             "poisson_average_log_length": float(self.poisson_average_log_length),
         }
+        if getattr(self, "gene_samp_offsets", None) is not None:
+            d["gene_samp_offsets"] = np.asarray(self.gene_samp_offsets, dtype=float)
         return d
 
     @staticmethod
     def _ctor_kwargs_from_dict(d):
         from .cme_toolbox import CMEModel
         ul = d.get("use_lengths", "")
-        return dict(
+        kw = dict(
             model=CMEModel.from_dict(d["model"]),
             use_lengths=(None if ul == "" else str(ul)),
             gradient_params={k: (v.item() if isinstance(v, np.generic) else v) for k, v in dict(d.get("gradient_params", {})).items()},
@@ -1070,6 +1107,9 @@ class InferenceParameters:
             gridsize=[int(g) for g in np.asarray(d["gridsize"]).ravel()],
             poisson_average_log_length=float(d.get("poisson_average_log_length", 5)),
         )
+        if d.get("gene_samp_offsets") is not None:   # absent on meK-Means dicts, whose constructor has no such argument
+            kw["gene_samp_offsets"] = np.asarray(d["gene_samp_offsets"], dtype=float)
+        return kw
 
     @classmethod
     def from_dict(cls, d):
@@ -1318,6 +1358,13 @@ class GradientInference:
             if model.seq_model == "Poisson" and model.bio_model == "ProteinBursty" and model.fit_unspliced:
                 regressor[:, 0] += global_parameters.poisson_average_log_length
             
+        offsets = getattr(global_parameters, "gene_samp_offsets", None)
+        if offsets is not None:
+            offsets = np.asarray(offsets, dtype=float)
+            if offsets.shape != regressor.shape:
+                raise ValueError(f"gene_samp_offsets has shape {offsets.shape}; expected {regressor.shape} (genes x sampling parameters)")
+            regressor = regressor + offsets
+
         self.grid_point = global_parameters.sampl_vals[point_index]
         self.point_index = point_index
         self.regressor = regressor
