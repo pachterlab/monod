@@ -152,6 +152,10 @@ def moment_start(hist: np.ndarray, rule: str, n_sites: int, chain: ChainFit, obj
     configs = ch.configurations(n).astype(float)
     lo, hi = 10.0 ** rate_bounds[0], 10.0 ** rate_bounds[1]
 
+    open_ = configs.any(1)
+    f_open = max(float(w[open_].sum()), 1e-12)
+    mu_u = float(w @ m_c)                                            # pooled nascent mean
+
     def rates_for(beta):
         a = beta * m_c                                               # rate per configuration
         if rule == "table":
@@ -159,8 +163,16 @@ def moment_start(hist: np.ndarray, rule: str, n_sites: int, chain: ChainFit, obj
         elif rule == "additive":
             r, *_ = np.linalg.lstsq(configs[1:] * np.sqrt(w[1:, None]), a[1:] * np.sqrt(w[1:]), rcond=None)
         else:
-            open_ = configs.any(1)
-            r = np.array([(w[open_] @ a[open_]) / max(w[open_].sum(), 1e-12)])
+            r = np.array([(w[open_] @ a[open_]) / f_open])
+        if not np.any(r > lo) and mu_u > 0:
+            # the open configurations carry no nascent counts (a handful of counts, all in
+            # closed cells): the pooled nascent mean, spread over the open fraction
+            r = np.full_like(r, beta * mu_u / f_open)
+        if not np.any(r > lo):
+            # no nascent counts at all: the mature mean with gamma in the middle of its box,
+            # rather than a start in the corner of the parameter box
+            gamma_mid = 10.0 ** (0.5 * (gamma_bounds[0] + gamma_bounds[1]))
+            r = np.full_like(r, gamma_mid * mu_s / f_open)
         return np.clip(r, lo, hi)
 
     best = None

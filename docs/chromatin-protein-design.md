@@ -475,6 +475,67 @@ Stages 1 to 4 were Python only and self-contained; stage 5 was the port.
    `k_p`). Pass 5 reruns the three joint fits with the real start, dropout
    fixed at -0.371, everything else as pass 4.
 
+   **Pass 5 (2026-11-06).** With the real start the summed divergence falls
+   to 7.97 at capture 0.1 and 7.60 at capture 0.3 (pass 2b 18.1), the median
+   Hellinger to 0.040, fifteen genes below 0.05; CD4 goes from 0.97 to 0.30,
+   CD45 to 0.13, Fas to 0.05. The two capture values trade off per gene: CD27
+   fits at 0.3 (0.08) with `gamma_p` on its -3.0 bound, as the regime test
+   predicted, while CD49d and integrin beta7 prefer 0.1. The rejection count
+   stays near twenty because the background-only antibodies sit on bounds
+   (transcription rate at -4, `k_p` at a bound), the flat direction the
+   standard errors flag, not a shape misfit. CD27 at capture 0.1 ended at
+   2.60 with the transcription rate near -3.4, and the cause is the start
+   again, in its honest form: CD27's unspliced layer has three counts in
+   6,508 cells, all in closed-configuration cells, so the per-configuration
+   nascent means are zero where the rate is defined, the rate clips to its
+   lower bound and `gamma` follows it into the corner of the box. From that
+   corner the Nelder-Mead pre-search converges into a local minimum (coarse
+   divergence 2.74 to 2.67 in 461 evaluations) and L-BFGS-B stops there, at
+   exactly the pass-5 optimum; plain L-BFGS-B from the same corner happens to
+   take a large first step and reaches 0.24. `moment_start` now falls back to
+   the pooled nascent mean spread over the open fraction when the open cells
+   carry no nascent counts, and to the mature mean with `gamma` at the middle
+   of its box when there are none at all
+   (`TestStart::test_moments_start_without_nascent_counts_in_open_cells`).
+   The pre-search itself is left alone: it cannot make the coarse objective
+   worse, but a start in a corner is where it does its damage. With the
+   fallback start CD27 begins at 0.32, the pre-search takes it to 0.23 and
+   L-BFGS-B to 0.22, the slow basin (`gamma_p` -2.3, `k_p` -0.7). Pass 5's
+   third point, capture 0.03, sums to 6.80 with 22 rejections and 17 genes on
+   a bound: the lower the capture, the more background-only antibodies end on
+   a bound, and the four genes whose Hellinger moves with capture (CD27,
+   integrin beta7, CD49d, CD45) do not agree on a value, so capture is not
+   identified across genes by this data; 0.1 is kept as the reporting point.
+
+   **Pass 6 (2026-11-06/07).** Pass 5 rerun with the fallback start. At
+   capture 0.1 the summed divergence is 5.57 (pass 5 7.97), rejections 17
+   (21), bound hits 11 (14), the median Hellinger 0.040 unchanged. The whole
+   change is the start: CD27 goes from 0.71 to 0.08 (divergence 2.60 to 0.22,
+   `gamma_p` -2.3), five background-only antibodies (CCR2, PD-1, CD68, CXCR6,
+   MCAM) leave the transcription-rate corner for interior points with the
+   same Hellinger and no bound flag, and the other twenty-two genes are
+   identical to pass 5 to three decimals. The remaining rejections are the
+   broad abundant antibodies (CD4 0.30, CD49d 0.28, CD25 0.26, CD63 0.23,
+   CD9 0.19) and the `k_p`-at-bound background antibodies. The run died on
+   bio's full disk after the capture-0.3 fit; the two remaining capture
+   points were rerun on atlas (same code, same seed; atlas needs
+   `PYTHONPATH` to the checkout because an old PyPI `monod_anndata` shadows
+   it, and pandas 3 needs `anndata.settings.allow_write_nullable_strings`).
+   Capture 0.3 sums to 7.54 (19 rejected, 10 on a bound), capture 0.03 to
+   6.53 (19 rejected, 15 on a bound). CD27 is now 0.08 at every capture,
+   with `gamma_p` on its -3.0 bound at 0.3 and interior (-2.3) below.
+   Fourteen genes are below Hellinger 0.05 at every capture, and only four
+   genes move with it by more than 0.02: CD45 needs capture at or above 0.1
+   (0.13 against 0.60 at 0.03), integrin beta7 and CD49d need it at or below
+   0.1 (0.15 and 0.28 against 0.65 and 0.50 at 0.3), CD63 drifts from 0.25
+   to 0.22. Capture 0.1 is the only value every gene accepts, and the value
+   to report; a per-cell capture shared across genes would be the next step
+   if these three ever had to agree. What remains rejected at 0.1 is the
+   broad abundant antibodies (CD4, CD49d, CD25, CD63, CD9, TNFRSF9, 0.18 to
+   0.30), which no single-rate protein layer with a floor background has
+   matched since pass 4, and the `k_p`-at-bound background antibodies, which
+   are flags rather than misfits.
+
 ## Open decisions
 
 - **Protein measurement noise.** `ProteinBursty` has none, and ADT counts carry

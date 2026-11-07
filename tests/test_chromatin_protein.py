@@ -438,3 +438,22 @@ class TestStart:
         assert abs((x0[-2] - x0[-1]) - (THETA[-2] - THETA[-1])) < 0.2    # background taken off the protein mean
         no_bg = _model(dropout_bounds=(0.0, 0.0, 1)).get_MoM(None, lb, ub, samp[:3], hist=hist, limits=L)
         assert x0[-2] < no_bg[-2]                                        # ignoring the background would overstate k_p
+
+    def test_moments_start_without_nascent_counts_in_open_cells(self):
+        # CD27 in the DOGMA-seq cells: three nascent counts in 6,508 cells, all in closed cells,
+        # so the per-configuration nascent means put the transcription rate at its lower bound
+        # and gamma followed it into the corner of the box; the optimizer never left it
+        m = _model(dropout_bounds=(0.0, 0.0, 1))
+        P = np.asarray(m.eval_model_pss(THETA, L))                       # (U, S, P, configuration)
+        P[1:, :, :, 1:] = 0.0                                            # no nascent counts in open configurations
+        P /= P.sum()
+        hist = cf.sparse_histogram(P)
+        lb, ub = np.array(m.bio_bounds["phys_lb"]), np.array(m.bio_bounds["phys_ub"])
+        x0 = m.get_MoM(None, lb, ub, None, hist=hist, limits=L)
+        assert x0[3] > lb[3] + 0.5, "the transcription rate start sits at its lower bound"
+        assert np.isfinite(m.eval_model_kld(x0, L, None, hist))
+        P[1:] = 0.0                                                      # no nascent counts at all
+        P /= P.sum()
+        x0 = m.get_MoM(None, lb, ub, None, hist=cf.sparse_histogram(P), limits=L)
+        assert x0[3] > lb[3] + 0.5
+        assert abs(x0[5] - 0.5 * (lb[5] + ub[5])) < 0.01                # gamma from the middle of its box
