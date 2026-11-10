@@ -29,6 +29,15 @@ _SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+# pandas 3 gives obs/var string indexes that anndata 0.11+ refuses to write
+# unless told that readers older than 0.11 need not open the file; the tests
+# write and read their own files.
+try:
+    import anndata as _ad
+    _ad.settings.allow_write_nullable_strings = True
+except (ImportError, AttributeError):
+    pass
+
 # ---------------------------------------------------------------------------
 # Snapshot directory
 # ---------------------------------------------------------------------------

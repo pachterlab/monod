@@ -239,7 +239,10 @@ needs_rust = pytest.mark.skipif(not ch._rust_available(), reason="monod_core wit
 
 @needs_rust
 class TestRustBackend:
-    """The Rust kernel follows the NumPy one step for step."""
+    """The Rust kernel follows the NumPy one step for step on a replayed
+    schedule; the adaptive runs may part at the last bit of rounding in the
+    Magnus steps (see test_chromatin_protein.TestRustBackend) and agree within
+    tolerance."""
 
     @pytest.mark.parametrize("case", ["fgp2", "nm3", "nm1"])
     def test_matches_numpy(self, case):
@@ -254,9 +257,10 @@ class TestRustBackend:
             limits = [30, 40]
         p_py, s_py = ch.eval_joint_pss(H, A, C, limits, backend="python", return_schedule=True)
         p_rs, s_rs = ch.eval_joint_pss(H, A, C, limits, backend="rust", return_schedule=True)
-        assert s_rs.size == s_py.size
-        np.testing.assert_allclose(np.asarray(s_rs), np.asarray(s_py), rtol=1e-6)   # controller rounding
-        np.testing.assert_allclose(p_rs, p_py, atol=1e-12)
+        assert abs(s_rs.size - s_py.size) <= 0.03 * s_py.size + 2
+        np.testing.assert_allclose(p_rs, p_py, atol=1e-8)
+        replay = ch.eval_joint_pss(H, A, C, limits, fixed_schedule=s_py, backend="rust")
+        np.testing.assert_allclose(replay, p_py, atol=1e-12)
 
     @pytest.mark.parametrize("case", ["switch", "additive", "table", "independent"])
     def test_bursty_matches_numpy_in_every_mode(self, case):
@@ -267,9 +271,8 @@ class TestRustBackend:
         H, A, C = ch.nascent_mature_system([0.5, 0.8], 1.0, eps, rule, 0.8, 0.3, rule_params=rates)
         p_py, s_py = ch.eval_joint_pss(H, A, C, [30, 40], burst=2.5, backend="python", return_schedule=True)
         p_rs, s_rs = ch.eval_joint_pss(H, A, C, [30, 40], burst=2.5, backend="rust", return_schedule=True)
-        assert s_rs.size == s_py.size
-        np.testing.assert_allclose(np.asarray(s_rs), np.asarray(s_py), rtol=1e-6)
-        np.testing.assert_allclose(p_rs, p_py, atol=1e-12)
+        assert abs(s_rs.size - s_py.size) <= 0.03 * s_py.size + 2
+        np.testing.assert_allclose(p_rs, p_py, atol=1e-8)
         replay = ch.eval_joint_pss(H, A, C, [30, 40], burst=2.5, fixed_schedule=s_py, backend="rust")
         np.testing.assert_allclose(replay, p_py, atol=1e-12)
         with pytest.raises(ValueError):
@@ -279,7 +282,7 @@ class TestRustBackend:
         H, A, C = ch.fgp_system([0.3, 0.6], 0.5, 0.4, [4.0, 2.0], [1.0, 1.0])
         p_py, s_py = ch.eval_joint_pss(H, A, C, [20, 20], backend="python", return_schedule=True)
         p_default = ch.eval_joint_pss(H, A, C, [20, 20])
-        np.testing.assert_allclose(p_default, p_py, atol=1e-12)
+        np.testing.assert_allclose(p_default, p_py, atol=1e-8)
         replay = ch.eval_joint_pss(H, A, C, [20, 20], fixed_schedule=s_py, backend="rust")
         np.testing.assert_allclose(replay, p_py, atol=1e-12)
 
@@ -289,7 +292,7 @@ class TestRustBackend:
         limits = [30, 40]                                   # 16 states × 30 × 21 points > 4096
         p_py = ch.eval_joint_pss(H, A, C, limits, backend="python")
         p_rs = ch.eval_joint_pss(H, A, C, limits, backend="rust")
-        np.testing.assert_allclose(p_rs, p_py, atol=1e-12)
+        np.testing.assert_allclose(p_rs, p_py, atol=1e-8)
 
     @pytest.mark.parametrize("case", ["switch", "additive", "table", "fgp_per_site", "independent", "independent_additive"])
     def test_structured_paths_match_dense(self, case):
@@ -318,7 +321,7 @@ class TestRustBackend:
         limits = [30, 40]
         p_py = ch.eval_joint_pss(H, A, C, limits, backend="python")
         p_rs = ch.eval_joint_pss(H, A, C, limits, backend="rust")
-        np.testing.assert_allclose(p_rs, p_py, atol=1e-12)
+        np.testing.assert_allclose(p_rs, p_py, atol=1e-8)
 
     def test_locus_structure_rejects_coupled_sites(self):
         H, A, C = ch.nascent_mature_system([0.5, 0.8], 1.0, 0.6, "additive", 0.8, 0.3, rule_params=[4.0, 2.0])

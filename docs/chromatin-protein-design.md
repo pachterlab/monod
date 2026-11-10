@@ -42,7 +42,9 @@ counts afterwards, which is model-agnostic.
 
 The chromatin kernel integrates the vector generating function
 `G[c, p] = E[prod_j (1 + u_j)^{x_j}; configuration c]` by Strang splitting with
-three exact sub-flows per step:
+three exact sub-flows per step (since 2026-11-09 the slow part of the horizon
+is taken by a Magnus step instead, "How stage 6 does it"; the production
+exponent below is what both steps share):
 
 1. production, diagonal in `c`: `G[c, p] *= exp(A[c] * integral of phi(U_nascent(s, p)) ds)`;
 2. configuration transitions: `G <- exp(H^T h) G`;
@@ -150,6 +152,57 @@ A pinned gradient on the 23 x 27 x 21 grid takes 3.5 s against 44 s. The
 Nelder-Mead pre-search (`presearch="auto"`) is on for this model when the
 Rust kernel is installed, as for `ProteinBursty`; without it the model falls
 back to NumPy and the pre-search stays off.
+
+## How stage 6 does it: the slow tail
+
+The Strang step's error is the commutator of `exp(H^T h)` and the production
+term, and the commutator does not shrink when the forcing becomes slow: with
+a protein a thousand locus clocks long the stepper took some 13,000 steps of
+about one clock over a horizon of 20,000 (pass 2 measured 2 s at
+`gamma_p = -1.8` and 64 s at -3.5 on the CD27 mesh; the cap of 20,000 steps
+truncated everything below -3.3, hence the `gamma_p` box floor at -3.0). The
+characteristic table was not the limit: at the kernel's tolerance it
+completes down to `gamma_p = 1e-4` (a probe at a tolerance of 1e-9 did hit
+the table's cap and clamped the forcing, which is now a warning; the fits
+never did).
+
+The midpoint Magnus step replaces the three sub-flows by one exponential of
+`h H^T + diag(X[:, p])` per mesh point, `X` the production exponent over the
+whole step (the two half-step Simpson panels summed). It is exact for a
+constant forcing, so its step is set by the change of the forcing over the
+step and not by its level: on the CD27 mesh it takes 124 to 150 steps at
+every `gamma_p` from 1e-2 to 1e-4, steps of hundreds to thousands of clocks
+in the tail, and agrees with the Strang result to 7e-7 at the working
+tolerance. A fourth-order Magnus step with the two-panel commutator term and
+a commutator-based error estimate was tried and rejected: the estimate
+ignores the damping the exponential applies and asked for four times the
+steps.
+
+The exponential costs about fifteen Strang steps per mesh point (an n x n
+complex exponential, Paterson-Stockmeyer degree-16 Taylor after scaling to a
+1-norm of one and squaring back, against a shared `exp(H^T h)` and
+elementwise exponentials), so the Magnus step pays only where its steps are
+at least that much longer. The kernel is therefore a hybrid: from the horizon
+down, Magnus while the accepted step is at least `_MAGNUS_MIN_STEP` (20,
+scaled by `N / 4`) chain relaxation times, then Strang from its own first
+step for the fast transient; both under the same step doubling and Richardson
+extrapolation. `StepSchedule.magnus` records the switch so replays take the
+same stepper per step, and the Rust kernel takes it (`magnus_steps`,
+`h_switch`) and returns it. On the CD27 mesh (bio, loaded): 4.3 s at
+`gamma_p = -1.8` against 6.1 s for Strang alone measured the same way, 9.8 s
+at -3.0, 15 s at -3.5, 18 s at -4.0; the RNA-only model at a fast `gamma`
+takes two Magnus steps and is unchanged. The `gamma_p` floor can now go
+below -3.0.
+
+One contract changed. The NumPy and Rust tables of the characteristics are
+different arithmetic (values per mesh point against affine maps per protein
+argument), equal to rounding; the Magnus error estimate is a small difference
+of large exponentials, so that rounding moves a step by about 1e-9 and the
+two adaptive controllers then drift apart (both within tolerance). The
+backend tests now assert replay agreement to 1e-11 in both directions, the
+same steps giving the same numbers, and adaptive agreement to 1e-8 with step
+counts within three percent; `_expm_batched` sums in the Rust order so that
+nothing else parts them.
 
 ## Model definition
 
@@ -310,7 +363,7 @@ Stages 1 to 4 were Python only and self-contained; stage 5 was the port.
    error does not shrink with the forcing's slow decay, so the step count
    scales with the horizon; an integrator that treats the slow protein tail
    with longer steps is the next kernel item if the fits keep going to the
-   low end. Pass 2 therefore fixes the dropout at the chromatin-only optimum
+   low end (built 2026-11-09, "How stage 6 does it"). Pass 2 therefore fixes the dropout at the chromatin-only optimum
    (an 8-point grid on the cheap model sets it; the protein does not inform
    it) and runs with standard errors and the rejection test. And the fit script
    must write its tables before any reporting line (the first attempt lost
@@ -434,7 +487,9 @@ Stages 1 to 4 were Python only and self-contained; stage 5 was the port.
    `gamma_p = -3.5` on CD27's grid (10,565 steps at -3.0), and a capped
    integration returns a truncated distribution without saying so (at -4.0
    the divergence jumps to 3.8); the kernel now warns when it hits the cap,
-   and the `gamma_p` box stays at -3.0 until the slow-tail integrator exists.
+   and the `gamma_p` box stays at -3.0 until the slow-tail integrator exists
+   (it does since 2026-11-09, "How stage 6 does it"; lowering the floor is a
+   fitting decision for the next pass).
    The same marginals showed a third defect, in the cells rather than the
    model: the CD4 antibody is bimodal within the "CD4 T" cluster, with a
    fifth of the cells at 60 to 130 counts against a mode near 900, and those

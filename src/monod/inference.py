@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import scipy
 from scipy import optimize, stats
 from ._core import make_dir, log, _build_sampling_grid, to_dense
-from .extract_data import extract_data, make_histogram, grid_limits, import_h5ad, _uns_unpack, model_from_uns
+from .extract_data import extract_data, make_histogram, grid_limits, import_h5ad, write_h5ad, _uns_unpack, model_from_uns
 from .cme_toolbox import CMEModel, _HAS_RUST, _MODELS_2D, _format_direction, _PROTEIN_ODE, _CUSTOM_ODE
 from .reaction_network import ReactionNetworkWarning, IdentifiabilityWarning
 from ._core import _mc          # None when the compiled extension is not installed
@@ -326,7 +326,7 @@ def perform_inference(h5ad_filepath,
         inference_string = results[0].inference_string
         make_dir(inference_string)
         adata_file_path = inference_string + '/monod_adata.h5ad'
-        monod_adata.write_h5ad(adata_file_path)
+        write_h5ad(monod_adata, adata_file_path)
         log.info('Run stored to %s (load results with analysis.load_search_results).', adata_file_path)
 
     return monod_adata

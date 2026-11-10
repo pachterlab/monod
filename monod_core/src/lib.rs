@@ -3775,6 +3775,81 @@ impl SmallMat {
     }
 }
 
+/// Small dense complex matrix, row-major: the per-point exponential of the
+/// chromatin Magnus step.  Mirrors `monod.chromatin._expm_batched`.
+struct CSmallMat {
+    n: usize,
+    a: Vec<Complex64>,
+}
+
+const CSMALL_FACT: [f64; 17] = [1.0, 1.0, 2.0, 6.0, 24.0, 120.0, 720.0, 5040.0, 40320.0, 362880.0, 3628800.0,
+                                39916800.0, 479001600.0, 6227020800.0, 87178291200.0, 1307674368000.0, 20922789888000.0];
+
+impl CSmallMat {
+    fn zeros(n: usize) -> Self { CSmallMat { n, a: vec![Complex64::new(0.0, 0.0); n * n] } }
+    /// out = a · b (out distinct from a and b)
+    fn mul_into(a: &CSmallMat, b: &CSmallMat, out: &mut CSmallMat) {
+        let n = a.n;
+        for v in out.a.iter_mut() { *v = Complex64::new(0.0, 0.0); }
+        for i in 0..n {
+            for k in 0..n {
+                let aik = a.a[i * n + k];
+                for j in 0..n {
+                    out.a[i * n + j] += aik * b.a[k * n + j];
+                }
+            }
+        }
+    }
+    fn norm1(&self) -> f64 {
+        let n = self.n;
+        (0..n)
+            .map(|j| (0..n).map(|i| self.a[i * n + j].norm()).sum::<f64>())
+            .fold(0.0_f64, f64::max)
+    }
+    /// exp(self) into `r`: the matrix scaled to a 1-norm of at most 1, the
+    /// degree-16 Taylor polynomial by Paterson-Stockmeyer (seven products) and
+    /// squaring back; `w` holds five scratch matrices of the same size.
+    fn expm_into(&self, r: &mut CSmallMat, w: &mut [CSmallMat; 5]) {
+        let n = self.n;
+        let nrm = self.norm1();
+        let s = if nrm > 1.0 { nrm.log2().ceil() as i32 } else { 0 };
+        let sc = 0.5_f64.powi(s);
+        let [x, x2, x3, x4, t] = w;
+        for (xi, ai) in x.a.iter_mut().zip(self.a.iter()) { *xi = ai * sc; }
+        CSmallMat::mul_into(x, x, x2);
+        CSmallMat::mul_into(x2, x, x3);
+        CSmallMat::mul_into(x3, x, x4);
+        let inv = |k: usize| 1.0 / CSMALL_FACT[k];
+        for v in r.a.iter_mut() { *v = Complex64::new(0.0, 0.0); }
+        for i in 0..n { r.a[i * n + i] = Complex64::new(inv(16), 0.0); }
+        for j in (0..4).rev() {
+            let k = 4 * j;
+            CSmallMat::mul_into(r, x4, t);
+            for i in 0..n {
+                for l in 0..n {
+                    let idx = i * n + l;
+                    let eye = if i == l { inv(k) } else { 0.0 };
+                    r.a[idx] = t.a[idx] + (eye + x.a[idx] * inv(k + 1) + x2.a[idx] * inv(k + 2) + x3.a[idx] * inv(k + 3));
+                }
+            }
+        }
+        for _ in 0..s {
+            CSmallMat::mul_into(r, r, t);
+            r.a.copy_from_slice(&t.a);
+        }
+    }
+    /// out = self · v
+    #[inline(always)]
+    fn apply(&self, v: &[Complex64], out: &mut [Complex64]) {
+        let n = self.n;
+        for i in 0..n {
+            let mut s = Complex64::new(0.0, 0.0);
+            for j in 0..n { s += self.a[i * n + j] * v[j]; }
+            out[i] = s;
+        }
+    }
+}
+
 /// `[exp(A h), h φ_1(A h), …, h φ_k(A h)]` from one exponential of the block
 /// matrix `[[A h, I, 0, …], [0, 0, I, …], …]`: the φ-functions of the
 /// exponential integrators (`custom_step_ops` takes k = 2, the chromatin
@@ -4475,15 +4550,24 @@ fn eval_custom_network_pgf(
 //     dG/dsigma = H^T G + diag(A u(tau)) G,      sigma = T - tau,
 //
 // integrated forward from the horizon T, starting from the chain's stationary
-// distribution.  Each step is a Strang splitting of two exact sub-flows: the
-// diagonal transcription term, whose integral over the step is analytic
-// (exp(C tau_a) · delta phi_1(C delta)), and exp(H^T h), shared by the whole
-// grid.  The step is chosen by comparing a full step with two half steps
-// (maximum error over the grid, so the grid shares one schedule) and the
-// difference feeds a Richardson extrapolation.  The full step's exp(H^T h)
-// is the square of the half step's, and when the step doubles the previous
-// full-step exponential is the new half-step one, so a smooth stretch costs
-// one matrix product per step and no matrix exponential.
+// distribution.  Two steppers share one error control (a full step against two
+// half steps, maximum over the grid so the grid shares one schedule, the
+// difference feeding a Richardson extrapolation).  From the horizon down, while
+// the forcing changes slowly, each step is a midpoint Magnus step: the
+// transcription term is integrated along the characteristics over the step into
+// an exponent X[c, p] (analytically, exp(C tau_a) · delta phi_1(C delta), or by
+// Simpson's rule with bursts and with the protein layer) and the step is one
+// exponential of h H^T + diag(X[:, p]) per grid point, exact for a constant
+// forcing, so a slow protein's tail goes in steps of hundreds of locus clocks.
+// Once an accepted Magnus step falls under `h_switch` (Python: twenty chain
+// relaxation times) the forcing is fast and the per-point exponential no longer
+// pays: the rest of the way is a Strang splitting of two exact sub-flows, the
+// diagonal transcription term and exp(H^T h), shared by the whole grid, at a
+// hundredth of the cost per step.  The full step's exp(H^T h) is the square of
+// the half step's, and when the step doubles the previous full-step
+// exponential is the new half-step one, so a smooth Strang stretch costs one
+// matrix product per step and no matrix exponential.  The number of leading
+// Magnus steps is returned with the schedule and taken as given on a replay.
 //
 // Structure in the inputs is used when present (the Python side detects it):
 //   - one transcribed species: the exponent of every configuration is its
@@ -4493,7 +4577,8 @@ fn eval_custom_network_pgf(
 //     (the additive rule, or one transcript per site): n exponentials and
 //     one complex product per configuration instead of 2^n exponentials;
 //   - independent sites (H a Kronecker sum): exp(H^T h) is a product of 2 x 2
-//     factors applied bit by bit, 2 n N operations per point instead of N^2.
+//     factors applied bit by bit, 2 n N operations per point instead of N^2
+//     (Strang steps; the Magnus exponential is per point and dense).
 //
 // The grid is stored in blocks of CHROMATIN_BLOCK points, each block
 // state-major with separate real and imaginary planes (index c * B + i), so
@@ -4544,6 +4629,7 @@ struct ChromatinSys<'a> {
     n:     usize,                 // configurations
     m:     usize,                 // RNA species
     chain: ChromatinChain,
+    ht:    SmallMat,              // H^T dense, for the Magnus exponent
     a:     &'a [f64],             // (n, m) row-major mean production rates
     c:     SmallMat,              // (m, m) characteristic generator
     diag:  ChromatinDiag,
@@ -4650,6 +4736,8 @@ struct ProtTable {
     nodes: Vec<f64>,
     coef: Vec<Vec<ProtAff>>,      // [group][node]
     t_end: f64,
+    /// (the step cap came before the horizon, steps taken, time reached)
+    cap: (bool, usize, f64),
 }
 
 impl ProtTable {
@@ -4765,8 +4853,9 @@ fn prot_tabulate(p: ProtParams, u: &[Vec<Complex64>], n_grid: usize, n_pad: usiz
         n_steps += 1;
         h *= fac;
     }
+    let cap = (t < t_end, n_steps, t);
     let t_end = *nodes.last().unwrap();
-    ProtTable { p, u_p, group_of, nodes, coef, t_end }
+    ProtTable { p, u_p, group_of, nodes, coef, t_end, cap }
 }
 
 /// The diagonal sub-flow's operator for one half of a step, in the form the
@@ -4785,9 +4874,10 @@ struct DiagFlow {
     pquad: Option<Vec<(f64, Vec<(ProtRow, ProtRow)>)>>,
 }
 
-/// Step operators for a Strang step from time-to-go `tau` to `tau - h`:
-/// d1 over [tau - h/2, tau], E = exp(H^T h), d2 over [tau - h, tau - h/2].
-struct ChromatinOps { d1: DiagFlow, e: ChainExp, d2: DiagFlow }
+/// Step operators for a step from time-to-go `tau` to `tau - h`: the
+/// production exponents d1 over [tau - h/2, tau] and d2 over [tau - h, tau - h/2],
+/// E = exp(H^T h) (Strang) and the step itself (Magnus).
+struct ChromatinOps { d1: DiagFlow, e: ChainExp, d2: DiagFlow, h: f64 }
 
 /// ∫_{tau_a}^{tau_a+delta} exp(C s) ds = exp(C tau_a) · delta phi_1(C delta),
 /// phi_1 read off exp([[C delta, I], [0, 0]]).
@@ -4838,7 +4928,7 @@ fn chromatin_ops(sys: &ChromatinSys, tau: f64, h: f64, e: ChainExp) -> Chromatin
     let hh = 0.5 * h;
     let d1 = chromatin_diag_flow(sys, tau - hh, hh);
     let d2 = chromatin_diag_flow(sys, tau - h, hh);
-    ChromatinOps { d1, e, d2 }
+    ChromatinOps { d1, e, d2, h }
 }
 
 /// (exp(x))·(gr, gi) in place for x = xr + i xi.
@@ -4856,11 +4946,10 @@ fn cmul_exp(xr: f64, xi: f64, gr: &mut f64, gi: &mut f64) {
 #[inline(always)]
 fn cmul(ar: f64, ai: f64, br: f64, bi: f64) -> (f64, f64) { (ar * br - ai * bi, ar * bi + ai * br) }
 
-/// g *= exp(d · u) on one block; `sr`, `si`, `tr`, `ti` are scratch of n × B.
+/// The flow's input per species at every point of one block (m × B planes).
 #[inline]
-fn chromatin_diag(sys: &ChromatinSys, d: &DiagFlow, b0: usize, gr: &mut [f64], gi: &mut [f64],
-                  sr: &mut [f64], si: &mut [f64], tr: &mut [f64], ti: &mut [f64]) {
-    let (n, m, bw) = (sys.n, sys.m, CHROMATIN_BLOCK);
+fn chromatin_flow_input(sys: &ChromatinSys, d: &DiagFlow, b0: usize) -> (Vec<f64>, Vec<f64>) {
+    let (m, bw) = (sys.m, CHROMATIN_BLOCK);
     // the flow's input per species at every point of the block: u itself, or
     // the burst integral Σ_k w_k φ(e^{C s_k} u) with φ(U) = U / (1 - b U)
     let mut xr = vec![0.0; m * bw];
@@ -4919,6 +5008,15 @@ fn chromatin_diag(sys: &ChromatinSys, d: &DiagFlow, b0: usize, gr: &mut [f64], g
             }
         }
     }
+    (xr, xi)
+}
+
+/// g *= exp(d · u) on one block; `sr`, `si`, `tr`, `ti` are scratch of n × B.
+#[inline]
+fn chromatin_diag(sys: &ChromatinSys, d: &DiagFlow, b0: usize, gr: &mut [f64], gi: &mut [f64],
+                  sr: &mut [f64], si: &mut [f64], tr: &mut [f64], ti: &mut [f64]) {
+    let (n, m, bw) = (sys.n, sys.m, CHROMATIN_BLOCK);
+    let (xr, xi) = chromatin_flow_input(sys, d, b0);
     // y[r] = Σ_l coef[r, l] x_l at every point of the block, written to (sr, si) row r
     let dots = |coef: &[f64], rows: usize, sr: &mut [f64], si: &mut [f64]| {
         for r in 0..rows {
@@ -5058,11 +5156,106 @@ fn chromatin_step_block(sys: &ChromatinSys, ops: &ChromatinOps, b0: usize,
     chromatin_diag(sys, &ops.d2, b0, gr, gi, sr, si, tr, ti);
 }
 
-/// Trial step on block `b`: writes the Richardson-extrapolated result to
-/// `out` and returns the block's maximum difference between the full step
-/// and the two half steps.
+/// X[c, i] += the production exponent of the flow `d` at every point of one
+/// block, into the planes (xr_out, xi_out) of n × B; `sr`, `si` are scratch of n × B.
+#[inline]
+fn chromatin_exponent(sys: &ChromatinSys, d: &DiagFlow, b0: usize, xr_out: &mut [f64], xi_out: &mut [f64],
+                      sr: &mut [f64], si: &mut [f64]) {
+    let (n, m, bw) = (sys.n, sys.m, CHROMATIN_BLOCK);
+    let (xr, xi) = chromatin_flow_input(sys, d, b0);
+    let dots = |coef: &[f64], rows: usize, sr: &mut [f64], si: &mut [f64]| {
+        for r in 0..rows {
+            for i in 0..bw {
+                let (mut yr, mut yi) = (0.0, 0.0);
+                for l in 0..m {
+                    let k = coef[r * m + l];
+                    yr += k * xr[l * bw + i];
+                    yi += k * xi[l * bw + i];
+                }
+                sr[r * bw + i] = yr;
+                si[r * bw + i] = yi;
+            }
+        }
+    };
+    match (&d.coef, &sys.diag) {
+        (DiagOps::General(k), _) => {
+            dots(k, n, sr, si);
+            for idx in 0..n * bw {
+                xr_out[idx] += sr[idx];
+                xi_out[idx] += si[idx];
+            }
+        }
+        (DiagOps::Shared(row), ChromatinDiag::Shared { group, distinct, .. }) => {
+            dots(row, 1, sr, si);                                   // z at every point in row 0
+            for c in 0..n {
+                let a = distinct[group[c]];
+                if a == 0.0 { continue; }
+                for i in 0..bw {
+                    xr_out[c * bw + i] += a * sr[i];
+                    xi_out[c * bw + i] += a * si[i];
+                }
+            }
+        }
+        (DiagOps::Factored(wm), ChromatinDiag::Factored { n_sites, .. }) => {
+            let ns = *n_sites;
+            dots(wm, ns, sr, si);                                   // y_j at every point, rows 0..ns
+            // X_c = Σ_{j in c} y_j by one sum per configuration (parent = c without its lowest bit)
+            let mut acc_r = vec![0.0; n * bw];
+            let mut acc_i = vec![0.0; n * bw];
+            for c in 1..n {
+                let j = c.trailing_zeros() as usize;
+                let parent = c & (c - 1);
+                for i in 0..bw {
+                    acc_r[c * bw + i] = acc_r[parent * bw + i] + sr[j * bw + i];
+                    acc_i[c * bw + i] = acc_i[parent * bw + i] + si[j * bw + i];
+                }
+            }
+            for idx in 0..n * bw {
+                xr_out[idx] += acc_r[idx];
+                xi_out[idx] += acc_i[idx];
+            }
+        }
+        _ => unreachable!("diagonal operator does not match the system's mode"),
+    }
+}
+
+/// One Magnus step on a block, in place: g_i <- exp(h H^T + diag X_i) g_i at every
+/// point, X the production exponent over the whole step (`sr`, `si`, `xr`, `xi`
+/// scratch of n × B).
+#[inline]
+fn chromatin_magnus_block(sys: &ChromatinSys, ops: &ChromatinOps, b0: usize,
+                          gr: &mut [f64], gi: &mut [f64],
+                          sr: &mut [f64], si: &mut [f64], xr: &mut [f64], xi: &mut [f64]) {
+    let (n, bw) = (sys.n, CHROMATIN_BLOCK);
+    for v in xr.iter_mut() { *v = 0.0; }
+    for v in xi.iter_mut() { *v = 0.0; }
+    chromatin_exponent(sys, &ops.d1, b0, xr, xi, sr, si);
+    chromatin_exponent(sys, &ops.d2, b0, xr, xi, sr, si);
+    let mut mm = CSmallMat::zeros(n);
+    let mut ex = CSmallMat::zeros(n);
+    let mut work = [CSmallMat::zeros(n), CSmallMat::zeros(n), CSmallMat::zeros(n), CSmallMat::zeros(n), CSmallMat::zeros(n)];
+    let mut g = vec![Complex64::new(0.0, 0.0); n];
+    let mut out = vec![Complex64::new(0.0, 0.0); n];
+    for i in 0..bw {
+        for r in 0..n {
+            for c in 0..n { mm.a[r * n + c] = Complex64::new(ops.h * sys.ht.get(r, c), 0.0); }
+            mm.a[r * n + r] += Complex64::new(xr[r * bw + i], xi[r * bw + i]);
+            g[r] = Complex64::new(gr[r * bw + i], gi[r * bw + i]);
+        }
+        mm.expm_into(&mut ex, &mut work);
+        ex.apply(&g, &mut out);
+        for r in 0..n {
+            gr[r * bw + i] = out[r].re;
+            gi[r * bw + i] = out[r].im;
+        }
+    }
+}
+
+/// Trial step on block `b` with the Magnus or the Strang stepper: writes the
+/// Richardson-extrapolated result to `out` and returns the block's maximum
+/// difference between the full step and the two half steps.
 fn chromatin_trial_block(
-    sys: &ChromatinSys, full: &ChromatinOps, half1: &ChromatinOps, half2: &ChromatinOps,
+    sys: &ChromatinSys, full: &ChromatinOps, half1: &ChromatinOps, half2: &ChromatinOps, magnus: bool,
     b: usize, gr: &[f64], gi: &[f64], outr: &mut [f64], outi: &mut [f64],
 ) -> f64 {
     let len = gr.len();
@@ -5071,9 +5264,15 @@ fn chromatin_trial_block(
     let mut g2r = gr.to_vec(); let mut g2i = gi.to_vec();
     let mut sr = vec![0.0; len]; let mut si = vec![0.0; len];
     let mut tr = vec![0.0; len]; let mut ti = vec![0.0; len];
-    chromatin_step_block(sys, full, b0, &mut g1r, &mut g1i, &mut sr, &mut si, &mut tr, &mut ti);
-    chromatin_step_block(sys, half1, b0, &mut g2r, &mut g2i, &mut sr, &mut si, &mut tr, &mut ti);
-    chromatin_step_block(sys, half2, b0, &mut g2r, &mut g2i, &mut sr, &mut si, &mut tr, &mut ti);
+    if magnus {
+        chromatin_magnus_block(sys, full, b0, &mut g1r, &mut g1i, &mut sr, &mut si, &mut tr, &mut ti);
+        chromatin_magnus_block(sys, half1, b0, &mut g2r, &mut g2i, &mut sr, &mut si, &mut tr, &mut ti);
+        chromatin_magnus_block(sys, half2, b0, &mut g2r, &mut g2i, &mut sr, &mut si, &mut tr, &mut ti);
+    } else {
+        chromatin_step_block(sys, full, b0, &mut g1r, &mut g1i, &mut sr, &mut si, &mut tr, &mut ti);
+        chromatin_step_block(sys, half1, b0, &mut g2r, &mut g2i, &mut sr, &mut si, &mut tr, &mut ti);
+        chromatin_step_block(sys, half2, b0, &mut g2r, &mut g2i, &mut sr, &mut si, &mut tr, &mut ti);
+    }
     let mut err = 0.0_f64;
     for i in 0..len {
         let (dr, di) = (g2r[i] - g1r[i], g2i[i] - g1i[i]);
@@ -5084,10 +5283,14 @@ fn chromatin_trial_block(
     err
 }
 
+/// The integration: Magnus steps from the horizon down while the accepted step
+/// stays at or above `h_switch`, then Strang steps; a replay (`fixed`) takes
+/// its first `fixed_magnus` steps with the Magnus stepper.  Returns the planes,
+/// the schedule and the number of leading Magnus steps.
 fn chromatin_pgf(
     sys: &ChromatinSys, w: &[f64], n_blocks: usize, t_horizon: f64, h_first: f64, h_min: f64, tol: f64,
-    fixed: Option<&[f64]>,
-) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    fixed: Option<&[f64]>, fixed_magnus: usize, h_switch: f64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, usize) {
     let (n, bw) = (sys.n, CHROMATIN_BLOCK);
     let blen = n * bw;
     let mut gr: Vec<f64> = (0..n_blocks).flat_map(|_| (0..n).flat_map(|c| std::iter::repeat(w[c]).take(bw))).collect();
@@ -5097,9 +5300,11 @@ fn chromatin_pgf(
     let par = n * n_blocks * bw >= CHROMATIN_PAR_MIN;
     let adaptive = fixed.is_none();
     let mut steps: Vec<f64> = Vec::new();
+    let mut n_magnus = 0usize;
+    let mut magnus = true;
     let mut tau = t_horizon;
-    let mut h = h_first;
-    let mut last_e: Option<(f64, ChainExp)> = None;      // the last accepted step's (h, exp(H^T h))
+    let mut h = if adaptive { h_first.max(h_switch.min(t_horizon)) } else { h_first };
+    let mut last_e: Option<(f64, ChainExp)> = None;      // the last accepted Strang step's (h, exp(H^T h))
     loop {
         if adaptive {
             if tau <= 0.0 || steps.len() >= CHROMATIN_MAX_STEPS { break; }
@@ -5108,26 +5313,31 @@ fn chromatin_pgf(
             let f = fixed.unwrap();
             if steps.len() >= f.len() { break; }
             h = f[steps.len()];
+            magnus = steps.len() < fixed_magnus;
         }
         let hh = 0.5 * h;
-        let e_half = match &last_e {
-            Some((hl, el)) if *hl == hh => el.clone(),
-            _ => sys.chain.expm(hh),
+        let e_half = if magnus {
+            ChainExp::Dense(SmallMat::zeros(0))                 // unused by the Magnus step
+        } else {
+            match &last_e {
+                Some((hl, el)) if *hl == hh => el.clone(),
+                _ => sys.chain.expm(hh),
+            }
         };
-        let full = chromatin_ops(sys, tau, h, e_half.square());
+        let full = chromatin_ops(sys, tau, h, if magnus { ChainExp::Dense(SmallMat::zeros(0)) } else { e_half.square() });
         let half1 = chromatin_ops(sys, tau, hh, e_half.clone());
         let half2 = chromatin_ops(sys, tau - hh, hh, e_half);
         let err = if par {
             outr.par_chunks_mut(blen).zip(outi.par_chunks_mut(blen))
                 .zip(gr.par_chunks(blen).zip(gi.par_chunks(blen)))
                 .enumerate()
-                .map(|(b, ((or_, oi), (sr, si)))| chromatin_trial_block(sys, &full, &half1, &half2, b, sr, si, or_, oi))
+                .map(|(b, ((or_, oi), (sr, si)))| chromatin_trial_block(sys, &full, &half1, &half2, magnus, b, sr, si, or_, oi))
                 .reduce(|| 0.0_f64, f64::max)
         } else {
             let mut e = 0.0_f64;
             for b in 0..n_blocks {
                 let r = b * blen..(b + 1) * blen;
-                e = e.max(chromatin_trial_block(sys, &full, &half1, &half2, b, &gr[r.clone()], &gi[r.clone()],
+                e = e.max(chromatin_trial_block(sys, &full, &half1, &half2, magnus, b, &gr[r.clone()], &gi[r.clone()],
                                                 &mut outr[r.clone()], &mut outi[r]));
             }
             e
@@ -5141,12 +5351,20 @@ fn chromatin_pgf(
         }
         std::mem::swap(&mut gr, &mut outr);
         std::mem::swap(&mut gi, &mut outi);
-        last_e = Some((h, full.e));
+        if !magnus { last_e = Some((h, full.e)); }
         tau -= h;
         steps.push(h);
-        if adaptive { h *= fac; }
+        if magnus { n_magnus += 1; }
+        if adaptive {
+            if magnus && h < h_switch {
+                magnus = false;                                  // the forcing is fast now: Strang, from its own first step
+                h = h_first;
+            } else {
+                h *= fac;
+            }
+        }
     }
-    (gr, gi, steps)
+    (gr, gi, steps, n_magnus)
 }
 
 /// Vector generating function of the chromatin model on the half-spectrum
@@ -5162,10 +5380,17 @@ fn chromatin_pgf(
 /// adds the protein layer downstream of the mature RNA: `c` must be the
 /// nascent/mature scheme, `u_re`/`u_im` carry a third row (the protein's
 /// argument), and the characteristics are tabulated with the protein
-/// integrator's step under those three controls.  Returns `(re, im,
-/// mesh_shape, steps)` with G point-major: index `p * n_states + c`.
+/// integrator's step under those three controls.  `magnus_steps` is the
+/// number of leading Magnus steps of a replayed schedule; `h_switch` the step
+/// below which the adaptive run hands over from the Magnus to the Strang
+/// stepper (0 keeps Magnus throughout).  Returns `(re, im, mesh_shape, steps,
+/// table, n_magnus)` with G point-major (index `p * n_states + c`), `table =
+/// (capped, steps, time reached)` of the characteristics' tabulation when
+/// there is a protein layer (`capped` when its step cap came before the
+/// horizon, so the forcing was held constant beyond it) and `n_magnus` the
+/// number of leading Magnus steps taken.
 #[pyfunction]
-#[pyo3(signature = (n_states, n_species, h, a, c, limits, w, t_horizon, h_first, h_min, tol, fixed_schedule=None, site_weights=None, independent=None, u_re=None, u_im=None, burst=None, protein=None))]
+#[pyo3(signature = (n_states, n_species, h, a, c, limits, w, t_horizon, h_first, h_min, tol, fixed_schedule=None, site_weights=None, independent=None, u_re=None, u_im=None, burst=None, protein=None, magnus_steps=None, h_switch=None))]
 fn eval_chromatin_pgf(
     py:             Python<'_>,
     n_states:       usize,
@@ -5186,8 +5411,14 @@ fn eval_chromatin_pgf(
     u_im:           Option<Vec<f64>>,
     burst:          Option<f64>,
     protein:        Option<(f64, f64, f64, f64, f64)>,
-) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>, Vec<f64>)> {
+    magnus_steps:   Option<usize>,
+    h_switch:       Option<f64>,
+) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>, Vec<f64>, Option<(bool, usize, f64)>, usize)> {
     let (n, m) = (n_states, n_species);
+    let h_switch = h_switch.unwrap_or(0.0);
+    if !(h_switch >= 0.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: h_switch must be non-negative"));
+    }
     if let Some(b) = burst {
         if !(b > 0.0) || !b.is_finite() {
             return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: burst must be a positive number"));
@@ -5229,7 +5460,7 @@ fn eval_chromatin_pgf(
             return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: independent must hold (k_on, k_off) per site"));
         }
     }
-    let (re, im, mx, steps) = py.allow_threads(|| {
+    let (re, im, mx, steps, table, n_magnus) = py.allow_threads(|| {
         // the PGF arguments: the half-spectrum mesh of `limits`, or the caller's
         // (already transformed by a sequencing-noise model)
         let mesh = match (&u_re, &u_im) {
@@ -5251,18 +5482,16 @@ fn eval_chromatin_pgf(
             let p = ProtParams { beta: -c[0], gamma: -c[3], k_p, gamma_p };
             prot_tabulate(p, u, n_grid, n_blocks * bw, t_horizon, hf, hm, ptol)
         });
+        let mut ht = SmallMat::zeros(n);
+        for i in 0..n {
+            for j in 0..n { ht.set(i, j, h[j * n + i]); }
+        }
         let chain = match &independent {
             Some(ind) => ChromatinChain::Kron((0..n_sites).map(|j| {
                 let (kon, koff) = (ind[2 * j], ind[2 * j + 1]);
                 SmallMat { n: 2, a: vec![-kon, koff, kon, -koff] }      // transposed 2 × 2 generator
             }).collect()),
-            None => {
-                let mut ht = SmallMat::zeros(n);
-                for i in 0..n {
-                    for j in 0..n { ht.set(i, j, h[j * n + i]); }
-                }
-                ChromatinChain::Dense(ht)
-            }
+            None => ChromatinChain::Dense(ht.clone()),
         };
         let diag = if let Some(sw) = site_weights {
             ChromatinDiag::Factored { n_sites, w: sw }
@@ -5285,8 +5514,10 @@ fn eval_chromatin_pgf(
             }
         };
         let cm = SmallMat { n: m, a: c.clone() };
-        let sys = ChromatinSys { n, m, chain, a: &a, c: cm, diag, burst, ur, ui, protein: prot };
-        let (gr, gi, steps) = chromatin_pgf(&sys, &w, n_blocks, t_horizon, h_first, h_min, tol, fixed_schedule.as_deref());
+        let sys = ChromatinSys { n, m, chain, ht, a: &a, c: cm, diag, burst, ur, ui, protein: prot };
+        let (gr, gi, steps, n_magnus) = chromatin_pgf(&sys, &w, n_blocks, t_horizon, h_first, h_min, tol,
+                                                      fixed_schedule.as_deref(), magnus_steps.unwrap_or(0), h_switch);
+        let table = sys.protein.as_ref().map(|pt| pt.cap);
         // back to point-major (p * n + c)
         let mut re = vec![0.0; n_grid * n];
         let mut im = vec![0.0; n_grid * n];
@@ -5297,9 +5528,9 @@ fn eval_chromatin_pgf(
                 im[p * n + cc] = gi[b * n * bw + cc * bw + i];
             }
         }
-        (re, im, mx, steps)
+        (re, im, mx, steps, table, n_magnus)
     });
-    Ok((re, im, mx, steps))
+    Ok((re, im, mx, steps, table, n_magnus))
 }
 
 // ============================================================================

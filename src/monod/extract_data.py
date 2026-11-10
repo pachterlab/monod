@@ -513,6 +513,21 @@ def combine_chunks(chunk_dir, output_file):
     return output_file
 
 
+def write_h5ad(adata, path):
+    """``adata.write_h5ad(path)`` for the AnnData objects monod returns.
+
+    pandas 3 stores ``obs_names`` and ``var_names`` as nullable strings, which
+    anndata 0.11 and later refuse to write unless told that readers older than
+    0.11 need not open the file; this sets that for the write and nothing else.
+    """
+    settings = getattr(ad, "settings", None)
+    if settings is not None and hasattr(settings, "allow_write_nullable_strings"):
+        with settings.override(allow_write_nullable_strings=True):
+            adata.write_h5ad(path)
+    else:
+        adata.write_h5ad(path)
+
+
 def import_h5ad(filename):
     """Read an h5ad file in backed mode, making duplicate gene names unique."""
     with warnings.catch_warnings():

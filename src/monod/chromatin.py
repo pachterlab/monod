@@ -21,12 +21,23 @@ state = c]``.  Along the characteristics ``u(tau)`` of the RNA part
 
 integrated forward from a horizon ``T`` beyond which the forcing is negligible,
 starting from the chain's stationary distribution (no RNA in the far past).
-:func:`eval_joint_pss` integrates this with a Strang splitting of two exact
-sub-flows, the diagonal transcription term (its integral over a step is
-analytic) and ``exp(H^T h)`` (one matrix exponential per step shared by the
-whole grid), with the step chosen by error control across the grid and
-Richardson extrapolation, as in :mod:`monod.reaction_network`.  Each
-configuration's component is then inverted by an FFT over the count axes.
+:func:`eval_joint_pss` integrates this with two steppers under one error
+control (a full step against two half steps across the grid, Richardson
+extrapolation, as in :mod:`monod.reaction_network`).  From the horizon down,
+while the forcing changes slowly, the step is one exponential of
+``h H^T + diag(X)`` per grid point, the midpoint Magnus rule with ``X`` the
+transcription term integrated along the characteristics over the step: exact
+for a constant forcing, it takes steps of hundreds of locus clocks in the tail
+of a slow protein, where the Strang splitting below is held to about one
+clock by the commutator of its two terms.  Once the accepted Magnus step falls
+under ``_MAGNUS_MIN_STEP`` chain relaxation times the forcing is fast and the
+per-point exponential no longer pays: the rest of the way is a Strang
+splitting of two exact sub-flows, the diagonal transcription term and
+``exp(H^T h)`` (one matrix exponential per step shared by the whole grid), at
+a hundredth of the cost per step.  The schedule records the switch
+(``StepSchedule.magnus``) so a replay takes the same steps with the same
+stepper.  Each configuration's component is then inverted by an FFT over
+the count axes.
 
 The integration runs in Rust (``monod_core.eval_chromatin_pgf``) when the
 extension is installed and in NumPy otherwise; both follow the same scheme
@@ -38,7 +49,10 @@ loci and loci to genes) follows.
 """
 from __future__ import annotations
 
+import math
 from typing import Optional, Sequence, Tuple
+
+import warnings
 
 import numpy as np
 from scipy.fft import irfftn
@@ -50,6 +64,8 @@ _TOL = 1e-5            # per-step error target on the generating function; with 
                        # extrapolation the error on P is about tol/100 (1e-7 here), tighter than the
                        # custom-network kernel at its 1e-6, at half the steps of tol = 1e-6
 _C0 = 0.05             # first step as a fraction of the fastest time scale
+_MAGNUS_MIN_STEP = 20.0  # a Magnus step costs about this many Strang steps on four configurations (n^3 against n^2 per
+                         # point); below this many chain relaxation times, scaled by N / 4, it hands over to Strang
 _MAX_STEPS = 20_000
 
 _expm = ReactionNetwork._expm
@@ -420,6 +436,9 @@ class _ProteinCharacteristics:
         self.V = np.asarray(V)
         self.W = np.asarray(W)
         self.T = float(self.nodes[-1])
+        self.capped = n_steps >= _MAX_STEPS and t < T
+        if self.capped:
+            _warn_table_cap(n_steps, t, T)
 
     def _derivatives(self, k):
         """``(v', w')`` at node ``k`` from the equations."""
@@ -568,6 +587,8 @@ def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
         T = float(np.sum(np.asarray(fixed_schedule, dtype=float)))   # replay over the schedule's own horizon
     h_first = _C0 / lam_fast
     h_min = 1e-12 / lam_fast
+    lam_chain = float(np.abs(np.diag(H)).max())
+    h_switch = (_MAGNUS_MIN_STEP * N / 4.0) / lam_chain if lam_chain > 0 else np.inf   # Magnus above it, Strang below
     if backend is None:
         backend = "rust" if _rust_available(protein is not None) else "python"
     if backend == "rust":
@@ -579,7 +600,7 @@ def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
         if protein is not None:
             lam_p = max(beta, gamma + 2.0 * k_p, gamma_p)              # the tabulation's own controls, as in Python
             prot = (k_p, gamma_p, _C0 / lam_p, 1e-12 / lam_p, 0.1 * tol)
-        re, im, _, steps = _mc.eval_chromatin_pgf(
+        out = _mc.eval_chromatin_pgf(
             N, m, H.ravel().tolist(), A.ravel().tolist(), C.ravel().tolist(),
             [1] * m, w.tolist(), float(T), float(h_first), float(h_min), float(tol),
             None if fixed_schedule is None else [float(x) for x in np.asarray(fixed_schedule, dtype=float)],
@@ -587,7 +608,12 @@ def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
             independent,
             u.real.ravel().tolist(), u.imag.ravel().tolist(),
             None if burst is None else float(burst),
-            prot)
+            prot,
+            None if fixed_schedule is None else int(getattr(fixed_schedule, "magnus", 0)),
+            float(h_switch))
+        re, im, _, steps, table, n_magnus = out
+        if table is not None and table[0]:                                   # (capped, steps taken, time reached)
+            _warn_table_cap(int(table[1]), float(table[2]), T)
         G = (np.asarray(re) + 1j * np.asarray(im)).reshape(P, N).T
         steps = list(steps)
     elif backend == "python":
@@ -597,11 +623,11 @@ def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
             chars = _LinearCharacteristics(C, u)
         else:
             chars = _ProteinCharacteristics(beta, gamma, k_p, gamma_p, u, T, 0.1 * tol)
-        G, steps = _integrate_numpy(HT, A, chars, G, T, h_first, h_min, tol, fixed_schedule,
-                                    None if burst is None else float(burst))
+        G, steps, n_magnus = _integrate_numpy(HT, A, chars, G, T, h_first, h_min, tol, fixed_schedule,
+                                              None if burst is None else float(burst), h_switch=h_switch)
     else:
         raise ValueError(f"backend must be 'rust', 'python' or None, got {backend!r}")
-    return G, StepSchedule(steps)
+    return G, StepSchedule(steps, magnus=n_magnus)
 
 
 def invert_joint_pgf(G: np.ndarray, mesh_shape: Sequence[int], limits: Sequence[int]) -> np.ndarray:
@@ -686,17 +712,95 @@ def _step(G, ops):
     return np.exp(X2) * G
 
 
-def _integrate_numpy(HT, A, chars, G, T, h_first, h_min, tol, fixed_schedule, burst=None):
-    """NumPy mirror of ``monod_core.eval_chromatin_pgf``: Strang steps with step
-    doubling and Richardson extrapolation; returns ``(G, steps)``.  The two
-    half steps share one ``exp(H^T h/2)``, the full step uses its square, and
-    when the step doubles the previous full-step exponential is reused.
-    ``chars`` provides the RNA characteristics (see :func:`_production_exponent`)."""
+def _warn_table_cap(n_steps: int, t: float, T: float) -> None:
+    warnings.warn(f"Chromatin characteristic table reached its cap of {n_steps} steps at time {t:.4g} of the horizon "
+                  f"{T:.4g}; the forcing is held constant beyond it. Loosen the tolerance or raise "
+                  "monod.chromatin._MAX_STEPS.", RuntimeWarning, stacklevel=3)
+
+
+def _production_exponents(A, chars, tau, h, burst):
+    """``X[c, p]`` of the step from time-to-go ``tau`` to ``tau - h``: the
+    production exponents of the two half steps, summed (Simpson's rule panel
+    by panel; the Rust kernel forms the same two panels)."""
+    hh = 0.5 * h
+    return _production_exponent(A, chars, tau - hh, hh, burst) + _production_exponent(A, chars, tau - h, hh, burst)
+
+
+_FACT = [float(math.factorial(k)) for k in range(17)]
+
+
+def _bmm(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """``a[p] @ b[p]`` for stacks of small matrices, summed over the inner index
+    in order from the first, as the Rust loops do; a BLAS product may sum in
+    another order, and the Magnus exponential's squarings amplify the last bit
+    of rounding into the step control, which must take the same decisions on
+    both backends."""
+    n = a.shape[1]
+    r = a[:, :, 0, None] * b[:, None, 0, :]
+    for k in range(1, n):
+        r = r + a[:, :, k, None] * b[:, None, k, :]
+    return r
+
+
+def _expm_batched(M: np.ndarray) -> np.ndarray:
+    """``exp(M[p])`` for a stack ``(P, n, n)`` of small complex matrices: each
+    matrix scaled to a 1-norm of at most 1, the degree-16 Taylor polynomial by
+    Paterson-Stockmeyer (seven products) and squaring back.  The algorithm of
+    the Rust ``CSmallMat::expm_into``, operation for operation and in the same
+    order, so the two kernels agree to the last bit."""
+    P, n, _ = M.shape
+    absm = np.abs(M)
+    colsum = absm[:, 0, :]
+    for i in range(1, n):
+        colsum = colsum + absm[:, i, :]
+    nrm = colsum.max(axis=1)
+    s = np.where(nrm > 1.0, np.ceil(np.log2(np.maximum(nrm, 1e-300))), 0.0).astype(int)
+    x = M * (0.5 ** s)[:, None, None]
+    eye = np.broadcast_to(np.eye(n, dtype=np.complex128), (P, n, n))
+    x2 = _bmm(x, x)
+    x3 = _bmm(x2, x)
+    x4 = _bmm(x3, x)
+    r = eye * (1.0 / _FACT[16])
+    for j in (3, 2, 1, 0):
+        k = 4 * j
+        r = _bmm(r, x4) + (eye * (1.0 / _FACT[k]) + x * (1.0 / _FACT[k + 1]) + x2 * (1.0 / _FACT[k + 2]) + x3 * (1.0 / _FACT[k + 3]))
+    for j in range(int(s.max()) if P else 0):
+        more = s > j
+        r[more] = _bmm(r[more], r[more])
+    return r
+
+
+def _magnus_step(HT, X, G, h):
+    """``G[:, p] <- exp(h H^T + diag(X[:, p])) G[:, p]``, the midpoint Magnus
+    step: exact when the forcing is constant over the step, so the step is
+    limited by the forcing's change over it and not, as the Strang splitting
+    is, by the commutator of the chain and the transcription term."""
+    N, P = X.shape
+    M = np.broadcast_to((h * HT).astype(np.complex128)[None], (P, N, N)).copy()
+    M[:, np.arange(N), np.arange(N)] += X.T
+    E = _expm_batched(M)
+    out = E[:, :, 0] * G[0][:, None]
+    for j in range(1, N):
+        out = out + E[:, :, j] * G[j][:, None]
+    return out.T
+
+
+def _integrate_numpy(HT, A, chars, G, T, h_first, h_min, tol, fixed_schedule, burst=None, h_switch=0.0):
+    """NumPy mirror of ``monod_core.eval_chromatin_pgf``: Magnus steps from the
+    horizon down while the accepted step stays at or above ``h_switch``, then
+    Strang steps, both under step doubling and Richardson extrapolation;
+    returns ``(G, steps, n_magnus)`` with ``n_magnus`` the number of leading
+    Magnus steps.  A replay (``fixed_schedule``) takes the recorded stepper
+    for each step (``StepSchedule.magnus``).  ``chars`` provides the RNA
+    characteristics (see :func:`_production_exponent`)."""
     adaptive = fixed_schedule is None
+    fixed_magnus = 0 if adaptive else int(getattr(fixed_schedule, "magnus", 0))
     steps = []
+    n_magnus = 0
     tau = T
-    h = h_first
-    last_E = None                                           # (h, exp(H^T h)) of the last accepted step
+    magnus = True
+    h = max(h_first, min(h_switch, T)) if adaptive else h_first
+    last_E = None                                           # (h, exp(H^T h)) of the last accepted Strang step
     while True:
         if adaptive:
             if tau <= 0 or len(steps) >= _MAX_STEPS:
@@ -706,13 +810,19 @@ def _integrate_numpy(HT, A, chars, G, T, h_first, h_min, tol, fixed_schedule, bu
             if len(steps) >= len(fixed_schedule):
                 break
             h = float(np.asarray(fixed_schedule)[len(steps)])
+            magnus = len(steps) < fixed_magnus
         hh = 0.5 * h
-        E_half = last_E[1] if last_E is not None and last_E[0] == hh else _expm(HT * hh)
-        full = _ops(A, chars, tau, h, E_half @ E_half, burst)
-        half1 = _ops(A, chars, tau, hh, E_half, burst)
-        half2 = _ops(A, chars, tau - hh, hh, E_half, burst)
-        G1 = _step(G, full)
-        G2 = _step(_step(G, half1), half2)
+        if magnus:
+            G1 = _magnus_step(HT, _production_exponents(A, chars, tau, h, burst), G, h)
+            Gm = _magnus_step(HT, _production_exponents(A, chars, tau, hh, burst), G, hh)
+            G2 = _magnus_step(HT, _production_exponents(A, chars, tau - hh, hh, burst), Gm, hh)
+        else:
+            E_half = last_E[1] if last_E is not None and last_E[0] == hh else _expm(HT * hh)
+            full = _ops(A, chars, tau, h, E_half @ E_half, burst)
+            half1 = _ops(A, chars, tau, hh, E_half, burst)
+            half2 = _ops(A, chars, tau - hh, hh, E_half, burst)
+            G1 = _step(G, full)
+            G2 = _step(_step(G, half1), half2)
         diff = G2 - G1
         if adaptive:
             err = float(np.abs(diff).max())
@@ -721,12 +831,19 @@ def _integrate_numpy(HT, A, chars, G, T, h_first, h_min, tol, fixed_schedule, bu
                 h = fac
                 continue
         G = G2 + diff / 3.0                                 # Richardson
-        last_E = (h, full[1])
+        if not magnus:
+            last_E = (h, full[1])
         tau -= h
         steps.append(h)
+        if magnus:
+            n_magnus += 1
         if adaptive:
-            h *= fac
-    return G, steps
+            if magnus and h < h_switch:
+                magnus = False                              # the forcing is fast now: Strang, from its own first step
+                h = h_first
+            else:
+                h *= fac
+    return G, steps, n_magnus
 
 
 def apply_dropout(pss: np.ndarray, n_sites: int, p_drop) -> np.ndarray:

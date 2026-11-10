@@ -1051,16 +1051,20 @@ def _phi_ops(A: np.ndarray, h: float, k: int) -> List[np.ndarray]:
 
 
 class StepSchedule:
-    """Accepted step sizes of one custom-network integration, with the delay
-    lengths (breakpoints) they were recorded at.  Behaves as the 1-D array of
-    steps; replaying it at other delays warps the time axis so every knot keeps
-    its position relative to the delays (see ``_warp_schedule``)."""
+    """Accepted step sizes of one integration, with the delay lengths
+    (breakpoints) a custom network recorded them at and, for the chromatin
+    kernel, the number of leading steps its exponential (Magnus) stepper took
+    before the Strang stepper (``magnus``; see :mod:`monod.chromatin`).
+    Behaves as the 1-D array of steps; replaying it at other delays warps the
+    time axis so every knot keeps its position relative to the delays (see
+    ``_warp_schedule``)."""
 
-    __slots__ = ("steps", "breakpoints")
+    __slots__ = ("steps", "breakpoints", "magnus")
 
-    def __init__(self, steps, breakpoints=()) -> None:
+    def __init__(self, steps, breakpoints=(), magnus=0) -> None:
         self.steps = np.asarray(steps, dtype=float)
         self.breakpoints = tuple(float(b) for b in breakpoints)
+        self.magnus = int(magnus)
 
     @property
     def size(self) -> int:
@@ -1079,7 +1083,7 @@ class StepSchedule:
         return self.steps if dtype is None else self.steps.astype(dtype)
 
     def copy(self) -> "StepSchedule":
-        return StepSchedule(self.steps.copy(), self.breakpoints)
+        return StepSchedule(self.steps.copy(), self.breakpoints, self.magnus)
 
     @property
     def times(self) -> np.ndarray:
@@ -1087,7 +1091,8 @@ class StepSchedule:
         return np.cumsum(self.steps)
 
     def __repr__(self) -> str:
-        return f"StepSchedule({self.size} steps, breakpoints={self.breakpoints})"
+        extra = f", magnus={self.magnus}" if self.magnus else ""
+        return f"StepSchedule({self.size} steps, breakpoints={self.breakpoints}{extra})"
 
 
 def _warp_schedule(steps: np.ndarray, base, new) -> np.ndarray:

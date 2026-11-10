@@ -232,3 +232,24 @@ def test_rejection_index_survives_round_trip():
     assert back.rejection_index == 0 and back.sigma_index == 0
     kept = back.get_bool_filt(None, discard_rejected=True)
     assert kept.tolist() == [True, False, True, False]
+
+
+class TestWriteH5ad:
+    def test_write_h5ad_accepts_nullable_string_indexes(self, tmp_path):
+        """pandas 3 stores obs_names and var_names as nullable strings, which anndata 0.11+
+        refuses to write unless told; monod's write tells it for the write only."""
+        import pandas as pd
+        from monod.extract_data import write_h5ad
+        settings = getattr(ad, "settings", None)
+        if settings is None or not hasattr(settings, "allow_write_nullable_strings"):
+            pytest.skip("this anndata has no nullable-string switch")
+        a = ad.AnnData(X=np.zeros((2, 3)), obs=pd.DataFrame(index=pd.Index(["c0", "c1"], dtype="string")),
+                       var=pd.DataFrame(index=pd.Index(["g0", "g1", "g2"], dtype="string")))
+        p = tmp_path / "s.h5ad"
+        with settings.override(allow_write_nullable_strings=False):
+            with pytest.raises(Exception):
+                a.write_h5ad(p)                                         # the plain write refuses the index
+            write_h5ad(a, p)                                            # monod's does not
+        assert settings.allow_write_nullable_strings is not None        # the setting is as it was outside the write
+        back = ad.read_h5ad(p)
+        assert list(back.obs_names) == ["c0", "c1"] and list(back.var_names) == ["g0", "g1", "g2"]

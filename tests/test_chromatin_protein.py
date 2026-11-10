@@ -210,18 +210,32 @@ class TestKernel:
                        for e in np.eye(SMALL.size)])
         np.testing.assert_allclose(grad, fd, rtol=0.02, atol=1e-4)
 
-    def test_step_cap_is_reported(self):
-        # a protein a hundred thousand times slower than the locus needs more than the 20,000 steps the
-        # stepper allows; the truncated result must not pass silently (the Mimitou fits found a divergence
-        # of 3.8 at gamma_p = -4 where -3.5 gave 0.5)
+    def test_step_cap_is_reported(self, monkeypatch):
+        # a truncated integration must not pass silently (before the Magnus step the Mimitou fits found a
+        # divergence of 3.8 at gamma_p = -4 where -3.5 gave 0.5, from the stepper's cap)
         m = _model()                                                                        # join_theta takes linear rates
-        slow = cf.join_theta([0.22, 0.05], 0.63, [0.02], 0.32, 0.003, 0.25, (0.08, 1e-4))   # CD27-like, gamma_p a decade below the box
+        theta = cf.join_theta([0.22, 0.05], 0.63, [0.02], 0.32, 0.003, 0.25, (0.08, 1e-2))
+        monkeypatch.setattr(ch, "_MAX_STEPS", 12)
         with pytest.warns(RuntimeWarning, match="cap of"):
-            pss = m.eval_model_pss(slow, [4, 4, 6, 4])
+            pss = m.eval_model_pss(theta, [4, 4, 6, 4])
         assert pss.shape == (4, 4, 6, 4)
+
+    @pytest.mark.parametrize("gamma_p", [1e-3, 10 ** -3.5])
+    def test_slow_protein_costs_a_few_hundred_steps(self, gamma_p):
+        # a protein living thousands of locus clocks: the Magnus steps are exact for a constant forcing, so
+        # the tail goes in steps of hundreds of clocks and the whole run stays near 500 steps, Strang finishing
+        # the fast transient (Strang alone took about one clock per step, 12,000 steps at gamma_p = 1e-3 and
+        # its cap of 20,000 at 10^-3.5); the RNA and configuration law does not depend on the protein, so the
+        # marginal must still be the chromatin model's
+        beta, gamma, k_p, b = 1.0, 10 ** -2.47, 10 ** -0.66, 10 ** -0.5                  # CD27 at capture 0.1
+        H, A, C = ch.nascent_mature_system([0.1, 0.1], 1.0, 1.0, "switch", beta, gamma, rule_params=[10 ** -1.6])
         with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            m.eval_model_pss(cf.join_theta([0.22, 0.05], 0.63, [0.02], 0.32, 0.003, 0.25, (0.08, 1e-2)), [4, 4, 6, 4])
+            warnings.simplefilter("error")                                                 # no cap, stepper or table
+            pss, sched = ch.eval_joint_pss(H, A, C, [6, 8, 16], burst=b, protein=(k_p, gamma_p), return_schedule=True)
+        assert sched.size < 1000 and sched.magnus >= 50
+        assert float(np.asarray(sched).max()) > 100.0
+        ref = ch.eval_joint_pss(H, A, C, [6, 8], burst=b)
+        np.testing.assert_allclose(pss.sum(axis=3), ref, atol=2e-6)
 
     def test_ambiguous_channel_goes_through_the_generic_route(self):
         m = _model(amb_model="Equal")
@@ -367,8 +381,12 @@ needs_rust_protein = pytest.mark.skipif(not ch._rust_available(True), reason="mo
 @needs_rust_protein
 class TestRustBackend:
     """The Rust kernel (design doc, stage 5) follows the NumPy one step for step:
-    the same tabulation schedule for the characteristics and the same stepper
-    schedule, through the affine-map table instead of a table over the mesh."""
+    the same tabulation schedule for the characteristics and, on a replayed
+    schedule, the same steps to rounding, through the affine-map table instead
+    of a table over the mesh.  The adaptive runs may part: the Magnus step's
+    error estimate is a small difference of large exponentials, so the last
+    bit of rounding (the two tables are different arithmetic) can move a step
+    by 1e-9 and the controllers then drift apart, both within tolerance."""
 
     def _system(self, rule, rates, bursty, k_p=0.5, gamma_p=0.5, beta=0.8, gamma=0.3, k_on=(0.5, 0.8), eps=0.6):
         H, A, C = ch.nascent_mature_system(list(k_on), 1.0, eps, rule, beta, gamma, rule_params=rates)
@@ -383,18 +401,19 @@ class TestRustBackend:
         lim = [14, 16, 14, 4][:3]
         p_py, s_py = ch.eval_joint_pss(H, A, C, lim, burst=burst, protein=protein, backend="python", return_schedule=True)
         p_rs, s_rs = ch.eval_joint_pss(H, A, C, lim, burst=burst, protein=protein, backend="rust", return_schedule=True)
-        assert s_rs.size == s_py.size
-        np.testing.assert_allclose(np.asarray(s_rs), np.asarray(s_py), rtol=1e-6)
-        np.testing.assert_allclose(p_rs, p_py, atol=1e-11)
+        assert abs(s_rs.size - s_py.size) <= 0.03 * s_py.size + 2 and s_rs.magnus >= 1
+        np.testing.assert_allclose(p_rs, p_py, atol=1e-8)                 # two adaptive runs within tolerance
         replay = ch.eval_joint_pss(H, A, C, lim, burst=burst, protein=protein, fixed_schedule=s_py, backend="rust")
-        np.testing.assert_allclose(replay, p_py, atol=1e-11)
+        np.testing.assert_allclose(replay, p_py, atol=1e-11)              # the same steps give the same numbers
+        back = ch.eval_joint_pss(H, A, C, lim, burst=burst, protein=protein, fixed_schedule=s_rs, backend="python")
+        np.testing.assert_allclose(back, p_rs, atol=1e-11)
 
     def test_small_grid_runs_the_sequential_path(self):
         H, A, C, burst, protein = self._system("switch", [1.5], True, k_on=(0.7,), eps=1.0)
         lim = [8, 8, 6]                                                   # 2 states x 8 x 8 x 4 points < 4096
         p_py = ch.eval_joint_pss(H, A, C, lim, burst=burst, protein=protein, backend="python")
         p_rs = ch.eval_joint_pss(H, A, C, lim, burst=burst, protein=protein, backend="rust")
-        np.testing.assert_allclose(p_rs, p_py, atol=1e-11)
+        np.testing.assert_allclose(p_rs, p_py, atol=1e-8)
 
     def test_model_takes_the_rust_path_with_capture_and_a_coarse_protein_axis(self):
         m = _model(seq="Poisson", protein_limit=10)
@@ -404,7 +423,7 @@ class TestRustBackend:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(ch, "_rust_available", lambda protein=False: False)
             slow = m.eval_model_pss(THETA, lim, samp)
-        np.testing.assert_allclose(fast, slow, atol=1e-11)
+        np.testing.assert_allclose(fast, slow, atol=1e-8)
         with pytest.raises(ValueError):
             ch.eval_joint_pss(*self._system("switch", [1.5], False)[:3], [8, 8, 6], protein=(-1.0, 0.5), backend="rust")
 
