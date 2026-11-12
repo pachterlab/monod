@@ -725,6 +725,45 @@ def _to_plain(v):
     return v
 
 
+def hellinger_statistic(expected, counts):
+    """The goodness-of-fit statistic :meth:`SearchResults.chisquare_testing`
+    reports as ``hellinger``.
+
+    Over the states the data occupies, the sum of ``(sqrt(expected) -
+    sqrt(observed))**2`` of the frequencies, plus the expected frequency left
+    outside those states, times ``1/sqrt(2)``: ``sqrt(2)`` times the squared
+    Hellinger distance between the two frequency vectors (the 0.05 rejection
+    threshold is set against this quantity, not against the distance).
+    ``expected`` is the fitted PMF times the cell count and ``counts`` the
+    observed cell counts, both over the same grid (any shape).
+    """
+    expected = np.asarray(expected, dtype=float).ravel()
+    counts = np.asarray(counts, dtype=float).ravel()
+    n = counts.sum()
+    occ = counts > 0
+    e = expected[occ] / n
+    o = counts[occ] / n
+    return float((((np.sqrt(e) - np.sqrt(o)) ** 2).sum() + max(1.0 - e.sum(), 0.0)) / np.sqrt(2.0))
+
+
+def hellinger_floor(pss, n_cells, reps=5, seed=0):
+    """The sampling floor of :func:`hellinger_statistic`: its mean over
+    ``reps`` multinomial draws of ``n_cells`` cells from ``pss`` itself.
+
+    The statistic runs over occupied states, so when the grid is wide compared
+    with the cell count (an abundant protein on a four-dimensional grid puts
+    every cell in its own state) it saturates towards ``1/sqrt(2)`` however
+    good the fit.  On the DOGMA-seq CD4 T cells the recorded 0.30 for CD4 was
+    0.28 floor, and a fit whose protein marginal matched the data to a percent
+    was rejected.  The excess over the floor is the misfit.
+    """
+    p = np.maximum(np.asarray(pss, dtype=float).ravel(), 0.0)
+    p = p / p.sum()
+    rng = np.random.default_rng(seed)
+    n = int(round(n_cells))
+    return float(np.mean([hellinger_statistic(p * n, rng.multinomial(n, p)) for _ in range(int(reps))]))
+
+
 def _attr_dict(obj, names):
     d = {}
     for n in names:
@@ -2128,7 +2167,7 @@ class SearchResults:
         "inference_string", "n_genes", "n_cells", "gene_names", "gene_log_lengths",
         "param_estimates", "klds", "obj_func", "d_time", "regressor",
         "samp_optimum_ind", "samp_optimum", "phys_optimum", "regressor_optimum",
-        "rejected_genes", "pval", "csq", "hellinger", "rejection_index", "sigma",
+        "rejected_genes", "pval", "csq", "hellinger", "hellinger_floor", "hellinger_excess", "rejection_index", "sigma",
         "sigma_fail", "sigma_flat_direction", "sigma_index",
         "analysis_figure_string", "full_result_string",
         "filt", "assigns", "group", "samp_optimum_shared",
@@ -2469,6 +2508,8 @@ class SearchResults:
         grouping_thr=5,
         use_hellinger=True,
         hellinger_thr=0.05,
+        hellinger_floor_reps=5,
+        hellinger_floor_seed=0,
     ):
         """Perform goodness-of-fit testing at the current sampling parameter optimum to identify poor fits.
 
@@ -2506,7 +2547,14 @@ class SearchResults:
         use_hellinger: bool, optional
             whether to use the Hellinger distance as an additional "effect size" estimate for goodness-of-fit.
         hellinger_thr: float, optional
-            which threshold to use for the Hellinger distance rejection.
+            which threshold to use for the Hellinger distance rejection; applied to the
+            excess of the statistic over its sampling floor (see below).
+        hellinger_floor_reps: int, optional
+            multinomial draws from each gene's fitted PMF used to estimate the sampling
+            floor of the statistic at the data's cell count (:func:`hellinger_floor`);
+            0 skips the floor and rejects on the raw statistic as before 0.4.
+        hellinger_floor_seed: int, optional
+            seed of those draws.
 
         Returns
         -------
@@ -2525,6 +2573,10 @@ class SearchResults:
             p-values calculated by the chi-squared test at the grid point indexed by rejection_index.
         hellinger: np.ndarray
             hellinger distances for all genes, computed at the grid point indexed by rejection_index.
+        hellinger_floor: np.ndarray
+            the statistic's sampling floor per gene (zeros when ``hellinger_floor_reps`` is 0).
+        hellinger_excess: np.ndarray
+            ``hellinger - hellinger_floor``, the quantity the threshold is applied to.
         rejected_genes: bool np.ndarray
             a boolean filter that reports the genes rejected by the goodness-of-fit procedure,
             whose parameters cannot be safely interpeted.
@@ -2563,12 +2615,21 @@ class SearchResults:
                 self.model.seq_model,
             )
             backend = "Rust"
+            floors = []
+            if hellinger_floor_reps:
+                for gene_index in range(self.n_genes):
+                    floors.append(hellinger_floor(self.gene_pss(search_data, gene_index), search_data.n_cells,
+                                                  hellinger_floor_reps, hellinger_floor_seed))
         else:
             backend = "Python"
             csqarr = []
             hellinger = []
+            floors = []
             for gene_index in range(self.n_genes):
-                expect_freq = self.gene_pss(search_data, gene_index) * search_data.n_cells
+                pss_full = self.gene_pss(search_data, gene_index)
+                if hellinger_floor_reps:
+                    floors.append(hellinger_floor(pss_full, search_data.n_cells, hellinger_floor_reps, hellinger_floor_seed))
+                expect_freq = pss_full * search_data.n_cells
                 # expected_freq[expected_freq < EPS] = EPS
                 # expected_freq /= expected_freq.sum()
                 # PROPOSAL = search_data.n_cells * expected_freq
@@ -2674,9 +2735,11 @@ class SearchResults:
         if bonferroni:
             threshold /= self.n_genes
         log.info('P-value threshold: %s (Bonferroni: %s), Hellinger threshold: %s', threshold, bonferroni, hellinger_thr)
+        floor = np.asarray(floors, dtype=float) if floors else np.zeros(self.n_genes)
+        excess = hellinger - floor
         self.rejected_genes = pval < threshold
         if use_hellinger:
-            self.rejected_genes = self.rejected_genes & (hellinger > hellinger_thr)
+            self.rejected_genes = self.rejected_genes & (excess > hellinger_thr)
         if reject_at_bounds:
             bound_range = self.sp.phys_ub - self.sp.phys_lb
             lb = self.sp.phys_lb + bound_range * bound_thr
@@ -2685,6 +2748,8 @@ class SearchResults:
         self.pval = pval
         self.csq = csq
         self.hellinger = hellinger
+        self.hellinger_floor = floor
+        self.hellinger_excess = excess
         self.rejection_index = self.samp_optimum_ind
 
         if viz:
@@ -3237,7 +3302,7 @@ class SearchResults:
 
 def reject_genes(adata, viz=False, EPS=1e-15, threshold=0.05, bonferroni=True,
                  reject_at_bounds=True, bound_thr=0.01, grouping_thr=5,
-                 use_hellinger=True, hellinger_thr=0.05, mek_means=None,
+                 use_hellinger=True, hellinger_thr=0.05, hellinger_floor_reps=5, mek_means=None,
                  save_csq=True, save_pval=True, save_hellinger=True):
     """Chi-square goodness-of-fit testing on a fitted AnnData; flags poorly fit genes.
 
@@ -3246,8 +3311,8 @@ def reject_genes(adata, viz=False, EPS=1e-15, threshold=0.05, bonferroni=True,
     downstream calls with ``discard_rejected=True`` (e.g. ``analysis.DE_parameters``)
     see the rejection flags.
 
-    Adds to ``adata.var``: ``rejected_genes`` plus ``csq``, ``pval``, ``hellinger``
-    (prefixed ``c<k>_`` per cluster for a meK-Means run); for a split fit
+    Adds to ``adata.var``: ``rejected_genes`` plus ``csq``, ``pval``, ``hellinger``,
+    ``hellinger_floor`` and ``hellinger_excess`` (prefixed ``c<k>_`` per cluster for a meK-Means run); for a split fit
     (``perform_inference(split_by=...)``) the same columns go into each group's
     table in ``adata.varm``.
 
@@ -3266,7 +3331,7 @@ def reject_genes(adata, viz=False, EPS=1e-15, threshold=0.05, bonferroni=True,
     kw = dict(viz=viz, EPS=EPS, threshold=threshold, bonferroni=bonferroni,
               reject_at_bounds=reject_at_bounds, bound_thr=bound_thr,
               grouping_thr=grouping_thr, use_hellinger=use_hellinger,
-              hellinger_thr=hellinger_thr)
+              hellinger_thr=hellinger_thr, hellinger_floor_reps=hellinger_floor_reps)
     search_data = searchdata_from_adata(adata)
     split = split_info(adata)
 
@@ -3280,6 +3345,8 @@ def reject_genes(adata, viz=False, EPS=1e-15, threshold=0.05, bonferroni=True,
             adata.var['pval'] = np.asarray(pval)
         if save_hellinger:
             adata.var['hellinger'] = np.asarray(hellinger)
+            adata.var['hellinger_floor'] = np.asarray(sr.hellinger_floor)
+            adata.var['hellinger_excess'] = np.asarray(sr.hellinger_excess)
         adata.uns['search_result'] = sr.to_dict()
         log.info("Rejected %d/%d genes; flags stored in adata.var['rejected_genes'].",
                  int(np.sum(sr.rejected_genes)), sr.n_genes)
@@ -3299,6 +3366,8 @@ def reject_genes(adata, viz=False, EPS=1e-15, threshold=0.05, bonferroni=True,
             cols['pval'] = np.asarray(pval)
         if save_hellinger:
             cols['hellinger'] = np.asarray(hellinger)
+            cols['hellinger_floor'] = np.asarray(sr.hellinger_floor)
+            cols['hellinger_excess'] = np.asarray(sr.hellinger_excess)
         if split is not None:
             tab = adata.varm[key]
             for c, v in cols.items():

@@ -177,6 +177,12 @@ def _chromatin_ssa(model, theta, n_cells, rng):
     np.fill_diagonal(Hoff, 0.0)
     slowest = min(beta, gamma, float(np.min(k_on)), 1.0, gamma_p if protein else 1.0)
     t_end = _WINDOW_FOLDS / slowest
+    # the per-cell factor: lognormal with unit mean, scaling the production (the burst
+    # size under bursty emission) of each cell; _observe scales the background by it
+    cf = getattr(model, "cell_factor", None)
+    factor = np.ones(n_cells)
+    if cf is not None and cf[0] > 0:
+        factor = np.exp(rng.normal(-0.5 * cf[0] ** 2, cf[0], n_cells))
     state = rng.choice(N, size=n_cells, p=w)
     U = np.zeros(n_cells, dtype=np.int64)
     S = np.zeros(n_cells, dtype=np.int64)
@@ -187,7 +193,7 @@ def _chromatin_ssa(model, theta, n_cells, rng):
         if act.size == 0:
             break
         s = state[act]
-        prod = A[s, 0] if burst is None else A[s, 0] / burst
+        prod = A[s, 0] * factor[act] if burst is None else A[s, 0] / burst
         cols = [Hoff[s], prod, beta * U[act], gamma * S[act]]
         if protein:
             cols += [k_p * S[act], gamma_p * P[act]]
@@ -207,7 +213,7 @@ def _chromatin_ssa(model, theta, n_cells, rng):
         if burst is None:
             U[act[is_prod]] += 1
         else:
-            U[act[is_prod]] += _geometric(rng, burst, int(is_prod.sum()))
+            U[act[is_prod]] += _geometric(rng, burst * factor[act[is_prod]], int(is_prod.sum()))
         is_spl = which == N + 1
         U[act[is_spl]] -= 1
         S[act[is_spl]] += 1
@@ -219,6 +225,7 @@ def _chromatin_ssa(model, theta, n_cells, rng):
     if protein:
         out["protein"] = P
     out["configuration"] = state
+    out["_cell_factor"] = factor
     return out
 
 
@@ -373,5 +380,6 @@ def _observe(model, latent, samp, theta_amb, rng):
         # protein background: nonspecific antibody counts, Poisson with the shared rate
         lam_bg = model.chromatin_background(samp)
         if lam_bg is not None:
-            counts["protein"] = counts["protein"] + rng.poisson(lam_bg, size=counts["protein"].shape)
+            factor = latent.get("_cell_factor", 1.0)
+            counts["protein"] = counts["protein"] + rng.poisson(lam_bg * factor, size=counts["protein"].shape)
     return {m: np.asarray(counts[m], dtype=np.int64) for m in mods}

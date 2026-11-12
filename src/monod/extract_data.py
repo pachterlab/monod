@@ -430,6 +430,34 @@ def add_gene_lengths(adata, length_dict, attribute_name='length_given', lengths_
     log.info('Added lengths')
     return adata
 
+def tail_droplets(counts, quantile=0.99, min_hits=5):
+    """Flag droplets that sit in the upper tail of many features at once.
+
+    ``counts`` is a cells x features matrix (dense or scipy sparse), typically
+    the whole antibody panel of a CITE-seq or DOGMA-seq run.  A cell collects
+    one hit per feature on which it exceeds that feature's ``quantile`` over
+    all cells.  Were the features independent the hits would be about Poisson
+    with mean ``n_features * (1 - quantile)``: at a mean of one or two, five or
+    more hits is rare (0.4% to 5% of cells) and ten or more does not happen, so
+    such a cell is a droplet-level event (an aggregate, a doublet, a
+    high-background droplet), not a cell state.  On the DOGMA-seq CD4 T cells
+    3.7% of the cells sat in the top 1% of ten or more of 210 antibodies and
+    8.6% in five or more (independence: none, and 2.8%); they carried the heavy
+    protein tails that a single-rate protein layer cannot match, and the fits
+    chased those tails.  The default ``min_hits`` of five takes a few ordinary
+    cells with the droplets; raise it on a small panel.
+
+    Returns ``(drop, hits)``: the boolean mask of cells to drop and the hit
+    count per cell.
+    """
+    X = to_dense(counts)
+    if X.ndim != 2:
+        raise ValueError(f"counts must be a cells x features matrix, got shape {X.shape}")
+    q = np.quantile(X, float(quantile), axis=0)
+    hits = (X > q[None, :]).sum(axis=1)
+    return hits >= int(min_hits), hits
+
+
 def threshold_by_expression(adata, filt_param=None):
     """
     Filters genes in an AnnData object based on expression thresholds for each layer.

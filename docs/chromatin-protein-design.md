@@ -591,8 +591,159 @@ Stages 1 to 4 were Python only and self-contained; stage 5 was the port.
    matched since pass 4, and the `k_p`-at-bound background antibodies, which
    are flags rather than misfits.
 
+   **Broad-antibody diagnosis (2026-11-09/10).** Three findings, in order of
+   weight. First, the recorded Hellinger is mostly sampling floor for the
+   abundant antibodies: `chisquare_testing` sums over the occupied 4D
+   microstates, and a cell with a thousand protein counts occupies its own
+   state, so the statistic saturates. Drawing data from each fitted model at
+   the data's cell count gives the floor; the excess over it is the misfit.
+   At pass 6 CD4 is 0.30 recorded with 0.28 floor, CD27 0.08 with 0.05, CD45
+   0.13 with its protein marginal matching to 0.002: these three fit, and
+   their fitted protein means and standard deviations agree with the data to
+   a percent. (The statistic as coded is `sqrt(2)` times the squared
+   Hellinger distance, no square root; the 0.05 threshold was set against
+   it, so it is left alone, but the floor has to be subtracted before a
+   value is read as misfit.) Second, nine antibodies are real misfits of
+   one shape: heavy tails. CD49d, CD25, CD63, CD9, CD137, integrin beta7,
+   CD253, OX40 and CCR10 have a 99.9th percentile two to four times the 99th,
+   and the maximum-likelihood fit of a thin-tailed protein layer chases the
+   tail: the fit puts 6 to 25% of its mass above the observed 99th
+   percentile (the data 1%), the fitted mean overshoots the observed by 1.5
+   to 10 times (CD63 36 against 3.4, CD137 11 against 1.3, CD25 46 against
+   8), and each tail cell costs 6 to 9 nats against 2 to 4 for a bulk cell.
+   Grid resolution is not the cause (binning both marginals at the smoothing
+   scale of `protein_limit` 50 leaves the gap). Third, the tails have two
+   sources. A droplet class carries most of them: 241 cells (3.7%) sit in
+   the top 1% of ten or more of the 210 antibodies at once (under
+   independence none would), 557 in five or more, and 325 of those 557 are in
+   the top decile of the per-cell factor (the median log-ratio over the
+   abundant antibodies, which tracks RNA UMIs and ATAC fragments 1.6 to 1.8x
+   between its top decile and the mean, so it is cell size or droplet
+   efficiency, and the nonspecific antibodies carry it as fully as the
+   specific ones). CD63, CCR10, CD49d, OX40 and CD253 tail cells are in other
+   antibodies' tails 5 to 11% of the time (chance 1%): aggregates or doublets
+   that survived qc2, a QC matter, not a model's. CD25 and integrin beta7
+   tail cells are not shared (2.5%) and CD25's are not high-factor cells
+   (11% in the top decile, chance 10%); CD25's tail co-occurs with CD137
+   (26%) and OX40 (12%): an activated subpopulation, biology the cell set
+   carries. A direct test agrees: six genes refitted on the central 30% of
+   the factor (1959 cells, factor sd 0.05) against a random 1959-cell
+   control bring CD4's excess over the floor from 0.017 to 0.001 and halve
+   the integrins' (beta7 0.040 to 0.022, CD49d 0.060 to 0.049), while CD27,
+   ICOS and CD25 do not move (0.024, 0.013, 0.09 either way). The factor's
+   other effect is on the estimates rather than the fit: the single-rate
+   layer absorbs it into the burst size (CD4 `b` -0.34 on the slice, 0.36
+   on the control; CD27 -3.0 against -1.6), so the parameters of the broad
+   antibodies are biased even where the fit passes. What follows for the
+   next pass, in order: report excess over the floor, not the raw statistic;
+   a qc3 that drops the multi-tail droplets (five or more top-1% memberships,
+   8.6% of cells) before any protein fit; the per-cell factor as a measured
+   covariate (stratify by it or integrate a fixed-spread lognormal over all
+   production rates) for the estimates; and a cell-state covariate or
+   clustering for CD25, CD137 and OX40. Scripts: `adt_shared*.py`,
+   `adt_slice.py`, `adt_floor.py`, `adt_res.py`, `adt_tail.py` on bio;
+   tables `fits/adt_floor6*.csv`, `adt_res6.csv`.
+
+   **Pass 7 (2026-11-10/11).** The four steps of the diagnosis, in order.
+   (1) Floor-corrected reporting. `chisquare_testing` now draws
+   `hellinger_floor_reps` (default 5) multinomial samples of the data's
+   size from the fitted PMF, scores each with the same statistic and
+   reports the mean as `hellinger_floor` and the difference as
+   `hellinger_excess`; the 0.05 threshold applies to the excess. The
+   statistic itself is unchanged (sum over the occupied microstates plus
+   the leftover bin, over root two: root two times the squared Hellinger
+   distance), so earlier values still compare. Both columns land in `var`
+   through `reject_genes` and serialise with the result
+   (`tests/test_fit_diagnostics.py`). Pass 6 re-read this way: 15
+   rejections (17), median excess 0.011; CD4's 0.30 is 0.023 over its 0.274
+   floor, CD45 0.013 over 0.121, CD27 0.032 over 0.049, and the misfits of
+   the diagnosis stand (CD63 0.196, CD9 0.182, TNFRSF9 0.169, CD25 0.149,
+   TNFSF10 0.097, CD49d 0.093, integrin beta7 0.083, OX40 0.073). (2) qc3.
+   `extract_data.tail_droplets(counts, quantile=0.99, min_hits=5)` flags
+   the cells above the 99th percentile of five or more features; on the
+   210-antibody panel that is 557 of 6,508 cells (under independence the
+   hits are Poisson with mean 2.1, so five or more is 0.4 to 5% of cells by
+   chance and ten or more never). `adt_qc3.py` writes `..._qc3_bg.h5ad`
+   with 5,951 cells, `obs['adt_tail_hits']`, `obs['adt_factor']` and the
+   factor's log sd 0.248 (0.288 before) in `uns['adt_qc3']`. Pass 7a is
+   pass 6 on these cells: summed divergence 4.28 (5.57), summed excess 0.75
+   (1.26), genes over 0.05 five (eight). TNFRSF9 drops from 0.169 to 0.004,
+   TNFSF10 0.097 to 0.004, OX40 0.073 to 0.011: their tails were the
+   droplet class. CD9 halves (0.182 to 0.086); CD63 (0.155), CD25 (0.156),
+   CD49d (0.090) and integrin beta7 (0.074) do not move: those tails are
+   cells. The well-identified estimates move by less than 0.2 in log10;
+   the large shifts (CD52 `b` +3.4, TNFRSF9 `b` +3.8, CD68, CD79a, LAG3 and
+   NCR3 `gamma_p` +1.4 to +3.6) are genes with a flat direction choosing
+   another point on it. (3) The per-cell factor.
+   `CMEModel("Chromatin", ..., cell_factor=(sigma, nodes))`: a unit-mean
+   lognormal `f` (`log f ~ N(-sigma^2/2, sigma^2)`) scales every production
+   rate (the transcription rates `A` and the burst size, so the burst
+   frequency is untouched) and the protein background, and the PMF is the
+   Gauss-Hermite mixture over `nodes` points (`hermegauss`, weights
+   normalised, `f` renormalised to unit mean). The generating function is
+   linear in the mixture, so the kernel evaluates the plain model once per
+   node with `A f`, `b f` and `lambda f` and sums; the pinned step schedule
+   becomes a list per node; the simulator draws `f` per cell and scales
+   the same quantities (`TestLayout::test_simulator_draws_the_cell_factor`,
+   `TestKernel::test_cell_factor_is_a_mixture_over_scaled_production`,
+   `test_cell_factor_pins_every_node_schedule`). The top node needs a wider
+   RNA grid: on [20, 24, 40] the mature mean loses 1 to 3% to the grid edge
+   at sigma 0.25, [24, 36, 60] is adequate. Pass 7b is pass 7a with
+   `cell_factor=(0.248, 5)`, the measured spread: summed divergence 4.07
+   (4.28), summed excess 0.69 (0.75), median 0.0055 (0.0071). The heavy
+   tails do not move (CD25 0.158, CD63 0.154, CD49d 0.082, integrin beta7
+   0.073, CD9 0.075); the well-fit genes improve a little (CD27 0.030 to
+   0.017, ICOS 0.024 to 0.015, CCR10 0.022 to 0.015). The estimates move
+   where the factor absorbs overdispersion: CD4 `b` -0.32, `k_p` -0.40,
+   `gamma_p` -0.41 (the slice-against-control direction of the diagnosis),
+   CD27 `b` +1.2 with `k_p` -0.6; median absolute shift `b` 0.05, `k_p`
+   0.13, `gamma_p` 0.19, the RNA rates 0.07; the valley genes swing by 2 to
+   3 (CXCR6 `b` +3.3, CD45 `b` -2.5) and four more flag unreliable errors
+   (22 against 18). Cost 2.1 times pass 7a (41,700 s against 19,700 s on a
+   shared bio). The factor is a correction to the estimates of the broad
+   antibodies, then, not a fix for their fit. (4) Cell state. Clusters 2
+   and 8 of the annotation (1,210 cells) hold the CD25, CD137 and OX40
+   tails; fit7c fits CD25, CD137, OX40, CD4 and CD27 on them and on the
+   resting clusters 0, 9, 10 and 11 (4,738 cells) separately. CD137 and
+   OX40 fit in both strata (excess at most 0.013) and differ in the
+   expected way: the activated cells have a transcription rate 4 to 10
+   times and a burst size 3 to 5 times the resting cells' (CD137 `a` -0.56
+   against -1.16, `b` 0.99 against 0.47; OX40 `a` -1.46 against -2.44, `b`
+   1.27 against 0.53). The controls show the limit of 1,210 cells: CD4 and
+   CD27 on the activated stratum pick other points on their flat directions
+   (CD27 `b` and `beta` on bounds, divergence 0.53 against 0.21 pooled) at
+   the same excess. CD25 is not rescued: the activated stratum has excess
+   0.080 (floor 0.31 on 1,210 cells), and the cold resting-stratum fit
+   landed at divergence 1.32 where the pooled optimum gives 0.35
+   (`strata_check.py`), a start problem; refitted from the pooled optimum
+   (`refit_rest.py`) it reaches divergence 0.31 and excess 0.076 over a
+   0.056 floor (pooled 0.156, activated 0.080): the split halves CD25's
+   misfit in each stratum and fits neither, so its tail lies within the
+   states, not between them. What the four steps leave rejected is five
+   abundant antibodies (CD25, CD63, CD49d, integrin beta7, CD9) whose
+   protein tails are heavier than one cell state with one production rate
+   carries; see the open decision below. Scripts: `adt_qc3.py`,
+   `adt_act.py`, `adt_strata.py`, `floor6.py`, `floor7a.py`,
+   `fit_mimitou5.py` (`CELL_FACTOR`, `NODES`), `strata_check.py`,
+   `refit_rest.py` on bio; tables `fits/*pass6_joint_cm10_floor.csv`,
+   `*pass7a_joint_cm10*`, `*pass7b_joint_cm10*`, `*act5_fit7c*`,
+   `*rest5_fit7c*`. Full suite on bio with the floor-based decision as the
+   default: 898 passed, 36 skipped.
+
 ## Open decisions
 
+- **Heavy protein tails of the abundant antibodies.** After pass 7 the
+  droplet filter, the per-cell factor and the activation split together
+  leave CD25, CD63, CD49d, integrin beta7 and CD9 rejected, each with
+  excess 0.07 to 0.16 over the floor and a fitted protein mean well above
+  the observed one. A factor shared across genes is not it (pass 7b), and
+  the tails sit inside the annotated cell states (fit7c). The candidates
+  are a per-gene two-state mixture (a second protein production rate with
+  a weight, two extra parameters) or a per-gene spread on the protein
+  production alone (one parameter, the `cell_factor` machinery with the
+  sd fitted rather than measured). Decide after checking whether the
+  tails are one-sided excesses (mixture) or a continuum (spread) on the
+  qc3 cells; neither is built.
 - **Protein measurement noise.** `ProteinBursty` has none, and ADT counts carry
   a known background. The DOGMA-seq DIG control shows it matters for the
   low-abundance antibodies: in CD4 T cells the rat isotype controls average

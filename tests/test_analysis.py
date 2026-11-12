@@ -179,10 +179,13 @@ def test_reject_genes_round_trip(two_adatas):
     from monod.inference import reject_genes, search_result_from_uns
     a1, a2 = two_adatas
     reject_genes(a1, reject_at_bounds=False)
-    for col in ("rejected_genes", "csq", "pval", "hellinger"):
+    for col in ("rejected_genes", "csq", "pval", "hellinger", "hellinger_floor", "hellinger_excess"):
         assert col in a1.var.columns
     sr = search_result_from_uns(a1.uns["search_result"])
     assert hasattr(sr, "rejected_genes") and len(sr.rejected_genes) == a1.n_vars
+    # the statistic is read against its sampling floor at this cell count
+    np.testing.assert_allclose(a1.var["hellinger_excess"], a1.var["hellinger"] - a1.var["hellinger_floor"])
+    assert (a1.var["hellinger_floor"] > 0).all() and np.allclose(sr.hellinger_floor, a1.var["hellinger_floor"])
     # discard_rejected now has something to act on
     reject_genes(a2, reject_at_bounds=False)
     gn, gf, offs, resid = analysis.DE_parameters(a1, a2, viz=False, use_sigma=False, discard_rejected=True, nit=2)

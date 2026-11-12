@@ -103,6 +103,44 @@ class TestLayout:
         extra = bg["protein"] - plain["protein"]
         assert extra.min() >= 0 and abs(extra.mean() - lam) < 0.1 and abs(extra.var() - lam) < 0.3
 
+    def test_cell_factor_is_a_model_option(self):
+        m = _model(cell_factor=(0.3, 5))
+        assert m.cell_factor == (0.3, 5)
+        f, w = m.chromatin_factor_nodes()
+        assert f.shape == (5,) and abs(w.sum() - 1) < 1e-12 and abs(w @ f - 1) < 1e-12      # unit mean: the rates keep their meaning
+        assert abs(w @ np.log(f) ** 2 - (w @ np.log(f)) ** 2 - 0.3 ** 2) < 1e-3               # the spread is sigma
+        assert _model().chromatin_factor_nodes() == (None, None) and _model(cell_factor=(0.0, 5)).chromatin_factor_nodes() == (None, None)
+        m2 = CMEModel.from_dict(m.to_dict())
+        assert m2.cell_factor == (0.3, 5) and m2.model_modalities == m.model_modalities
+        assert "cell_factor" not in _model().to_dict()
+        assert m._chromatin_rna_twin().cell_factor == (0.3, 5)                               # the RNA scales with the cell too
+        with pytest.raises(ValueError, match="Chromatin"):
+            CMEModel("Bursty", "None", cell_factor=(0.3, 5))
+        with pytest.raises(ValueError, match="cell_factor"):
+            _model(cell_factor=(-0.1, 5))
+
+    def test_simulator_draws_the_cell_factor(self):
+        from monod.simulate import simulate_counts
+        sigma = 0.25
+        plain = simulate_counts(_model(), THETA, 6000, np.array([0.0, 0.0, 0.0]), seed=5)
+        fac = simulate_counts(_model(cell_factor=(sigma, 5)), THETA, 6000, np.array([0.0, 0.0, 0.0]), seed=5)
+        # the top quadrature node doubles the burst size, so the kernel needs a wider RNA grid than L:
+        # on L the mixture loses 1% of the mature mean and a tenth of its variance to the grid edge
+        pss = _model(cell_factor=(sigma, 5)).eval_model_pss(THETA, [24, 36, 60, 4])
+        for k, ax in (("spliced", 1), ("protein", 2)):
+            mp, mf = plain[k].mean(), fac[k].mean()
+            assert abs(mf / mp - 1) < 0.08                                                   # unit-mean factor: the means stay
+            # the factor adds at least (e^sigma^2 - 1) mean^2 to the variance (more under bursty
+            # emission, whose intrinsic variance grows with the burst size); the kernel's own
+            # mixture says how much
+            marg = pss.sum(axis=tuple(j for j in range(4) if j != ax)); x = np.arange(marg.size)
+            v_kernel = marg @ x ** 2 - (marg @ x) ** 2
+            assert fac[k].var() - plain[k].var() > 0.5 * (np.exp(sigma ** 2) - 1) * mp ** 2
+            assert abs(fac[k].var() / v_kernel - 1) < 0.15
+        m = _model(protein_background=(-1.0, 1.0, 3), cell_factor=(sigma, 5))
+        bg = simulate_counts(m, THETA, 6000, np.array([0.0, 0.0, 0.0, np.log10(3.0)]), seed=5)
+        assert abs(bg["protein"].mean() - fac["protein"].mean() - 3.0) < 0.2                # the background scales with the cell too
+
 
 class TestKernel:
     def test_rna_and_configuration_marginal_is_the_chromatin_model(self):
@@ -247,6 +285,48 @@ class TestKernel:
         ref = _model().eval_model_pss(SMALL, [lim[0] + 5, lim[1] + 5, lim[2], 4])
         np.testing.assert_allclose(pss.sum(axis=(0, 1, 4)), ref.sum(axis=(0, 1)), atol=2e-5)    # the split leaves protein and locus alone
 
+    def test_cell_factor_is_a_mixture_over_scaled_production(self):
+        sigma = 0.3
+        m = _model(protein_background=(-1.0, 1.0, 3), cell_factor=(sigma, 5))
+        samp = np.array([0.0, 0.0, 0.0, np.log10(1.5)])
+        pss = m.eval_model_pss(THETA, L, samp)
+        f, w = m.chromatin_factor_nodes()
+        plain = _model(protein_background=(-1.0, 1.0, 3))
+        mix = 0.0
+        for fi, wi in zip(f, w):
+            theta = THETA.copy()
+            theta[3] += np.log10(fi)                                       # the switch rule's production rate
+            theta[6] += np.log10(fi)                                       # the burst size: frequency unchanged, mean x f
+            samp_f = samp.copy(); samp_f[3] += np.log10(fi)                # the background scales with the cell
+            mix = mix + wi * plain.eval_model_pss(theta, L, samp_f)
+        np.testing.assert_allclose(pss, mix, atol=1e-9)
+        assert isinstance(m._last_schedule, list) and len(m._last_schedule) == 5
+        np.testing.assert_allclose(_model(cell_factor=(0.0, 5)).eval_model_pss(THETA, L), _model().eval_model_pss(THETA, L), atol=1e-13)
+        # the RNA mean is kept (unit-mean factor), the protein variance grows by about (e^sigma^2 - 1) mean^2
+        base = _model().eval_model_pss(THETA, L)
+        x = np.arange(L[1]); y = np.arange(L[2])
+        ps, pf = base.sum(axis=(0, 2, 3)), _model(cell_factor=(sigma, 5)).eval_model_pss(THETA, L).sum(axis=(0, 2, 3))
+        assert abs((pf @ x) / (ps @ x) - 1) < 0.04                          # unit mean up to what L's edge takes from the top node
+        qs, qf = base.sum(axis=(0, 1, 3)), _model(cell_factor=(sigma, 5)).eval_model_pss(THETA, L).sum(axis=(0, 1, 3))
+        mean = qs @ y
+        extra = (qf @ y ** 2 - (qf @ y) ** 2) - (qs @ y ** 2 - mean ** 2)
+        assert extra > 0.6 * (np.exp(sigma ** 2) - 1) * mean ** 2          # more than the mean's spread alone: the bursts grow too
+
+    def test_cell_factor_pins_every_node_schedule(self):
+        m = _model(cell_factor=(0.25, 3))
+        pss = m.eval_model_pss(SMALL, L_SMALL)
+        with m.pinned_schedule(SMALL, L_SMALL):
+            assert len(m._fixed_schedule) == 3
+            np.testing.assert_allclose(m.eval_model_pss(SMALL, L_SMALL), pss, atol=1e-13)
+        P2 = m.eval_model_pss(SMALL + 0.1, L_SMALL)
+        keep = P2 > 1e-6
+        data = (np.argwhere(keep), P2[keep] / P2[keep].sum())
+        _, grad = m.eval_model_kld_and_grad(SMALL, L_SMALL, None, data)
+        h = 1e-3
+        fd = np.array([(m.eval_model_kld(SMALL + h * e, L_SMALL, None, data) - m.eval_model_kld(SMALL - h * e, L_SMALL, None, data)) / (2 * h)
+                       for e in np.eye(SMALL.size)])
+        np.testing.assert_allclose(grad, fd, rtol=0.02, atol=1e-4)
+
 
 class TestPipeline:
     """perform_inference on simulated four-layer data (design doc, stage 4): a three-point
@@ -305,6 +385,10 @@ class TestPipeline:
             np.testing.assert_allclose(marg, joint.sum(axis=tuple(j for j in range(4) if j != k)), atol=1e-12)
         csq, pval, hel = sr_.chisquare_testing(sd, reject_at_bounds=True)
         assert np.all(np.isfinite(csq)) and 0 <= hel[0] < 1.5 and sr_.rejected_genes.shape == (1,)
+        # the statistic's sampling floor at this cell count, and the excess the threshold is applied to
+        assert 0 < sr_.hellinger_floor[0] < hel[0] + 1e-9 and sr_.hellinger_excess[0] == pytest.approx(hel[0] - sr_.hellinger_floor[0])
+        back = search_result_from_uns(sr_.to_dict())
+        np.testing.assert_allclose(back.hellinger_floor, sr_.hellinger_floor)
 
     def test_per_gene_protein_background_rides_on_the_sampling_vector(self, tmp_path, monkeypatch):
         import anndata as ad

@@ -583,6 +583,7 @@ class CMEModel:
         bursty = False,
         protein = False,
         protein_background = None,
+        cell_factor = None,
         amb_species = None,
     ):
         """Initialize the CMEModel instance.
@@ -701,6 +702,16 @@ class CMEModel:
                     self.protein_background = (float(lo), float(hi), int(ng))
             elif protein_background is not None:
                 raise ValueError("protein_background needs protein=True")
+            # a per-cell lognormal factor on the production rates (and the protein
+            # background), integrated by Gauss-Hermite quadrature: (sd of log f, nodes)
+            self.cell_factor = None
+            if cell_factor is not None:
+                sigma, nodes = cell_factor
+                if float(sigma) < 0 or int(nodes) < 1:
+                    raise ValueError(f"cell_factor must be (sd of the log factor >= 0, quadrature nodes >= 1), got {cell_factor!r}")
+                self.cell_factor = (float(sigma), int(nodes))
+        elif cell_factor is not None:
+            raise ValueError("cell_factor is an option of the Chromatin model")
 
         # Modalities (in order), expression filter and parameter box: from the
         # family table for the built-in models, from the structure otherwise.
@@ -1037,7 +1048,7 @@ class CMEModel:
         "quad_vec_T", "protein_limit", "fit_unspliced", "min_fudge", "max_fudge",
         "network", "normalize_production_rate", "burst_mean_rate",
         "n_sites", "rule", "periodic", "chromatin_tol", "chromatin_search_tol", "dropout_bounds", "bursty",
-        "protein", "protein_background", "amb_species",
+        "protein", "protein_background", "cell_factor", "amb_species",
     )
 
     def to_dict(self):
@@ -1073,6 +1084,8 @@ class CMEModel:
                 if self.protein_background is not None:
                     lo, hi, ng = self.protein_background
                     d["protein_background"] = [float(lo), float(hi), int(ng)]
+            if self.cell_factor is not None:
+                d["cell_factor"] = [float(self.cell_factor[0]), int(self.cell_factor[1])]
         if self.amb_model != "None":
             d["amb_species"] = [str(x) for x in self.amb_species]
         return d
@@ -1091,6 +1104,9 @@ class CMEModel:
             kwargs["dropout_bounds"] = tuple(np.asarray(kwargs["dropout_bounds"]).tolist())
         if kwargs.get("protein_background") is not None:
             kwargs["protein_background"] = tuple(np.asarray(kwargs["protein_background"]).tolist())
+        if kwargs.get("cell_factor") is not None:
+            sigma, nodes = np.asarray(kwargs["cell_factor"]).tolist()
+            kwargs["cell_factor"] = (float(sigma), int(nodes))
         if "amb_species" in kwargs:
             kwargs["amb_species"] = tuple(str(x) for x in np.atleast_1d(np.asarray(kwargs["amb_species"], dtype=object)).ravel())
         return cls(**kwargs)
@@ -1917,6 +1933,19 @@ class CMEModel:
             return None
         return float(10.0 ** samp[3])
 
+    def chromatin_factor_nodes(self):
+        """Quadrature of the per-cell factor: ``(f, w)`` with ``sum w = 1`` and
+        ``sum w f = 1`` (Gauss-Hermite in log f, renormalised so the mean
+        production rate keeps its meaning), or ``(None, None)`` without one."""
+        cf = getattr(self, "cell_factor", None)
+        if cf is None or cf[0] == 0.0:
+            return None, None
+        sigma, nodes = cf
+        z, w = np.polynomial.hermite_e.hermegauss(int(nodes))
+        w = w / w.sum()
+        f = np.exp(sigma * z - 0.5 * sigma ** 2)
+        return f / float(w @ f), w
+
     def _eval_model_pss_chromatin(self, p, limits, samp):
         """Joint distribution over (unspliced, spliced, configuration): the
         chromatin kernel on the RNA mesh, transformed by the sequencing model,
@@ -1942,15 +1971,37 @@ class CMEModel:
         g = self._apply_seq_transform(g, None if samp is None else np.asarray(samp, dtype=float).ravel()[:2])
         H, A, C = self.chromatin_system(p)
         k_on, eps, rates, _, _ = _chromatin.split_theta(p, self.rule, self.n_sites)
-        structure = _chromatin.rule_structure(H, A, k_on, 1.0, eps, self.rule, rates)
         protein = self.chromatin_protein(p)
+        burst = self.chromatin_burst(p)
         backend = "rust" if _HAS_RUST and _chromatin._rust_available(protein is not None) else "python"
-        G, sched = _chromatin.eval_joint_pgf(H, A, C, g, tol=self.chromatin_tol,
-                                             fixed_schedule=self._fixed_schedule,
-                                             burst=self.chromatin_burst(p), structure=structure,
-                                             backend=backend, protein=protein)
-        self._last_schedule = sched
-        n_steps = len(getattr(sched, "steps", sched))
+        lam_bg = self.chromatin_background(samp)
+        f_nodes, w_nodes = self.chromatin_factor_nodes()
+        if f_nodes is None:
+            f_nodes, w_nodes = np.ones(1), np.ones(1)
+        fixed = self._fixed_schedule
+        if not isinstance(fixed, (list, tuple)):
+            fixed = [fixed] * f_nodes.size
+        if len(fixed) != f_nodes.size:
+            raise ValueError(f"the pinned schedule has {len(fixed)} node schedules; the model's cell factor has {f_nodes.size} nodes")
+        G = None
+        scheds = []
+        for f, w, fx in zip(f_nodes, w_nodes, fixed):
+            # the per-cell factor scales every production rate (under bursty emission
+            # through the burst size, the burst frequency unchanged) and the protein
+            # background; the generating function is linear in the mixture
+            A_f, rates_f = A * f, rates * f
+            structure = _chromatin.rule_structure(H, A_f, k_on, 1.0, eps, self.rule, rates_f)
+            G_f, sched = _chromatin.eval_joint_pgf(H, A_f, C, g, tol=self.chromatin_tol, fixed_schedule=fx,
+                                                   burst=None if burst is None else burst * f, structure=structure,
+                                                   backend=backend, protein=protein)
+            if lam_bg is not None:
+                # background counts add independently: the PGF gains the Poisson
+                # factor exp(lambda (g_P - 1)) at every protein frequency kept
+                G_f = G_f * np.exp(lam_bg * f * g[2])[None, :]
+            G = w * G_f if G is None else G + w * G_f
+            scheds.append(sched)
+        self._last_schedule = scheds if len(scheds) > 1 else scheds[0]
+        n_steps = max(len(getattr(sc, "steps", sc)) for sc in scheds)
         if n_steps >= _chromatin._MAX_STEPS:
             # the stepper stopped short of the horizon: the slow tail (gamma or
             # gamma_p below about -3 in units of k_off) is cut off and the
@@ -1959,11 +2010,6 @@ class CMEModel:
                 f"Chromatin integrator reached its cap of {n_steps} steps before the horizon; the "
                 "distribution is truncated. Keep gamma and gamma_p above about -3 (units of k_off) "
                 "or raise monod.chromatin._MAX_STEPS.", RuntimeWarning, stacklevel=2)
-        lam_bg = self.chromatin_background(samp)
-        if lam_bg is not None:
-            # background counts add independently: the PGF gains the Poisson
-            # factor exp(lambda (g_P - 1)) at every protein frequency kept
-            G = G * np.exp(lam_bg * g[2])[None, :]
         pss = _chromatin.invert_joint_pgf(G, mx, counts)                # (N, lu, ls[, lp])
         p_drop = self.chromatin_dropout(samp)
         if p_drop is not None:
