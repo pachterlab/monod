@@ -560,3 +560,78 @@ class TestStart:
         x0 = m.get_MoM(None, lb, ub, None, hist=cf.sparse_histogram(P), limits=L)
         assert x0[3] > lb[3] + 0.5
         assert abs(x0[5] - 0.5 * (lb[5] + ub[5])) < 0.01                # gamma from the middle of its box
+
+
+class TestRnaOnlyCheck:
+    """``inference.rna_only_check``: the joint fit's shared parameters against a
+    chromatin-plus-RNA refit of the same cells."""
+    TRUTH = TestPipeline.TRUTH
+    CAPTURE = TestPipeline.CAPTURE
+    GP = {"max_iterations": 3, "init_pattern": "moments", "num_restarts": 1, "num_gene_cores": 1, "check_identifiability": False}
+
+    def _joint(self, tmp_path, monkeypatch, **model_kw):
+        from monod.inference import perform_inference
+        from monod.simulate import simulate_adata
+        monkeypatch.chdir(tmp_path)
+        d = np.log10(0.1)
+        m = _model(seq="Poisson", dropout_bounds=(d, d, 1), **model_kw)
+        n_samp = 4 if model_kw.get("protein_background") is not None else 3
+        samp = list(self.CAPTURE) + [d] + ([0.0] if n_samp == 4 else [])
+        a = simulate_adata(m, [self.TRUTH], 1500, np.append(self.CAPTURE, d), seed=5, gene_names=["geneA"])
+        if n_samp == 4:
+            a.var["log10_protein_background"] = [np.log10(0.5)]
+        path = tmp_path / "joint.h5ad"; a.write_h5ad(path)
+        return perform_inference(str(path), m, n_genes=1, viz=False, gradient_params=dict(self.GP), dataset_string="joint",
+                                 exclude_sigma=True, filt_param={"min_means": [0] * 4, "max_maxes": [10_000] * 4, "min_maxes": [0] * 4},
+                                 samp_lb=samp, samp_ub=samp, gridsize=[1] * n_samp)
+
+    def test_columns_shared_parameters_and_result(self, tmp_path, monkeypatch):
+        from monod.inference import rna_only_check, search_result_from_uns
+        out = self._joint(tmp_path, monkeypatch)
+        table = rna_only_check(out, gradient_params=dict(self.GP), num_cores=1)
+        names = [p.replace(r"\log_{10} ", "") for p in _model(seq="Poisson").param_str]
+        shared = names[:-2]                                                 # everything but k_p and gamma_p
+        for n in shared:
+            for c in ("rna_only_" + n, "rna_only_error_" + n, "shift_" + n):
+                assert c in table.columns and c in out.var.columns and np.isfinite(table[c].iloc[0])
+            assert table["shift_" + n].iloc[0] == pytest.approx(float(out.var[n].iloc[0]) - table["rna_only_" + n].iloc[0])
+        for n in names[-2:]:                                                 # k_p and gamma_p
+            assert "rna_only_" + n not in table.columns
+        for c in ("rna_only_error_unreliable", "rna_only_hellinger_excess", "rna_only_rejected", "b_shift_sigma", "protein_biases_b"):
+            assert c in out.var.columns
+        assert table["b_shift_sigma"].iloc[0] == pytest.approx(table["shift_$b$"].iloc[0] / table["rna_only_error_$b$"].iloc[0])
+        # the RNA-only result is a Chromatin fit without a protein layer, at the joint's capture and dropout
+        sr_rna = search_result_from_uns(out.uns["rna_only_search_result"])
+        assert not sr_rna.model.protein and list(sr_rna.model.model_modalities) == ["unspliced", "spliced", "configuration"]
+        np.testing.assert_allclose(np.asarray(sr_rna.samp_optimum, float), list(self.CAPTURE) + [np.log10(0.1)])
+        assert search_result_from_uns(out.uns["search_result"]).model.protein and out.uns["model"]["protein"]   # the joint result is untouched
+
+    def test_joint_start_and_background_entry(self, tmp_path, monkeypatch):
+        """A joint fit with a per-gene protein background has a fourth sampling entry;
+        the RNA-only fit drops it. Started at the joint optimum the shared entries begin
+        there, so one optimizer step leaves them within a few hundredths (a moments start
+        moves them by tenths)."""
+        from monod.inference import rna_only_check, search_result_from_uns
+        out = self._joint(tmp_path, monkeypatch, protein_background=(0.0, 0.0, 1))
+        gp = dict(self.GP, max_iterations=1)
+        table = rna_only_check(out, gradient_params=gp, start="joint")
+        sr_rna = search_result_from_uns(out.uns["rna_only_search_result"])
+        assert len(np.asarray(sr_rna.samp_optimum)) == 3
+        names = [p.replace(r"\log_{10} ", "") for p in sr_rna.model.param_str]
+        for n in names:
+            assert abs(table["shift_" + n].iloc[0]) < 0.05
+
+    def test_needs_a_protein_fit(self, tmp_path, monkeypatch):
+        from monod.inference import perform_inference, rna_only_check
+        from monod.simulate import simulate_adata
+        monkeypatch.chdir(tmp_path)
+        d = np.log10(0.1)
+        m = CMEModel("Chromatin", "Poisson", n_sites=2, rule="switch", bursty=True, dropout_bounds=(d, d, 1))
+        theta = self.TRUTH[:-2]
+        a = simulate_adata(m, [theta], 500, np.append(self.CAPTURE, d), seed=3, gene_names=["geneA"])
+        path = tmp_path / "rna.h5ad"; a.write_h5ad(path)
+        out = perform_inference(str(path), m, n_genes=1, viz=False, gradient_params=dict(self.GP), dataset_string="rna", exclude_sigma=True,
+                                filt_param={"min_means": [0] * 3, "max_maxes": [10_000] * 3, "min_maxes": [0] * 3},
+                                samp_lb=list(self.CAPTURE) + [d], samp_ub=list(self.CAPTURE) + [d], gridsize=[1, 1, 1])
+        with pytest.raises(ValueError, match="protein layer"):
+            rna_only_check(out, gradient_params=dict(self.GP))

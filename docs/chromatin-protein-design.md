@@ -753,6 +753,29 @@ Stages 1 to 4 were Python only and self-contained; stage 5 was the port.
    RNA-only fit with their protein parameters withheld, and for every gene
    a check of the joint `b` against the RNA-only fit before trusting it.
 
+   **The burst-size check as a routine (2026-11-16).** `inference.rna_only_check(adata,
+   gradient_params, num_cores, start="moments" | "joint", sigma_threshold=3)`
+   does what pass 7r did by hand: it rebuilds the fitted model without its
+   protein layer (`protein=False`, the background entry dropped from the
+   sampling vector), refits every gene of a joint result on the same cells at
+   the joint capture and dropout, computes the RNA-only standard errors and
+   writes `rna_only_<name>`, `rna_only_error_<name>` and `shift_<name>` (joint
+   minus RNA-only) for the seven shared parameters, the RNA-only excess and
+   rejection, `b_shift_sigma` and the flag `protein_biases_b` (the shift in
+   `b` beyond three RNA-only standard errors, reliable errors only); the
+   RNA-only result object goes to `uns['rna_only_search_result']`
+   (`TestRnaOnlyCheck`). On pass 7a (284 s for 28 genes on bio,
+   `fits/*pass7a_joint_cm10_rna_check.csv`) it reproduces the pass 7r shifts
+   (CD63 -1.13, CD9 +0.95, integrin beta7 -0.47, CD27 -1.65, CD4 -0.11, CD25
+   and CD49d under 0.02) and flags six genes: CD45 (`b` -1.45, 42 standard
+   errors, at a passing excess of 0.009), CXCR6 (-3.3), CD63 (-1.1), CD27
+   (-1.65), ICOS (-0.19, 4.5 errors) and CD52 (-0.15, 4.0). Three more
+   (FASLG, CD9, CD68) shift by 6 to 9 nominal errors but their RNA-only
+   errors are the unreliable fallback, so they are reported and not flagged.
+   The rule from pass 7r holds beyond the rejected genes: a protein layer that
+   passes the fit test can still have moved the burst size by an order of
+   magnitude, and the check belongs after every joint fit.
+
 ## Open decisions
 
 - **Heavy protein tails of the abundant antibodies.** After pass 7 the
@@ -767,8 +790,9 @@ Stages 1 to 4 were Python only and self-contained; stage 5 was the port.
   sd fitted rather than measured). Decided 2026-11-12: neither is built.
   A model shaped for five antibodies of one dataset is a bespoke example,
   not a feature; these genes' RNA parameters come from the chromatin plus
-  RNA fit (pass 7r) and their protein parameters are withheld. The
-  decision reopens only if the same tails appear in a second dataset.
+  RNA fit (pass 7r) and their protein parameters are withheld; every
+  joint fit is followed by `inference.rna_only_check`. The decision
+  reopens only if the same tails appear in a second dataset.
 - **Protein measurement noise.** `ProteinBursty` has none, and ADT counts carry
   a known background. The DOGMA-seq DIG control shows it matters for the
   low-abundance antibodies: in CD4 T cells the rat isotype controls average

@@ -840,6 +840,114 @@ def warm_start(results):
     return {str(g): opt[i].copy() for i, g in enumerate(results.var_names)}
 
 
+def rna_only_check(adata, gradient_params=None, num_cores=1, start="moments", sigma_threshold=3.0,
+                   dataset_string="rna_only_check"):
+    """Refit the genes of a joint chromatin, RNA and protein result with the
+    protein layer dropped, on the same cells at the same sampling point, and
+    report how far the joint fit moved each parameter the two models share.
+
+    A protein layer the model cannot match (a heavy tail of the antibody) pulls
+    on the burst size through the shared production term, even when the
+    goodness-of-fit test passes the gene: in the DOGMA-seq CD4 T-cell fit the
+    joint `b` of CD27 sat 1.65 log10 below the RNA-only value at a passing
+    Hellinger excess of 0.03. The RNA-only fit is the reference because its
+    `b` is pinned by the nascent and mature counts alone, with standard errors
+    of a few hundredths for an abundant gene.
+
+    Parameters
+    ----------
+    adata: AnnData
+        the output of :func:`perform_inference` for a ``CMEModel("Chromatin",
+        protein=True)`` fit (``uns['search_result']``, the layers, the grid limits).
+    gradient_params: dict, optional
+        settings of the RNA-only fit; the defaults of :func:`perform_inference`
+        otherwise.
+    num_cores: int
+        parallelism of the fit and of the standard errors.
+    start: "moments" or "joint"
+        where the RNA-only fit begins: at the moments estimate (independent of
+        the joint fit, the default) or at the joint optimum's shared entries.
+    sigma_threshold: float
+        a gene is flagged when ``|shift_b| / rna_only_error_b`` exceeds it and
+        the RNA-only errors are reliable.
+    dataset_string: str
+        label of the RNA-only fit (nothing is written to disk).
+
+    Returns
+    -------
+    pandas.DataFrame indexed by gene with the columns written into ``adata.var``:
+    ``rna_only_<name>``, ``rna_only_error_<name>`` and ``shift_<name>`` (joint
+    minus RNA-only, log10) for every shared parameter, ``rna_only_error_unreliable``,
+    ``rna_only_hellinger_excess``, ``rna_only_rejected``, ``b_shift_sigma`` and
+    ``protein_biases_b``. The RNA-only result object lands in
+    ``adata.uns['rna_only_search_result']``.
+    """
+    import pandas as pd
+    from .cme_toolbox import CMEModel
+    sr = search_result_from_uns(adata.uns["search_result"])
+    model = sr.model
+    if model.bio_model != "Chromatin" or not getattr(model, "protein", False):
+        raise ValueError("rna_only_check needs a Chromatin fit with a protein layer (CMEModel('Chromatin', protein=True))")
+    d = model.to_dict()
+    d["protein"] = False
+    for k in ("protein_limit", "protein_background"):
+        d.pop(k, None)
+    rna_model = CMEModel.from_dict(d)
+    joint_names = [p.replace(r"\log_{10} ", "") for p in model.param_str]
+    rna_names = [p.replace(r"\log_{10} ", "") for p in rna_model.param_str]
+    shared = [n for n in rna_names if n in joint_names]
+    if shared != rna_names:
+        raise RuntimeError(f"the RNA-only model's parameters {rna_names} are not all in the joint model's {joint_names}")
+    j_idx = [joint_names.index(n) for n in shared]
+    # the same cells and genes, read through the RNA-only model's modalities
+    rna = adata.copy()
+    rna.uns["model"] = rna_model.to_dict()
+    for key in ("search_result", "rna_only_search_result"):
+        rna.uns.pop(key, None)
+    sd = searchdata_from_adata(rna)
+    samp = np.asarray(sr.samp_optimum, dtype=float)
+    if getattr(model, "protein_background", None) is not None:
+        samp = samp[:-1]                                   # the background entry belongs to the protein layer
+    lb = np.asarray(sr.sp.phys_lb, dtype=float)[j_idx]
+    ub = np.asarray(sr.sp.phys_ub, dtype=float)[j_idx]
+    gp = dict(DEFAULT_GRADIENT_PARAMS if gradient_params is None else gradient_params)
+    if start == "joint":
+        gp["init_pattern"] = "given"
+        gp["x0"] = np.asarray(sr.phys_optimum, dtype=float)[:, j_idx]
+    elif start != "moments":
+        raise ValueError(f"start must be 'moments' or 'joint', got {start!r}")
+    ip = InferenceParameters(dataset_string, rna_model, gradient_params=gp, phys_lb=lb, phys_ub=ub,
+                             samp_lb=samp.tolist(), samp_ub=samp.tolist(), gridsize=[1] * samp.size)
+    sr_rna = ip.fit_all_grid_points(sd, num_cores=num_cores, checkpoint=False, save=False)
+    sr_rna.find_sampling_optimum(discard_rejected=False)
+    sr_rna.compute_sigma(sd, num_cores=num_cores)
+    sr_rna.chisquare_testing(sd, reject_at_bounds=True)
+    joint = np.asarray(sr.phys_optimum, dtype=float)[:, j_idx]
+    est = np.asarray(sr_rna.phys_optimum, dtype=float)
+    err = np.asarray(sr_rna.sigma, dtype=float)
+    unreliable = np.asarray(sr_rna.sigma_fail, dtype=bool)
+    out = {}
+    for k, n in enumerate(shared):
+        out["rna_only_" + n] = est[:, k]
+        out["rna_only_error_" + n] = err[:, k]
+        out["shift_" + n] = joint[:, k] - est[:, k]
+    out["rna_only_error_unreliable"] = unreliable
+    out["rna_only_hellinger_excess"] = np.asarray(sr_rna.hellinger_excess, dtype=float)
+    out["rna_only_rejected"] = np.asarray(sr_rna.rejected_genes, dtype=bool)
+    bare = [n.strip("$") for n in shared]                   # the names carry TeX dollars: "$b$"
+    if "b" in bare:
+        kb = bare.index("b")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            z = (joint[:, kb] - est[:, kb]) / err[:, kb]
+        out["b_shift_sigma"] = z
+        out["protein_biases_b"] = (np.abs(z) > float(sigma_threshold)) & ~unreliable
+    table = pd.DataFrame(out, index=adata.var_names)
+    for c in table.columns:
+        adata.var[c] = table[c].to_numpy()
+    adata.uns["rna_only_search_result"] = sr_rna.to_dict()
+    return table
+
+
 def _validate_bounds(model, phys_lb, phys_ub, samp_lb, samp_ub, gridsize):
     """Raise ValueError for malformed parameter bounds / sampling grids.
 
