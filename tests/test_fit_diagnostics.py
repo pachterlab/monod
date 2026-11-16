@@ -1,5 +1,6 @@
 """The goodness-of-fit statistic's sampling floor and the multi-tail droplet filter
 (docs/chromatin-protein-design.md, broad-antibody diagnosis, 2026-11-10)."""
+import os
 import numpy as np
 import pytest
 
@@ -63,3 +64,95 @@ class TestTailDroplets:
         assert np.array_equal(drop_sp, drop) and np.array_equal(hits_sp, hits)
         with pytest.raises(ValueError):
             tail_droplets(X[0])
+
+
+_GABA = os.path.join(os.path.dirname(__file__), "..", "example_h5ad", "gaba_example.h5ad")   # gitignored; see test_gaba_inference
+_GENES = ["Eif5b", "Xrcc5", "Klhl12"]
+_GP = {"max_iterations": 5, "init_pattern": "moments", "num_restarts": 1, "num_gene_cores": 1, "n_jac_jobs": 1}
+
+
+def _bursty_fit(workdir, gp):
+    """A quick 3-gene Bursty/None fit of the gaba example, run inside ``workdir``."""
+    import warnings
+    from monod.inference import perform_inference
+    warnings.filterwarnings("ignore")
+    cwd = os.getcwd(); os.chdir(workdir)
+    try:
+        return perform_inference(_GABA, CMEModel("Bursty", "None"), n_genes=3, genes_to_fit=_GENES, viz=False,
+                                 modality_name_dict={"unspliced": "unspliced", "spliced": "spliced"},
+                                 gradient_params=gp, seed=1, use_lengths=None)
+    finally:
+        os.chdir(cwd)
+
+
+@pytest.fixture(scope="module")
+def cold(tmp_path_factory):
+    if not os.path.exists(_GABA):
+        pytest.skip("gaba_example.h5ad not available")
+    """The moments-started fit the warm starts are measured against."""
+    return _bursty_fit(tmp_path_factory.mktemp("cold"), dict(_GP))
+
+
+class TestWarmStart:
+    """``init_pattern="given"``: a fit can start where an earlier one ended."""
+
+    GP = _GP
+
+    def _fit(self, workdir, gp):
+        return _bursty_fit(workdir, gp)
+
+    def test_warm_start_maps_gene_names_to_optima(self, cold):
+        from monod.inference import search_result_from_uns, warm_start
+        x0 = warm_start(cold)
+        sr = search_result_from_uns(cold.uns["search_result"])
+        assert set(x0) == set(cold.var_names)
+        for i, g in enumerate(cold.var_names):
+            np.testing.assert_array_equal(x0[g], sr.phys_optimum[i])
+
+    def test_warm_start_from_path_and_without_a_result(self, cold, tmp_path):
+        import anndata as ad
+        from monod.inference import warm_start
+        from monod.extract_data import write_h5ad
+        path = str(tmp_path / "cold.h5ad"); write_h5ad(cold, path)
+        again = warm_start(path)
+        for g in cold.var_names:
+            np.testing.assert_array_equal(again[g], warm_start(cold)[g])
+        bare = ad.AnnData(X=np.zeros((2, 2)))
+        with pytest.raises(ValueError, match="search_result"):
+            warm_start(bare)
+
+    def test_a_warm_start_at_the_optimum_stays_there(self, cold, tmp_path):
+        """Started at the cold fit's optimum, the fit reproduces it: a contract
+        between the start and the optimizer, not a new optimum."""
+        from monod.inference import search_result_from_uns, warm_start
+        gp = dict(self.GP, init_pattern="given", x0=warm_start(cold))
+        warm = self._fit(tmp_path, gp)
+        s0, s1 = search_result_from_uns(cold.uns["search_result"]), search_result_from_uns(warm.uns["search_result"])
+        assert list(warm.var_names) == list(cold.var_names) and cold.n_vars == 3
+        k0, k1 = np.asarray(s0.klds).ravel(), np.asarray(s1.klds).ravel()
+        assert np.all(k1 <= k0 + 1e-6)
+        np.testing.assert_allclose(s1.phys_optimum, s0.phys_optimum, atol=0.05)
+
+    def test_missing_genes_take_the_moments_start(self, cold, tmp_path):
+        """A mapping that lacks a gene, or an array row with a NaN, falls back to
+        the moments start for that gene and only that gene."""
+        from monod.inference import search_result_from_uns, warm_start
+        x0 = warm_start(cold); g_drop = list(cold.var_names)[0]; del x0[g_drop]
+        (tmp_path / "a").mkdir()
+        warm = self._fit(tmp_path / "a", gp=dict(self.GP, init_pattern="given", x0=x0))
+        s0, s1 = search_result_from_uns(cold.uns["search_result"]), search_result_from_uns(warm.uns["search_result"])
+        # the dropped gene repeats the cold (moments-started) fit exactly; the others sit at the warm optimum
+        np.testing.assert_allclose(s1.phys_optimum[0], s0.phys_optimum[0], atol=1e-8)
+        np.testing.assert_allclose(s1.phys_optimum[1:], s0.phys_optimum[1:], atol=0.05)
+        arr = np.asarray(s0.phys_optimum, float).copy(); arr[1, 0] = np.nan
+        (tmp_path / "b").mkdir()
+        warm_b = self._fit(tmp_path / "b", gp=dict(self.GP, init_pattern="given", x0=arr))
+        s2 = search_result_from_uns(warm_b.uns["search_result"])
+        np.testing.assert_allclose(s2.phys_optimum[1], s0.phys_optimum[1], atol=1e-8)
+
+    def test_bad_x0_raises(self, cold, tmp_path):
+        with pytest.raises(ValueError, match="x0"):
+            self._fit(tmp_path, gp=dict(self.GP, init_pattern="given"))
+        (tmp_path / "shape").mkdir()
+        with pytest.raises(ValueError, match="shape"):
+            self._fit(tmp_path / "shape", gp=dict(self.GP, init_pattern="given", x0=np.zeros((3, 2))))

@@ -17,6 +17,8 @@ from ._core import _mc          # None when the compiled extension is not instal
 #: Default settings for the per-gene fits.  Keys:
 #:   max_iterations   maximum L-BFGS-B iterations per start
 #:   init_pattern     "moments" starts the first attempt at the method-of-moments estimate
+#:                    "given" starts it at gradient_params["x0"] (genes x parameters in log10,
+#:                    or {gene: parameters}; see warm_start); "random" draws every start
 #:   num_restarts     number of starts per gene; later starts are drawn uniformly in the restart box
 #:   num_gene_cores   gene-level parallelism per grid point (-1 = all cores)
 #:   n_jac_jobs       joblib parallelism over finite-difference perturbations (Python path)
@@ -814,6 +816,30 @@ def search_result_list_to_uns(srs):
 _USE_LENGTHS_MODES = (None, "unspliced", "spliced", "both")
 
 
+def warm_start(results):
+    """Starting points for ``gradient_params={"init_pattern": "given", "x0": ...}``
+    from an earlier fit: a mapping from gene name to the gene's physical optimum
+    (log10) in ``results``, an AnnData written by :func:`perform_inference` or
+    the path of its h5ad. Genes the new fit has and the mapping lacks take the
+    moments start, so a fit on a subset of cells, or with more genes, can begin
+    from a pooled fit's optimum. A clustered fit (``uns['search_result_list']``)
+    is not supported.
+
+    Why: a cold start on a few thousand cells can settle in a poor optimum
+    (a resting-cell stratum of the DOGMA-seq CD25 fit reached divergence 1.32
+    where the pooled optimum gave 0.35); from the pooled point it reached 0.31.
+    """
+    if isinstance(results, (str, os.PathLike)):
+        import anndata
+        results = anndata.read_h5ad(results)
+    if "search_result" not in results.uns:
+        raise ValueError("warm_start needs uns['search_result'] from perform_inference; a clustered fit "
+                         "(uns['search_result_list']) has one optimum per cluster and is not supported")
+    sr = search_result_from_uns(results.uns["search_result"])
+    opt = np.asarray(sr.phys_optimum, dtype=float)
+    return {str(g): opt[i].copy() for i, g in enumerate(results.var_names)}
+
+
 def _validate_bounds(model, phys_lb, phys_ub, samp_lb, samp_ub, gridsize):
     """Raise ValueError for malformed parameter bounds / sampling grids.
 
@@ -1009,7 +1035,9 @@ class InferenceParameters:
         gradient_params: dict, optional
             settings for the per-gene fits; missing keys take ``DEFAULT_GRADIENT_PARAMS``.
             "max_iterations" defines the maximum number of gradient descent iterations.
-            "init_pattern" defines whether the first try starts at the method of moments estimate.
+            "init_pattern" defines where the first try starts: "moments" at the method of moments
+                estimate, "given" at gradient_params["x0"] (genes x parameters in log10, or a
+                {gene: parameters} mapping such as warm_start builds), "random" in the restart box.
             "num_restarts" defines how many attempts should be made.
             "presearch" selects a derivative-free search run from the first starting point before
                 gradient descent: "auto" (default; Nelder-Mead for ProteinBursty, nothing otherwise),
@@ -1339,7 +1367,9 @@ class GradientInference:
         gradient_params: dict
             settings for the per-gene fits; missing keys take ``DEFAULT_GRADIENT_PARAMS``.
             "max_iterations" defines the maximum number of gradient descent iterations.
-            "init_pattern" defines whether the first try starts at the method of moments estimate.
+            "init_pattern" defines where the first try starts: "moments" at the method of moments
+                estimate, "given" at gradient_params["x0"] (genes x parameters in log10, or a
+                {gene: parameters} mapping such as warm_start builds), "random" in the restart box.
             "num_restarts" defines how many attempts should be made.
         phys_lb: float np.ndarray
             log10 lower bounds on biological parameters.
@@ -1423,59 +1453,101 @@ class GradientInference:
         self._restart_ub = 2.0 * np.ones(self.n_phys_pars)
         self._restart_range = self._restart_ub - self._restart_lb
 
-        if self.gradient_params["init_pattern"] == "moments":
-            _sd_is_rust_sd = _mc is not None and isinstance(search_data, _mc.SearchData)
-            if model.bio_model == "Custom" and getattr(model, "composition", None) is None:
-                # No moment estimator for an arbitrary network: every gene starts
-                # from the middle of the parameter box (see CMEModel.get_MoM); the
-                # network form of a composed model takes its family's start below.
-                mid = 0.5 * (np.asarray(global_parameters.phys_lb, float) + np.asarray(global_parameters.phys_ub, float))
-                self.param_MoM = np.tile(mid, (search_data.n_genes, 1))
-            elif model.bio_model == "Chromatin":
-                # chain from the configuration marginal, rates from conditional means: needs the histogram
-                self.param_MoM = np.asarray([
-                    model.get_MoM(None, global_parameters.phys_lb, global_parameters.phys_ub, regressor[i],
-                                  hist=search_data.hist[i], limits=np.asarray(search_data.M[:, i]))
-                    for i in range(search_data.n_genes)
-                ])
-            elif _sd_is_rust_sd and model.amb_model == "None" and model.bio_model != "Custom":
-                # Zero-Python-loop path: Rust computes MoM for all genes at once
-                # (the ambiguous models and composed networks take the Python
-                # start, which uses the ambiguous moments and the composition).
-                samp_list_mom = None
-                if model.seq_model in ("Poisson", "Bernoulli"):
-                    samp_list_mom = [
-                        (regressor[gi].tolist() if regressor[gi] is not None else None)
-                        for gi in range(search_data.n_genes)
-                    ]
-                self.param_MoM = np.asarray(
-                    search_data.mom_x0_all(
-                        model.bio_model,
-                        model.seq_model,
-                        model.amb_model,
-                        global_parameters.phys_lb.tolist(),
-                        global_parameters.phys_ub.tolist(),
-                        samp_list_mom,
-                    )
-                )
-            else:
-                _saved_filters = warnings.filters[:]
-                warnings.filterwarnings("ignore", category=RuntimeWarning)
-                self.param_MoM = np.asarray(
-                    [
-                        model.get_MoM(
-                            search_data.moments[i],
-                            global_parameters.phys_lb,
-                            global_parameters.phys_ub,
-                            regressor[i],
-                        )
-                        for i in range(search_data.n_genes)
-                    ]
-                )
-                warnings.filters[:] = _saved_filters   # restore the caller's filters
+        pattern = self.gradient_params["init_pattern"]
+        if pattern == "given":
+            self.param_MoM = self._given_start(model, search_data, global_parameters, regressor)
+        elif pattern == "moments":
+            self.param_MoM = self._moments_start(model, search_data, global_parameters, regressor)
 
         if point_index == 0:
             global_parameters.identifiability = self._check_identifiability(model, search_data)
+
+    def _moments_start(self, model, search_data, global_parameters, regressor):
+        """The method-of-moments starting point of every gene (genes x parameters,
+        log10) at this grid point: the Rust all-gene estimator when the data is a
+        Rust ``SearchData`` and the model has one, the per-gene Python estimator
+        otherwise (Chromatin from the histogram, Custom networks without a
+        composition from the middle of the box)."""
+        _sd_is_rust_sd = _mc is not None and isinstance(search_data, _mc.SearchData)
+        if model.bio_model == "Custom" and getattr(model, "composition", None) is None:
+            # No moment estimator for an arbitrary network: every gene starts
+            # from the middle of the parameter box (see CMEModel.get_MoM); the
+            # network form of a composed model takes its family's start below.
+            mid = 0.5 * (np.asarray(global_parameters.phys_lb, float) + np.asarray(global_parameters.phys_ub, float))
+            start = np.tile(mid, (search_data.n_genes, 1))
+        elif model.bio_model == "Chromatin":
+            # chain from the configuration marginal, rates from conditional means: needs the histogram
+            start = np.asarray([
+                model.get_MoM(None, global_parameters.phys_lb, global_parameters.phys_ub, regressor[i],
+                              hist=search_data.hist[i], limits=np.asarray(search_data.M[:, i]))
+                for i in range(search_data.n_genes)
+            ])
+        elif _sd_is_rust_sd and model.amb_model == "None" and model.bio_model != "Custom":
+            # Zero-Python-loop path: Rust computes MoM for all genes at once
+            # (the ambiguous models and composed networks take the Python
+            # start, which uses the ambiguous moments and the composition).
+            samp_list_mom = None
+            if model.seq_model in ("Poisson", "Bernoulli"):
+                samp_list_mom = [
+                    (regressor[gi].tolist() if regressor[gi] is not None else None)
+                    for gi in range(search_data.n_genes)
+                ]
+            start = np.asarray(
+                search_data.mom_x0_all(
+                    model.bio_model,
+                    model.seq_model,
+                    model.amb_model,
+                    global_parameters.phys_lb.tolist(),
+                    global_parameters.phys_ub.tolist(),
+                    samp_list_mom,
+                )
+            )
+        else:
+            _saved_filters = warnings.filters[:]
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            start = np.asarray(
+                [
+                    model.get_MoM(
+                        search_data.moments[i],
+                        global_parameters.phys_lb,
+                        global_parameters.phys_ub,
+                        regressor[i],
+                    )
+                    for i in range(search_data.n_genes)
+                ]
+            )
+            warnings.filters[:] = _saved_filters   # restore the caller's filters
+        return start
+
+    def _given_start(self, model, search_data, global_parameters, regressor):
+        """The caller's starting points, ``gradient_params["x0"]``: a (genes x
+        parameters) log10 array aligned with ``search_data``'s genes, or a mapping
+        from gene name to parameter vector (see :func:`warm_start`). Genes the
+        mapping lacks, and rows with a non-finite entry, take the moments start;
+        the result is clipped to the parameter box."""
+        x0 = self.gradient_params.get("x0")
+        if x0 is None:
+            raise ValueError('init_pattern "given" needs gradient_params["x0"]: a (genes x parameters) log10 array '
+                             'or a {gene: parameters} mapping (inference.warm_start builds one from an earlier fit)')
+        n_genes, n_pars = search_data.n_genes, self.n_phys_pars
+        if hasattr(x0, "keys"):
+            names = getattr(search_data, "gene_names", None)
+            if names is None:
+                raise ValueError("a {gene: parameters} x0 needs gene names on the search data; pass an array instead")
+            arr = np.full((n_genes, n_pars), np.nan)
+            for gi, g in enumerate(names):
+                if g in x0:
+                    arr[gi] = np.asarray(x0[g], dtype=float)
+            x0 = arr
+        x0 = np.array(x0, dtype=float)
+        if x0.ndim == 1 and n_genes == 1:
+            x0 = x0[None, :]
+        if x0.shape != (n_genes, n_pars):
+            raise ValueError(f"gradient_params['x0'] has shape {x0.shape}; expected ({n_genes}, {n_pars}) (genes x parameters)")
+        missing = ~np.isfinite(x0).all(axis=1)
+        if missing.any():
+            x0[missing] = np.asarray(self._moments_start(model, search_data, global_parameters, regressor), dtype=float)[missing]
+        return np.clip(x0, self.phys_lb, self.phys_ub)
 
     def _check_identifiability(self, model, search_data):
         """Numerical rank check of the model, once per inference.
@@ -1524,7 +1596,8 @@ class GradientInference:
         """Fit the data for a single gene using KL divergence gradient descent.
 
         If init_pattern = moments, the first search's starting point is set to the
-            method of moments parameter estimate for the current grid point.
+            method of moments parameter estimate for the current grid point; if
+            "given", to the caller's gradient_params["x0"].
         If num_restarts>1, the optimum is only updated if new KLD is lower
             than 0.99*previous lowest KLD.
 
@@ -1764,14 +1837,14 @@ class GradientInference:
     def _starting_points(self, n_genes):
         """Starting points for every gene: ``num_restarts`` draws from the
         restart box per gene, the first replaced by the moments estimate when
-        ``init_pattern == "moments"``.  Built once per grid point so the scipy
+        ``init_pattern == "moments"`` and by the caller's point when it is ``"given"``.  Built once per grid point so the scipy
         and Rust paths share identical restarts.  Returns nested lists
         ``[gene][restart][parameter]``."""
         n_restarts = self.gradient_params["num_restarts"]
         x0_all = []
         for gi in range(n_genes):
             x0 = np.random.rand(n_restarts, self.n_phys_pars) * self._restart_range + self._restart_lb
-            if self.gradient_params["init_pattern"] == "moments":
+            if self.gradient_params["init_pattern"] in ("moments", "given"):
                 x0[0] = self.param_MoM[gi]
             x0_all.append(x0.tolist())
         return x0_all

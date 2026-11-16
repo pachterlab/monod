@@ -716,7 +716,9 @@ Stages 1 to 4 were Python only and self-contained; stage 5 was the port.
    0.080 (floor 0.31 on 1,210 cells), and the cold resting-stratum fit
    landed at divergence 1.32 where the pooled optimum gives 0.35
    (`strata_check.py`), a start problem; refitted from the pooled optimum
-   (`refit_rest.py`) it reaches divergence 0.31 and excess 0.076 over a
+   (`refit_rest.py`; since 2026-11-13 `gradient_params={"init_pattern":
+   "given", "x0": inference.warm_start(results)}`, `START=<results h5ad>`
+   in `fit_mimitou5.py`) it reaches divergence 0.31 and excess 0.076 over a
    0.056 floor (pooled 0.156, activated 0.080): the split halves CD25's
    misfit in each stratum and fits neither, so its tail lies within the
    states, not between them. What the four steps leave rejected is five
@@ -730,6 +732,27 @@ Stages 1 to 4 were Python only and self-contained; stage 5 was the port.
    `*rest5_fit7c*`. Full suite on bio with the floor-based decision as the
    default: 898 passed, 36 skipped.
 
+   **RNA-only reporting for the rejected antibodies (2026-11-12).** The
+   five antibodies pass 7 leaves rejected (CD25, CD63, CD49d, integrin
+   beta7, CD9) are refitted with the chromatin and RNA layers alone on the
+   qc3 cells, same capture and dropout, with CD4 and CD27 as controls
+   (`fit_rna5.py`, `fits/*pass7r_rna_cm10*`; 40 s for seven genes). All
+   seven fit (excess at most 0.003). Against the joint fit the chain
+   parameters agree within 0.05 (CD63 under the factor, 0.3); the rates
+   `a`, `beta` and `gamma` move together along the clock direction by up
+   to 0.6, within their standard errors (0.5 to 1.5 for the low-RNA
+   genes); and the burst size shows the bias the protein tail imposes:
+   CD63 `b` is 0.40 alone and -0.72 jointly (-1.6 with the factor),
+   integrin beta7 -0.02 against -0.49, CD9 -1.39 against -0.44, each 5 to
+   12 RNA-only standard errors, while CD25 and CD49d, whose RNA is
+   abundant, are unmoved (0.02). The control CD27 moves too (`b` -0.06
+   alone, -1.71 jointly, -0.48 with the factor) although its protein layer
+   passes at excess 0.03, so the bias is not confined to the rejected
+   genes; CD4 shifts 0.1 (0.4 with the factor). The reporting choice is
+   therefore the RNA parameters of the rejected antibodies from the
+   RNA-only fit with their protein parameters withheld, and for every gene
+   a check of the joint `b` against the RNA-only fit before trusting it.
+
 ## Open decisions
 
 - **Heavy protein tails of the abundant antibodies.** After pass 7 the
@@ -741,9 +764,11 @@ Stages 1 to 4 were Python only and self-contained; stage 5 was the port.
   are a per-gene two-state mixture (a second protein production rate with
   a weight, two extra parameters) or a per-gene spread on the protein
   production alone (one parameter, the `cell_factor` machinery with the
-  sd fitted rather than measured). Decide after checking whether the
-  tails are one-sided excesses (mixture) or a continuum (spread) on the
-  qc3 cells; neither is built.
+  sd fitted rather than measured). Decided 2026-11-12: neither is built.
+  A model shaped for five antibodies of one dataset is a bespoke example,
+  not a feature; these genes' RNA parameters come from the chromatin plus
+  RNA fit (pass 7r) and their protein parameters are withheld. The
+  decision reopens only if the same tails appear in a second dataset.
 - **Protein measurement noise.** `ProteinBursty` has none, and ADT counts carry
   a known background. The DOGMA-seq DIG control shows it matters for the
   low-abundance antibodies: in CD4 T cells the rat isotype controls average
