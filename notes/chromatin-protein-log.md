@@ -632,6 +632,26 @@ Stages 1 to 4 were Python only and self-contained; stage 5 was the port.
    passes the fit test can still have moved the burst size by an order of
    magnitude, and the check belongs after every joint fit.
 
+   **The locus sections of the notebook (2026-11-18).** `demos/dogma_seq.ipynb`
+   gained a section on the locus before the joint fit and one on the fit
+   along the configuration axis after the floor reading, with a
+   chromatin-only fit of the qc3 cells on the 8-point dropout grid at
+   Poisson capture 0.1 (tag `qc3_bg_chromatin_grid`, 9 minutes). Findings:
+   the median gene reads closed in 87% of cells; the summed divergence is
+   flat (0.195 to 0.200) over dropout 0.01 to 0.43 and rises only at 0.79,
+   so the dropout is not identified and the opening rates move with it
+   (median +0.24 log10 from 0.01 to 0.43; coupling and burst size do not);
+   the argmin is -0.371 again. Chromatin plus RNA passes on 25 of 28 (the
+   three rejections at the gamma floor of -2.5, excess sum 0.007). The joint
+   fit keeps the locus parameters (median 0.007 log10, PTPRC k_on,0 0.3 off)
+   and the closed fraction (0.013), reproduces the nascent open/closed
+   contrast (median +0.10 log2 over ten readable genes) but under-predicts
+   the mature contrast on 14 of 15 genes (median 0.34 log2) and the protein
+   contrast on 27 of 28 (median 0.08; CD25 1.0, CD137 0.7): the fitted
+   lifetimes average over the locus history, the cells do not. Read as a
+   slow shared variable (cell state) rather than faster chromatin; the
+   activation split is the follow-up the notebook already has.
+
 ## Open decisions
 
 - **Heavy protein tails of the abundant antibodies.** After pass 7 the
