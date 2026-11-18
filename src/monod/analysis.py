@@ -206,8 +206,9 @@ def compare_nested_models(model_small, model_big, embed=None, x_small=None, limi
     information, ``2 d`` gradient evaluations of the big model; with
     ``table="always"`` it decides nothing and is skipped unless
     ``score=True`` (``score`` is then ``(nan, df, nan)``).  ``n_jobs`` is
-    the thread count of the finite-difference stencil behind every gradient
-    (:meth:`CMEModel.eval_model_kld_and_grad`); the Hessian columns of the
+    the thread count of the finite-difference stencil behind the gradients of
+    the models that use one (:meth:`CMEModel.eval_model_kld_and_grad`; the
+    Chromatin model's adjoint gradient does not); the Hessian columns of the
     score test are taken in the same pool.
 
     Returns a dict with ``x_small``, ``kld_small``, ``score`` (statistic, df,
