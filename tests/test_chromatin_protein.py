@@ -1,4 +1,4 @@
-"""The Chromatin model's protein layer (docs/chromatin-protein-design.md, stage 1,
+"""The Chromatin model's protein layer (docs/chromatin.md, stage 1,
 2026-11-02): the chromatin stepper fed by the protein characteristics, checked
 at the limits where another kernel gives the answer."""
 import warnings

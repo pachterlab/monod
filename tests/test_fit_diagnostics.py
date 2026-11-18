@@ -1,5 +1,5 @@
 """The goodness-of-fit statistic's sampling floor and the multi-tail droplet filter
-(docs/chromatin-protein-design.md, broad-antibody diagnosis, 2026-11-10)."""
+(notes/chromatin-protein-log.md, broad-antibody diagnosis, 2026-11-10)."""
 import os
 import numpy as np
 import pytest

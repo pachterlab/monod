@@ -642,8 +642,8 @@ class CMEModel:
             ``ProteinBursty`` downstream of the mature RNA (translation at
             ``k_p``, degradation at ``gamma_p``, the two parameters last).
             Modalities become ``unspliced, spliced, protein, configuration``;
-            ``protein_limit`` coarse-grains the protein axis as there.  NumPy
-            kernel only for now (see docs/chromatin-protein-design.md).
+            ``protein_limit`` coarse-grains the protein axis as there; the
+            kernel runs in Rust when monod_core has it (docs/chromatin.md).
         chromatin_tol, chromatin_search_tol: float
             step tolerance of the chromatin integrator for reported values and
             during the search (see :meth:`search_tolerance`).
@@ -949,7 +949,7 @@ class CMEModel:
             if regulation is not None:
                 raise ValueError("a chromatin locus and CIR or extrinsic regulation cannot be combined")
             # the joint chromatin + RNA + protein model is the Chromatin kernel with the protein
-            # characteristic (docs/chromatin-protein-design.md), in Rust when monod_core has it
+            # characteristic (docs/chromatin.md), in Rust when monod_core has it
             if lifetime != "exponential":
                 raise ValueError("the chromatin model has exponential splicing and degradation only")
             if want_protein:
