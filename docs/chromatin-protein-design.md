@@ -240,7 +240,8 @@ CMEModel.compose("bursty", locus=dict(n_sites=2, rule="switch"), protein=dict(pr
 
 ## Fitting
 
-- Optimiser: the scipy path with central finite differences and pinned
+- Optimiser: the scipy path with the kernel's adjoint gradient (a pinned
+  finite-difference stencil as the fallback, `chromatin_grad`) and pinned
   schedules, as for `Chromatin` today. The Nelder-Mead pre-search that
   `ProteinBursty` uses by default (`presearch="auto"`) would suit
   `protein=True` too, because the `k_p`/`gamma_p` valley is the same valley;
@@ -289,7 +290,140 @@ mesh point per sub-step. In Python expect a few seconds per evaluation, enough
 to validate on synthetic data, not to fit panels; the Rust branch is what makes
 real data feasible.
 
+### Where the hours go (2026-11-17)
+
+Pass 7a took 3.9 hours for 28 genes on bio's 24 cores. One gene at a time,
+instrumented: the Rust kernel is 89 percent of a call and already spreads
+one call over every core (CD4: 8 s single-threaded, 0.76 s on 24), at 2 to
+3 microseconds per mesh point and step; a CD4 call takes about 1,000 steps
+at the 1e-4 search tolerance and 3,900 at the 1e-5 reporting one (IL2RA
+270 and 750, CCR2 18 and 28). The multipliers were the evaluation count,
+not the kernel: central differences in a Python loop (19 kernel calls per
+gradient, a round trip each), about 100 gradients per gene (every fit
+reaches the 60-iteration cap, and scipy evaluates the full stencil at each
+line-search trial), and the Hessian at the fine tolerance (343 calls, a
+quarter to a third of a gene). The gene threads share one rayon pool with
+a fork-join at every step, so gene-level threading added little.
+
+Two changes kept and two rejected, each checked gene by gene. Kept: (1)
+the stencil runs as one Rust call with the points in parallel
+(`monod_core.eval_chromatin_pgf_batch`, `chromatin.eval_joint_pgf_batch`,
+`CMEModel._chromatin_kld_and_grad`), replaying the base point's schedule as
+before; (2) `chromatin_fd="forward"` halves the stencil (IL2RA 1,947 to
+1,266 kernel calls, CD4 1,727 to 1,015, CD9 1,332 to 957) and reaches the
+central-difference optimum on every gene tried (IL2RA, CD4, CD9, CD52,
+CCR10, to three decimals); the DOGMA-seq fits use it, the default stays
+central. Rejected: a search tolerance of 1e-3. IL2RA and CD4 are unmoved
+by it, but on the full pass CD9 stops at a divergence of 0.561 against
+0.275, CD52 at 0.070 against 0.058 and CCR10 at 0.090 against 0.078, with
+either stencil and in fewer iterations: the coarse evaluation's noise ends
+the line search early on the harder landscapes. Rejected: adapting the
+Hessian's pinned schedule at the search tolerance. It is four to five
+times cheaper (CD4 71 s against 378 s) and changes the Hessian by 0.3
+percent of its largest element, but that is enough to move the standard
+errors of CD226 and CD4 by up to 50 percent along their weak directions
+(smallest eigenvalue 1.5e-3 against 2.1e-3), so `par_fun_hess` keeps the
+fine tolerance. On IL2RA and CD4 the divergence is
+unchanged to three decimals in every variant (0.586, 0.690) and the
+estimates move only along the flat valley that `sigma_flat_direction`
+reports. One gene with its fit and a search-tolerance Hessian on the idle
+machine: IL2RA 558 s batched with central differences at 1e-4 and 254 s
+batched with forward differences at 1e-3; CD4 1,084 s and 397 s; the
+serial baseline, measured with a second job running, was 1,676 s and
+2,516 s. The whole pass (fit and fine-tolerance Hessian, 12 gene threads):
+3.9 hours for pass 7a; 40 minutes with the batch, forward differences and
+the 1e-3 tolerance (three genes worse, above); 62 minutes (3,748 s) with
+the batch and forward differences at 1e-4, the settings kept: 3.7 times
+faster, the same 17 rejections and every divergence equal to three
+decimals (the standard-error flag moved on four genes, as it does between
+any two runs of a pass). The adjoint gradient of the next section then
+removes the stencil altogether.
+
+### An adjoint gradient (2026-11-18)
+
+The stencil is gone. Every step of the kernel is linear in the generating
+function: `G_k = M_k G_{k-1}` with `M_k = (4 S_half2 S_half1 - S_full) / 3`
+(the Richardson pair), `S` a Strang step `diag(e^X1) exp(H^T h) diag(e^X2)`
+or a Magnus step `exp(h H^T + diag X_p)` per mesh point, and `G_0 = w(theta)`
+the chain's stationary weights. The divergence is a scalar of `G_K`, so its
+gradient is one backward sweep `lambda_{k-1} = M_k^T lambda_k` from
+`lambda_K = dKLD/dG` plus, per step, the scalar
+`Re lambda_k^T (dM_k/dtheta_j) G_{k-1}`. The transposes are free:
+`exp(H^T h)^T = exp(H h)`, shared by all mesh points, and
+`exp(M_p)^T = exp(M_p^T)`, the same exponential transposed. The result is the
+exact derivative of the pinned map the stencil used to difference.
+
+Built as `monod_core.eval_chromatin_pgf_adjoint`,
+`chromatin.eval_joint_pgf_adjoint` and
+`CMEModel._chromatin_kld_and_grad_adjoint`, selected by
+`CMEModel(chromatin_grad="auto" | "adjoint" | "stencil")` (`auto`, the
+default, takes the adjoint when the installed `monod_core` has it). The
+forward pass is the batched call over the cell-factor nodes as before,
+adaptive or replaying an enclosing pin; the Python head runs the chain rule
+back through the divergence, the dropout, the normalisation, the inverse
+transform (the adjoint of `irfftn` is `conj(rfftn)` on the kept bins,
+doubled off the real bins) and the mixture, to `dL/dG` per node. Per node
+one Rust call replays the schedule, keeping every `G` when the trajectory
+fits in a gigabyte and checkpoints every `sqrt(K)` steps otherwise, and
+sweeps backward: the transposed Strang block (the chain exponential's
+transpose, the production exponents' elementwise adjoints), the transposed
+Magnus block (the reverse mode of the scaling-and-squaring exponential at
+every mesh point) and, per step, the contraction with the operators'
+dependence on the kernel's inputs. It returns the derivatives with respect
+to `H` (the Strang chain exponentials collected per step size and sent
+through the adjoint Fréchet derivative, one `2N x 2N` exponential each; the
+Magnus matrices directly), `w`, `A`, `C`, the burst size and the protein
+rates (through the table's affine maps). Three shared small operators are
+differentiated by central differences at a relative step of 1e-6, smooth
+closed forms exact to about 1e-10: `exp(C s)` at the Simpson nodes,
+`∫ exp(C s) ds` for single molecules, and the protein table re-tabulated on
+its pinned nodes at each of the four rates plus and minus. The Python side
+turns the input derivatives into the log10 gradient with the local Jacobian
+of the closed forms (`H`, `w`, `A`, `C`, `b`, `k_p`, `gamma_p`), central
+differences at 1e-6 as well.
+
+Exactness (`TestAdjoint`, `TestAdjointRnaOnly`): the adjoint agrees with
+central differences of the divergence under the same pin to 1e-6 relative
+on the RNA-only models (bursts and single molecules, the switch, additive
+and table rules, a Kronecker chain, a Magnus tail) and with the protein
+layer when the table is fine. At the table's working tolerance (a tenth of
+the kernel's, `chromatin._PROTEIN_TABLE_TOL`) the adjoint differentiates
+the table at its pinned nodes while a stencil re-tabulates at every point,
+and the two differ by the table's own error, up to 1e-4 relative on the
+protein rates. Near an optimum the stencil's truncation error is of the
+gradient's own size: at pass 7a's CD4 optimum the forward stencil is 25
+percent of the largest component away from the adjoint, the central one
+1.6 percent, and the Hessians by differences of gradients differ by 4e-5
+(CD4) to 6e-3 (IL2RA, indefinite) of their largest element.
+
+Cost on bio (24 threads, the box shared with a one-core job, so take 20
+percent as noise), one gradient at the search tolerance and the
+fine-tolerance Hessian (18 gradients against the stencil's 343 calls):
+
+| gene | adjoint | forward stencil | central stencil | Hessian adjoint | Hessian stencil |
+|---|---|---|---|---|---|
+| CD4 | 3.1 s | 5.2 s | 9.1 s | 249 s | 483 s |
+| IL2RA | 2.0 s | 2.7 s | 4.8 s | 113 s | 201 s |
+| CD52 | 1.1 s | 1.3 s | 2.2 s | 85 s | 115 s |
+| CCR10 | 0.32 s | 0.41 s | 0.69 s | 10 s | 20 s |
+
+The batched stencil runs its points in parallel and fills the machine
+better than one call's blocks do, so the gain is less than the call count
+says: 1.3 to 1.7 on the gradient against the forward stencil, 2 to 3
+against the central one, about 2 on the Hessian. The whole pass (fit and
+fine-tolerance Hessian, 12 gene threads) takes 45
+minutes (2,711 s) against 62 with the forward stencil and 3.9 hours for
+pass 7a: the same 17 rejections, every divergence equal to three decimals
+except CD63, which the adjoint takes from 0.320 to 0.312 (its parameters
+move by 0.6 decades along the flat direction), and the standard-error flag
+moved on one gene. The stencil stays available as
+`chromatin_grad="stencil"`.
+
 ## Validation plan, in order
+
+`demos/dogma_seq.ipynb` (2026-11-16) tells the DOGMA-seq part of this plan as one
+notebook: the final versions of the assembly, filter, fit and check scripts, run
+against the saved fits, with the figures the passes below describe in words.
 
 1. **Python kernel, limits.** Done. A one-site `table` locus transcribing at the
    same rate in both configurations (the locus invisible; `k_on >> 1` would

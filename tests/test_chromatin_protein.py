@@ -635,3 +635,181 @@ class TestRnaOnlyCheck:
                                 samp_lb=list(self.CAPTURE) + [d], samp_ub=list(self.CAPTURE) + [d], gridsize=[1, 1, 1])
         with pytest.raises(ValueError, match="protein layer"):
             rna_only_check(out, gradient_params=dict(self.GP))
+
+
+class TestBatchedStencil:
+    """The finite-difference stencil batched into one kernel call
+    (``monod_core.eval_chromatin_pgf_batch``) and the forward stencil."""
+    SAMP = [-0.3, -0.3, 0.0]
+
+    @staticmethod
+    def _data(m, theta, lim, samp, n_cells=600, seed=3):
+        pss = m.eval_model_pss(theta, lim, samp)
+        flat = pss.ravel() / pss.sum()
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(flat.size, size=n_cells, p=flat)
+        cells = np.column_stack(np.unravel_index(idx, pss.shape))
+        coords, counts = np.unique(cells, axis=0, return_counts=True)
+        return (coords.astype(np.int64), counts / counts.sum())
+
+    @staticmethod
+    def _needs_batch():
+        if not ch._rust_batch_available(True):
+            pytest.skip("monod_core without eval_chromatin_pgf_batch")
+
+    def test_batch_matches_single_points(self):
+        self._needs_batch()
+        m = _model(seq="Poisson", protein_limit=10, dropout_bounds=(0, 0, 1))
+        th2 = SMALL.copy(); th2[3] += 0.1
+        points, g, _ = m._chromatin_points(SMALL, L_SMALL, self.SAMP)
+        points2, _, _ = m._chromatin_points(th2, L_SMALL, self.SAMP)
+        batch = ch.eval_joint_pgf_batch(points + points2, g)
+        assert len(batch) == 2
+        for pt, (G, sched) in zip(points + points2, batch):
+            G1, sched1 = ch.eval_joint_pgf(pt["H"], pt["A"], pt["C"], g, tol=pt["tol"], burst=pt["burst"],
+                                           structure=pt["structure"], protein=pt["protein"])
+            np.testing.assert_allclose(G, G1, rtol=1e-12, atol=1e-14)
+            assert list(sched.steps) == list(sched1.steps) and sched.magnus == sched1.magnus
+        for th, pss in zip([SMALL, th2], m._eval_model_pss_chromatin_batch([SMALL, th2], L_SMALL, self.SAMP)):
+            np.testing.assert_allclose(pss, m.eval_model_pss(th, L_SMALL, self.SAMP), rtol=1e-12, atol=1e-15)
+        assert ch.eval_joint_pgf_batch([], g) == []
+        with pytest.raises(ValueError, match="one row per RNA species|protein layer"):   # a point without the layer on a protein mesh
+            ch.eval_joint_pgf_batch([points[0], dict(points[0], protein=None)], g)
+
+    def test_batched_gradient_matches_serial(self, monkeypatch):
+        self._needs_batch()
+        m = _model(seq="Poisson", protein_limit=10, dropout_bounds=(0, 0, 1))
+        data = self._data(m, SMALL, L_SMALL, self.SAMP)
+        k_b, g_b = m.eval_model_kld_and_grad(SMALL, L_SMALL, self.SAMP, data)
+        assert not m._schedule_is_pinned()
+        monkeypatch.setattr(ch, "_rust_batch_available", lambda *a, **k: False)
+        k_s, g_s = m.eval_model_kld_and_grad(SMALL, L_SMALL, self.SAMP, data)
+        assert k_b == pytest.approx(k_s, rel=1e-12)
+        np.testing.assert_allclose(g_b, g_s, rtol=1e-8, atol=1e-10)
+        # the same under an enclosing pin (the Hessian's stencil)
+        monkeypatch.undo()
+        with m.pinned_schedule(SMALL, L_SMALL, self.SAMP):
+            _, g_p = m.eval_model_kld_and_grad(SMALL, L_SMALL, self.SAMP, data)
+        np.testing.assert_allclose(g_p, g_b, rtol=1e-8, atol=1e-10)
+
+    def test_cell_factor_batches_every_node(self, monkeypatch):
+        self._needs_batch()
+        m = _model(seq="Poisson", protein_limit=10, dropout_bounds=(0, 0, 1), cell_factor=(0.3, 3))
+        th2 = SMALL.copy(); th2[6] -= 0.1
+        for th, pss in zip([SMALL, th2], m._eval_model_pss_chromatin_batch([SMALL, th2], L_SMALL, self.SAMP)):
+            np.testing.assert_allclose(pss, m.eval_model_pss(th, L_SMALL, self.SAMP), rtol=1e-12, atol=1e-15)
+        data = self._data(m, SMALL, L_SMALL, self.SAMP)
+        _, g_b = m.eval_model_kld_and_grad(SMALL, L_SMALL, self.SAMP, data)
+        monkeypatch.setattr(ch, "_rust_batch_available", lambda *a, **k: False)
+        _, g_s = m.eval_model_kld_and_grad(SMALL, L_SMALL, self.SAMP, data)
+        np.testing.assert_allclose(g_b, g_s, rtol=1e-8, atol=1e-10)
+
+    def test_forward_differences(self):
+        m_c = _model(seq="Poisson", protein_limit=10, dropout_bounds=(0, 0, 1))
+        m_f = _model(seq="Poisson", protein_limit=10, dropout_bounds=(0, 0, 1), chromatin_fd="forward")
+        data = self._data(m_c, SMALL, L_SMALL, self.SAMP)
+        k_c, g_c = m_c.eval_model_kld_and_grad(SMALL, L_SMALL, self.SAMP, data)
+        k_f, g_f = m_f.eval_model_kld_and_grad(SMALL, L_SMALL, self.SAMP, data)
+        assert k_f == pytest.approx(k_c, rel=1e-12)
+        np.testing.assert_allclose(g_f, g_c, rtol=2e-2, atol=2e-2 * np.abs(g_c).max())
+        d = m_f.to_dict()
+        assert d["chromatin_fd"] == "forward" and CMEModel.from_dict(d).chromatin_fd == "forward"
+        assert m_c.chromatin_fd == "central"
+        with pytest.raises(ValueError, match="chromatin_fd"):
+            _model(chromatin_fd="backward")
+
+
+class TestAdjoint:
+    """The adjoint gradient (``monod_core.eval_chromatin_pgf_adjoint``) against
+    central differences of the divergence under the same pinned schedule."""
+    SAMP = [-0.3, -0.3, -0.6, 0.0]
+
+    @staticmethod
+    def _needs_adjoint():
+        if not ch._rust_adjoint_available(True):
+            pytest.skip("monod_core without eval_chromatin_pgf_adjoint")
+
+    @staticmethod
+    def _fd(m, theta, lim, samp, data, eps=1e-5):
+        theta = np.asarray(theta, dtype=float)
+        g = np.zeros(theta.size)
+        with m.pinned_schedule(theta, lim, samp):
+            for j in range(theta.size):
+                e = np.zeros(theta.size); e[j] = eps
+                g[j] = (m.eval_model_kld(theta + e, lim, samp, data) - m.eval_model_kld(theta - e, lim, samp, data)) / (2 * eps)
+        return g
+
+    def _check(self, m, theta, lim, samp, rtol=3e-4, atol=1e-8):
+        """The adjoint against the pinned stencil.  The adjoint differentiates
+        the protein table at its pinned nodes while the stencil re-tabulates at
+        every point, so with the table at its working tolerance the two differ
+        by the table's error (up to 1e-4 relative on the protein rates); with a fine
+        table (``test_exact_with_a_fine_table``) they agree to 1e-6."""
+        data = TestBatchedStencil._data(m, theta, lim, samp)
+        th = np.asarray(theta, dtype=float) + 0.05                      # off the generating point: a gradient to speak of
+        k_a, g_a = m.eval_model_kld_and_grad(th, lim, samp, data)
+        assert not m._schedule_is_pinned()
+        assert k_a == pytest.approx(m.eval_model_kld(th, lim, samp, data), rel=1e-12)
+        np.testing.assert_allclose(g_a, self._fd(m, th, lim, samp, data), rtol=rtol, atol=atol)
+        return th, data, g_a
+
+    def test_exact_with_a_fine_table(self, monkeypatch):
+        self._needs_adjoint()
+        monkeypatch.setattr(ch, "_PROTEIN_TABLE_TOL", 1e-4)
+        m = _model(seq="Poisson", protein_limit=10, dropout_bounds=(-1.5, -0.3, 3), cell_factor=(0.3, 3), protein_background=(-1.0, 1.0, 3))
+        self._check(m, SMALL, L_SMALL, self.SAMP, rtol=1e-6, atol=1e-9)
+
+    def test_switch_cell_factor_background_dropout(self):
+        self._needs_adjoint()
+        kw = dict(seq="Poisson", protein_limit=10, dropout_bounds=(-1.5, -0.3, 3), cell_factor=(0.3, 3), protein_background=(-1.0, 1.0, 3))
+        m = _model(**kw)
+        assert m.chromatin_grad == "auto"
+        th, data, g_a = self._check(m, SMALL, L_SMALL, self.SAMP)
+        # the stencil at its 1e-4 step carries its truncation error; the adjoint agrees to that
+        _, g_s = _model(chromatin_grad="stencil", **kw).eval_model_kld_and_grad(th, L_SMALL, self.SAMP, data)
+        np.testing.assert_allclose(g_a, g_s, rtol=2e-3, atol=1e-6)
+
+    def test_additive_and_table_rules(self):
+        """The factored and the general production structure."""
+        self._needs_adjoint()
+        for rule, rates in (("additive", [1.0, 2.0]), ("table", [0.2, 1.0, 1.5, 3.0])):
+            m = _model(rule=rule, seq="Poisson", protein_limit=10)
+            theta = cf.join_theta([0.5, 0.8], 0.6, rates, 0.8, 0.4, 1.5, (0.4, 0.8))
+            self._check(m, theta, L_SMALL, [-0.3, -0.3, 0.0, 0.0])
+
+    def test_single_molecules_and_independent_sites(self):
+        """Constitutive emission under a protein layer; a Kronecker chain (eps = 1)."""
+        self._needs_adjoint()
+        m = _model(seq="Poisson", protein_limit=10, bursty=False)
+        theta = cf.join_theta([0.5, 0.8], 0.6, [1.5], 0.8, 0.4, None, (0.4, 0.8))
+        self._check(m, theta, L_SMALL, [-0.3, -0.3, 0.0, 0.0])
+        m = _model(seq="Poisson", protein_limit=10)
+        theta = cf.join_theta([0.5, 0.8], 1.0, [1.5], 0.8, 0.4, 1.5, (0.4, 0.8))
+        self._check(m, theta, L_SMALL, [-0.3, -0.3, 0.0, 0.0])
+
+    def test_enclosing_pin_and_magnus_tail(self):
+        self._needs_adjoint()
+        m = _model(seq="Poisson", protein_limit=10, dropout_bounds=(-1.5, -0.3, 3))
+        samp = self.SAMP[:3]
+        th = SMALL.copy(); th[5] = -1.0; th[-1] = -1.3                  # slow degradation: Magnus steps in the tail
+        data = TestBatchedStencil._data(m, th, L_SMALL, samp)
+        k_a, g_a = m.eval_model_kld_and_grad(th, L_SMALL, samp, data)
+        with m.pinned_schedule(th, L_SMALL, samp):
+            assert getattr(m._fixed_schedule, "magnus", 0) >= 1
+            k_p, g_p = m.eval_model_kld_and_grad(th, L_SMALL, samp, data)
+            assert m._schedule_is_pinned()
+        assert k_p == pytest.approx(k_a, rel=1e-12)
+        np.testing.assert_allclose(g_p, g_a, rtol=1e-9, atol=1e-12)
+        np.testing.assert_allclose(g_a, self._fd(m, th, L_SMALL, samp, data), rtol=1e-4, atol=1e-8)
+
+    def test_options(self, monkeypatch):
+        with pytest.raises(ValueError, match="chromatin_grad"):
+            _model(chromatin_grad="exact")
+        m = _model(chromatin_grad="stencil")
+        d = m.to_dict()
+        assert d["chromatin_grad"] == "stencil" and CMEModel.from_dict(d).chromatin_grad == "stencil"
+        m = _model(seq="Poisson", protein_limit=10, chromatin_grad="adjoint")
+        data = TestBatchedStencil._data(m, SMALL, L_SMALL, [-0.3, -0.3, 0.0, 0.0])
+        monkeypatch.setattr(ch, "_rust_adjoint_available", lambda *a, **k: False)
+        with pytest.raises(RuntimeError, match="adjoint"):
+            m.eval_model_kld_and_grad(SMALL, L_SMALL, [-0.3, -0.3, 0.0, 0.0], data)

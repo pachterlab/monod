@@ -579,6 +579,8 @@ class CMEModel:
         periodic = False,
         chromatin_tol = 1e-5,
         chromatin_search_tol = 1e-4,
+        chromatin_fd = "central",
+        chromatin_grad = "auto",
         dropout_bounds = (-2.0, -0.05, 3),
         bursty = False,
         protein = False,
@@ -645,6 +647,20 @@ class CMEModel:
         chromatin_tol, chromatin_search_tol: float
             step tolerance of the chromatin integrator for reported values and
             during the search (see :meth:`search_tolerance`).
+        chromatin_fd: str
+            ``"central"`` (default) or ``"forward"``: the finite-difference
+            stencil of the chromatin gradient, 2 n + 1 or n + 1 kernel calls.
+            Every stencil point replays the base point's step schedule, so the
+            forward stencil's error is the truncation of a 1e-4 step, not the
+            integrator's noise floor.  Used when the gradient runs as a stencil.
+        chromatin_grad: str
+            ``"auto"`` (default), ``"adjoint"`` or ``"stencil"``: how the
+            chromatin gradient is computed.  The adjoint is one backward sweep
+            of the kernel (``monod_core.eval_chromatin_pgf_adjoint``), the exact
+            derivative of the pinned map at about four kernel calls; the
+            stencil differences the kernel at ``2 n + 1`` or ``n + 1`` points.
+            ``"auto"`` takes the adjoint when the installed ``monod_core`` has
+            it; ``"adjoint"`` insists and raises otherwise.
         dropout_bounds: (float, float, int)
             ATAC dropout is a sampling parameter on the configuration axis,
             scanned on the grid like the sequencing parameters: log10 bounds and
@@ -687,6 +703,12 @@ class CMEModel:
             self.periodic = bool(periodic)
             self.chromatin_tol = float(chromatin_tol)
             self.chromatin_search_tol = float(chromatin_search_tol)
+            if chromatin_fd not in ("central", "forward"):
+                raise ValueError(f"chromatin_fd must be 'central' or 'forward', got {chromatin_fd!r}")
+            self.chromatin_fd = str(chromatin_fd)
+            if chromatin_grad not in ("auto", "adjoint", "stencil"):
+                raise ValueError(f"chromatin_grad must be 'auto', 'adjoint' or 'stencil', got {chromatin_grad!r}")
+            self.chromatin_grad = str(chromatin_grad)
             self.dropout_bounds = tuple(dropout_bounds)
             self.bursty = bool(bursty)
             self.protein = bool(protein)
@@ -927,7 +949,7 @@ class CMEModel:
             if regulation is not None:
                 raise ValueError("a chromatin locus and CIR or extrinsic regulation cannot be combined")
             # the joint chromatin + RNA + protein model is the Chromatin kernel with the protein
-            # characteristic (docs/chromatin-protein-design.md); NumPy only so far
+            # characteristic (docs/chromatin-protein-design.md), in Rust when monod_core has it
             if lifetime != "exponential":
                 raise ValueError("the chromatin model has exponential splicing and degradation only")
             if want_protein:
@@ -1047,7 +1069,7 @@ class CMEModel:
         "bio_model", "seq_model", "amb_model", "quad_method", "fixed_quad_T", "quad_order",
         "quad_vec_T", "protein_limit", "fit_unspliced", "min_fudge", "max_fudge",
         "network", "normalize_production_rate", "burst_mean_rate",
-        "n_sites", "rule", "periodic", "chromatin_tol", "chromatin_search_tol", "dropout_bounds", "bursty",
+        "n_sites", "rule", "periodic", "chromatin_tol", "chromatin_search_tol", "chromatin_fd", "chromatin_grad", "dropout_bounds", "bursty",
         "protein", "protein_background", "cell_factor", "amb_species",
     )
 
@@ -1077,6 +1099,7 @@ class CMEModel:
         if self.bio_model == "Chromatin":
             d.update(n_sites=int(self.n_sites), rule=self.rule, periodic=bool(self.periodic),
                      chromatin_tol=float(self._chromatin_tol), chromatin_search_tol=float(self.chromatin_search_tol),
+                     chromatin_fd=self.chromatin_fd, chromatin_grad=self.chromatin_grad,
                      dropout_bounds=[float(self.dropout_bounds[0]), float(self.dropout_bounds[1]), int(self.dropout_bounds[2])],
                      bursty=bool(self.bursty), protein=bool(self.protein))
             if self.protein:
@@ -1281,6 +1304,20 @@ class CMEModel:
                 )
                 return kld0, np.array(grad_list)
 
+        # Chromatin: the adjoint of the kernel (one backward sweep per cell-factor
+        # node, monod_core.eval_chromatin_pgf_adjoint), or the whole stencil in one
+        # kernel call with the points in parallel (eval_chromatin_pgf_batch); both
+        # replay the base point's schedule.
+        if self.bio_model == "Chromatin" and self.amb_model == "None":
+            from . import chromatin as _chromatin
+            prot = bool(getattr(self, "protein", False))
+            adjoint = _HAS_RUST and _chromatin._rust_adjoint_available(prot)
+            if self.chromatin_grad == "adjoint" and not adjoint:
+                raise RuntimeError("chromatin_grad='adjoint' needs monod_core with eval_chromatin_pgf_adjoint")
+            if adjoint and self.chromatin_grad != "stencil":
+                return self._chromatin_kld_and_grad_adjoint(p, limits, samp, data, EPS)
+            if _HAS_RUST and _chromatin._rust_batch_available(prot):
+                return self._chromatin_kld_and_grad(p, limits, samp, data, EPS, eps)
         # Python fallback: forward finite differences.
         outer_pin = self._schedule_is_pinned()
         kld0 = self.eval_model_kld(p, limits, samp, data, EPS)
@@ -1289,8 +1326,8 @@ class CMEModel:
         # bins deep in the tail sit near the FFT's absolute precision and put a
         # noise floor of about 1e-9 on the KLD, which a 1e-6 forward difference
         # would turn into gradient errors of order 1e-2.
-        central = self.bio_model in ("Custom", "Chromatin")
-        if central:
+        central = self.bio_model == "Custom" or (self.bio_model == "Chromatin" and self.chromatin_fd == "central")
+        if self.bio_model in ("Custom", "Chromatin"):
             eps = max(float(eps), _CUSTOM_FD_EPS)
 
         n_params = len(p)
@@ -1535,7 +1572,8 @@ class CMEModel:
         ``chromatin_search_tol`` instead of ``chromatin_tol``).  The optimiser
         searches here and reports its optimum at the fine tolerance; with the
         Richardson extrapolation the coarse setting is still accurate to about
-        1e-6 on the distribution at half the steps.  No-op for other models."""
+        1e-6 on the distribution at half the steps (1e-3 was tried: three of 28
+        DOGMA-seq genes then stop early at a worse optimum).  No-op for other models."""
         if self.bio_model != "Chromatin":
             yield
             return
@@ -1946,10 +1984,9 @@ class CMEModel:
         f = np.exp(sigma * z - 0.5 * sigma ** 2)
         return f / float(w @ f), w
 
-    def _eval_model_pss_chromatin(self, p, limits, samp):
-        """Joint distribution over (unspliced, spliced, configuration): the
-        chromatin kernel on the RNA mesh, transformed by the sequencing model,
-        then dropout on the configuration axis."""
+    def _chromatin_points(self, p, limits, samp):
+        """The kernel points of one evaluation, one per cell-factor node, with
+        the PGF arguments ``g`` and what :meth:`_chromatin_assemble` needs."""
         from . import chromatin as _chromatin
         n = self.n_sites
         N = 2 ** n
@@ -1973,7 +2010,6 @@ class CMEModel:
         k_on, eps, rates, _, _ = _chromatin.split_theta(p, self.rule, self.n_sites)
         protein = self.chromatin_protein(p)
         burst = self.chromatin_burst(p)
-        backend = "rust" if _HAS_RUST and _chromatin._rust_available(protein is not None) else "python"
         lam_bg = self.chromatin_background(samp)
         f_nodes, w_nodes = self.chromatin_factor_nodes()
         if f_nodes is None:
@@ -1983,24 +2019,36 @@ class CMEModel:
             fixed = [fixed] * f_nodes.size
         if len(fixed) != f_nodes.size:
             raise ValueError(f"the pinned schedule has {len(fixed)} node schedules; the model's cell factor has {f_nodes.size} nodes")
-        G = None
-        scheds = []
-        for f, w, fx in zip(f_nodes, w_nodes, fixed):
+        points = []
+        for f, fx in zip(f_nodes, fixed):
             # the per-cell factor scales every production rate (under bursty emission
             # through the burst size, the burst frequency unchanged) and the protein
             # background; the generating function is linear in the mixture
             A_f, rates_f = A * f, rates * f
             structure = _chromatin.rule_structure(H, A_f, k_on, 1.0, eps, self.rule, rates_f)
-            G_f, sched = _chromatin.eval_joint_pgf(H, A_f, C, g, tol=self.chromatin_tol, fixed_schedule=fx,
-                                                   burst=None if burst is None else burst * f, structure=structure,
-                                                   backend=backend, protein=protein)
-            if lam_bg is not None:
+            points.append(dict(H=H, A=A_f, C=C, tol=self.chromatin_tol, fixed_schedule=fx,
+                               burst=None if burst is None else burst * f, structure=structure, protein=protein))
+        return points, g, dict(f_nodes=f_nodes, w_nodes=w_nodes, lam_bg=lam_bg, mx=mx, counts=counts, n=n)
+
+    def _chromatin_mix(self, results, g, ctx, record=True):
+        """The mixture over the cell-factor nodes of the per-node ``(G, schedule)``
+        pairs of :meth:`_chromatin_points`, with the protein background factor:
+        ``(G, factors)``, ``factors[i]`` the node's weight times its background
+        factor over the mesh (what the adjoint multiplies back onto dL/dG).
+        ``record`` keeps the schedules for a pin."""
+        from . import chromatin as _chromatin
+        G, scheds, factors = None, [], []
+        for (G_f, sched), f, w in zip(results, ctx["f_nodes"], ctx["w_nodes"]):
+            fac = np.full((1, G_f.shape[1]), float(w))
+            if ctx["lam_bg"] is not None:
                 # background counts add independently: the PGF gains the Poisson
                 # factor exp(lambda (g_P - 1)) at every protein frequency kept
-                G_f = G_f * np.exp(lam_bg * f * g[2])[None, :]
-            G = w * G_f if G is None else G + w * G_f
+                fac = fac * np.exp(ctx["lam_bg"] * f * g[2])[None, :]
+            G = fac * G_f if G is None else G + fac * G_f
             scheds.append(sched)
-        self._last_schedule = scheds if len(scheds) > 1 else scheds[0]
+            factors.append(fac)
+        if record:
+            self._last_schedule = scheds if len(scheds) > 1 else scheds[0]
         n_steps = max(len(getattr(sc, "steps", sc)) for sc in scheds)
         if n_steps >= _chromatin._MAX_STEPS:
             # the stepper stopped short of the horizon: the slow tail (gamma or
@@ -2009,12 +2057,146 @@ class CMEModel:
             warnings.warn(
                 f"Chromatin integrator reached its cap of {n_steps} steps before the horizon; the "
                 "distribution is truncated. Keep gamma and gamma_p above about -3 (units of k_off) "
-                "or raise monod.chromatin._MAX_STEPS.", RuntimeWarning, stacklevel=2)
-        pss = _chromatin.invert_joint_pgf(G, mx, counts)                # (N, lu, ls[, lp])
+                "or raise monod.chromatin._MAX_STEPS.", RuntimeWarning, stacklevel=3)
+        return G, factors
+
+    def _chromatin_assemble(self, results, g, ctx, samp, record=True):
+        """The PMF ``(lu, ls[, lp], N)`` from the per-node ``(G, schedule)`` pairs
+        of :meth:`_chromatin_points`: the mixture, the inverse transform, the
+        dropout on the configuration axis."""
+        from . import chromatin as _chromatin
+        G, _ = self._chromatin_mix(results, g, ctx, record)
+        pss = _chromatin.invert_joint_pgf(G, ctx["mx"], ctx["counts"])      # (N, lu, ls[, lp])
         p_drop = self.chromatin_dropout(samp)
         if p_drop is not None:
-            pss = _chromatin.apply_dropout(pss, n, p_drop)
+            pss = _chromatin.apply_dropout(pss, ctx["n"], p_drop)
         return np.moveaxis(pss, 0, -1)                                  # (lu, ls[, lp], N)
+
+    def _eval_model_pss_chromatin(self, p, limits, samp):
+        """Joint distribution over (unspliced, spliced[, protein], configuration):
+        the chromatin kernel on the RNA mesh, transformed by the sequencing
+        model, then dropout on the configuration axis."""
+        from . import chromatin as _chromatin
+        points, g, ctx = self._chromatin_points(p, limits, samp)
+        backend = "rust" if _HAS_RUST and _chromatin._rust_available(points[0]["protein"] is not None) else "python"
+        results = [_chromatin.eval_joint_pgf(pt["H"], pt["A"], pt["C"], g, tol=pt["tol"], fixed_schedule=pt["fixed_schedule"],
+                                             burst=pt["burst"], structure=pt["structure"], protein=pt["protein"], backend=backend)
+                   for pt in points]
+        return self._chromatin_assemble(results, g, ctx, samp)
+
+    def _eval_model_pss_chromatin_batch(self, p_list, limits, samp):
+        """:meth:`eval_model_pss` at several parameter vectors in one kernel
+        call, the points in parallel (a finite-difference stencil).  The
+        schedules are not recorded, so a pin stays with the base point."""
+        from . import chromatin as _chromatin
+        plans = [self._chromatin_points(p, limits, samp) for p in p_list]
+        if not plans:
+            return []
+        g = plans[0][1]
+        flat = [pt for points, _, _ in plans for pt in points]
+        results = _chromatin.eval_joint_pgf_batch(flat, g)
+        out, k = [], 0
+        for points, _, ctx in plans:
+            out.append(self._chromatin_assemble(results[k:k + len(points)], g, ctx, samp, record=False))
+            k += len(points)
+        return out
+
+    def _chromatin_kld_and_grad(self, p, limits, samp, data, EPS, eps):
+        """KLD and finite-difference gradient of the Chromatin model with the
+        stencil batched into one kernel call (:meth:`eval_model_kld_and_grad`).
+        The base point runs first and pins its schedule for the stencil unless
+        an enclosing block already did; ``chromatin_fd`` selects central or
+        forward differences at a step of at least ``_CUSTOM_FD_EPS``."""
+        p = np.asarray(p, dtype=float)
+        eps = max(float(eps), _CUSTOM_FD_EPS)
+        central = self.chromatin_fd == "central"
+        x, f = data
+
+        def kld_of(pss):
+            pss[pss < EPS] = EPS
+            return float(np.sum(f * np.log(f / pss[tuple(x.T)])))
+
+        pin_here = not self._schedule_is_pinned()
+        kld0 = self.eval_model_kld(p, limits, samp, data, EPS)        # adapts the schedule and records it
+        if pin_here:
+            self._fixed_schedule = self._last_schedule
+        try:
+            n = p.size
+            pts = []
+            for i in range(n):
+                e = np.zeros(n); e[i] = eps
+                pts.append(p + e)
+                if central:
+                    pts.append(p - e)
+            klds = [kld_of(q) for q in self._eval_model_pss_chromatin_batch(pts, limits, samp)]
+        finally:
+            if pin_here:
+                self._fixed_schedule = None
+        if central:
+            grad = np.array([(klds[2 * i] - klds[2 * i + 1]) / (2 * eps) for i in range(n)])
+        else:
+            grad = (np.array(klds) - kld0) / eps
+        return kld0, grad
+
+    def _chromatin_kld_and_grad_adjoint(self, p, limits, samp, data, EPS):
+        """KLD and its gradient by the adjoint of the chromatin kernel
+        (:func:`monod.chromatin.eval_joint_pgf_adjoint`).  The forward pass
+        (adaptive, or replaying an enclosing pin) gives the distribution and
+        records its schedule; the chain rule runs back through the divergence,
+        the dropout, the normalisation, the inverse transform and the mixture
+        over the cell-factor nodes to dL/dG per node; one backward sweep per
+        node gives the derivatives with respect to the kernel's inputs (H and
+        its stationary weights, A, C, the burst size, the protein rates), and
+        the local Jacobian of those inputs in the log10 parameters (central
+        differences of the closed forms at 1e-6) turns them into the gradient.
+        The exact derivative of the pinned map, at about four kernel calls
+        where the stencil takes 10 or 19."""
+        from . import chromatin as _chromatin
+        p = np.asarray(p, dtype=float)
+        x, f = data
+        points, g, ctx = self._chromatin_points(p, limits, samp)
+        results = _chromatin.eval_joint_pgf_batch(points, g)              # one kernel call, the nodes in parallel
+        G, factors = self._chromatin_mix(results, g, ctx)                 # records the schedules for a pin
+        R = _chromatin._invert_raw(G, ctx["mx"], ctx["counts"])            # (N, lu, ls[, lp]) before |.| and the sum
+        Rabs = np.abs(R)
+        S = float(Rabs.sum())
+        Q = Rabs / S
+        p_drop = self.chromatin_dropout(samp)
+        D = _chromatin.dropout_matrix(ctx["n"], p_drop) if p_drop is not None else None
+        P = np.tensordot(D.T, Q, axes=(1, 0)) if D is not None else Q
+        P = np.moveaxis(P, 0, -1)
+        Px = P[tuple(x.T)]
+        low = Px < EPS
+        Px = np.where(low, EPS, Px)
+        kld = float(np.sum(f * np.log(f / Px)))
+        # back through the divergence, the dropout, the normalisation, the transform
+        dP = np.zeros_like(P)
+        np.add.at(dP, tuple(x.T), np.where(low, 0.0, -f / Px))
+        dP = np.moveaxis(dP, -1, 0)
+        dQ = np.tensordot(D, dP, axes=(1, 0)) if D is not None else dP
+        dR = (dQ - float((dQ * Q).sum())) / S * np.sign(R)
+        lam = np.stack([_chromatin._irfftn_adjoint(dR[c], ctx["mx"], ctx["counts"]).ravel() for c in range(R.shape[0])])
+        raws = [_chromatin.eval_joint_pgf_adjoint(pt["H"], pt["A"], pt["C"], g, fac * lam, sched, tol=pt["tol"], burst=pt["burst"],
+                                                  structure=pt["structure"], protein=pt["protein"])
+                for pt, (_, sched), fac in zip(points, results, factors)]
+        # the kernel inputs' Jacobian in the log10 parameters
+        eps = 1e-6
+        grad = np.zeros(p.size)
+        for j in range(p.size):
+            e = np.zeros(p.size); e[j] = eps
+            pts_p = self._chromatin_points(p + e, limits, samp)[0]
+            pts_m = self._chromatin_points(p - e, limits, samp)[0]
+            for raw, qp, qm in zip(raws, pts_p, pts_m):
+                acc = (np.sum(raw["d_H"] * (qp["H"] - qm["H"])) + np.sum(raw["d_A"] * (qp["A"] - qm["A"]))
+                       + np.sum(raw["d_C"] * (qp["C"] - qm["C"]))
+                       + raw["d_w"] @ (_chromatin.stationary_distribution(qp["H"]) - _chromatin.stationary_distribution(qm["H"])))
+                if qp["burst"] is not None:
+                    acc += raw["d_burst"] * (qp["burst"] - qm["burst"])
+                if qp["protein"] is not None:
+                    acc += (raw["d_protein"][0] * (qp["protein"][0] - qm["protein"][0])
+                            + raw["d_protein"][1] * (qp["protein"][1] - qm["protein"][1]))
+                grad[j] += acc / (2 * eps)
+        return kld, grad
 
     def eval_model_pss_batch(self, params_list, limits_list, samp_list=None, num_threads=None):
         """Evaluate PSS for N genes in one batched call.

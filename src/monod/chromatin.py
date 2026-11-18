@@ -50,12 +50,13 @@ loci and loci to genes) follows.
 from __future__ import annotations
 
 import math
+import types
 from typing import Optional, Sequence, Tuple
 
 import warnings
 
 import numpy as np
-from scipy.fft import irfftn
+from scipy.fft import irfftn, rfftn
 
 from ._core import _mc, step_control
 from .reaction_network import ReactionNetwork, StepSchedule, _phi_ops
@@ -64,6 +65,9 @@ _TOL = 1e-5            # per-step error target on the generating function; with 
                        # extrapolation the error on P is about tol/100 (1e-7 here), tighter than the
                        # custom-network kernel at its 1e-6, at half the steps of tol = 1e-6
 _C0 = 0.05             # first step as a fraction of the fastest time scale
+_PROTEIN_TABLE_TOL = 0.1  # the protein characteristics' table tolerance as a fraction of the kernel's (the adjoint
+                        # differentiates the table at pinned nodes; the stencil re-tabulates, and the two differ
+                        # by the table's error, about 3e-5 relative on the protein rates at this setting)
 _MAGNUS_MIN_STEP = 20.0  # a Magnus step costs about this many Strang steps on four configurations (n^3 against n^2 per
                          # point); below this many chain relaxation times, scaled by N / 4, it hands over to Strang
 _MAX_STEPS = 20_000
@@ -531,6 +535,79 @@ def rule_structure(H: np.ndarray, A: np.ndarray, k_on, k_off, epsilon: float, ru
     return site_weights, independent
 
 
+def _kernel_setup(H, A, C, u, tol, fixed_schedule, burst, protein):
+    """What every backend of :func:`eval_joint_pgf` derives from its arguments:
+    the stationary chain weights, the horizon and the step controls."""
+    H = np.asarray(H, dtype=float); A = np.asarray(A, dtype=float); C = np.asarray(C, dtype=float)
+    u = np.asarray(u, dtype=np.complex128)
+    N, m = A.shape
+    if u.shape[0] != m + (1 if protein is not None else 0):
+        raise ValueError(f"u must have one row per RNA species ({m}){' plus the protein' if protein is not None else ''}, "
+                         f"got shape {u.shape}")
+    P = u.shape[1]
+    w = stationary_distribution(H)
+    lam = np.abs(np.linalg.eigvals(C).real)
+    lam_slow = float(lam[lam > 0].min()) if np.any(lam > 0) else 1.0
+    lam_fast = max(float(lam.max()), float(np.abs(np.diag(H)).max()), float(2.0 * np.abs(A).max()), 1e-300)
+    k_p = gamma_p = beta = gamma = None
+    if protein is not None:
+        k_p, gamma_p = (float(x) for x in protein)
+        if not (k_p > 0.0 and gamma_p > 0.0):
+            raise ValueError(f"protein=(k_p, gamma_p) must be positive, got {protein!r}")
+        if m != 2 or C[1, 0] != 0.0 or C[0, 1] != -C[0, 0]:
+            raise ValueError("the protein layer needs the nascent/mature scheme C = [[-beta, beta], [0, -gamma]]")
+        beta, gamma = -C[0, 0], -C[1, 1]
+        lam_slow = min(lam_slow, gamma_p)
+        lam_fast = max(lam_fast, gamma + 2.0 * k_p, gamma_p)
+    T = (np.log(1.0 / tol) + np.log1p(2.0 * float(np.abs(A).max()) / lam_slow)) / lam_slow
+    if protein is not None:
+        T += max(0.0, np.log(2.0 * k_p / gamma)) / gamma_p          # as the protein integrator's horizon
+    if fixed_schedule is not None:
+        T = float(np.sum(np.asarray(fixed_schedule, dtype=float)))   # replay over the schedule's own horizon
+    h_first = _C0 / lam_fast
+    h_min = 1e-12 / lam_fast
+    lam_chain = float(np.abs(np.diag(H)).max())
+    h_switch = (_MAGNUS_MIN_STEP * N / 4.0) / lam_chain if lam_chain > 0 else np.inf   # Magnus above it, Strang below
+    return types.SimpleNamespace(H=H, A=A, C=C, u=u, N=N, m=m, P=P, w=w, T=T, h_first=h_first, h_min=h_min,
+                                 h_switch=h_switch, tol=float(tol), fixed_schedule=fixed_schedule,
+                                 burst=None if burst is None else float(burst), protein=protein,
+                                 k_p=k_p, gamma_p=gamma_p, beta=beta, gamma=gamma)
+
+
+def _rust_point_args(s, structure):
+    """The per-point keyword arguments of ``monod_core.eval_chromatin_pgf``."""
+    site_weights, independent = locus_structure(s.H, s.A) if structure is None else structure
+    prot = None
+    if s.protein is not None:
+        lam_p = max(s.beta, s.gamma + 2.0 * s.k_p, s.gamma_p)              # the tabulation's own controls, as in Python
+        prot = (s.k_p, s.gamma_p, _C0 / lam_p, 1e-12 / lam_p, _PROTEIN_TABLE_TOL * s.tol)
+    fx = s.fixed_schedule
+    return dict(h=s.H.ravel().tolist(), a=s.A.ravel().tolist(), c=s.C.ravel().tolist(), w=s.w.tolist(),
+                t_horizon=float(s.T), h_first=float(s.h_first), h_min=float(s.h_min), tol=float(s.tol),
+                fixed_schedule=None if fx is None else [float(x) for x in np.asarray(fx, dtype=float)],
+                site_weights=None if site_weights is None else np.asarray(site_weights, dtype=float).ravel().tolist(),
+                independent=independent, burst=s.burst, protein=prot,
+                magnus_steps=None if fx is None else int(getattr(fx, "magnus", 0)), h_switch=float(s.h_switch))
+
+
+def _rust_unpack(out, s):
+    re, im, _, steps, table, n_magnus = out
+    if table is not None and table[0]:                                   # (capped, steps taken, time reached)
+        _warn_table_cap(int(table[1]), float(table[2]), s.T)
+    G = (np.asarray(re) + 1j * np.asarray(im)).reshape(s.P, s.N).T
+    return G, StepSchedule(list(steps), magnus=n_magnus)
+
+
+def _rust_batch_available(protein: bool = False) -> bool:
+    """Whether ``monod_core.eval_chromatin_pgf_batch`` is installed."""
+    return _rust_available(protein) and hasattr(_mc, "eval_chromatin_pgf_batch")
+
+
+def _rust_adjoint_available(protein: bool = False) -> bool:
+    """Whether ``monod_core.eval_chromatin_pgf_adjoint`` is installed."""
+    return _rust_available(protein) and hasattr(_mc, "eval_chromatin_pgf_adjoint")
+
+
 def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
                    tol: float = _TOL, fixed_schedule: Optional[StepSchedule] = None,
                    backend: Optional[str] = None, burst: Optional[float] = None,
@@ -560,84 +637,118 @@ def eval_joint_pgf(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray,
     unchanged.  The Rust kernel tabulates the same characteristics as an
     affine map per distinct protein argument (``monod_core.eval_chromatin_pgf``
     with ``protein=``)."""
-    H = np.asarray(H, dtype=float); A = np.asarray(A, dtype=float); C = np.asarray(C, dtype=float)
-    u = np.asarray(u, dtype=np.complex128)
-    N, m = A.shape
-    if u.shape[0] != m + (1 if protein is not None else 0):
-        raise ValueError(f"u must have one row per RNA species ({m}){' plus the protein' if protein is not None else ''}, "
-                         f"got shape {u.shape}")
-    P = u.shape[1]
-    w = stationary_distribution(H)
-    lam = np.abs(np.linalg.eigvals(C).real)
-    lam_slow = float(lam[lam > 0].min()) if np.any(lam > 0) else 1.0
-    lam_fast = max(float(lam.max()), float(np.abs(np.diag(H)).max()), float(2.0 * np.abs(A).max()), 1e-300)
-    if protein is not None:
-        k_p, gamma_p = (float(x) for x in protein)
-        if not (k_p > 0.0 and gamma_p > 0.0):
-            raise ValueError(f"protein=(k_p, gamma_p) must be positive, got {protein!r}")
-        if m != 2 or C[1, 0] != 0.0 or C[0, 1] != -C[0, 0]:
-            raise ValueError("the protein layer needs the nascent/mature scheme C = [[-beta, beta], [0, -gamma]]")
-        beta, gamma = -C[0, 0], -C[1, 1]
-        lam_slow = min(lam_slow, gamma_p)
-        lam_fast = max(lam_fast, gamma + 2.0 * k_p, gamma_p)
-    T = (np.log(1.0 / tol) + np.log1p(2.0 * float(np.abs(A).max()) / lam_slow)) / lam_slow
-    if protein is not None:
-        T += max(0.0, np.log(2.0 * k_p / gamma)) / gamma_p          # as the protein integrator's horizon
-    if fixed_schedule is not None:
-        T = float(np.sum(np.asarray(fixed_schedule, dtype=float)))   # replay over the schedule's own horizon
-    h_first = _C0 / lam_fast
-    h_min = 1e-12 / lam_fast
-    lam_chain = float(np.abs(np.diag(H)).max())
-    h_switch = (_MAGNUS_MIN_STEP * N / 4.0) / lam_chain if lam_chain > 0 else np.inf   # Magnus above it, Strang below
+    s = _kernel_setup(H, A, C, u, tol, fixed_schedule, burst, protein)
     if backend is None:
         backend = "rust" if _rust_available(protein is not None) else "python"
     if backend == "rust":
         if not _rust_available(protein is not None):
             raise RuntimeError("monod_core with eval_chromatin_pgf" + (" taking the protein layer" if protein is not None else "")
                                + " is not installed")
-        site_weights, independent = locus_structure(H, A) if structure is None else structure
-        prot = None
-        if protein is not None:
-            lam_p = max(beta, gamma + 2.0 * k_p, gamma_p)              # the tabulation's own controls, as in Python
-            prot = (k_p, gamma_p, _C0 / lam_p, 1e-12 / lam_p, 0.1 * tol)
-        out = _mc.eval_chromatin_pgf(
-            N, m, H.ravel().tolist(), A.ravel().tolist(), C.ravel().tolist(),
-            [1] * m, w.tolist(), float(T), float(h_first), float(h_min), float(tol),
-            None if fixed_schedule is None else [float(x) for x in np.asarray(fixed_schedule, dtype=float)],
-            None if site_weights is None else np.asarray(site_weights, dtype=float).ravel().tolist(),
-            independent,
-            u.real.ravel().tolist(), u.imag.ravel().tolist(),
-            None if burst is None else float(burst),
-            prot,
-            None if fixed_schedule is None else int(getattr(fixed_schedule, "magnus", 0)),
-            float(h_switch))
-        re, im, _, steps, table, n_magnus = out
-        if table is not None and table[0]:                                   # (capped, steps taken, time reached)
-            _warn_table_cap(int(table[1]), float(table[2]), T)
-        G = (np.asarray(re) + 1j * np.asarray(im)).reshape(P, N).T
-        steps = list(steps)
+        out = _mc.eval_chromatin_pgf(s.N, s.m, limits=[1] * s.m, u_re=s.u.real.ravel().tolist(), u_im=s.u.imag.ravel().tolist(),
+                                     **_rust_point_args(s, structure))
+        return _rust_unpack(out, s)
     elif backend == "python":
-        HT = H.T
-        G = np.repeat(w[:, None].astype(np.complex128), P, axis=1)
+        HT = s.H.T
+        G = np.repeat(s.w[:, None].astype(np.complex128), s.P, axis=1)
         if protein is None:
-            chars = _LinearCharacteristics(C, u)
+            chars = _LinearCharacteristics(s.C, s.u)
         else:
-            chars = _ProteinCharacteristics(beta, gamma, k_p, gamma_p, u, T, 0.1 * tol)
-        G, steps, n_magnus = _integrate_numpy(HT, A, chars, G, T, h_first, h_min, tol, fixed_schedule,
-                                              None if burst is None else float(burst), h_switch=h_switch)
+            chars = _ProteinCharacteristics(s.beta, s.gamma, s.k_p, s.gamma_p, s.u, s.T, _PROTEIN_TABLE_TOL * s.tol)
+        G, steps, n_magnus = _integrate_numpy(HT, s.A, chars, G, s.T, s.h_first, s.h_min, s.tol, fixed_schedule,
+                                              s.burst, h_switch=s.h_switch)
+        return G, StepSchedule(steps, magnus=n_magnus)
     else:
         raise ValueError(f"backend must be 'rust', 'python' or None, got {backend!r}")
-    return G, StepSchedule(steps, magnus=n_magnus)
+
+
+def eval_joint_pgf_adjoint(H: np.ndarray, A: np.ndarray, C: np.ndarray, u: np.ndarray, lam: np.ndarray, schedule,
+                           tol: float = _TOL, burst: Optional[float] = None, structure=None,
+                           protein: Optional[Tuple[float, float]] = None):
+    """The adjoint of :func:`eval_joint_pgf` over the pinned ``schedule``: for a
+    real scalar ``L`` of the generating function and ``lam = dL/dG`` (shape
+    ``(N, P)``, in the pairing ``dL = Re sum(lam * dG)``), the derivatives of
+    ``L`` with respect to the kernel's inputs, as a dict: ``d_w`` (N, the
+    chain's stationary weights), ``d_H`` (N, N), ``d_A`` (N, m), ``d_C`` (m, m;
+    with a protein layer ``[[-dL/dbeta, 0], [0, -dL/dgamma]]``), ``d_burst``
+    and ``d_protein`` (``(dL/dk_p, dL/dgamma_p)``).  One backward sweep of the
+    stepper (``monod_core.eval_chromatin_pgf_adjoint``, which replays the
+    schedule with checkpoints): the exact derivative of the replayed map that
+    a finite-difference stencil only approximates."""
+    s = _kernel_setup(H, A, C, u, tol, schedule, burst, protein)
+    if not _rust_adjoint_available(protein is not None):
+        raise RuntimeError("monod_core with eval_chromatin_pgf_adjoint" + (" taking the protein layer" if protein is not None else "")
+                           + " is not installed")
+    kw = _rust_point_args(s, structure)
+    lam = np.asarray(lam, dtype=np.complex128).reshape(s.N, s.P).T           # point-major, as the kernel lays out G
+    d_w, d_h, d_a, d_c, d_b, d_p = _mc.eval_chromatin_pgf_adjoint(
+        s.N, s.m, kw["h"], kw["a"], kw["c"], [1] * s.m, kw["w"], kw["t_horizon"], kw["h_first"], kw["h_min"], kw["tol"],
+        kw["fixed_schedule"], lam.real.ravel().tolist(), lam.imag.ravel().tolist(), magnus_steps=kw["magnus_steps"],
+        site_weights=kw["site_weights"], independent=kw["independent"],
+        u_re=s.u.real.ravel().tolist(), u_im=s.u.imag.ravel().tolist(),
+        burst=kw["burst"], protein=kw["protein"], h_switch=kw["h_switch"])
+    return dict(d_w=np.asarray(d_w, dtype=float), d_H=np.asarray(d_h, dtype=float).reshape(s.N, s.N),
+                d_A=np.asarray(d_a, dtype=float).reshape(s.N, s.m), d_C=np.asarray(d_c, dtype=float).reshape(s.m, s.m),
+                d_burst=float(d_b), d_protein=(float(d_p[0]), float(d_p[1])))
+
+
+def eval_joint_pgf_batch(points, u: np.ndarray, backend: Optional[str] = None):
+    """:func:`eval_joint_pgf` at several parameter points that share the PGF
+    arguments ``u`` (a finite-difference stencil), in one kernel call that
+    runs the points in parallel (``monod_core.eval_chromatin_pgf_batch``).
+
+    ``points`` is a list of dicts with the keys ``H, A, C`` and optionally
+    ``tol, fixed_schedule, burst, structure, protein``, the keyword arguments
+    of :func:`eval_joint_pgf`; every point carries the protein layer, or none.
+    Returns the list of ``(G, StepSchedule)`` in order.  Without the batched
+    kernel (or with ``backend="python"``) the points run one after another."""
+    setups = [_kernel_setup(pt["H"], pt["A"], pt["C"], u, pt.get("tol", _TOL), pt.get("fixed_schedule"),
+                            pt.get("burst"), pt.get("protein")) for pt in points]
+    if not setups:
+        return []
+    has_protein = setups[0].protein is not None
+    if any((s.protein is not None) != has_protein for s in setups):
+        raise ValueError("every point of a batch carries the protein layer, or none")
+    if backend is None:
+        backend = "rust" if _rust_available(has_protein) else "python"
+    if backend != "rust" or not _rust_batch_available(has_protein):
+        return [eval_joint_pgf(pt["H"], pt["A"], pt["C"], u, tol=pt.get("tol", _TOL), fixed_schedule=pt.get("fixed_schedule"),
+                               backend=backend, burst=pt.get("burst"), structure=pt.get("structure"), protein=pt.get("protein"))
+                for pt in points]
+    args = [_rust_point_args(s, pt.get("structure")) for s, pt in zip(setups, points)]
+    s0 = setups[0]
+    col = lambda key: [a[key] for a in args]
+    out = _mc.eval_chromatin_pgf_batch(
+        s0.N, s0.m, [1] * s0.m, col("h"), col("a"), col("c"), col("w"), col("t_horizon"), col("h_first"), col("h_min"), col("tol"),
+        col("fixed_schedule"), col("site_weights"), col("independent"), s0.u.real.ravel().tolist(), s0.u.imag.ravel().tolist(),
+        col("burst"), col("protein"), [0 if v is None else v for v in col("magnus_steps")], col("h_switch"))
+    return [_rust_unpack(o, s) for o, s in zip(out, setups)]
+
+
+def _invert_raw(G: np.ndarray, mesh_shape: Sequence[int], limits: Sequence[int]) -> np.ndarray:
+    """The inverse transform of each configuration's generating function, before
+    the absolute value and the normalisation: ``R[c, x]``."""
+    N = G.shape[0]
+    R = np.empty((N,) + tuple(int(l) for l in limits))
+    for c in range(N):
+        R[c] = irfftn(G[c].reshape(tuple(mesh_shape)), s=[int(l) for l in limits])
+    return R
 
 
 def invert_joint_pgf(G: np.ndarray, mesh_shape: Sequence[int], limits: Sequence[int]) -> np.ndarray:
     """``P[c, x]`` from the half-spectrum generating function of each configuration."""
-    N = G.shape[0]
-    pss = np.empty((N,) + tuple(int(l) for l in limits))
-    for c in range(N):
-        pss[c] = irfftn(G[c].reshape(tuple(mesh_shape)), s=[int(l) for l in limits])
-    pss = np.abs(pss)
+    pss = np.abs(_invert_raw(G, mesh_shape, limits))
     return pss / pss.sum()
+
+
+def _irfftn_adjoint(r: np.ndarray, mesh_shape: Sequence[int], limits: Sequence[int]) -> np.ndarray:
+    """The adjoint of ``irfftn(., s=limits)`` on the half mesh: ``lam`` with
+    ``sum(r * irfftn(dG, s=limits)) == Re sum(lam * dG)`` for every ``dG`` of
+    shape ``mesh_shape``.  ``conj(rfftn(r))`` on the kept bins over the grid
+    size, doubled on the bins the real transform pairs with their conjugates."""
+    limits = tuple(int(l) for l in limits)
+    F = np.conj(rfftn(r))[tuple(slice(0, int(m)) for m in mesh_shape)] / float(np.prod(limits))
+    k = np.arange(int(mesh_shape[-1]))
+    return F * np.where((k == 0) | (2 * k == limits[-1]), 1.0, 2.0)
 
 
 def eval_joint_pss(H: np.ndarray, A: np.ndarray, C: np.ndarray, limits: Sequence[int],

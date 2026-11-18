@@ -2995,6 +2995,9 @@ class SearchResults:
         # The protein and custom-network integrators adapt their steps; every
         # stencil point replays the optimum's schedule so the integrator's
         # tolerance does not enter the differences divided by the small step.
+        # The schedule is the fine-tolerance one: adapting it at the search
+        # tolerance (tried 2026-11-17) is four times cheaper but moves the
+        # standard errors along a gene's weak directions by up to half.
         with self.model.pinned_schedule(x0, limits, samp):
             if method == "gradient":
                 h = float(getattr(self, "_hess_step", 1e-2))

@@ -324,3 +324,58 @@ class TestPipeline:
         assert res["lr"] > 20.0
         rates = cf.split_theta(res["x_big"], "table", 2)[2]
         assert rates[3] > 5 * rates[:3].max()                               # the AND gate is recovered
+
+
+class TestBatchedStencilRnaOnly:
+    def test_batched_gradient_matches_serial(self, monkeypatch):
+        """Without a protein layer the stencil also runs as one kernel call."""
+        if not ch._rust_batch_available(False):
+            pytest.skip("monod_core without eval_chromatin_pgf_batch")
+        m = _model("switch", seq="Poisson")
+        theta = _theta("switch", [5.0])
+        rng = np.random.default_rng(1)
+        samp = [-0.2, -0.2, 0.0]
+        data, lim = _hist(_cells(m, theta, 800, rng, samp=samp))
+        k_b, g_b = m.eval_model_kld_and_grad(theta, lim, samp, data)
+        monkeypatch.setattr(ch, "_rust_batch_available", lambda *a, **k: False)
+        k_s, g_s = m.eval_model_kld_and_grad(theta, lim, samp, data)
+        assert k_b == pytest.approx(k_s, rel=1e-12)
+        np.testing.assert_allclose(g_b, g_s, rtol=1e-8, atol=1e-10)
+
+
+class TestAdjointRnaOnly:
+    """The adjoint gradient without a protein layer, against pinned central differences."""
+
+    def _check(self, m, theta, samp, rtol=1e-6):
+        if not ch._rust_adjoint_available(False):
+            pytest.skip("monod_core without eval_chromatin_pgf_adjoint")
+        rng = np.random.default_rng(1)
+        data, lim = _hist(_cells(m, theta, 800, rng, samp=samp))
+        th = np.asarray(theta, dtype=float) + 0.05
+        k_a, g_a = m.eval_model_kld_and_grad(th, lim, samp, data)
+        assert k_a == pytest.approx(m.eval_model_kld(th, lim, samp, data), rel=1e-12)
+        g_fd = np.zeros(th.size)
+        with m.pinned_schedule(th, lim, samp):
+            for j in range(th.size):
+                e = np.zeros(th.size); e[j] = 1e-5
+                g_fd[j] = (m.eval_model_kld(th + e, lim, samp, data) - m.eval_model_kld(th - e, lim, samp, data)) / 2e-5
+        np.testing.assert_allclose(g_a, g_fd, rtol=rtol, atol=1e-9)
+
+    def test_bursty_switch_with_dropout(self):
+        m = _model("switch", seq="Poisson", bursty=True, dropout_bounds=(-1.5, -0.3, 3))
+        theta = cf.join_theta(TRUTH["k_on"], TRUTH["eps"], [5.0], TRUTH["beta"], TRUTH["gamma"], 2.0)
+        self._check(m, theta, [-0.2, -0.2, -0.6])
+
+    def test_single_molecules_additive(self):
+        m = _model("additive")
+        self._check(m, _theta("additive", [2.0, 4.0]), None)
+
+    def test_slow_degradation(self):
+        """Magnus steps in the tail, single molecules: the exponential's reverse mode and ∫ exp(C s) ds."""
+        m = _model("switch", seq="Poisson")
+        theta = cf.join_theta(TRUTH["k_on"], TRUTH["eps"], [5.0], TRUTH["beta"], 0.05)
+        rng = np.random.default_rng(2)
+        data, lim = _hist(_cells(m, theta, 800, rng, limits=(40, 120, 4), samp=[-0.2, -0.2, 0.0]))
+        with m.pinned_schedule(theta, lim, [-0.2, -0.2, 0.0]):
+            assert getattr(m._fixed_schedule, "magnus", 0) >= 1
+        self._check(m, theta, [-0.2, -0.2, 0.0])

@@ -3777,6 +3777,7 @@ impl SmallMat {
 
 /// Small dense complex matrix, row-major: the per-point exponential of the
 /// chromatin Magnus step.  Mirrors `monod.chromatin._expm_batched`.
+#[derive(Clone)]
 struct CSmallMat {
     n: usize,
     a: Vec<Complex64>,
@@ -4781,9 +4782,9 @@ impl ProtTable {
 
 /// Tabulate the protein characteristics over `[0, t_end]` with step doubling,
 /// the error taken exactly over the mesh points (`u`: the three PGF rows).
-fn prot_tabulate(p: ProtParams, u: &[Vec<Complex64>], n_grid: usize, n_pad: usize,
-                 t_end: f64, h_first: f64, h_min: f64, tol: f64) -> ProtTable {
-    let one = Complex64::new(1.0, 0.0);
+/// The distinct protein arguments of the mesh: their values, the group of
+/// every padded point and the members of each group.
+fn prot_groups(u: &[Vec<Complex64>], n_grid: usize, n_pad: usize) -> (Vec<Complex64>, Vec<usize>, Vec<Vec<usize>>) {
     let mut u_p: Vec<Complex64> = Vec::new();
     let mut group_of = vec![0usize; n_pad];
     let mut members: Vec<Vec<usize>> = Vec::new();
@@ -4796,6 +4797,13 @@ fn prot_tabulate(p: ProtParams, u: &[Vec<Complex64>], n_grid: usize, n_pad: usiz
         group_of[q] = g;
         members[g].push(q);
     }
+    (u_p, group_of, members)
+}
+
+fn prot_tabulate(p: ProtParams, u: &[Vec<Complex64>], n_grid: usize, n_pad: usize,
+                 t_end: f64, h_first: f64, h_min: f64, tol: f64) -> ProtTable {
+    let one = Complex64::new(1.0, 0.0);
+    let (u_p, group_of, members) = prot_groups(u, n_grid, n_pad);
     let v0: Vec<Complex64> = (0..n_grid).map(|q| u[0][q] + one).collect();
     let w0: Vec<Complex64> = (0..n_grid).map(|q| u[1][q] + one).collect();
     let ng = u_p.len();
@@ -4872,6 +4880,12 @@ struct DiagFlow {
     /// protein layer: Simpson weights and, per node, the (v, w) rows of the
     /// characteristics' affine map per distinct protein argument
     pquad: Option<Vec<(f64, Vec<(ProtRow, ProtRow)>)>>,
+    /// for the adjoint: K = A M in full (n × m), M itself (the identity with
+    /// bursts or a protein) and the interval [tau_a, tau_a + delta]
+    k_full: Vec<f64>,
+    mm: SmallMat,
+    tau_a: f64,
+    delta: f64,
 }
 
 /// Step operators for a step from time-to-go `tau` to `tau - h`: the
@@ -4910,16 +4924,20 @@ fn chromatin_diag_ops(sys: &ChromatinSys, mm: &SmallMat) -> DiagOps {
 
 /// The diagonal flow over `[tau_a, tau_a + delta]`.
 fn chromatin_diag_flow(sys: &ChromatinSys, tau_a: f64, delta: f64) -> DiagFlow {
+    let flow = |mm: SmallMat, quad: Option<Vec<(SmallMat, f64)>>, pquad: Option<Vec<(f64, Vec<(ProtRow, ProtRow)>)>>| DiagFlow {
+        coef: chromatin_diag_ops(sys, &mm), quad, pquad,
+        k_full: chromatin_mat_mul(sys.a, sys.n, sys.m, &mm), mm, tau_a, delta,
+    };
     if let Some(pt) = &sys.protein {
         // the characteristics come from the table; Simpson on the interval, with or without bursts
-        return DiagFlow { coef: chromatin_diag_ops(sys, &SmallMat::eye(sys.m)), quad: None, pquad: Some(pt.simpson(tau_a, delta)) };
+        return flow(SmallMat::eye(sys.m), None, Some(pt.simpson(tau_a, delta)));
     }
     match sys.burst {
-        None => DiagFlow { coef: chromatin_diag_ops(sys, &chromatin_char_integral(&sys.c, tau_a, delta)), quad: None, pquad: None },
+        None => flow(chromatin_char_integral(&sys.c, tau_a, delta), None, None),
         Some(_) => {
             let nodes = [(tau_a, delta / 6.0), (tau_a + 0.5 * delta, 4.0 * delta / 6.0), (tau_a + delta, delta / 6.0)];
             let quad = nodes.iter().map(|&(s, w)| (sys.c.scaled(s).expm(), w)).collect();
-            DiagFlow { coef: chromatin_diag_ops(sys, &SmallMat::eye(sys.m)), quad: Some(quad), pquad: None }
+            flow(SmallMat::eye(sys.m), Some(quad), None)
         }
     }
 }
@@ -5161,8 +5179,15 @@ fn chromatin_step_block(sys: &ChromatinSys, ops: &ChromatinOps, b0: usize,
 #[inline]
 fn chromatin_exponent(sys: &ChromatinSys, d: &DiagFlow, b0: usize, xr_out: &mut [f64], xi_out: &mut [f64],
                       sr: &mut [f64], si: &mut [f64]) {
-    let (n, m, bw) = (sys.n, sys.m, CHROMATIN_BLOCK);
     let (xr, xi) = chromatin_flow_input(sys, d, b0);
+    chromatin_exponent_from(sys, d, &xr, &xi, xr_out, xi_out, sr, si);
+}
+
+/// `chromatin_exponent` from the flow's input `(xr, xi)` already computed.
+#[allow(clippy::too_many_arguments)]
+fn chromatin_exponent_from(sys: &ChromatinSys, d: &DiagFlow, xr: &[f64], xi: &[f64], xr_out: &mut [f64], xi_out: &mut [f64],
+                           sr: &mut [f64], si: &mut [f64]) {
+    let (n, m, bw) = (sys.n, sys.m, CHROMATIN_BLOCK);
     let dots = |coef: &[f64], rows: usize, sr: &mut [f64], si: &mut [f64]| {
         for r in 0..rows {
             for i in 0..bw {
@@ -5389,6 +5414,165 @@ fn chromatin_pgf(
 /// there is a protein layer (`capped` when its step cap came before the
 /// horizon, so the forcing was held constant beyond it) and `n_magnus` the
 /// number of leading Magnus steps taken.
+/// One parameter point of the chromatin kernel: the arguments of
+/// `eval_chromatin_pgf` that a finite-difference stencil varies.
+struct ChromatinPointArgs {
+    h:              Vec<f64>,
+    a:              Vec<f64>,
+    c:              Vec<f64>,
+    w:              Vec<f64>,
+    t_horizon:      f64,
+    h_first:        f64,
+    h_min:          f64,
+    tol:            f64,
+    fixed_schedule: Option<Vec<f64>>,
+    site_weights:   Option<Vec<f64>>,
+    independent:    Option<Vec<f64>>,
+    burst:          Option<f64>,
+    protein:        Option<(f64, f64, f64, f64, f64)>,
+    magnus_steps:   usize,
+    h_switch:       f64,
+}
+
+/// `(re, im, mesh_shape, steps, table, n_magnus)` of one point, see `eval_chromatin_pgf`.
+type ChromatinPointOut = (Vec<f64>, Vec<f64>, Vec<usize>, Vec<f64>, Option<(bool, usize, f64)>, usize);
+type ChromatinMesh = Arc<(Vec<Vec<Complex64>>, Vec<usize>, usize)>;
+
+fn chromatin_check(what: &str, n: usize, m: usize, limits: &[usize], u_re: &Option<Vec<f64>>, u_im: &Option<Vec<f64>>,
+                   p: &ChromatinPointArgs) -> PyResult<()> {
+    let err = |s: &str| pyo3::exceptions::PyValueError::new_err(format!("{what}: {s}"));
+    if !(p.h_switch >= 0.0) {
+        return Err(err("h_switch must be non-negative"));
+    }
+    if let Some(b) = p.burst {
+        if !(b > 0.0) || !b.is_finite() {
+            return Err(err("burst must be a positive number"));
+        }
+    }
+    let rows = m + if p.protein.is_some() { 1 } else { 0 };
+    if let (Some(ur), Some(ui)) = (u_re, u_im) {
+        if ur.len() != ui.len() || ur.len() % rows != 0 {
+            return Err(err("u_re/u_im must be n_species (+1 with a protein) × n_grid"));
+        }
+    } else if u_re.is_some() != u_im.is_some() {
+        return Err(err("give both u_re and u_im or neither"));
+    }
+    if let Some((k_p, gamma_p, hf, hm, ptol)) = p.protein {
+        if u_re.is_none() {
+            return Err(err("the protein layer needs u_re/u_im with the protein row"));
+        }
+        if m != 2 || p.c.len() != 4 || p.c[2] != 0.0 || p.c[1] != -p.c[0] {
+            return Err(err("the protein layer needs the nascent/mature scheme c = [[-beta, beta], [0, -gamma]]"));
+        }
+        if !(k_p > 0.0 && gamma_p > 0.0 && hf > 0.0 && hm > 0.0 && ptol > 0.0) {
+            return Err(err("protein = (k_p, gamma_p, h_first, h_min, tol), all positive"));
+        }
+    }
+    if p.h.len() != n * n || p.a.len() != n * m || p.c.len() != m * m || p.w.len() != n || limits.len() != m {
+        return Err(err("inconsistent shapes of h, a, c, w or limits"));
+    }
+    let n_sites = n.trailing_zeros() as usize;
+    let pow2 = n.is_power_of_two();
+    if let Some(sw) = &p.site_weights {
+        if !pow2 || sw.len() != n_sites * m {
+            return Err(err("site_weights must be (log2 n_states) × n_species"));
+        }
+    }
+    if let Some(ind) = &p.independent {
+        if !pow2 || ind.len() != 2 * n_sites {
+            return Err(err("independent must hold (k_on, k_off) per site"));
+        }
+    }
+    Ok(())
+}
+
+/// The PGF arguments: the half-spectrum mesh of `limits`, or the caller's
+/// (already transformed by a sequencing-noise model).
+fn chromatin_mesh(m: usize, limits: &[usize], u_re: &Option<Vec<f64>>, u_im: &Option<Vec<f64>>, protein: bool) -> ChromatinMesh {
+    let rows = m + if protein { 1 } else { 0 };
+    match (u_re, u_im) {
+        (Some(ur), Some(ui)) => {
+            let n_grid = ur.len() / rows;
+            let u: Vec<Vec<Complex64>> = (0..rows)
+                .map(|j| (0..n_grid).map(|p| Complex64::new(ur[j * n_grid + p], ui[j * n_grid + p])).collect())
+                .collect();
+            Arc::new((u, vec![n_grid], n_grid))
+        }
+        _ => build_mesh_nd_cached(limits),
+    }
+}
+
+/// The system of one point: the padded planes of the PGF arguments, the
+/// chain, the production structure and the protein table; with the number
+/// of blocks.
+fn chromatin_sys<'a>(n: usize, m: usize, mesh: &ChromatinMesh, p: &'a ChromatinPointArgs) -> (ChromatinSys<'a>, usize) {
+    let (u, n_grid) = (&mesh.0, mesh.2);
+    let bw = CHROMATIN_BLOCK;
+    let n_blocks = (n_grid + bw - 1) / bw;
+    let ur: Vec<Vec<f64>> = u.iter().take(m).map(|uj| (0..n_blocks * bw).map(|q| if q < n_grid { uj[q].re } else { 0.0 }).collect()).collect();
+    let ui: Vec<Vec<f64>> = u.iter().take(m).map(|uj| (0..n_blocks * bw).map(|q| if q < n_grid { uj[q].im } else { 0.0 }).collect()).collect();
+    let prot = p.protein.map(|(k_p, gamma_p, hf, hm, ptol)| {
+        let pp = ProtParams { beta: -p.c[0], gamma: -p.c[3], k_p, gamma_p };
+        prot_tabulate(pp, u, n_grid, n_blocks * bw, p.t_horizon, hf, hm, ptol)
+    });
+    let mut ht = SmallMat::zeros(n);
+    for i in 0..n {
+        for j in 0..n { ht.set(i, j, p.h[j * n + i]); }
+    }
+    let n_sites = n.trailing_zeros() as usize;
+    let chain = match &p.independent {
+        Some(ind) => ChromatinChain::Kron((0..n_sites).map(|j| {
+            let (kon, koff) = (ind[2 * j], ind[2 * j + 1]);
+            SmallMat { n: 2, a: vec![-kon, koff, kon, -koff] }      // transposed 2 × 2 generator
+        }).collect()),
+        None => ChromatinChain::Dense(ht.clone()),
+    };
+    let a = &p.a;
+    let diag = if let Some(sw) = &p.site_weights {
+        ChromatinDiag::Factored { n_sites, w: sw.clone() }
+    } else {
+        let nonzero: Vec<usize> = (0..m).filter(|&j| (0..n).any(|cc| a[cc * m + j] != 0.0)).collect();
+        if nonzero.len() == 1 {
+            let col = nonzero[0];
+            let mut distinct: Vec<f64> = Vec::new();
+            let mut group = vec![0usize; n];
+            for cc in 0..n {
+                let r = a[cc * m + col];
+                group[cc] = match distinct.iter().position(|&x| x == r) {
+                    Some(k) => k,
+                    None => { distinct.push(r); distinct.len() - 1 }
+                };
+            }
+            ChromatinDiag::Shared { col, group, distinct }
+        } else {
+            ChromatinDiag::General
+        }
+    };
+    let cm = SmallMat { n: m, a: p.c.clone() };
+    (ChromatinSys { n, m, chain, ht, a, c: cm, diag, burst: p.burst, ur, ui, protein: prot }, n_blocks)
+}
+
+/// The kernel at one point, GIL released by the caller.
+fn chromatin_point(n: usize, m: usize, mesh: &ChromatinMesh, p: &ChromatinPointArgs) -> ChromatinPointOut {
+    let (mx, n_grid) = (mesh.1.clone(), mesh.2);
+    let bw = CHROMATIN_BLOCK;
+    let (sys, n_blocks) = chromatin_sys(n, m, mesh, p);
+    let (gr, gi, steps, n_magnus) = chromatin_pgf(&sys, &p.w, n_blocks, p.t_horizon, p.h_first, p.h_min, p.tol,
+                                                  p.fixed_schedule.as_deref(), p.magnus_steps, p.h_switch);
+    let table = sys.protein.as_ref().map(|pt| pt.cap);
+    // back to point-major (p * n + c)
+    let mut re = vec![0.0; n_grid * n];
+    let mut im = vec![0.0; n_grid * n];
+    for q in 0..n_grid {
+        let (b, i) = (q / bw, q % bw);
+        for cc in 0..n {
+            re[q * n + cc] = gr[b * n * bw + cc * bw + i];
+            im[q * n + cc] = gi[b * n * bw + cc * bw + i];
+        }
+    }
+    (re, im, mx, steps, table, n_magnus)
+}
+
 #[pyfunction]
 #[pyo3(signature = (n_states, n_species, h, a, c, limits, w, t_horizon, h_first, h_min, tol, fixed_schedule=None, site_weights=None, independent=None, u_re=None, u_im=None, burst=None, protein=None, magnus_steps=None, h_switch=None))]
 fn eval_chromatin_pgf(
@@ -5413,124 +5597,914 @@ fn eval_chromatin_pgf(
     protein:        Option<(f64, f64, f64, f64, f64)>,
     magnus_steps:   Option<usize>,
     h_switch:       Option<f64>,
-) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>, Vec<f64>, Option<(bool, usize, f64)>, usize)> {
+) -> PyResult<ChromatinPointOut> {
     let (n, m) = (n_states, n_species);
-    let h_switch = h_switch.unwrap_or(0.0);
-    if !(h_switch >= 0.0) {
-        return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: h_switch must be non-negative"));
-    }
-    if let Some(b) = burst {
-        if !(b > 0.0) || !b.is_finite() {
-            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: burst must be a positive number"));
+    let args = ChromatinPointArgs {
+        h, a, c, w, t_horizon, h_first, h_min, tol, fixed_schedule, site_weights, independent, burst, protein,
+        magnus_steps: magnus_steps.unwrap_or(0), h_switch: h_switch.unwrap_or(0.0),
+    };
+    chromatin_check("eval_chromatin_pgf", n, m, &limits, &u_re, &u_im, &args)?;
+    Ok(py.allow_threads(|| {
+        let mesh = chromatin_mesh(m, &limits, &u_re, &u_im, args.protein.is_some());
+        chromatin_point(n, m, &mesh, &args)
+    }))
+}
+
+/// `eval_chromatin_pgf` at several parameter points that share the PGF
+/// arguments (a finite-difference stencil): the per-point arguments come as
+/// parallel lists (`hs[i]`, `as_[i]`, ... for point i), the mesh (`limits`
+/// or `u_re`/`u_im`) is built once, and the points run in parallel with the
+/// GIL released.  The optional lists default to `None`/`0` per point; every
+/// point must carry the protein layer, or none.  Returns one
+/// `(re, im, mesh_shape, steps, table, n_magnus)` per point, in order.
+#[pyfunction]
+#[pyo3(signature = (n_states, n_species, limits, hs, as_, cs, ws, t_horizons, h_firsts, h_mins, tols, fixed_schedules=None, site_weights=None, independents=None, u_re=None, u_im=None, bursts=None, proteins=None, magnus_steps=None, h_switches=None))]
+fn eval_chromatin_pgf_batch(
+    py:              Python<'_>,
+    n_states:        usize,
+    n_species:       usize,
+    limits:          Vec<usize>,
+    hs:              Vec<Vec<f64>>,
+    as_:             Vec<Vec<f64>>,
+    cs:              Vec<Vec<f64>>,
+    ws:              Vec<Vec<f64>>,
+    t_horizons:      Vec<f64>,
+    h_firsts:        Vec<f64>,
+    h_mins:          Vec<f64>,
+    tols:            Vec<f64>,
+    fixed_schedules: Option<Vec<Option<Vec<f64>>>>,
+    site_weights:    Option<Vec<Option<Vec<f64>>>>,
+    independents:    Option<Vec<Option<Vec<f64>>>>,
+    u_re:            Option<Vec<f64>>,
+    u_im:            Option<Vec<f64>>,
+    bursts:          Option<Vec<Option<f64>>>,
+    proteins:        Option<Vec<Option<(f64, f64, f64, f64, f64)>>>,
+    magnus_steps:    Option<Vec<usize>>,
+    h_switches:      Option<Vec<f64>>,
+) -> PyResult<Vec<ChromatinPointOut>> {
+    let (n, m) = (n_states, n_species);
+    let k = hs.len();
+    let err = |s: String| pyo3::exceptions::PyValueError::new_err(format!("eval_chromatin_pgf_batch: {s}"));
+    let mut fixed_schedules = fixed_schedules.unwrap_or_else(|| vec![None; k]);
+    let mut site_weights = site_weights.unwrap_or_else(|| vec![None; k]);
+    let mut independents = independents.unwrap_or_else(|| vec![None; k]);
+    let bursts = bursts.unwrap_or_else(|| vec![None; k]);
+    let proteins = proteins.unwrap_or_else(|| vec![None; k]);
+    let magnus_steps = magnus_steps.unwrap_or_else(|| vec![0; k]);
+    let h_switches = h_switches.unwrap_or_else(|| vec![0.0; k]);
+    for (name, len) in [("as_", as_.len()), ("cs", cs.len()), ("ws", ws.len()), ("t_horizons", t_horizons.len()),
+                        ("h_firsts", h_firsts.len()), ("h_mins", h_mins.len()), ("tols", tols.len()),
+                        ("fixed_schedules", fixed_schedules.len()), ("site_weights", site_weights.len()),
+                        ("independents", independents.len()), ("bursts", bursts.len()), ("proteins", proteins.len()),
+                        ("magnus_steps", magnus_steps.len()), ("h_switches", h_switches.len())] {
+        if len != k {
+            return Err(err(format!("{name} has {len} entries, hs has {k}")));
         }
     }
-    let rows = m + if protein.is_some() { 1 } else { 0 };
-    if let (Some(ur), Some(ui)) = (&u_re, &u_im) {
-        if ur.len() != ui.len() || ur.len() % rows != 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: u_re/u_im must be n_species (+1 with a protein) × n_grid"));
-        }
-    } else if u_re.is_some() != u_im.is_some() {
-        return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: give both u_re and u_im or neither"));
+    let has_protein = proteins.first().map_or(false, |p| p.is_some());
+    if proteins.iter().any(|p| p.is_some() != has_protein) {
+        return Err(err("every point must carry the protein layer, or none".to_string()));
     }
-    if let Some((k_p, gamma_p, hf, hm, ptol)) = protein {
-        if u_re.is_none() {
-            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: the protein layer needs u_re/u_im with the protein row"));
-        }
-        if m != 2 || c.len() != 4 || c[2] != 0.0 || c[1] != -c[0] {
-            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: the protein layer needs the nascent/mature scheme c = [[-beta, beta], [0, -gamma]]"));
-        }
-        if !(k_p > 0.0 && gamma_p > 0.0 && hf > 0.0 && hm > 0.0 && ptol > 0.0) {
-            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: protein = (k_p, gamma_p, h_first, h_min, tol), all positive"));
-        }
-    }
-    if h.len() != n * n || a.len() != n * m || c.len() != m * m || w.len() != n || limits.len() != m {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "eval_chromatin_pgf: inconsistent shapes of h, a, c, w or limits",
-        ));
-    }
-    let n_sites = n.trailing_zeros() as usize;
-    let pow2 = n.is_power_of_two();
-    if let Some(sw) = &site_weights {
-        if !pow2 || sw.len() != n_sites * m {
-            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: site_weights must be (log2 n_states) × n_species"));
-        }
-    }
-    if let Some(ind) = &independent {
-        if !pow2 || ind.len() != 2 * n_sites {
-            return Err(pyo3::exceptions::PyValueError::new_err("eval_chromatin_pgf: independent must hold (k_on, k_off) per site"));
-        }
-    }
-    let (re, im, mx, steps, table, n_magnus) = py.allow_threads(|| {
-        // the PGF arguments: the half-spectrum mesh of `limits`, or the caller's
-        // (already transformed by a sequencing-noise model)
-        let mesh = match (&u_re, &u_im) {
-            (Some(ur), Some(ui)) => {
-                let n_grid = ur.len() / rows;
-                let u: Vec<Vec<Complex64>> = (0..rows)
-                    .map(|j| (0..n_grid).map(|p| Complex64::new(ur[j * n_grid + p], ui[j * n_grid + p])).collect())
-                    .collect();
-                Arc::new((u, vec![n_grid], n_grid))
-            }
-            _ => build_mesh_nd_cached(&limits),
-        };
-        let (u, mx, n_grid) = (&mesh.0, mesh.1.clone(), mesh.2);
-        let bw = CHROMATIN_BLOCK;
-        let n_blocks = (n_grid + bw - 1) / bw;
-        let ur: Vec<Vec<f64>> = u.iter().take(m).map(|uj| (0..n_blocks * bw).map(|p| if p < n_grid { uj[p].re } else { 0.0 }).collect()).collect();
-        let ui: Vec<Vec<f64>> = u.iter().take(m).map(|uj| (0..n_blocks * bw).map(|p| if p < n_grid { uj[p].im } else { 0.0 }).collect()).collect();
-        let prot = protein.map(|(k_p, gamma_p, hf, hm, ptol)| {
-            let p = ProtParams { beta: -c[0], gamma: -c[3], k_p, gamma_p };
-            prot_tabulate(p, u, n_grid, n_blocks * bw, t_horizon, hf, hm, ptol)
+    let (mut hs, mut as_, mut cs, mut ws) = (hs, as_, cs, ws);
+    let mut args: Vec<ChromatinPointArgs> = Vec::with_capacity(k);
+    for i in 0..k {
+        args.push(ChromatinPointArgs {
+            h: std::mem::take(&mut hs[i]), a: std::mem::take(&mut as_[i]), c: std::mem::take(&mut cs[i]), w: std::mem::take(&mut ws[i]),
+            t_horizon: t_horizons[i], h_first: h_firsts[i], h_min: h_mins[i], tol: tols[i],
+            fixed_schedule: fixed_schedules[i].take(), site_weights: site_weights[i].take(), independent: independents[i].take(),
+            burst: bursts[i], protein: proteins[i], magnus_steps: magnus_steps[i], h_switch: h_switches[i],
         });
-        let mut ht = SmallMat::zeros(n);
+    }
+    for a in &args {
+        chromatin_check("eval_chromatin_pgf_batch", n, m, &limits, &u_re, &u_im, a)?;
+    }
+    Ok(py.allow_threads(|| {
+        let mesh = chromatin_mesh(m, &limits, &u_re, &u_im, has_protein);
+        args.par_iter().map(|a| chromatin_point(n, m, &mesh, a)).collect()
+    }))
+}
+
+// ============================================================================
+// The adjoint of the chromatin kernel: the gradient without a stencil
+// ============================================================================
+//
+// Every step of `chromatin_pgf` is linear in the generating function,
+// G_k = M_k G_{k-1} with M_k = (4 S_half2 S_half1 - S_full) / 3 (the Richardson
+// pair) and S a Strang step diag(e^X1) exp(H^T h) diag(e^X2) or a Magnus step
+// exp(h H^T + diag X_p) per mesh point, and G_0 = w.  For a real scalar L of
+// G_K with lambda_K = dL/dG_K in the pairing dL = Re Σ lambda ⊙ dG, one
+// backward sweep lambda_{k-1} = M_k^T lambda_k gives the derivative of L with
+// respect to every operator entry along the way, and those are contracted
+// with the operators' dependence on the kernel's inputs: the production
+// exponent X = (A M) x(u) (A; the burst size, C or the protein rates through
+// the characteristics x), the chain exponential exp(H^T h) (H, through the
+// adjoint Fréchet derivative), the Magnus matrix h H^T + diag X (H and X,
+// through the reverse mode of the exponential) and G_0 = w.  Plain
+// transposes throughout: exp(H^T h)^T = exp(H h) is shared by the mesh and
+// exp(M)^T = exp(M^T) is the same exponential transposed.  The sweep replays
+// a pinned schedule with checkpoints every sqrt(K) steps and recomputes each
+// segment forward, so it holds 2 sqrt(K) copies of G.
+//
+// The shared small operators (the characteristic matrices exp(C s), the
+// single-molecule integral ∫ exp(C s) ds and the protein table's affine maps)
+// are differentiated by central differences at a relative step of 1e-6 with
+// the table's nodes pinned: smooth closed forms, exact to about 1e-10, a
+// negligible part of the cost.
+
+const CHROMATIN_ADJ_FD: f64 = 1e-6;
+const CHROMATIN_ADJ_STORE: usize = 1 << 30;   // bytes of trajectory kept outright before falling back to checkpoints
+
+impl SmallMat {
+    fn transpose(&self) -> SmallMat {
+        let n = self.n;
+        let mut t = SmallMat::zeros(n);
         for i in 0..n {
-            for j in 0..n { ht.set(i, j, h[j * n + i]); }
+            for j in 0..n { t.a[j * n + i] = self.a[i * n + j]; }
         }
-        let chain = match &independent {
-            Some(ind) => ChromatinChain::Kron((0..n_sites).map(|j| {
-                let (kon, koff) = (ind[2 * j], ind[2 * j + 1]);
-                SmallMat { n: 2, a: vec![-kon, koff, kon, -koff] }      // transposed 2 × 2 generator
-            }).collect()),
-            None => ChromatinChain::Dense(ht.clone()),
-        };
-        let diag = if let Some(sw) = site_weights {
-            ChromatinDiag::Factored { n_sites, w: sw }
-        } else {
-            let nonzero: Vec<usize> = (0..m).filter(|&j| (0..n).any(|cc| a[cc * m + j] != 0.0)).collect();
-            if nonzero.len() == 1 {
-                let col = nonzero[0];
-                let mut distinct: Vec<f64> = Vec::new();
-                let mut group = vec![0usize; n];
-                for cc in 0..n {
-                    let r = a[cc * m + col];
-                    group[cc] = match distinct.iter().position(|&x| x == r) {
-                        Some(k) => k,
-                        None => { distinct.push(r); distinct.len() - 1 }
-                    };
+        t
+    }
+
+    /// The adjoint Fréchet derivative of the exponential:
+    /// `L*(M, W) = ∫_0^1 exp((1-s) M^T) W exp(s M^T) ds`, so that
+    /// `<W, d exp(M)[Z]> = <L*(M, W), Z>` in the trace pairing; read off the
+    /// top-right block of `exp([[M^T, W], [0, M^T]])`.
+    fn expm_frechet_adjoint(&self, w: &SmallMat) -> SmallMat {
+        let n = self.n;
+        let mut big = SmallMat::zeros(2 * n);
+        for i in 0..n {
+            for j in 0..n {
+                let mt = self.a[j * n + i];
+                big.set(i, j, mt);
+                big.set(n + i, n + j, mt);
+                big.set(i, n + j, w.a[i * n + j]);
+            }
+        }
+        let e = big.expm();
+        let mut out = SmallMat::zeros(n);
+        for i in 0..n {
+            for j in 0..n { out.set(i, j, e.get(i, n + j)); }
+        }
+        out
+    }
+}
+
+impl ChainExp {
+    fn transpose(&self) -> ChainExp {
+        match self {
+            ChainExp::Dense(e) => ChainExp::Dense(e.transpose()),
+            ChainExp::Kron(es) => ChainExp::Kron(es.iter().map(|e| e.transpose()).collect()),
+        }
+    }
+}
+
+impl CSmallMat {
+    /// out = a · bᵀ
+    fn mul_abt_into(a: &CSmallMat, b: &CSmallMat, out: &mut CSmallMat) {
+        let n = a.n;
+        for i in 0..n {
+            for j in 0..n {
+                let mut s = Complex64::new(0.0, 0.0);
+                for k in 0..n { s += a.a[i * n + k] * b.a[j * n + k]; }
+                out.a[i * n + j] = s;
+            }
+        }
+    }
+
+    /// out = aᵀ · b
+    fn mul_atb_into(a: &CSmallMat, b: &CSmallMat, out: &mut CSmallMat) {
+        let n = a.n;
+        for i in 0..n {
+            for j in 0..n {
+                let mut s = Complex64::new(0.0, 0.0);
+                for k in 0..n { s += a.a[k * n + i] * b.a[k * n + j]; }
+                out.a[i * n + j] = s;
+            }
+        }
+    }
+
+    fn add_scaled(&mut self, o: &CSmallMat, k: f64) {
+        for (a, b) in self.a.iter_mut().zip(o.a.iter()) { *a += b * k; }
+    }
+
+    /// Reverse mode of `expm_into`: `e` receives exp(self) and, for `ebar` the
+    /// derivative of a real scalar with respect to it (pairing dL = Re Σ ebar ⊙ dE),
+    /// the return value is the derivative with respect to `self` in the same
+    /// pairing.  Plain transposes, no conjugation; the forward intermediates
+    /// (the scaled powers, the input of every Paterson-Stockmeyer stage and of
+    /// every squaring) are recomputed here.
+    fn expm_adjoint(&self, ebar: &CSmallMat, e: &mut CSmallMat) -> CSmallMat {
+        let n = self.n;
+        let nrm = self.norm1();
+        let s = if nrm > 1.0 { nrm.log2().ceil() as i32 } else { 0 };
+        let sc = 0.5_f64.powi(s);
+        let mut x = CSmallMat::zeros(n);
+        for (xi, ai) in x.a.iter_mut().zip(self.a.iter()) { *xi = ai * sc; }
+        let (mut x2, mut x3, mut x4) = (CSmallMat::zeros(n), CSmallMat::zeros(n), CSmallMat::zeros(n));
+        CSmallMat::mul_into(&x, &x, &mut x2);
+        CSmallMat::mul_into(&x2, &x, &mut x3);
+        CSmallMat::mul_into(&x3, &x, &mut x4);
+        let inv = |k: usize| 1.0 / CSMALL_FACT[k];
+        let mut r = CSmallMat::zeros(n);
+        for i in 0..n { r.a[i * n + i] = Complex64::new(inv(16), 0.0); }
+        let mut t = CSmallMat::zeros(n);
+        let mut r_in: Vec<CSmallMat> = Vec::with_capacity(4);      // input of stage j = 3, 2, 1, 0
+        for j in (0..4).rev() {
+            let k = 4 * j;
+            r_in.push(r.clone());
+            CSmallMat::mul_into(&r, &x4, &mut t);
+            for i in 0..n {
+                for l in 0..n {
+                    let idx = i * n + l;
+                    let eye = if i == l { inv(k) } else { 0.0 };
+                    r.a[idx] = t.a[idx] + (eye + x.a[idx] * inv(k + 1) + x2.a[idx] * inv(k + 2) + x3.a[idx] * inv(k + 3));
                 }
-                ChromatinDiag::Shared { col, group, distinct }
-            } else {
-                ChromatinDiag::General
-            }
-        };
-        let cm = SmallMat { n: m, a: c.clone() };
-        let sys = ChromatinSys { n, m, chain, ht, a: &a, c: cm, diag, burst, ur, ui, protein: prot };
-        let (gr, gi, steps, n_magnus) = chromatin_pgf(&sys, &w, n_blocks, t_horizon, h_first, h_min, tol,
-                                                      fixed_schedule.as_deref(), magnus_steps.unwrap_or(0), h_switch);
-        let table = sys.protein.as_ref().map(|pt| pt.cap);
-        // back to point-major (p * n + c)
-        let mut re = vec![0.0; n_grid * n];
-        let mut im = vec![0.0; n_grid * n];
-        for p in 0..n_grid {
-            let (b, i) = (p / bw, p % bw);
-            for cc in 0..n {
-                re[p * n + cc] = gr[b * n * bw + cc * bw + i];
-                im[p * n + cc] = gi[b * n * bw + cc * bw + i];
             }
         }
-        (re, im, mx, steps, table, n_magnus)
-    });
-    Ok((re, im, mx, steps, table, n_magnus))
+        let mut sq_in: Vec<CSmallMat> = Vec::with_capacity(s.max(0) as usize);
+        for _ in 0..s {
+            sq_in.push(r.clone());
+            CSmallMat::mul_into(&r, &r, &mut t);
+            r.a.copy_from_slice(&t.a);
+        }
+        e.a.copy_from_slice(&r.a);
+        // backward through the squarings: R = r r gives r̄ = R̄ rᵀ + rᵀ R̄
+        let mut rbar = ebar.clone();
+        let mut tmp = CSmallMat::zeros(n);
+        for ri in sq_in.iter().rev() {
+            CSmallMat::mul_abt_into(&rbar, ri, &mut t);
+            CSmallMat::mul_atb_into(ri, &rbar, &mut tmp);
+            for (a, (b, c)) in rbar.a.iter_mut().zip(t.a.iter().zip(tmp.a.iter())) { *a = b + c; }
+        }
+        // the stages ran j = 3, 2, 1, 0; backward j = 0, 1, 2, 3 with r_in[3 - j] the stage's input:
+        // r_out = r_in x4 + I/k! + x/(k+1)! + x2/(k+2)! + x3/(k+3)!
+        let (mut xbar, mut x2bar, mut x3bar, mut x4bar) =
+            (CSmallMat::zeros(n), CSmallMat::zeros(n), CSmallMat::zeros(n), CSmallMat::zeros(n));
+        for j in 0..4 {
+            let k = 4 * j;
+            let rin = &r_in[3 - j];
+            xbar.add_scaled(&rbar, inv(k + 1));
+            x2bar.add_scaled(&rbar, inv(k + 2));
+            x3bar.add_scaled(&rbar, inv(k + 3));
+            CSmallMat::mul_atb_into(rin, &rbar, &mut t);
+            x4bar.add_scaled(&t, 1.0);
+            CSmallMat::mul_abt_into(&rbar, &x4, &mut t);
+            rbar.a.copy_from_slice(&t.a);
+        }
+        // x4 = x3 x, x3 = x2 x, x2 = x x
+        CSmallMat::mul_abt_into(&x4bar, &x, &mut t); x3bar.add_scaled(&t, 1.0);
+        CSmallMat::mul_atb_into(&x3, &x4bar, &mut t); xbar.add_scaled(&t, 1.0);
+        CSmallMat::mul_abt_into(&x3bar, &x, &mut t); x2bar.add_scaled(&t, 1.0);
+        CSmallMat::mul_atb_into(&x2, &x3bar, &mut t); xbar.add_scaled(&t, 1.0);
+        CSmallMat::mul_abt_into(&x2bar, &x, &mut t); xbar.add_scaled(&t, 1.0);
+        CSmallMat::mul_atb_into(&x, &x2bar, &mut t); xbar.add_scaled(&t, 1.0);
+        for v in xbar.a.iter_mut() { *v *= sc; }
+        xbar
+    }
+}
+
+/// The protein table on a given node list (the base table's), for the local
+/// differences of the characteristics with respect to the four rates.
+fn prot_tabulate_replay(p: ProtParams, u: &[Vec<Complex64>], n_grid: usize, n_pad: usize, nodes: &[f64],
+                        cap: (bool, usize, f64)) -> ProtTable {
+    let (u_p, group_of, _) = prot_groups(u, n_grid, n_pad);
+    let ng = u_p.len();
+    let mut cur = vec![ProtAff::identity(); ng];
+    let mut coef: Vec<Vec<ProtAff>> = (0..ng).map(|g| vec![cur[g]]).collect();
+    let n_steps = (nodes.len() - 1) / 2;
+    for s in 0..n_steps {
+        let t = nodes[2 * s];
+        let h = nodes[2 * s + 2] - nodes[2 * s];
+        for g in 0..ng {
+            let m = prot_step(&p, u_p[g], t, 0.5 * h).after(&cur[g]);
+            let t2 = prot_step(&p, u_p[g], t + 0.5 * h, 0.5 * h).after(&m);
+            coef[g].push(m);
+            coef[g].push(t2);
+            cur[g] = t2;
+        }
+    }
+    let t_end = *nodes.last().unwrap();
+    ProtTable { p, u_p, group_of, nodes: nodes.to_vec(), coef, t_end, cap }
+}
+
+/// Block-local accumulators of the adjoint of one diagonal flow.
+#[derive(Clone)]
+struct FlowAcc {
+    /// n × m: Σ_p Re(X̄[c, p] x_l[p]), the derivative with respect to K = A M
+    kbar: Vec<f64>,
+    /// per Simpson node, m × m: Σ_p Re(Ū_l[p] u_j[p]), the derivative with respect to exp(C s_k) (bursts, no protein)
+    ekbar: Vec<Vec<f64>>,
+    /// per Simpson node, per protein group: (Ū_v v0, Ū_v w0, Ū_v, Ū_w v0, Ū_w w0, Ū_w) summed over the group's points
+    rbar: Vec<Vec<Complex64>>,
+    /// the burst size
+    bbar: f64,
+}
+
+impl FlowAcc {
+    fn zeros(n: usize, m: usize, ng: usize) -> FlowAcc {
+        FlowAcc {
+            kbar: vec![0.0; n * m],
+            ekbar: vec![vec![0.0; m * m]; 3],
+            rbar: vec![vec![Complex64::new(0.0, 0.0); ng * 6]; 3],
+            bbar: 0.0,
+        }
+    }
+    fn add(&mut self, o: &FlowAcc) {
+        for (a, b) in self.kbar.iter_mut().zip(o.kbar.iter()) { *a += b; }
+        for (ea, eb) in self.ekbar.iter_mut().zip(o.ekbar.iter()) {
+            for (a, b) in ea.iter_mut().zip(eb.iter()) { *a += b; }
+        }
+        for (ra, rb) in self.rbar.iter_mut().zip(o.rbar.iter()) {
+            for (a, b) in ra.iter_mut().zip(rb.iter()) { *a += b; }
+        }
+        self.bbar += o.bbar;
+    }
+}
+
+/// The block-local accumulators of one step: its six diagonal flows (full
+/// d1, d2; half1 d1, d2; half2 d1, d2), the chain exponentials of the full
+/// and the half step (Strang) and the Magnus matrices (as h H^T, transposed
+/// on output).
+struct StepAcc { flows: Vec<FlowAcc>, ebar_full: Vec<f64>, ebar_half: Vec<f64>, hbar: Vec<f64> }
+
+impl StepAcc {
+    fn zeros(n: usize, m: usize, ng: usize) -> StepAcc {
+        StepAcc { flows: vec![FlowAcc::zeros(n, m, ng); 6], ebar_full: vec![0.0; n * n], ebar_half: vec![0.0; n * n], hbar: vec![0.0; n * n] }
+    }
+    fn add(mut self, o: StepAcc) -> StepAcc {
+        for (a, b) in self.flows.iter_mut().zip(o.flows.iter()) { a.add(b); }
+        for (a, b) in self.ebar_full.iter_mut().zip(o.ebar_full.iter()) { *a += b; }
+        for (a, b) in self.ebar_half.iter_mut().zip(o.ebar_half.iter()) { *a += b; }
+        for (a, b) in self.hbar.iter_mut().zip(o.hbar.iter()) { *a += b; }
+        self
+    }
+}
+
+/// Backward through one diagonal flow on a block: from X̄ (n × B planes, the
+/// derivative with respect to the production exponent) to the flow's
+/// accumulators.  X = K x with K = A M and x the flow's input per species.
+fn adj_flow_block(sys: &ChromatinSys, d: &DiagFlow, b0: usize, xr: &[f64], xi: &[f64], xbr: &[f64], xbi: &[f64], acc: &mut FlowAcc) {
+    let (n, m, bw) = (sys.n, sys.m, CHROMATIN_BLOCK);
+    for c in 0..n {
+        for l in 0..m {
+            let mut s = 0.0;
+            for i in 0..bw { s += xbr[c * bw + i] * xr[l * bw + i] - xbi[c * bw + i] * xi[l * bw + i]; }
+            acc.kbar[c * m + l] += s;
+        }
+    }
+    // x̄_l = Σ_c K[c, l] X̄[c]
+    let mut yr = vec![0.0; m * bw];
+    let mut yi = vec![0.0; m * bw];
+    for l in 0..m {
+        for c in 0..n {
+            let k = d.k_full[c * m + l];
+            if k == 0.0 { continue; }
+            for i in 0..bw {
+                yr[l * bw + i] += k * xbr[c * bw + i];
+                yi[l * bw + i] += k * xbi[c * bw + i];
+            }
+        }
+    }
+    match (&d.pquad, &sys.protein, &d.quad, sys.burst) {
+        (Some(pq), Some(pt), _, burst) => {
+            for (k, (wk, rows)) in pq.iter().enumerate() {
+                for i in 0..bw {
+                    let q = b0 + i;
+                    let g = pt.group_of[q];
+                    let (rv, rw) = rows[g];
+                    let v0 = Complex64::new(sys.ur[0][q] + 1.0, sys.ui[0][q]);
+                    let w0 = Complex64::new(sys.ur[1][q] + 1.0, sys.ui[1][q]);
+                    let us = [rv.at(v0, w0) - 1.0, rw.at(v0, w0) - 1.0];
+                    for j in 0..2 {
+                        let xb = Complex64::new(yr[j * bw + i], yi[j * bw + i]) * *wk;
+                        let ub = match burst {
+                            Some(b) => {
+                                let dd = 1.0 - b * us[j];
+                                let dphi = 1.0 / (dd * dd);
+                                acc.bbar += (xb * us[j] * us[j] * dphi).re;
+                                xb * dphi
+                            }
+                            None => xb,
+                        };
+                        let o = g * 6 + 3 * j;
+                        acc.rbar[k][o] += ub * v0;
+                        acc.rbar[k][o + 1] += ub * w0;
+                        acc.rbar[k][o + 2] += ub;
+                    }
+                }
+            }
+        }
+        (_, _, Some(quad), Some(b)) => {
+            let mut uu = vec![Complex64::new(0.0, 0.0); m];
+            let mut up = vec![Complex64::new(0.0, 0.0); m];
+            for (k, (ek, wk)) in quad.iter().enumerate() {
+                for i in 0..bw {
+                    for j in 0..m { up[j] = Complex64::new(sys.ur[j][b0 + i], sys.ui[j][b0 + i]); }
+                    for l in 0..m {
+                        let mut s = Complex64::new(0.0, 0.0);
+                        for j in 0..m { s += ek.get(l, j) * up[j]; }
+                        uu[l] = s;
+                    }
+                    for l in 0..m {
+                        let xb = Complex64::new(yr[l * bw + i], yi[l * bw + i]) * *wk;
+                        let dd = 1.0 - b * uu[l];
+                        let dphi = 1.0 / (dd * dd);
+                        acc.bbar += (xb * uu[l] * uu[l] * dphi).re;
+                        let ub = xb * dphi;
+                        for j in 0..m { acc.ekbar[k][l * m + j] += (ub * up[j]).re; }
+                    }
+                }
+            }
+        }
+        _ => {}                                                 // single molecules: x = u, C sits in M
+    }
+}
+
+/// Adjoint of one Strang sub-step on a block: from G_in and lambda_out to
+/// lambda_in, the chain exponential's accumulator and the two flows'.
+#[allow(clippy::too_many_arguments)]
+fn adj_strang_block(sys: &ChromatinSys, ops: &ChromatinOps, et: &ChainExp, b0: usize,
+                    gr: &[f64], gi: &[f64], lr: &[f64], li: &[f64], olr: &mut [f64], oli: &mut [f64],
+                    ebar: &mut [f64], f1: &mut FlowAcc, f2: &mut FlowAcc) {
+    let (n, bw) = (sys.n, CHROMATIN_BLOCK);
+    let len = n * bw;
+    let mut sr = vec![0.0; len]; let mut si = vec![0.0; len];
+    let mut x1r = vec![0.0; len]; let mut x1i = vec![0.0; len];
+    let mut x2r = vec![0.0; len]; let mut x2i = vec![0.0; len];
+    let (in1r, in1i) = chromatin_flow_input(sys, &ops.d1, b0);
+    let (in2r, in2i) = chromatin_flow_input(sys, &ops.d2, b0);
+    chromatin_exponent_from(sys, &ops.d1, &in1r, &in1i, &mut x1r, &mut x1i, &mut sr, &mut si);
+    chromatin_exponent_from(sys, &ops.d2, &in2r, &in2i, &mut x2r, &mut x2i, &mut sr, &mut si);
+    let (mut e1r, mut e1i, mut e2r, mut e2i) = (vec![0.0; len], vec![0.0; len], vec![0.0; len], vec![0.0; len]);
+    for idx in 0..len {
+        let s1 = x1r[idx].exp(); let (sn1, cs1) = x1i[idx].sin_cos();
+        e1r[idx] = s1 * cs1; e1i[idx] = s1 * sn1;
+        let s2 = x2r[idx].exp(); let (sn2, cs2) = x2i[idx].sin_cos();
+        e2r[idx] = s2 * cs2; e2i[idx] = s2 * sn2;
+    }
+    // a = e1 ⊙ G_in, b = E a, out = e2 ⊙ b
+    let (mut ar, mut ai) = (vec![0.0; len], vec![0.0; len]);
+    for idx in 0..len { let (x, y) = cmul(e1r[idx], e1i[idx], gr[idx], gi[idx]); ar[idx] = x; ai[idx] = y; }
+    let (mut br, mut bi) = (vec![0.0; len], vec![0.0; len]);
+    chromatin_apply(n, &ops.e, &ar, &ai, &mut br, &mut bi);
+    // X̄2 = lambda_out ⊙ out, lambda_b = e2 ⊙ lambda_out
+    let (mut xb2r, mut xb2i, mut lbr, mut lbi) = (vec![0.0; len], vec![0.0; len], vec![0.0; len], vec![0.0; len]);
+    for idx in 0..len {
+        let (outr, outi) = cmul(e2r[idx], e2i[idx], br[idx], bi[idx]);
+        let (x, y) = cmul(lr[idx], li[idx], outr, outi);
+        xb2r[idx] = x; xb2i[idx] = y;
+        let (x, y) = cmul(e2r[idx], e2i[idx], lr[idx], li[idx]);
+        lbr[idx] = x; lbi[idx] = y;
+    }
+    // Ē[r, k] += Σ_i Re(lambda_b[r, i] a[k, i])
+    for r in 0..n {
+        for k in 0..n {
+            let mut s = 0.0;
+            for i in 0..bw { s += lbr[r * bw + i] * ar[k * bw + i] - lbi[r * bw + i] * ai[k * bw + i]; }
+            ebar[r * n + k] += s;
+        }
+    }
+    // lambda_a = Eᵀ lambda_b, X̄1 = lambda_a ⊙ a, lambda_in = e1 ⊙ lambda_a
+    let (mut lar, mut lai) = (vec![0.0; len], vec![0.0; len]);
+    chromatin_apply(n, et, &lbr, &lbi, &mut lar, &mut lai);
+    let (mut xb1r, mut xb1i) = (vec![0.0; len], vec![0.0; len]);
+    for idx in 0..len {
+        let (x, y) = cmul(lar[idx], lai[idx], ar[idx], ai[idx]);
+        xb1r[idx] = x; xb1i[idx] = y;
+        let (x, y) = cmul(e1r[idx], e1i[idx], lar[idx], lai[idx]);
+        olr[idx] = x; oli[idx] = y;
+    }
+    adj_flow_block(sys, &ops.d1, b0, &in1r, &in1i, &xb1r, &xb1i, f1);
+    adj_flow_block(sys, &ops.d2, b0, &in2r, &in2i, &xb2r, &xb2i, f2);
+}
+
+/// Adjoint of one Magnus sub-step on a block: per point the reverse mode of
+/// exp(h H^T + diag X), into lambda_in, the Magnus matrices' accumulator
+/// (indexed as h H^T) and the two flows' (the step's exponent is their sum).
+#[allow(clippy::too_many_arguments)]
+fn adj_magnus_block(sys: &ChromatinSys, ops: &ChromatinOps, b0: usize,
+                    gr: &[f64], gi: &[f64], lr: &[f64], li: &[f64], olr: &mut [f64], oli: &mut [f64],
+                    hbar: &mut [f64], f1: &mut FlowAcc, f2: &mut FlowAcc) {
+    let (n, bw) = (sys.n, CHROMATIN_BLOCK);
+    let len = n * bw;
+    let mut sr = vec![0.0; len]; let mut si = vec![0.0; len];
+    let mut xr = vec![0.0; len]; let mut xi = vec![0.0; len];
+    let (in1r, in1i) = chromatin_flow_input(sys, &ops.d1, b0);
+    let (in2r, in2i) = chromatin_flow_input(sys, &ops.d2, b0);
+    chromatin_exponent_from(sys, &ops.d1, &in1r, &in1i, &mut xr, &mut xi, &mut sr, &mut si);
+    chromatin_exponent_from(sys, &ops.d2, &in2r, &in2i, &mut xr, &mut xi, &mut sr, &mut si);
+    let mut mm = CSmallMat::zeros(n);
+    let mut ex = CSmallMat::zeros(n);
+    let mut ebar = CSmallMat::zeros(n);
+    let (mut xbr, mut xbi) = (vec![0.0; len], vec![0.0; len]);
+    for i in 0..bw {
+        for r in 0..n {
+            for c in 0..n { mm.a[r * n + c] = Complex64::new(ops.h * sys.ht.get(r, c), 0.0); }
+            mm.a[r * n + r] += Complex64::new(xr[r * bw + i], xi[r * bw + i]);
+        }
+        // Ē = lambda_out ⊗ G_inᵀ
+        for r in 0..n {
+            let lam_r = Complex64::new(lr[r * bw + i], li[r * bw + i]);
+            for c in 0..n { ebar.a[r * n + c] = lam_r * Complex64::new(gr[c * bw + i], gi[c * bw + i]); }
+        }
+        let mbar = mm.expm_adjoint(&ebar, &mut ex);
+        // lambda_in = Eᵀ lambda_out
+        for c in 0..n {
+            let mut s = Complex64::new(0.0, 0.0);
+            for r in 0..n { s += ex.a[r * n + c] * Complex64::new(lr[r * bw + i], li[r * bw + i]); }
+            olr[c * bw + i] = s.re;
+            oli[c * bw + i] = s.im;
+        }
+        for r in 0..n {
+            xbr[r * bw + i] = mbar.a[r * n + r].re;
+            xbi[r * bw + i] = mbar.a[r * n + r].im;
+            for c in 0..n { hbar[r * n + c] += ops.h * mbar.a[r * n + c].re; }
+        }
+    }
+    adj_flow_block(sys, &ops.d1, b0, &in1r, &in1i, &xbr, &xbi, f1);
+    adj_flow_block(sys, &ops.d2, b0, &in2r, &in2i, &xbr, &xbi, f2);
+}
+
+/// Adjoint of one Richardson step on block `b`: lambda_{k-1} from lambda_k and
+/// G_{k-1}, with the step's accumulators.  The full sub-step takes -1/3 of
+/// lambda_k, the half pair 4/3, the half steps in reverse order through the
+/// recomputed midpoint.
+#[allow(clippy::too_many_arguments)]
+fn adj_step_block(sys: &ChromatinSys, full: &ChromatinOps, half1: &ChromatinOps, half2: &ChromatinOps,
+                  et_full: &ChainExp, et_half: &ChainExp, magnus: bool, b: usize,
+                  gr: &[f64], gi: &[f64], lr: &[f64], li: &[f64], olr: &mut [f64], oli: &mut [f64]) -> StepAcc {
+    let (n, bw) = (sys.n, CHROMATIN_BLOCK);
+    let len = n * bw;
+    let b0 = b * bw;
+    let ng = sys.protein.as_ref().map_or(0, |pt| pt.u_p.len());
+    let mut acc = StepAcc::zeros(n, sys.m, ng);
+    let mut gmr = gr.to_vec();
+    let mut gmi = gi.to_vec();
+    {
+        let mut sr = vec![0.0; len]; let mut si = vec![0.0; len];
+        let mut tr = vec![0.0; len]; let mut ti = vec![0.0; len];
+        if magnus {
+            chromatin_magnus_block(sys, half1, b0, &mut gmr, &mut gmi, &mut sr, &mut si, &mut tr, &mut ti);
+        } else {
+            chromatin_step_block(sys, half1, b0, &mut gmr, &mut gmi, &mut sr, &mut si, &mut tr, &mut ti);
+        }
+    }
+    let lfr: Vec<f64> = lr.iter().map(|v| -v / 3.0).collect();
+    let lfi: Vec<f64> = li.iter().map(|v| -v / 3.0).collect();
+    let l2r: Vec<f64> = lr.iter().map(|v| 4.0 * v / 3.0).collect();
+    let l2i: Vec<f64> = li.iter().map(|v| 4.0 * v / 3.0).collect();
+    let (mut lfin_r, mut lfin_i) = (vec![0.0; len], vec![0.0; len]);
+    let (mut lmid_r, mut lmid_i) = (vec![0.0; len], vec![0.0; len]);
+    let (mut l1in_r, mut l1in_i) = (vec![0.0; len], vec![0.0; len]);
+    let (f0, rest) = acc.flows.split_first_mut().unwrap();
+    let (f1, rest) = rest.split_first_mut().unwrap();
+    let (f2, rest) = rest.split_first_mut().unwrap();
+    let (f3, rest) = rest.split_first_mut().unwrap();
+    let (f4, rest) = rest.split_first_mut().unwrap();
+    let f5 = &mut rest[0];
+    if magnus {
+        adj_magnus_block(sys, full, b0, gr, gi, &lfr, &lfi, &mut lfin_r, &mut lfin_i, &mut acc.hbar, f0, f1);
+        adj_magnus_block(sys, half2, b0, &gmr, &gmi, &l2r, &l2i, &mut lmid_r, &mut lmid_i, &mut acc.hbar, f4, f5);
+        adj_magnus_block(sys, half1, b0, gr, gi, &lmid_r, &lmid_i, &mut l1in_r, &mut l1in_i, &mut acc.hbar, f2, f3);
+    } else {
+        adj_strang_block(sys, full, et_full, b0, gr, gi, &lfr, &lfi, &mut lfin_r, &mut lfin_i, &mut acc.ebar_full, f0, f1);
+        adj_strang_block(sys, half2, et_half, b0, &gmr, &gmi, &l2r, &l2i, &mut lmid_r, &mut lmid_i, &mut acc.ebar_half, f4, f5);
+        adj_strang_block(sys, half1, et_half, b0, gr, gi, &lmid_r, &lmid_i, &mut l1in_r, &mut l1in_i, &mut acc.ebar_half, f2, f3);
+    }
+    for idx in 0..len {
+        olr[idx] = lfin_r[idx] + l1in_r[idx];
+        oli[idx] = lfin_i[idx] + l1in_i[idx];
+    }
+    acc
+}
+
+/// What the adjoint returns: derivatives with respect to the kernel's inputs.
+struct AdjOut { d_w: Vec<f64>, d_h: Vec<f64>, d_a: Vec<f64>, d_c: Vec<f64>, d_burst: f64, d_protein: [f64; 4] }
+
+/// Central differences of a shared small matrix function of C, contracted with `mbar`.
+fn adj_fd_c(c: &SmallMat, mbar: &[f64], d_c: &mut [f64], f: impl Fn(&SmallMat) -> SmallMat) {
+    let m = c.n;
+    let cmax = c.a.iter().fold(0.0_f64, |acc, v| acc.max(v.abs())).max(1e-300);
+    let eps = CHROMATIN_ADJ_FD * cmax;
+    for a in 0..m {
+        for b in 0..m {
+            let mut cp = c.clone(); cp.a[a * m + b] += eps;
+            let mut cm = c.clone(); cm.a[a * m + b] -= eps;
+            let (fp, fm) = (f(&cp), f(&cm));
+            let mut s = 0.0;
+            for j in 0..m {
+                for l in 0..m { s += mbar[j * m + l] * (fp.get(j, l) - fm.get(j, l)); }
+            }
+            d_c[a * m + b] += s / (2.0 * eps);
+        }
+    }
+}
+
+/// Fold one step's reduced accumulators into the output: the flows' K = A M
+/// into A and (through M or the nodes' exp(C s)) into C, the protein rows
+/// into the four rates through the ± tables, the Magnus matrices into H; the
+/// Strang chain exponentials are collected per step size for the Fréchet
+/// derivative at the end.
+#[allow(clippy::too_many_arguments)]
+fn adj_fold_step(out: &mut AdjOut, ebar_by_h: &mut std::collections::BTreeMap<u64, Vec<f64>>, acc: &StepAcc,
+                 full: &ChromatinOps, half1: &ChromatinOps, half2: &ChromatinOps, h: f64, magnus: bool,
+                 sys: &ChromatinSys, prot_pm: &Option<Vec<(ProtTable, ProtTable, f64)>>) {
+    let (n, m) = (sys.n, sys.m);
+    if !magnus {
+        for (hh, eb) in [(h, &acc.ebar_full), (0.5 * h, &acc.ebar_half)] {
+            let e = ebar_by_h.entry(hh.to_bits()).or_insert_with(|| vec![0.0; n * n]);
+            for (a, b) in e.iter_mut().zip(eb.iter()) { *a += b; }
+        }
+    } else {
+        for r in 0..n {
+            for c in 0..n { out.d_h[c * n + r] += acc.hbar[r * n + c]; }
+        }
+    }
+    let flows = [&full.d1, &full.d2, &half1.d1, &half1.d2, &half2.d1, &half2.d2];
+    for (f, d) in acc.flows.iter().zip(flows.iter()) {
+        // K = A M: Ā += kbar Mᵀ
+        for c in 0..n {
+            for j in 0..m {
+                let mut s = 0.0;
+                for l in 0..m { s += f.kbar[c * m + l] * d.mm.get(j, l); }
+                out.d_a[c * m + j] += s;
+            }
+        }
+        out.d_burst += f.bbar;
+        let s_nodes = [d.tau_a, d.tau_a + 0.5 * d.delta, d.tau_a + d.delta];
+        match (&d.pquad, &d.quad) {
+            (Some(_), _) => {
+                if let (Some(pm), Some(pt)) = (prot_pm, &sys.protein) {
+                    let ng = pt.u_p.len();
+                    for (ip, (tp, tm, two_eps)) in pm.iter().enumerate() {
+                        let mut s = 0.0;
+                        for (k, &sk) in s_nodes.iter().enumerate() {
+                            let rb = &f.rbar[k];
+                            for g in 0..ng {
+                                let (rvp, rwp) = tp.rows_at(g, sk);
+                                let (rvm, rwm) = tm.rows_at(g, sk);
+                                let o = g * 6;
+                                s += (rb[o] * (rvp.cv - rvm.cv) + rb[o + 1] * (rvp.cw - rvm.cw) + rb[o + 2] * (rvp.b - rvm.b)).re
+                                   + (rb[o + 3] * (rwp.cv - rwm.cv) + rb[o + 4] * (rwp.cw - rwm.cw) + rb[o + 5] * (rwp.b - rwm.b)).re;
+                            }
+                        }
+                        out.d_protein[ip] += s / two_eps;
+                    }
+                }
+            }
+            (None, Some(_)) => {
+                for (k, &sk) in s_nodes.iter().enumerate() {
+                    adj_fd_c(&sys.c, &f.ekbar[k], &mut out.d_c, |cc| cc.scaled(sk).expm());
+                }
+            }
+            (None, None) => {
+                // M̄ = Aᵀ kbar, then M = ∫ exp(C s) ds over the interval
+                let mut mbar = vec![0.0; m * m];
+                for j in 0..m {
+                    for l in 0..m {
+                        let mut s = 0.0;
+                        for c in 0..n { s += sys.a[c * m + j] * f.kbar[c * m + l]; }
+                        mbar[j * m + l] = s;
+                    }
+                }
+                adj_fd_c(&sys.c, &mbar, &mut out.d_c, |cc| chromatin_char_integral(cc, d.tau_a, d.delta));
+            }
+        }
+    }
+}
+
+/// The adjoint sweep over a pinned schedule: `lam_r`/`lam_i` are dL/dG_K in
+/// block planes; returns the derivatives with respect to w, H, A, C, the
+/// burst size and the protein rates (beta, gamma, k_p, gamma_p).
+fn chromatin_pgf_adjoint(sys: &ChromatinSys, p: &ChromatinPointArgs, n_blocks: usize, lam_r: Vec<f64>, lam_i: Vec<f64>,
+                         prot_pm: &Option<Vec<(ProtTable, ProtTable, f64)>>) -> AdjOut {
+    let (n, m, bw) = (sys.n, sys.m, CHROMATIN_BLOCK);
+    let blen = n * bw;
+    let total = n_blocks * blen;
+    let fixed: &[f64] = p.fixed_schedule.as_deref().unwrap_or(&[]);
+    let kk = fixed.len();
+    let par = n * n_blocks * bw >= CHROMATIN_PAR_MIN;
+    let ng = sys.protein.as_ref().map_or(0, |pt| pt.u_p.len());
+    let mut taus = Vec::with_capacity(kk);
+    let mut tau = p.t_horizon;
+    for &h in fixed { taus.push(tau); tau -= h; }
+    let ops_at = |k: usize| -> (ChromatinOps, ChromatinOps, ChromatinOps, bool) {
+        let h = fixed[k];
+        let hh = 0.5 * h;
+        let magnus = k < p.magnus_steps;
+        let e_half = if magnus { ChainExp::Dense(SmallMat::zeros(0)) } else { sys.chain.expm(hh) };
+        let full = chromatin_ops(sys, taus[k], h, if magnus { ChainExp::Dense(SmallMat::zeros(0)) } else { e_half.square() });
+        let half1 = chromatin_ops(sys, taus[k], hh, e_half.clone());
+        let half2 = chromatin_ops(sys, taus[k] - hh, hh, e_half);
+        (full, half1, half2, magnus)
+    };
+    let forward_step = |full: &ChromatinOps, half1: &ChromatinOps, half2: &ChromatinOps, magnus: bool,
+                        gr: &[f64], gi: &[f64], outr: &mut [f64], outi: &mut [f64]| {
+        if par {
+            outr.par_chunks_mut(blen).zip(outi.par_chunks_mut(blen))
+                .zip(gr.par_chunks(blen).zip(gi.par_chunks(blen)))
+                .enumerate()
+                .for_each(|(b, ((or_, oi), (sr, si)))| { chromatin_trial_block(sys, full, half1, half2, magnus, b, sr, si, or_, oi); });
+        } else {
+            for b in 0..n_blocks {
+                let r = b * blen..(b + 1) * blen;
+                chromatin_trial_block(sys, full, half1, half2, magnus, b, &gr[r.clone()], &gi[r.clone()], &mut outr[r.clone()], &mut outi[r]);
+            }
+        }
+    };
+    // forward: the whole trajectory when it fits, else checkpoints every cs steps (G_0 = w is the first)
+    let store_all = kk.saturating_mul(total).saturating_mul(16) <= CHROMATIN_ADJ_STORE;
+    let cs = if store_all { kk.max(1) } else { ((kk as f64).sqrt().ceil() as usize).max(1) };
+    let mut gr: Vec<f64> = (0..n_blocks).flat_map(|_| (0..n).flat_map(|c| std::iter::repeat(p.w[c]).take(bw))).collect();
+    let mut gi = vec![0.0; total];
+    let mut ckpt: Vec<(Vec<f64>, Vec<f64>)> = vec![(gr.clone(), gi.clone())];
+    let mut traj: Vec<(Vec<f64>, Vec<f64>)> = Vec::new();            // every G_k (the input of step k) when stored outright
+    let mut outr = vec![0.0; total];
+    let mut outi = vec![0.0; total];
+    for k in 0..kk {
+        let (full, half1, half2, magnus) = ops_at(k);
+        forward_step(&full, &half1, &half2, magnus, &gr, &gi, &mut outr, &mut outi);
+        if store_all {
+            traj.push((std::mem::replace(&mut gr, std::mem::take(&mut outr)), std::mem::replace(&mut gi, std::mem::take(&mut outi))));
+            outr = vec![0.0; total];
+            outi = vec![0.0; total];
+        } else {
+            std::mem::swap(&mut gr, &mut outr);
+            std::mem::swap(&mut gi, &mut outi);
+            if (k + 1) % cs == 0 && k + 1 < kk { ckpt.push((gr.clone(), gi.clone())); }
+        }
+    }
+    // backward, segment by segment
+    let mut out = AdjOut { d_w: vec![0.0; n], d_h: vec![0.0; n * n], d_a: vec![0.0; n * m], d_c: vec![0.0; m * m], d_burst: 0.0, d_protein: [0.0; 4] };
+    let mut ebar_by_h: std::collections::BTreeMap<u64, Vec<f64>> = std::collections::BTreeMap::new();
+    let (mut lr, mut li) = (lam_r, lam_i);
+    let mut nlr = vec![0.0; total];
+    let mut nli = vec![0.0; total];
+    for seg in (0..ckpt.len()).rev() {
+        let k0 = seg * cs;
+        let k1 = ((seg + 1) * cs).min(kk);
+        let gs: Vec<(Vec<f64>, Vec<f64>)> = if store_all {
+            std::mem::take(&mut traj)
+        } else {
+            let mut gs = Vec::with_capacity(k1 - k0);
+            let (mut cr, mut ci) = ckpt[seg].clone();
+            for k in k0..k1 {
+                if k + 1 < k1 {
+                    let (full, half1, half2, magnus) = ops_at(k);
+                    forward_step(&full, &half1, &half2, magnus, &cr, &ci, &mut outr, &mut outi);
+                    gs.push((std::mem::replace(&mut cr, std::mem::take(&mut outr)), std::mem::replace(&mut ci, std::mem::take(&mut outi))));
+                    outr = vec![0.0; total];
+                    outi = vec![0.0; total];
+                } else {
+                    gs.push((cr.clone(), ci.clone()));
+                }
+            }
+            gs
+        };
+        for k in (k0..k1).rev() {
+            let (full, half1, half2, magnus) = ops_at(k);
+            let (et_full, et_half) = if magnus {
+                (ChainExp::Dense(SmallMat::zeros(0)), ChainExp::Dense(SmallMat::zeros(0)))
+            } else {
+                (full.e.transpose(), half1.e.transpose())
+            };
+            let (gkr, gki) = &gs[k - k0];
+            let acc = if par {
+                nlr.par_chunks_mut(blen).zip(nli.par_chunks_mut(blen))
+                    .zip(lr.par_chunks(blen).zip(li.par_chunks(blen)))
+                    .zip(gkr.par_chunks(blen).zip(gki.par_chunks(blen)))
+                    .enumerate()
+                    .map(|(b, (((olr, oli), (lr_b, li_b)), (gr_b, gi_b)))|
+                         adj_step_block(sys, &full, &half1, &half2, &et_full, &et_half, magnus, b, gr_b, gi_b, lr_b, li_b, olr, oli))
+                    .collect::<Vec<StepAcc>>()
+                    .into_iter()
+                    .fold(StepAcc::zeros(n, m, ng), |a, b| a.add(b))     // in block order: the same bits on any thread count
+            } else {
+                let mut acc = StepAcc::zeros(n, m, ng);
+                for b in 0..n_blocks {
+                    let r = b * blen..(b + 1) * blen;
+                    let a = adj_step_block(sys, &full, &half1, &half2, &et_full, &et_half, magnus, b,
+                                           &gkr[r.clone()], &gki[r.clone()], &lr[r.clone()], &li[r.clone()],
+                                           &mut nlr[r.clone()], &mut nli[r]);
+                    acc = acc.add(a);
+                }
+                acc
+            };
+            std::mem::swap(&mut lr, &mut nlr);
+            std::mem::swap(&mut li, &mut nli);
+            adj_fold_step(&mut out, &mut ebar_by_h, &acc, &full, &half1, &half2, fixed[k], magnus, sys, prot_pm);
+        }
+    }
+    // G_0 = w
+    for c in 0..n {
+        let mut s = 0.0;
+        for b in 0..n_blocks {
+            for i in 0..bw { s += lr[b * blen + c * bw + i]; }
+        }
+        out.d_w[c] = s;
+    }
+    // the Strang chain exponentials: dL/dH[k, r] = h L*(h H^T, Ē_h)[r, k]
+    for (hbits, w) in ebar_by_h.iter() {
+        let h = f64::from_bits(*hbits);
+        let lstar = sys.ht.scaled(h).expm_frechet_adjoint(&SmallMat { n, a: w.clone() });
+        for r in 0..n {
+            for k in 0..n { out.d_h[k * n + r] += h * lstar.get(r, k); }
+        }
+    }
+    out
+}
+
+/// The adjoint of `eval_chromatin_pgf` over a pinned schedule: for a real
+/// scalar L of the generating function and `lam_re`/`lam_im` its derivative
+/// dL/dG (point-major like G, in the pairing dL = Re Σ lam ⊙ dG), the
+/// derivatives of L with respect to the kernel's inputs: `(d_w, d_h, d_a,
+/// d_c, d_burst, d_protein)` with `d_h` (n_states²) and `d_a` (n_states ×
+/// n_species) row-major, `d_c` (n_species²) the derivative with respect to
+/// the entries of `c` (with a protein layer, whose characteristics depend
+/// on beta and gamma only, `d_c = [[-dL/dbeta, 0], [0, -dL/dgamma]]`) and
+/// `d_protein = (dL/dk_p, dL/dgamma_p)`.  The schedule and `magnus_steps`
+/// are replayed; the other arguments are those of `eval_chromatin_pgf`.
+#[pyfunction]
+#[pyo3(signature = (n_states, n_species, h, a, c, limits, w, t_horizon, h_first, h_min, tol, fixed_schedule, lam_re, lam_im, magnus_steps=None, site_weights=None, independent=None, u_re=None, u_im=None, burst=None, protein=None, h_switch=None))]
+#[allow(clippy::too_many_arguments)]
+fn eval_chromatin_pgf_adjoint(
+    py:             Python<'_>,
+    n_states:       usize,
+    n_species:      usize,
+    h:              Vec<f64>,
+    a:              Vec<f64>,
+    c:              Vec<f64>,
+    limits:         Vec<usize>,
+    w:              Vec<f64>,
+    t_horizon:      f64,
+    h_first:        f64,
+    h_min:          f64,
+    tol:            f64,
+    fixed_schedule: Vec<f64>,
+    lam_re:         Vec<f64>,
+    lam_im:         Vec<f64>,
+    magnus_steps:   Option<usize>,
+    site_weights:   Option<Vec<f64>>,
+    independent:    Option<Vec<f64>>,
+    u_re:           Option<Vec<f64>>,
+    u_im:           Option<Vec<f64>>,
+    burst:          Option<f64>,
+    protein:        Option<(f64, f64, f64, f64, f64)>,
+    h_switch:       Option<f64>,
+) -> PyResult<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, f64, (f64, f64))> {
+    let (n, m) = (n_states, n_species);
+    let err = |s: &str| pyo3::exceptions::PyValueError::new_err(format!("eval_chromatin_pgf_adjoint: {s}"));
+    if fixed_schedule.is_empty() {
+        return Err(err("the schedule to replay is empty"));
+    }
+    let magnus_steps = magnus_steps.unwrap_or(0);
+    if magnus_steps > fixed_schedule.len() {
+        return Err(err("magnus_steps exceeds the schedule's length"));
+    }
+    let args = ChromatinPointArgs {
+        h, a, c, w, t_horizon, h_first, h_min, tol, fixed_schedule: Some(fixed_schedule), site_weights, independent, burst, protein,
+        magnus_steps, h_switch: h_switch.unwrap_or(0.0),
+    };
+    chromatin_check("eval_chromatin_pgf_adjoint", n, m, &limits, &u_re, &u_im, &args)?;
+    let mesh = chromatin_mesh(m, &limits, &u_re, &u_im, args.protein.is_some());
+    let n_grid = mesh.2;
+    if lam_re.len() != n_grid * n || lam_im.len() != n_grid * n {
+        return Err(err("lam_re/lam_im must have n_grid × n_states entries, point-major"));
+    }
+    Ok(py.allow_threads(|| {
+        let bw = CHROMATIN_BLOCK;
+        let (sys, n_blocks) = chromatin_sys(n, m, &mesh, &args);
+        let mut lr = vec![0.0; n_blocks * n * bw];
+        let mut li = vec![0.0; n_blocks * n * bw];
+        for q in 0..n_grid {
+            let (b, i) = (q / bw, q % bw);
+            for cc in 0..n {
+                lr[b * n * bw + cc * bw + i] = lam_re[q * n + cc];
+                li[b * n * bw + cc * bw + i] = lam_im[q * n + cc];
+            }
+        }
+        let prot_pm = sys.protein.as_ref().map(|pt| {
+            let base = [pt.p.beta, pt.p.gamma, pt.p.k_p, pt.p.gamma_p];
+            let mk = |v: [f64; 4]| ProtParams { beta: v[0], gamma: v[1], k_p: v[2], gamma_p: v[3] };
+            (0..4).map(|ip| {
+                let e = CHROMATIN_ADJ_FD * base[ip];
+                let mut vp = base; vp[ip] += e;
+                let mut vm = base; vm[ip] -= e;
+                (prot_tabulate_replay(mk(vp), &mesh.0, n_grid, n_blocks * bw, &pt.nodes, pt.cap),
+                 prot_tabulate_replay(mk(vm), &mesh.0, n_grid, n_blocks * bw, &pt.nodes, pt.cap),
+                 2.0 * e)
+            }).collect::<Vec<_>>()
+        });
+        let out = chromatin_pgf_adjoint(&sys, &args, n_blocks, lr, li, &prot_pm);
+        let d_c = if sys.protein.is_some() {
+            let mut d = vec![0.0; m * m];
+            d[0] = -out.d_protein[0];
+            d[m * m - 1] = -out.d_protein[1];
+            d
+        } else {
+            out.d_c
+        };
+        (out.d_w, out.d_h, out.d_a, d_c, out.d_burst, (out.d_protein[2], out.d_protein[3]))
+    }))
 }
 
 // ============================================================================
@@ -6900,6 +7874,8 @@ fn monod_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(searchdata_from_h5ad, m)?)?;
     m.add_function(wrap_pyfunction!(eval_custom_network_pgf, m)?)?;
     m.add_function(wrap_pyfunction!(eval_chromatin_pgf, m)?)?;
+    m.add_function(wrap_pyfunction!(eval_chromatin_pgf_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(eval_chromatin_pgf_adjoint, m)?)?;
     m.add_function(wrap_pyfunction!(partition_searchdata_2d, m)?)?;
     #[cfg(feature = "kmeans")]
     m.add_function(wrap_pyfunction!(initialize_q_kmeans, m)?)?;
