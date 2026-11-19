@@ -458,6 +458,53 @@ def tail_droplets(counts, quantile=0.99, min_hits=5):
     return hits >= int(min_hits), hits
 
 
+def aggregate_cells(counts, quantile=0.99, factor=3.0):
+    """Flag cells that carry an antibody aggregate: any feature above
+    ``factor`` times that feature's ``quantile`` over all cells.
+
+    ``counts`` is a cells x features matrix (dense or scipy sparse) of
+    antibody counts.  A single count of several times the 99th percentile is
+    a clump of antibody in the droplet, not expression; such cells set the
+    protein grid limit and distort the fit of that antibody.  Returns the
+    boolean mask of cells to drop (see :func:`tail_droplets` for the cells
+    that sit in the tail of many antibodies at once).
+    """
+    X = to_dense(counts)
+    if X.ndim != 2:
+        raise ValueError(f"counts must be a cells x features matrix, got shape {X.shape}")
+    q = np.quantile(X, float(quantile), axis=0)
+    return (X > float(factor) * q[None, :]).any(axis=1)
+
+
+def cell_factor(counts, names=None, n_features=25, min_mean=15.0, exclude=("sotype", "IgG")):
+    """Per-cell log factor of an antibody panel: how much more or less of
+    every abundant antibody a cell carries than the average cell.
+
+    ``counts`` is a cells x features matrix of the whole panel (or a
+    DataFrame, whose columns are the ``names``).  The ``n_features`` most
+    abundant antibodies with a mean above ``min_mean`` are taken, leaving out
+    those whose name contains one of ``exclude`` (isotype controls); the
+    factor of a cell is the median over them of ``log1p(count)`` minus that
+    antibody's mean over cells.  Its standard deviation over cells is the
+    ``sigma`` of ``CMEModel("Chromatin", cell_factor=(sigma, nodes))``, the
+    lognormal spread of a factor shared by a cell's production rates.
+    Returns the factor per cell (natural log units).
+    """
+    if isinstance(counts, pd.DataFrame):
+        names = list(counts.columns) if names is None else names
+        counts = counts.to_numpy()
+    X = to_dense(counts)
+    if X.ndim != 2:
+        raise ValueError(f"counts must be a cells x features matrix, got shape {X.shape}")
+    names = [str(n) for n in names] if names is not None else [""] * X.shape[1]
+    mean = X.mean(0)
+    abundant = [j for j in np.argsort(-mean) if mean[j] > float(min_mean) and not any(e in names[j] for e in exclude)][:int(n_features)]
+    if not abundant:
+        raise ValueError(f"no feature has a mean above min_mean={min_mean}")
+    L = np.log1p(X[:, abundant])
+    return np.median(L - L.mean(0), axis=1)
+
+
 def threshold_by_expression(adata, filt_param=None):
     """
     Filters genes in an AnnData object based on expression thresholds for each layer.

@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from monod.cme_toolbox import CMEModel
-from monod.extract_data import tail_droplets
+from monod.extract_data import aggregate_cells, cell_factor, tail_droplets
 from monod.inference import hellinger_floor, hellinger_statistic
 
 
@@ -156,3 +156,35 @@ class TestWarmStart:
         (tmp_path / "shape").mkdir()
         with pytest.raises(ValueError, match="shape"):
             self._fit(tmp_path / "shape", gp=dict(self.GP, init_pattern="given", x0=np.zeros((3, 2))))
+
+
+class TestAntibodyPanel:
+    """The panel-level steps before a protein fit: aggregates and the per-cell factor."""
+
+    def test_aggregate_cells(self):
+        rng = np.random.default_rng(0)
+        X = rng.poisson(20, size=(2000, 6)).astype(float)
+        assert not aggregate_cells(X).any()
+        X[[3, 77], [1, 4]] = 500
+        np.testing.assert_array_equal(np.flatnonzero(aggregate_cells(X)), [3, 77])
+        import scipy.sparse as sp
+        np.testing.assert_array_equal(aggregate_cells(sp.csr_matrix(X)), aggregate_cells(X))
+        assert aggregate_cells(X, factor=100).sum() == 0
+        with pytest.raises(ValueError):
+            aggregate_cells(X[0])
+
+    def test_cell_factor(self):
+        import pandas as pd
+        rng = np.random.default_rng(2)
+        n = 3000
+        f = np.exp(rng.normal(0, 0.3, size=n))
+        means = np.array([200.0, 150.0, 120.0, 90.0, 60.0, 2.0, 400.0])
+        X = rng.poisson(f[:, None] * means[None, :])
+        names = ["a", "b", "c", "d", "e", "dim", "Mouse IgG1 isotype"]
+        fac = cell_factor(pd.DataFrame(X, columns=names))
+        assert fac.shape == (n,) and np.corrcoef(fac, np.log(f))[0, 1] > 0.97
+        assert fac.std() == pytest.approx(0.3, rel=0.1)
+        np.testing.assert_allclose(fac, cell_factor(X[:, :5]))                                        # the dim antibody and the isotype control are left out
+        np.testing.assert_allclose(cell_factor(X, names=names, n_features=2), cell_factor(X[:, :2]))
+        with pytest.raises(ValueError):
+            cell_factor(X, min_mean=1e6)

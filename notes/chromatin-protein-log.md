@@ -652,6 +652,22 @@ Stages 1 to 4 were Python only and self-contained; stage 5 was the port.
    slow shared variable (cell state) rather than faster chromatin; the
    activation split is the follow-up the notebook already has.
 
+   **Library sweep (2026-11-19).** The notebook's general helpers moved
+   into the package, each checked against the artifact it had produced:
+   `inference.fit_table` (the pass 7a table to rounding),
+   `SearchResults.sampling_grid_table`, `inference.observed_marginal`,
+   `chromatin_data.state_table` and `SearchResults.state_table` (observed
+   and fitted counts by chromatin state), `extract_data.aggregate_cells`
+   (155 cells), `extract_data.cell_factor` (sd 0.248; its recipe of 25
+   abundant antibodies is this panel's) and `chromatin_data.read_kb_nac`,
+   which returns kb's three matrices as written and leaves the ambiguous
+   counts to the caller. Kept in the notebook as this dataset's assembly:
+   the arc matrix through scanpy, the GEO antibody table, the background
+   table (its thresholds were tuned on these 28 antibodies; a library
+   function waits for a second dataset), the marker-based cell types, the
+   CD4/CD8a gate and the activation strata. The panel's gene-to-antibody
+   map is `demos/dogma_seq_protein_map.csv`.
+
 ## Open decisions
 
 - **Heavy protein tails of the abundant antibodies.** After pass 7 the

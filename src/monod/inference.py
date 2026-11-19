@@ -816,6 +816,55 @@ def search_result_list_to_uns(srs):
 _USE_LENGTHS_MODES = (None, "unspliced", "spliced", "both")
 
 
+def fit_table(adata, search_result=None):
+    """The per-gene table of a finished fit: what a results file is usually
+    read for, as one DataFrame indexed by gene.
+
+    ``adata`` is the output of :func:`perform_inference`; ``search_result``
+    the :class:`SearchResults` to read (default: the one stored in
+    ``adata.uns['search_result']``; pass the object after
+    ``chisquare_testing`` when the test has not been written back).  Columns:
+    the estimates at the sampling optimum under the model's parameter names
+    (log10, without the ``\\log_{10}`` prefix), ``error_<name>`` and
+    ``error_unreliable`` when standard errors were computed, ``at_bound``
+    (the names of the parameters within 1% of a search bound, comma
+    separated), ``kld`` and, after ``chisquare_testing``, ``rejected``,
+    ``pval``, ``hellinger``, ``hellinger_floor`` and ``hellinger_excess``."""
+    sr = search_result_from_uns(adata.uns["search_result"]) if search_result is None else search_result
+    names = [p.replace(r"\log_{10} ", "") for p in sr.model.param_str]
+    opt = np.asarray(sr.phys_optimum, dtype=float)
+    est = pd.DataFrame(opt, columns=names, index=adata.var_names)
+    for n in names:
+        if "error_" + n in adata.var.columns:
+            est["error_" + n] = adata.var["error_" + n].to_numpy()
+    if "error_unreliable" in adata.var.columns:
+        est["error_unreliable"] = adata.var["error_unreliable"].to_numpy()
+    lb, ub = np.asarray(sr.sp.phys_lb, dtype=float), np.asarray(sr.sp.phys_ub, dtype=float)
+    near = ((opt - lb) < 0.01 * (ub - lb)) | ((ub - opt) < 0.01 * (ub - lb))
+    est["at_bound"] = [",".join(n for n, f in zip(names, row) if f) for row in near]
+    klds = np.asarray(sr.klds)
+    est["kld"] = klds[sr.samp_optimum_ind] if klds.ndim == 2 else klds
+    if getattr(sr, "rejected_genes", None) is not None:
+        est["rejected"] = np.asarray(sr.rejected_genes, dtype=bool)
+        for col in ("pval", "hellinger", "hellinger_floor", "hellinger_excess"):
+            if getattr(sr, col, None) is not None:
+                est[col] = np.asarray(getattr(sr, col))
+    return est
+
+
+def observed_marginal(search_data, i_, marg, modalities):
+    """The observed marginal distribution of one modality of gene ``i_``
+    (``marg``: its name among ``modalities``, the model's modality list) on
+    the data's grid, from the histogram the fit used: the counterpart of
+    :meth:`SearchResults.gene_pss` with the same ``marg``."""
+    lind = _resolve_marg(marg, modalities)
+    coords, freqs = search_data.hist[i_]
+    coords = np.asarray(coords); freqs = np.asarray(freqs, dtype=float)
+    out = np.zeros(int(np.asarray(search_data.M)[lind, i_]))
+    np.add.at(out, coords[:, lind].astype(np.int64), freqs / freqs.sum())
+    return out
+
+
 def warm_start(results):
     """Starting points for ``gradient_params={"init_pattern": "given", "x0": ...}``
     from an earlier fit: a mapping from gene name to the gene's physical optimum
@@ -3311,6 +3360,42 @@ class SearchResults:
         
         fig1.tight_layout()
         self._savefig("length_dependence.png")
+
+    def sampling_grid_table(self):
+        """The scan over the sampling grid as a DataFrame: one row per grid
+        point with its sampling parameters (``samp_0``, ``samp_1``, ... in
+        the order of the sampling vector, log10) and ``kld_sum``, the
+        divergence summed over the genes, whose minimum is the sampling
+        optimum (``optimum`` marks it)."""
+        vals = np.asarray(self.sp.sampl_vals, dtype=float)
+        klds = np.asarray(self.klds, dtype=float)
+        klds = klds[None, :] if klds.ndim == 1 else klds
+        out = pd.DataFrame({f"samp_{k}": vals[:, k] for k in range(vals.shape[1])})
+        out["kld_sum"] = klds.sum(1)
+        out["optimum"] = np.arange(len(out)) == int(self.samp_optimum_ind)
+        return out
+
+    def state_table(self, search_data, min_mean=0.02):
+        """The fitted counterpart of :func:`monod.chromatin_data.state_table`
+        for a Chromatin fit: per gene, the configuration fractions and the
+        mean of every count modality over the closed locus and over the open
+        configurations under the fitted PMF at the sampling optimum (dropout
+        and capture included, so the table compares with the observed one
+        column for column)."""
+        from .chromatin_data import _state_frame
+        if self.model.bio_model != "Chromatin":
+            raise ValueError("state_table is defined for the Chromatin model")
+        names = list(self.model.model_modalities[:-1])
+        fractions, closed, open_ = [], [], []
+        for i in range(len(self.phys_optimum)):
+            pss = np.asarray(self.gene_pss(search_data, i), dtype=float)
+            pss = pss / pss.sum()
+            m = pss.ndim - 1
+            p_c = pss.sum(axis=tuple(range(m)))
+            ex = np.array([(pss.sum(axis=tuple(k for k in range(m) if k != a)) * np.arange(pss.shape[a])[:, None]).sum(0)
+                           for a in range(m)])                                     # E[x_a 1_c], (m, N)
+            fractions.append(p_c); closed.append(ex[:, 0] / p_c[0]); open_.append(ex[:, 1:].sum(1) / p_c[1:].sum())
+        return _state_frame(list(search_data.gene_names), np.array(fractions), np.array(closed), np.array(open_), names, min_mean)
 
     def gene_pss(self, search_data, i_, marg="joint"):
         """The fitted PMF of gene ``i_`` at the sampling optimum over the data's

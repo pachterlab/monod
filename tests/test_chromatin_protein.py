@@ -389,6 +389,29 @@ class TestPipeline:
         assert 0 < sr_.hellinger_floor[0] < hel[0] + 1e-9 and sr_.hellinger_excess[0] == pytest.approx(hel[0] - sr_.hellinger_floor[0])
         back = search_result_from_uns(sr_.to_dict())
         np.testing.assert_allclose(back.hellinger_floor, sr_.hellinger_floor)
+        # the tables a results file is read for (inference.fit_table, sampling_grid_table, state_table, observed_marginal)
+        from monod import chromatin_data as cd
+        from monod.inference import fit_table, observed_marginal
+        tab = fit_table(out, sr_)
+        assert list(tab.index) == ["geneA"] and list(tab.columns[:9]) == names
+        np.testing.assert_allclose(tab[names].to_numpy()[0], est)
+        assert tab.kld.iloc[0] == pytest.approx(float(np.asarray(sr_.klds)[sr_.samp_optimum_ind, 0]))
+        assert {"at_bound", "rejected", "pval", "hellinger", "hellinger_floor", "hellinger_excess"} <= set(tab.columns)
+        assert "rejected" not in fit_table(out).columns and "at_bound" in fit_table(out).columns    # the stored result predates the test
+        g = sr_.sampling_grid_table()
+        np.testing.assert_allclose(g.samp_2, grid); assert int(g.optimum.sum()) == 1 and g.kld_sum[g.optimum].iloc[0] == g.kld_sum.min()
+        obs, fit = cd.state_table(out), sr_.state_table(sd)
+        assert list(obs.columns) == list(fit.columns) and list(fit.index) == ["geneA"]
+        cfgl = np.asarray(out.layers["configuration"])[:, 0]; prot = np.asarray(out.layers["protein"])[:, 0]
+        assert obs.closed_fraction.iloc[0] == pytest.approx((cfgl == 0).mean()) and obs.fraction_3.iloc[0] == pytest.approx((cfgl == 3).mean())
+        assert obs.protein_open.iloc[0] == pytest.approx(prot[cfgl > 0].mean()) and obs.protein_closed.iloc[0] == pytest.approx(prot[cfgl == 0].mean())
+        assert obs.protein_log2_ratio.iloc[0] == pytest.approx(np.log2(prot[cfgl > 0].mean() / prot[cfgl == 0].mean()))
+        assert fit.closed_fraction.iloc[0] == pytest.approx(joint.sum(axis=(0, 1, 2))[0] / joint.sum(), rel=1e-9)
+        assert abs(fit.closed_fraction.iloc[0] - obs.closed_fraction.iloc[0]) < 0.05               # a fit reproduces the configuration marginal
+        assert np.isnan(cd.state_table(out, min_mean=1e9).protein_log2_ratio.iloc[0])               # too sparse to read
+        om = observed_marginal(sd, 0, "protein", m2.model_modalities)
+        assert om.shape == (limits[2],) and om.sum() == pytest.approx(1.0)
+        assert (om * np.arange(om.size)).sum() == pytest.approx(prot.mean(), rel=1e-9)
 
     def test_per_gene_protein_background_rides_on_the_sampling_vector(self, tmp_path, monkeypatch):
         import anndata as ad

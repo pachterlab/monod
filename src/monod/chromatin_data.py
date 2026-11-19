@@ -318,6 +318,108 @@ def build_multiome_adata(rna, atac, genes, rule: str = "tss_window", n_sites: in
     return out
 
 
+# ---------------------------------------------------------------------------
+# Reader for kb-python's nascent / mature / ambiguous matrices
+# ---------------------------------------------------------------------------
+
+def _read_lines(path) -> list:
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt") as fh:
+        return [line.rstrip("\n") for line in fh]
+
+
+def _barcode_core(b: str) -> str:
+    """A barcode without its GEM-well suffix (``AAAC...-1`` -> ``AAAC...``)."""
+    return re.sub(r"-\d+$", "", b)
+
+
+def read_kb_nac(directory, obs=None):
+    """The count matrices of a ``kb count --workflow nac`` run
+    (``cells_x_genes.{nascent,mature,ambiguous}.mtx`` with the barcode and
+    gene lists in ``directory``) as an AnnData with the layers ``nascent``,
+    ``mature`` (also ``X``) and ``ambiguous``, as kb wrote them; gene names
+    as ``var_names`` (made unique), Ensembl ids without version in
+    ``var['gene_id']``.  How the ambiguous counts are used is the caller's
+    choice (added to the mature counts, or fitted through a model's
+    ``amb_model``).  ``obs`` (a DataFrame indexed by barcode, for instance
+    the called cells with their annotations) keeps those cells, in that
+    order, matching with the GEM-well suffix removed; cells kb did not see
+    are dropped."""
+    import os
+    import anndata as ad
+    import scipy.io
+    stem = os.path.join(str(directory), "cells_x_genes")
+    barcodes = _read_lines(stem + ".barcodes.txt")
+    ids = [g.strip().split(".")[0] for g in _read_lines(stem + ".genes.txt")]
+    names = [g.strip() for g in _read_lines(stem + ".genes.names.txt")]
+    parts = {k: scipy.io.mmread(f"{stem}.{k}.mtx").tocsr() for k in ("nascent", "mature", "ambiguous")}
+    if obs is None:
+        obs = pd.DataFrame(index=barcodes)
+    else:
+        pos = {_barcode_core(b): i for i, b in enumerate(barcodes)}
+        keep = [c for c in obs.index if _barcode_core(c) in pos]
+        rows = [pos[_barcode_core(c)] for c in keep]
+        parts = {k: v[rows] for k, v in parts.items()}
+        obs = obs.loc[keep]
+    rna = ad.AnnData(X=parts["mature"].copy(), obs=obs, var=pd.DataFrame({"gene_id": ids}, index=names), layers=parts)
+    rna.var_names_make_unique()
+    return rna
+
+
+# ---------------------------------------------------------------------------
+# Counts by chromatin state
+# ---------------------------------------------------------------------------
+
+def _state_frame(index, fractions, closed, open_, names, min_mean):
+    """The table of :func:`state_table` from the configuration fractions
+    (genes x N) and the closed- and open-state means (genes x modalities)."""
+    fractions = np.asarray(fractions, dtype=float)
+    closed = np.asarray(closed, dtype=float); open_ = np.asarray(open_, dtype=float)
+    out = pd.DataFrame({f"fraction_{c}": fractions[:, c] for c in range(fractions.shape[1])}, index=index)
+    out["closed_fraction"] = fractions[:, 0]
+    for k, name in enumerate(names):
+        out[f"{name}_closed"] = closed[:, k]
+        out[f"{name}_open"] = open_[:, k]
+        ok = np.minimum(closed[:, k], open_[:, k]) >= float(min_mean)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out[f"{name}_log2_ratio"] = np.where(ok, np.log2(open_[:, k] / closed[:, k]), np.nan)
+    return out
+
+
+def state_table(adata, layers: Optional[Sequence[str]] = None, min_mean: float = 0.02) -> pd.DataFrame:
+    """Counts by chromatin state, per gene: what the configuration read by
+    ATAC says about the other assays of the same cell.
+
+    For every gene of an AnnData with a ``configuration`` layer: the fraction
+    of cells in each configuration (``fraction_0`` ... ; configuration 0 is
+    the fully closed locus, also ``closed_fraction``) and, for every count
+    layer in ``layers`` (default: those of ``unspliced``, ``spliced``,
+    ``protein`` present), the mean over the cells whose locus reads closed
+    (``<layer>_closed``), over those with at least one site open
+    (``<layer>_open``) and the log2 ratio of the two
+    (``<layer>_log2_ratio``), left NaN where either mean is below
+    ``min_mean`` counts per cell and the ratio would be noise.
+    :meth:`monod.inference.SearchResults.state_table` gives the same table
+    under a fitted model."""
+    from ._core import to_dense
+    if "configuration" not in adata.layers:
+        raise ValueError("state_table needs a 'configuration' layer (see build_multiome_adata)")
+    if layers is None:
+        layers = [l for l in ("unspliced", "spliced", "protein") if l in adata.layers]
+    config = np.asarray(to_dense(adata.layers["configuration"])).astype(np.int64)
+    n_states = int(2 ** int(adata.uns["chromatin_data"]["n_sites"])) if "chromatin_data" in adata.uns else int(config.max()) + 1
+    fractions = np.stack([(config == c).mean(0) for c in range(n_states)], axis=1)
+    is_closed = config == 0
+    n_closed = is_closed.sum(0); n_open = config.shape[0] - n_closed
+    closed, open_ = [], []
+    for l in layers:
+        X = np.asarray(to_dense(adata.layers[l]), dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            closed.append((X * is_closed).sum(0) / n_closed)
+            open_.append((X * ~is_closed).sum(0) / n_open)
+    return _state_frame(adata.var_names, fractions, np.stack(closed, 1), np.stack(open_, 1), list(layers), min_mean)
+
+
 def site_summary(adata) -> pd.DataFrame:
     """Per gene and site: the peak and the fraction of cells in which it is open."""
     sites = adata.uns["chromatin_sites"]

@@ -153,3 +153,26 @@ class TestConfiguration:
         assert list(grid_limits(m_adata)[3, :]) == [2, 2] and grid_limits(m_adata)[2, 0] > 20
         with pytest.raises(ValueError, match="protein"):
             cd.build_multiome_adata(rna, atac, _genes(), rule="tss_window", n_sites=1, window=1500, protein=prot[:0])
+
+
+class TestReaders:
+    def test_kb_nac(self, tmp_path):
+        """The three kb matrices as layers, on the called cells in their own order."""
+        import scipy.io, scipy.sparse as sp
+        rng = np.random.default_rng(0)
+        cells = [f"{b}-1" for b in ("AAAC", "CCCG", "GGGT", "TTTA")]
+        kb_bc = ["GGGT", "AAAC", "NNNN", "TTTA"]; parts = {k: rng.poisson(3, size=(4, 2)) for k in ("nascent", "mature", "ambiguous")}
+        for k, v in parts.items():
+            scipy.io.mmwrite(str(tmp_path / f"cells_x_genes.{k}.mtx"), sp.csr_matrix(v))
+        (tmp_path / "cells_x_genes.barcodes.txt").write_text("\n".join(kb_bc) + "\n")
+        (tmp_path / "cells_x_genes.genes.txt").write_text("ENSG1.4\nENSG2.1\n"); (tmp_path / "cells_x_genes.genes.names.txt").write_text("G1\nG2\n")
+        obs = pd.DataFrame({"cell_type": ["T", "B", "T", "T"]}, index=cells)
+        rna = cd.read_kb_nac(tmp_path, obs=obs)
+        assert list(rna.obs_names) == ["AAAC-1", "GGGT-1", "TTTA-1"] and list(rna.obs["cell_type"]) == ["T", "T", "T"]   # CCCG is not in kb
+        assert list(rna.var_names) == ["G1", "G2"] and list(rna.var["gene_id"]) == ["ENSG1", "ENSG2"]
+        rows = [1, 0, 3]
+        for k in parts:
+            np.testing.assert_array_equal(rna.layers[k].toarray(), parts[k][rows])
+        np.testing.assert_array_equal(rna.X.toarray(), parts["mature"][rows])
+        whole = cd.read_kb_nac(tmp_path)
+        assert whole.n_obs == 4 and list(whole.obs_names) == kb_bc
